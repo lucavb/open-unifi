@@ -95,7 +95,7 @@ func (d *devicesDataSource) Read(ctx context.Context, req datasource.ReadRequest
 			Name:  types.StringValue(dev.Name),
 			Model: types.StringValue(dev.Model),
 			IP:    types.StringValue(dev.IP),
-			State: types.StringValue(dev.State),
+			State: types.StringValue(stateName(dev.State)),
 		})
 	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &model)...)

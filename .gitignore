@@ -1,5 +1,6 @@
 unifi_sysvinit_all.deb
 *.deb
+*.bin
 tmpwork/
 f730-*
 ghidra.rep/

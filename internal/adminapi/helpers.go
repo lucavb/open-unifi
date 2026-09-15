@@ -61,7 +61,7 @@ type whoAmI struct {
 // requireToken enforces Bearer-token auth when the token is configured.
 // GET requests are NOT exempt — every /api route requires the token
 // (only /healthz and / are open).
-func requireToken(cfg DegenerateConfig, next http.HandlerFunc) http.HandlerFunc {
+func requireToken(cfg Config, next http.HandlerFunc) http.HandlerFunc {
 	if cfg.AdminToken == "" {
 		return next
 	}
@@ -123,11 +123,28 @@ var validSecurities = map[string]bool{
 	"wpa-eap": true,
 }
 
-// validateWlan enforces server-side rules; the web console mirrors them.
-// Returns "" when valid, or a short human message for the 400 body.
+// validateWlan enforces server-side rules. The web console mirrors the
+// length/security rules client-side (see static/index.html validateWlan);
+// the control-character and ID-charset checks are deliberately
+// server-side-only defense-in-depth: control chars in SSID/Name/Passphrase
+// (or separators in an ID) could inject extra system_cfg rows at emission
+// time even if a client bypasses the console. Returns "" when valid, or a
+// short human message for the 400 body.
 func validateWlan(wl *Wlan) string {
 	if !validSecurities[wl.Security] {
 		return "security must be one of open, wpa-p, wpa-eap"
+	}
+	if hasControlChar(wl.SSID) {
+		return "ssid must not contain control characters"
+	}
+	if hasControlChar(wl.Name) {
+		return "name must not contain control characters"
+	}
+	if hasControlChar(wl.Passphrase) {
+		return "passphrase must not contain control characters"
+	}
+	if err := validateWlanID(wl.ID); err != "" {
+		return err
 	}
 	if n := len(wl.SSID); n < 1 || n > 32 {
 		return "ssid length must be 1..32"
@@ -143,6 +160,43 @@ func validateWlan(wl *Wlan) string {
 	}
 	if len(wl.Passphrase) < 8 {
 		return "passphrase must be at least 8 characters when security is " + wl.Security
+	}
+	return ""
+}
+
+// hasControlChar reports any character below 0x20 (includes \n and \r — the
+// newline IS the system_cfg row separator, so a \n inside an emitted value
+// would inject a forged row) or 0x7F (DEL).
+func hasControlChar(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] == 0x7F {
+			return true
+		}
+	}
+	return false
+}
+
+// validateWlanID checks the wlans[].id field when the client supplies one.
+// Empty ID is fine (server derives sha256(nameSSID)[:24]); a supplied ID
+// lands verbatim in WlanConf/WirelessConf `id` rows, so it must be a safe
+// token: visible printable ASCII minus value separators (no whitespace, no
+// = , ; " '), max 64 chars. Hex-style IDs like "wlan-1" pass.
+func validateWlanID(id string) string {
+	if id == "" {
+		return ""
+	}
+	if len(id) > 64 {
+		return "id must be at most 64 characters"
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if c <= 0x20 || c > 0x7E { // 0x7F included by c > 0x7E
+			return "id may only contain visible printable ASCII (no spaces or separators)"
+		}
+		switch c {
+		case '=', ',', ';', '"', '\'':
+			return "id must not contain = , ; or quote characters"
+		}
 	}
 	return ""
 }

@@ -6,7 +6,9 @@ package provider
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
@@ -84,8 +86,25 @@ func (p *openUnifiProvider) Configure(ctx context.Context, req provider.Configur
 		insecure = cfg.InsecureSkipVerify.ValueBool()
 	}
 
-	resp.ResourceData = newAPIClient(cfg.URL.ValueString(), token, insecure)
-	resp.DataSourceData = resp.ResourceData
+	client := newAPIClient(cfg.URL.ValueString(), token, insecure)
+
+	// Configure-time connectivity/auth probe: GET /api/v1/whoami always
+	// exists on an open-unifi admin API, so this catches unreachable
+	// controllers, wrong ports, missing/renamed API routes (404), auth
+	// rejections (401), and protocol mismatches (decode errors) up front.
+	// The authConfigured result is logged only — token validity against a
+	// token-less server is the operator's call; resources will error if a
+	// real request is rejected.
+	if err := client.checkConnectivity(ctx); err != nil {
+		resp.Diagnostics.AddError(
+			"Unreachable open-unifi admin API",
+			fmt.Sprintf("probing %s/api/v1/whoami failed: %s", strings.TrimRight(cfg.URL.ValueString(), "/"), err.Error()),
+		)
+		return
+	}
+
+	resp.ResourceData = client
+	resp.DataSourceData = client
 }
 
 func (p *openUnifiProvider) Resources(_ context.Context) []func() resource.Resource {

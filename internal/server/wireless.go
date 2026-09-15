@@ -212,7 +212,7 @@ func (s *Server) emitWirelessCfg(b *strings.Builder, d store.Device, wls []Wlan)
 		return
 	}
 
-	line := func(k, v string) { b.WriteString(k); b.WriteString("="); b.WriteString(v); b.WriteString("\n") }
+	line := s.lineWriter(b, "wireless-radio")
 
 	// Header block (int §488-497 / doc §1) — country default 840, outdoor
 	// override from site settings we do not carry yet → "disabled".
@@ -225,10 +225,6 @@ func (s *Server) emitWirelessCfg(b *strings.Builder, d store.Device, wls []Wlan)
 
 	// radio.<n4> rows (doc §3, worked-example row order), then the per-vap
 	// virtual companion rows for vapIdxOnRadio > 0 (doc §536-542).
-	perRadioCount := map[int]int{}
-	for _, v := range vaps {
-		perRadioCount[v.radioN]++
-	}
 	for i, r := range radios {
 		n := i + 1
 		prefix := fmt.Sprintf("radio.%d.", n)
@@ -322,13 +318,8 @@ func numFromExtra(extra store.JSONMap, key string) (bool, int64) {
 // then the common tail.
 func (s *Server) emitAaaRows(b *strings.Builder, n int, v vapPlan, openHostapd bool) {
 	p := fmt.Sprintf("aaa.%d.", n)
-	line := func(k, vv string) {
-		b.WriteString(p)
-		b.WriteString(k)
-		b.WriteString("=")
-		b.WriteString(vv)
-		b.WriteString("\n")
-	}
+	prefix := s.lineWriter(b, "aaa-rows")
+	line := func(k, vv string) { prefix(p+k, vv) }
 	name := ssidOf(v.wlan)
 
 	// §4.1 always-first block (int §566-578; no log_level row: record field
@@ -417,13 +408,8 @@ func aaaBridge(v vapPlan) string {
 // key order; security is LITERAL none, authmode 0 only for open).
 func (s *Server) emitWirelessRows(b *strings.Builder, n int, v vapPlan) {
 	p := fmt.Sprintf("wireless.%d.", n)
-	line := func(k, vv string) {
-		b.WriteString(p)
-		b.WriteString(k)
-		b.WriteString("=")
-		b.WriteString(vv)
-		b.WriteString("\n")
-	}
+	prefix := s.lineWriter(b, "wireless-rows")
+	line := func(k, vv string) { prefix(p+k, vv) }
 
 	line("mode", "master")
 	line("devname", "ath"+strconv.Itoa(v.athN))
@@ -464,7 +450,7 @@ func (s *Server) emitWirelessRows(b *strings.Builder, n int, v vapPlan) {
 // emitVlanBlocks writes `# vlan`, `# bridge`, `# netconf` and `# dhcpc`
 // from the vap wiring (doc §6 + §7 excerpt).
 func (s *Server) emitVlanBlocks(b *strings.Builder, vaps []vapPlan) {
-	line := func(k, v string) { b.WriteString(k); b.WriteString("="); b.WriteString(v); b.WriteString("\n") }
+	line := s.lineWriter(b, "vlan-blocks")
 
 	// collect tagged vids (sorted) and bridge memberships
 	vidAths := map[int][]string{}

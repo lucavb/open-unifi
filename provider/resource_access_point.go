@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"net/http"
+	"strconv"
 
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -80,17 +81,18 @@ func (r *accessPointResource) Schema(_ context.Context, _ resource.SchemaRequest
 	}
 }
 
-// apDevice mirrors the JSON of GET/POST /api/v1/devices and
-// GET /api/v1/devices/{mac}.
+// apDevice mirrors the JSON of GET /api/v1/devices/{mac}
+// (adminapi.DeviceView). The server encodes `state` as a JSON number and
+// `last_seen` as a unix-seconds int64; site_id is request-only and never
+// appears in a response body, so it is deliberately absent here.
 type apDevice struct {
 	Mac      string `json:"mac"`
 	Name     string `json:"name"`
-	SiteID   string `json:"site_id,omitempty"`
 	Model    string `json:"model,omitempty"`
-	State    string `json:"state,omitempty"`
+	State    int    `json:"state"`
 	IP       string `json:"ip,omitempty"`
 	Firmware string `json:"firmware,omitempty"`
-	LastSeen string `json:"last_seen,omitempty"`
+	LastSeen int64  `json:"last_seen,omitempty"`
 }
 
 func (r *accessPointResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -226,25 +228,24 @@ func notConfiguredErr(d interface {
 	d.AddError("Provider not configured", "Configure must set the API client before resource use.")
 }
 
-// applyDevice copies server truth into the Terraform model. Empty strings
-// are tolerated (a pending/standalone device may not yet report an IP).
+// applyDevice copies server truth into the Terraform model, mapping the
+// server's numeric state into the TF vocabulary via stateName. Empty
+// strings are tolerated (a pending/standalone device may not yet report an
+// IP). `site` is the configured/request-only site_id: the server never
+// echoes it back, so state keeps the configured value.
 func applyDevice(m *apModel, dev *apDevice, site string) {
-	m.SiteID = orString(dev.SiteID, site)
-	m.State = orString(dev.State, "pending")
+	m.SiteID = types.StringValue(site)
+	m.State = types.StringValue(stateName(dev.State))
 	m.IP = types.StringValue(dev.IP)
 	m.Firmware = types.StringValue(dev.Firmware)
-	m.LastSeen = types.StringValue(dev.LastSeen)
+	if dev.LastSeen > 0 {
+		m.LastSeen = types.StringValue(strconv.FormatInt(dev.LastSeen, 10))
+	} else {
+		m.LastSeen = types.StringValue("")
+	}
 	if dev.Name != "" {
 		m.Name = types.StringValue(dev.Name)
 	} else if m.Name.IsUnknown() {
 		m.Name = types.StringNull()
 	}
-}
-
-// orString returns v, falling back to def when v is empty.
-func orString(v, def string) types.String {
-	if v != "" {
-		return types.StringValue(v)
-	}
-	return types.StringValue(def)
 }

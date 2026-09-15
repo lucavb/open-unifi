@@ -55,9 +55,6 @@ var (
 	// ErrSnappyUnsupported is returned when flag 0x04 is set; snappy is
 	// legacy wallet-side and not implemented here.
 	ErrSnappyUnsupported = errors.New("inform: snappy-compressed payloads are not supported")
-	// ErrZlibUnsupported is retained for API completeness but is currently
-	// unreachable: zlib (flag 0x02) is decompressed transparently.
-	ErrZlibUnsupported = errors.New("inform: zlib-compressed payloads are not supported")
 )
 
 // Packet is a decoded inform packet.
@@ -333,16 +330,22 @@ func (p *Packet) EncryptPayloadGCM(key, plaintext, aad []byte) error {
 	return nil
 }
 
-// inflateZlib decompresses a zlib stream, bounded by MaxBodySize.
+// inflateZlib decompresses a zlib stream. An inflated body larger than
+// MaxBodySize is an ERROR (never a silent truncation misreported downstream
+// as a decrypt failure) — the classic servlet bounds the inform body the
+// same way ("Content too long").
 func inflateZlib(body []byte) ([]byte, error) {
 	zr, err := zlib.NewReader(bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("inform: zlib: %w", err)
 	}
 	defer zr.Close()
-	out, err := io.ReadAll(io.LimitReader(zr, MaxBodySize))
+	out, err := io.ReadAll(io.LimitReader(zr, MaxBodySize+1))
 	if err != nil {
 		return nil, fmt.Errorf("inform: zlib: %w", err)
+	}
+	if len(out) > MaxBodySize {
+		return nil, fmt.Errorf("inform: zlib: inflated body exceeds %d bytes", MaxBodySize)
 	}
 	return out, nil
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -106,46 +107,94 @@ func (c *apiClient) do(ctx context.Context, method, path string, body any, out a
 	return nil
 }
 
-// doErr converts a non-2xx HTTP response into a Go error.
-//
-// 401 is rendered as "unauthorized: check token" so the message lines up
-// with the server's anonymous-vs-token auth model.
+// doErr converts a non-2xx HTTP response into a typed *apiError. When the
+// body carries the server's canonical JSON error shape ({"error":"..."})
+// that message is extracted for a clean diagnostic instead of embedding the
+// raw body; plain-text bodies are passed through trimmed.
 func doErr(status int, body []byte) error {
-	msg := strings.TrimSpace(string(body))
-	switch status {
+	a := &apiError{status: status, body: strings.TrimSpace(string(body))}
+	a.message = a.body
+	var jerr struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &jerr); err == nil && jerr.Error != "" {
+		a.message = jerr.Error
+	}
+	return a
+}
+
+// apiError is the typed error for non-2xx API responses, so call sites can
+// branch on status via errors.As instead of string matching.
+type apiError struct {
+	status  int    // HTTP status code
+	body    string // raw response body
+	message string // clean diagnostic: JSON "error" field when present, else trimmed body
+}
+
+func (e *apiError) Error() string {
+	switch e.status {
 	case http.StatusUnauthorized:
-		if msg != "" {
-			return fmt.Errorf("unauthorized: check token (%s)", msg)
+		// Line the message up with the server's anonymous-vs-token auth
+		// model; the canonical body ("unauthorized") adds nothing.
+		if e.message == "" || e.message == "unauthorized" {
+			return "unauthorized: check token"
 		}
-		return fmt.Errorf("unauthorized: check token")
+		return "unauthorized: check token (" + e.message + ")"
 	case http.StatusNotFound:
-		if msg != "" {
-			return fmt.Errorf("not found: %s", msg)
+		if e.message == "" {
+			return "not found"
 		}
-		return fmt.Errorf("not found")
+		return "not found: " + e.message
 	default:
-		if msg != "" {
-			return fmt.Errorf("http %d: %s", status, msg)
+		if e.message != "" {
+			return fmt.Sprintf("http %d: %s", e.status, e.message)
 		}
-		return fmt.Errorf("http %d", status)
+		return fmt.Sprintf("http %d", e.status)
 	}
 }
 
+// NotFound reports whether the error came from an HTTP 404 response.
+func (e *apiError) NotFound() bool { return e.status == http.StatusNotFound }
+
 // errNotFound reports whether err came from a 404 response.
 func errNotFound(err error) bool {
-	return err != nil && strings.HasPrefix(err.Error(), "not found:")
+	var ae *apiError
+	return errors.As(err, &ae) && ae.NotFound()
 }
 
-// device is the wire shape of /api/v1/devices objects.
+// device is the wire shape of /api/v1/devices objects
+// (adminapi.DeviceView). The server encodes `state` as a JSON number
+// (store.StatePending..StateLost) and `last_seen` as unix-seconds int64.
+// site_id is request-only on device creation and never appears in a
+// response body, so it is deliberately absent here.
 type device struct {
 	Mac      string `json:"mac"`
 	Name     string `json:"name"`
 	Model    string `json:"model,omitempty"`
-	State    string `json:"state,omitempty"`
+	State    int    `json:"state"`
 	IP       string `json:"ip,omitempty"`
-	SiteID   string `json:"site_id,omitempty"`
 	Firmware string `json:"firmware,omitempty"`
-	LastSeen string `json:"last_seen,omitempty"`
+	LastSeen int64  `json:"last_seen,omitempty"`
+}
+
+// stateNames maps the server's numeric device states (internal/store
+// StatePending..StateLost, the raw UniFi inform vocabulary) to the
+// Terraform provider's string vocabulary.
+var stateNames = map[int]string{
+	1: "pending",
+	2: "adopting",
+	3: "adopted",
+	4: "lost",
+}
+
+// stateName renders a numeric server state as the TF schema vocabulary.
+// Unknown numbers degrade to a readable "unknown(<n>)" placeholder instead
+// of silently colliding with a known state.
+func stateName(n int) string {
+	if name, ok := stateNames[n]; ok {
+		return name
+	}
+	return fmt.Sprintf("unknown(%d)", n)
 }
 
 // listDevices GETs /api/v1/devices. The endpoint may return either a bare
@@ -215,14 +264,27 @@ func (c *apiClient) putWireless(ctx context.Context, env *wirelessEnvelope) erro
 	return c.do(ctx, http.MethodPut, "/api/v1/wireless", env, nil)
 }
 
-// whoami is a cheap health/auth probe: GET /api/v1/whoami.
-func (c *apiClient) whoami(ctx context.Context) (bool, error) {
+// whoami is a cheap health/auth probe: GET /api/v1/whoami. It always
+// exists on an open-unifi admin API (any /api/v1 route), so it doubles as
+// the provider's Configure-time connection check: a connection failure,
+// auth rejection, or decode error surfaces here before any resource call.
+func (c *apiClient) whoami(ctx context.Context) (authConfigured bool, err error) {
 	var out struct {
 		Server         string `json:"server"`
+		Version        string `json:"version"`
 		AuthConfigured bool   `json:"authConfigured"`
 	}
 	if err := c.do(ctx, http.MethodGet, "/api/v1/whoami", nil, &out); err != nil {
 		return false, err
 	}
 	return out.AuthConfigured, nil
+}
+
+// checkConnectivity verifies the controller is reachable and speaking the
+// admin API by probing GET /api/v1/whoami. It returns a ready-to-render
+// error on any failure (connection, HTTP status — including a missing
+// whoami route (404) — auth rejection, or protocol/decode error).
+func (c *apiClient) checkConnectivity(ctx context.Context) error {
+	_, err := c.whoami(ctx)
+	return err
 }

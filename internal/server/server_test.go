@@ -7,18 +7,23 @@ package server
 
 import (
 	"bytes"
+	"compress/zlib"
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/lucabecker/open-unifi/internal/inform"
 	"github.com/lucabecker/open-unifi/internal/store"
 )
 
@@ -304,7 +309,11 @@ func TestInformUnknownMAC404(t *testing.T) {
 	}
 }
 
-// (a) plaintext JSON inform: rejected by default, allowed under AllowPlainText.
+// (a) plaintext JSON inform: rejected by default (400 before any store
+// lookup or key path). Under AllowPlainText a pending record with NO
+// assignment receives a noop and STAYS StatePending — plaintext can never
+// initiate adoption (deviation from the classic debug-build rotation,
+// validator-approved).
 func TestInformPlainText(t *testing.T) {
 	plain, err := json.Marshal(infoBody(""))
 	if err != nil {
@@ -333,18 +342,123 @@ func TestInformPlainText(t *testing.T) {
 	if _, ok := jm["server_time_in_utc"]; !ok {
 		t.Fatal("missing server_time_in_utc in plaintext reply")
 	}
-	if jm["_type"] != "noop" && jm["_type"] != "setparam" {
-		t.Fatalf("plaintext reply type = %v", jm["_type"])
-	}
-	if jm["_type"] == "setparam" && jm["mgmt_cfg"] == nil {
-		t.Fatal("setparam without mgmt_cfg")
+	if jm["_type"] != "noop" {
+		t.Fatalf("plaintext reply type = %v, want noop for an unassigned device", jm["_type"])
 	}
 	rec, err := st.Get(testMAC)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec.State != store.StateAdopting && rec.State != store.StateAdopted {
-		t.Fatalf("plaintext inform left state = %d", rec.State)
+	if rec.State != store.StatePending || rec.XAuthkey != "" {
+		t.Fatalf("plaintext inform mutated pending record: state=%d xauthkey=%q",
+			rec.State, rec.XAuthkey)
+	}
+}
+
+// (a2) framed packet with NO encryption flags: gated like plain JSON
+// (classic InformServlet gates unencrypted informs, docs §5 L262-265).
+func TestFramedPlainTextGate(t *testing.T) {
+	pkt := buildInform(t, testMACRaw(), 0, bytes16(0x01), mustJSON(t, infoBody("")))
+	// note: dataVersion 1, payload plaintext (unparseable JSON not even needed)
+
+	h0, st := newServerWith(Config{})
+	registerPending(t, st)
+	resp := post(t, h0, pkt)
+	if resp.Code != http.StatusBadRequest ||
+		!strings.Contains(resp.Body.String(), "Plain text inform is not supported") {
+		t.Fatalf("framed plain w/o allow: want 400, got %d %q", resp.Code, resp.Body.String())
+	}
+	pending, _ := st.Pending()
+	if pending[testMAC] != "" {
+		t.Fatal("framed plain info must not touch the store before the gate")
+	}
+}
+
+// (a3) AllowPlainText + framed zlib-only (0x02) inform: MAC from the header,
+// payload inflated by DecryptPayload's transparent zlib path, then the plain
+// semantics (noop for the unassigned pending record).
+func TestFramedPlainZlib(t *testing.T) {
+	var zbuf bytes.Buffer
+	zw := zlib.NewWriter(&zbuf)
+	if _, err := zw.Write(mustJSON(t, infoBody(""))); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	pkt := buildInform(t, testMACRaw(), inform.FlagZlib, bytes16(0x02), zbuf.Bytes())
+
+	h, st := newServerWith(Config{AllowPlainText: true})
+	registerPending(t, st)
+	resp := post(t, h, pkt)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("framed zlib plain: %d %q", resp.Code, resp.Body.String())
+	}
+	var jm map[string]any
+	if err := json.Unmarshal(resp.Body.Bytes(), &jm); err != nil {
+		t.Fatal(err)
+	}
+	if jm["_type"] != "noop" {
+		t.Fatalf("type = %v, want noop (no assignment)", jm["_type"])
+	}
+}
+
+// (a4) plaintext claim = stale/missing key → mgmt_cfg-only push carrying
+// the CURRENT XAuthkey, NO rotation, state unchanged.
+func TestPlainRekeyPushNoRotation(t *testing.T) {
+	const xk = "11112222333344445555666677778888"
+	plain, err := json.Marshal(infoBody("aaaa"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, st := newServerWith(Config{AllowPlainText: true})
+	registerAdopted(t, st, "aaaa", xk)
+
+	resp := post(t, h, plain) // no _authkey claim in body
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status %d %q", resp.Code, resp.Body.String())
+	}
+	var jm map[string]any
+	if err := json.Unmarshal(resp.Body.Bytes(), &jm); err != nil {
+		t.Fatal(err)
+	}
+	exactKeys(t, jm, "_type", "server_time_in_utc", "mgmt_cfg")
+	mgmt := jm["mgmt_cfg"].(string)
+	if !strings.Contains(mgmt, "authkey="+xk+"\n") {
+		t.Fatalf("plain push mgmt_cfg missing current assignment: %q", mgmt)
+	}
+	rec, err := st.Get(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.XAuthkey != xk || rec.CfgVersion != "aaaa" || rec.State != store.StateAdopted {
+		t.Fatalf("plain push rotated/mutated assignment: %+v", rec)
+	}
+}
+
+// (a5) plaintext claim == XAuthkey with cfgversion drift → full provisioning.
+func TestPlainClaimDriftFullProvision(t *testing.T) {
+	const xk = "11112222333344445555666677778888"
+	h, st := newServerWith(Config{AllowPlainText: true})
+	registerAdopted(t, st, "aaaa", xk)
+
+	// with the claim equal to the assigned key
+	withClaim := infoBody("stale-1")
+	withClaim["_authkey"] = xk
+	plain, err := json.Marshal(withClaim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := post(t, h, plain)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status %d", resp.Code)
+	}
+	var jm map[string]any
+	if err := json.Unmarshal(resp.Body.Bytes(), &jm); err != nil {
+		t.Fatal(err)
+	}
+	if jm["_type"] != "setparam" || jm["system_cfg"] == nil || jm["cfgversion"] != "aaaa" {
+		t.Fatalf("plain claim drift type = %v, want full provisioning", jm["_type"])
 	}
 }
 
@@ -1114,5 +1228,607 @@ func TestAdoptionPushLeavesHash(t *testing.T) {
 	// but a full provisioning later does capture it.
 	if !containsKey(rec.Authkeys, rec.XAuthkey) {
 		t.Fatal("x_authkey not appended")
+	}
+}
+
+// ---- failing store / false branches (§8e, §2e) ----------------------------
+
+// failingStore wraps NewMemStore with injectable Get/Update failures.
+type failingStore struct {
+	store.DeviceStore
+	failGet    bool
+	failUpdate bool
+}
+
+func (f *failingStore) Get(mac string) (store.Device, error) {
+	if f.failGet {
+		return store.Device{}, errors.New("injected Get failure")
+	}
+	return f.DeviceStore.Get(mac)
+}
+
+func (f *failingStore) Update(mac string, fn func(*store.Device) error) error {
+	if f.failUpdate {
+		return errors.New("injected Update/Put failure")
+	}
+	return f.DeviceStore.Update(mac, fn)
+}
+
+func TestStoreGetError500(t *testing.T) {
+	st := &failingStore{DeviceStore: store.NewMemStore(), failGet: true}
+	s := New(Config{}, st, testLogger())
+	body := encryptCBC(t, mustJSON(t, infoBody("")), hexKey(t, testDefaultKey), testIV)
+	resp := post(t, s.InformHandler(), body)
+	if resp.Code != http.StatusInternalServerError {
+		t.Fatalf("want 500 on store Get error, got %d", resp.Code)
+	}
+}
+
+func TestStorePutError500(t *testing.T) {
+	st := &failingStore{DeviceStore: store.NewMemStore(), failUpdate: true}
+	if err := st.DeviceStore.Put(store.Device{MAC: testMAC, State: store.StatePending}); err != nil {
+		t.Fatal(err)
+	}
+	s := New(Config{}, st, testLogger())
+	body := encryptCBC(t, mustJSON(t, infoBody("")), hexKey(t, testDefaultKey), testIV)
+	resp := post(t, s.InformHandler(), body)
+	if resp.Code != http.StatusInternalServerError {
+		t.Fatalf("want 500 on store Put/Update error, got %d", resp.Code)
+	}
+	// the failed record cycle must not leak into the store
+	got, err := st.DeviceStore.Get(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.XAuthkey != "" || got.CfgVersion != "" {
+		t.Fatalf("failed cycle persisted a rotation: %+v", got)
+	}
+}
+
+func TestHandlerFalseBranches(t *testing.T) {
+	h, st := newServerWith(Config{})
+	registerPending(t, st)
+
+	// 405 non-POST
+	req := httptest.NewRequest(http.MethodGet, "/inform", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET /inform: want 405, got %d", rec.Code)
+	}
+
+	// > 10 MB body
+	resp := post(t, h, bytes.Repeat([]byte{0}, maxInformBody+1))
+	if resp.Code != http.StatusBadRequest || !strings.Contains(resp.Body.String(), "payload too large") {
+		t.Fatalf("oversize: want 400 payload too large, got %d %q", resp.Code, resp.Body.String())
+	}
+
+	// wrong-key encrypted inform
+	resp = post(t, h, encryptCBC(t, mustJSON(t, infoBody("")), hexKey(t, "99998888777766665555444433332222"), testIV))
+	if resp.Code != http.StatusBadRequest || !strings.Contains(resp.Body.String(), "unable to decrypt inform payload") {
+		t.Fatalf("wrong key: want 400 unable to decrypt, got %d %q", resp.Code, resp.Body.String())
+	}
+}
+
+// ---- authkeys pruning (§4) -------------------------------------------------
+
+// After three default-key rotations only the newest two assigned keys may
+// decrypt; the first rotated key is gone (GCM requests — lenient CBC would
+// accept garbage).
+func TestAuthkeysPrunedToTwo(t *testing.T) {
+	h, st := newServerWith(Config{})
+	registerPending(t, st)
+
+	keys := []string{}
+	for i := 0; i < 3; i++ {
+		body := encryptGCM(t, mustJSON(t, infoBody("")), hexKey(t, testDefaultKey), testIV)
+		resp := post(t, h, body)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("rotation#%d: status %d", i+1, resp.Code)
+		}
+		rec, err := st.Get(testMAC)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !containsKey(rec.Authkeys, rec.XAuthkey) {
+			t.Fatalf("rotation#%d: XAuthkey missing from Authkeys", i+1)
+		}
+		if len(rec.Authkeys) > 2 {
+			t.Fatalf("rotation#%d: Authkeys not capped (len %d): %v", i+1, len(rec.Authkeys), rec.Authkeys)
+		}
+		keys = append(keys, rec.XAuthkey)
+	}
+	// fists key pruned; decrypt must fail → 400.
+	resp := post(t, h, encryptGCM(t, mustJSON(t, infoBody("")), hexKey(t, keys[0]), testIV))
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("pruned key#1 still decrypts: %d", resp.Code)
+	}
+	// second-newest key still decrypts (mid-rotation tolerance), triggers rotation.
+	resp = post(t, h, encryptGCM(t, mustJSON(t, infoBody("")), hexKey(t, keys[1]), testIV))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("second-newest key rejected: %d", resp.Code)
+	}
+	rec, err := st.Get(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.XAuthkey == keys[1] || rec.XAuthkey == keys[2] {
+		t.Fatal("expected a further rotation on stale-key usage")
+	}
+}
+
+// ---- injection-guard test (§3b) --------------------------------------------
+
+// Newlines in inform-fed values must never reach config rows: the guarded
+// writer skips the whole row and logs (fail loud, never emit).
+func TestNewlineInjectionGuarded(t *testing.T) {
+	rec := u7pg2Record()
+	rec.Extra["timezone"] = "UTC\ninjected=1"
+	rec.Extra["radio_table"] = []any{
+		map[string]any{"name": "ra0", "radio": "ng", "channel": "5\nevil=1",
+			"tx_power_mode": "auto", "tx_power": "auto",
+			"builtin_antenna": true, "builtin_ant_gain": 0.0},
+	}
+	s := New(Config{WirelessSource: func() []Wlan { return workedEnvelope() }}, store.NewMemStore(), testLogger())
+	sys := s.buildSystemCfg(rec)
+	if strings.Contains(sys, "injected=1") || strings.Contains(sys, "evil=1") {
+		t.Fatalf("injected newline value leaked into system_cfg:\n%s", sys)
+	}
+	if !strings.Contains(sys, "radio.1.phyname=ra0\n") {
+		t.Fatalf("radio rows unexpectedly absent:\n%s", sys)
+	}
+
+	// mgmt_cfg: device IP with newline → the doubtful rows are skipped.
+	mrec := store.Device{MAC: testMAC, CfgVersion: "aaaa", XAuthkey: testDefaultKey,
+		InformURL: "http://10.0.0.5:8080/inform", IP: "10.0.0.1\nbad=1"}
+	mgmt := s.buildMgmtCfg(mrec, testDefaultKey)
+	if strings.Contains(mgmt, "bad=1") {
+		t.Fatalf("newline value leaked into mgmt_cfg: %q", mgmt)
+	}
+}
+
+// ---- CBC legacy zero-pad fallback (§8d) ------------------------------------
+
+func TestCBCLegacyZeroPadFallback(t *testing.T) {
+	// NOT PKCS7-valid: "hello world" + NUL padding to a block boundary.
+	msg := []byte("hello world")
+	buf := make([]byte, (aes.BlockSize + len(msg)/aes.BlockSize*aes.BlockSize))
+	copy(buf, msg)
+	buf[11] = 0
+	block, err := aes.NewCipher(hexKey(t, testDefaultKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct := make([]byte, len(buf))
+	cipher.NewCBCEncrypter(block, testIV).CryptBlocks(ct, buf)
+	wire := buildInform(t, testMACRaw(), testFlagEncCBC, testIV, ct)
+	pkt, err := inform.ParsePacket(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := pkt.DecryptPayload(hexKey(t, testDefaultKey))
+	if err != nil {
+		t.Fatalf("lenient decrypt failed: %v", err)
+	}
+	if !bytes.Equal(bytes.TrimRight(got, "\x00"), msg) {
+		t.Fatalf("legacy fallback round trip mismatch: %q", got)
+	}
+}
+
+// ---- discovery table tests (§8a) -------------------------------------------
+
+func mkTLV(typ byte, val []byte) []byte {
+	out := []byte{typ, byte(len(val) >> 8), byte(len(val) & 0xff)}
+	return append(out, val...)
+}
+
+// mkDiscovery frames a discovery packet with the BE dlen header value.
+func mkDiscovery(ver, cmd byte, data []byte) []byte {
+	return append([]byte{ver, cmd, byte(len(data) >> 8), byte(len(data) & 0xff)}, data...)
+}
+
+func TestParseDiscovery(t *testing.T) {
+	macRaw := []byte{0x24, 0xa4, 0x3c, 0x11, 0x22, 0x33}
+	sender := []byte{0x24, 0xa4, 0x3c, 0xaa, 0xbb, 0xcc}
+	oneMAC := append(mkTLV(1, macRaw), mkTLV(12, []byte("e50"))...)
+	twoMAC := append(append(mkTLV(1, macRaw), mkTLV(19, sender)...), mkTLV(12, []byte("e50"))...)
+
+	cases := []struct {
+		name   string
+		body   []byte
+		mac    string
+		note   string
+		reject bool
+	}{
+		{"v0 legacy valid", mkDiscovery(0, 6, append(macRaw, make([]byte, 5)...)), "24a43c112233", "discovery:platform=unknown", false},
+		{"v0 too short", []byte{0, 6, 0, 6, 1, 2, 3, 4, 5}, "", "", true},
+		{"v1 TLV stream", mkDiscovery(1, 6, oneMAC), "24a43c112233", "discovery:platform=e50", false},
+		{"sender-MAC wins (type19 over type1)", mkDiscovery(2, 6, twoMAC), "24a43caabbcc", "discovery:platform=e50", false},
+		{"truncated TLV stream (dlen > data tolerated)", func() []byte {
+			b := mkDiscovery(1, 6, mkTLV(1, macRaw))
+			b[2], b[3] = 0xff, 0xff // dlen beyond data
+			return b
+		}(), "24a43c112233", "discovery:platform=", false},
+		{"ver 3 rejected", []byte{3, 6, 0, 0}, "", "", true},
+		{"cmd 2 ignored", mkDiscovery(1, 2, oneMAC), "", "", true},
+		{"cmd 8 ignored", mkDiscovery(1, 8, oneMAC), "", "", true},
+		{"header too short", []byte{1, 6, 0}, "", "", true},
+		{"no MAC TLV", append([]byte{1, 6, 0, 3}, mkTLV(12, []byte("e50"))...), "", "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mac, note, ok := parseDiscovery(tc.body)
+			if tc.reject && ok {
+				t.Fatalf("expected rejection, got mac=%q note=%q", mac, note)
+			}
+			if !tc.reject {
+				if !ok {
+					t.Fatalf("expected acceptance, got rejection")
+				}
+				if mac != tc.mac || note != tc.note {
+					t.Fatalf("mac=%q note=%q, want %q/%q", mac, note, tc.mac, tc.note)
+				}
+			}
+		})
+	}
+}
+
+// seeDiscovery: dedupe window and opportunistic pruning above the threshold.
+func TestSeeDiscoveryDedupe(t *testing.T) {
+	s := New(Config{}, store.NewMemStore(), testLogger())
+	if !s.seeDiscovery("24a43c112233") {
+		t.Fatal("first sighting must pass")
+	}
+	if s.seeDiscovery("24a43c112233") {
+		t.Fatal("second sighting inside window must dedupe")
+	}
+	// prune: fill with stale entries then exceed the threshold.
+	now := time.Now()
+	s.seenMu.Lock()
+	for i := 0; i < 4100; i++ {
+		s.seenAt[fmt.Sprintf("%012x", i)] = now.Add(-discoveryDedupWindow * 2)
+	}
+	s.seenMu.Unlock()
+	if !s.seeDiscovery("999999999999") {
+		t.Fatal("new MAC must pass")
+	}
+	s.seenMu.Lock()
+	_, staleLeft := s.seenAt["000000000000"]
+	_, freshLeft := s.seenAt["24a43c112233"]
+	s.seenMu.Unlock()
+	if staleLeft {
+		t.Fatal("stale entries not pruned")
+	}
+	if !freshLeft {
+		t.Fatal("recent entry must survive pruning")
+	}
+}
+
+// full discovery-record path: MarkPending note shape.
+func TestDiscoveryMarkPendingNote(t *testing.T) {
+	st := store.NewMemStore()
+	s := New(Config{}, st, testLogger())
+	pkt := mkDiscovery(1, 6, append(mkTLV(1, []byte{0x24, 0xa4, 0x3c, 0x11, 0x22, 0x33}), mkTLV(12, []byte("BZ2"))...))
+	s.handleDiscoveryPacket(pkt)
+	pending, err := st.Pending()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending["24a43c112233"] != "discovery:platform=BZ2" {
+		t.Fatalf("pending note = %q", pending["24a43c112233"])
+	}
+}
+
+// ---- GCM adoption parameterization (§8b) -----------------------------------
+
+// TestGCMAdoptionMatrix runs the adoption lifecycle over both cipher
+// families. The FIRST packet shape (factory default key + GCM) is the #1
+// real-world risk: response must be a GCM-sealed adoption push (flags
+// 0x0009, dataVersion untouched 1) that decrypts under the RESPONSE's own
+// header AAD rule.
+func TestGCMAdoptionMatrix(t *testing.T) {
+	const xk = "11112222333344445555666677778888"
+	for _, family := range []struct {
+		name      string
+		req       func(t *testing.T, plain []byte, key []byte) []byte
+		wantFlags uint16
+	}{
+		{"cbc", func(t *testing.T, plain []byte, key []byte) []byte {
+			return encryptCBC(t, plain, key, testIV)
+		}, testFlagEncCBC},
+		{"gcm", func(t *testing.T, plain []byte, key []byte) []byte {
+			return encryptGCM(t, plain, key, testIV)
+		}, testFlagGCM | testFlagEncCBC},
+	} {
+		t.Run(family.name, func(t *testing.T) {
+			h, st := newServerWith(Config{})
+			registerPending(t, st)
+
+			// inform#1: factory-fresh device, DEFAULT key.
+			body := family.req(t, mustJSON(t, radioBody("")), hexKey(t, testDefaultKey))
+			resp := post(t, h, body)
+			if resp.Code != http.StatusOK {
+				t.Fatalf("inform#1: %d %q", resp.Code, resp.Body.String())
+			}
+			flags, jm := decryptResponse(t, resp.Body.Bytes(), hexKey(t, testDefaultKey))
+			if flags != family.wantFlags {
+				t.Fatalf("inform#1 response flags %04x, want %04x", flags, family.wantFlags)
+			}
+			if jm["_type"] != "setparam" {
+				t.Fatalf("inform#1 type = %v", jm["_type"])
+			}
+			exactKeys(t, jm, "_type", "server_time_in_utc", "mgmt_cfg")
+			rec, err := st.Get(testMAC)
+			if err != nil {
+				t.Fatal(err)
+			}
+			xkey := rec.XAuthkey
+
+			// inform#2: re-keyed + cfg applied → noop (same family).
+			body = family.req(t, mustJSON(t, radioBody(rec.CfgVersion)), hexKey(t, xkey))
+			resp = post(t, h, body)
+			if resp.Code != http.StatusOK {
+				t.Fatalf("inform#2: %d", resp.Code)
+			}
+			flags, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
+			if jm["_type"] != "noop" || flags != family.wantFlags {
+				t.Fatalf("inform#2 type=%v flags=%04x want noop/%04x", jm["_type"], flags, family.wantFlags)
+			}
+			rec, err = st.Get(testMAC)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// inform#3: cfgversion drift on the assigned key → full provisioning.
+			body = family.req(t, mustJSON(t, radioBody("bogus-drift")), hexKey(t, xkey))
+			resp = post(t, h, body)
+			flags, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
+			if jm["_type"] != "setparam" || jm["system_cfg"] == nil {
+				t.Fatalf("inform#3 type = %v, want full provisioning", jm["_type"])
+			}
+			if rec, _ := st.Get(testMAC); rec.State != store.StateAdopting {
+				t.Fatalf("inform#3 state %d, want adopting", rec.State)
+			}
+		})
+	}
+}
+
+// ---- multi-WLAN system_cfg pin (§8c) ---------------------------------------
+
+// Two enabled WLANs (untagged open + tagged 42 wpa-p — the
+// examples/terraform scenario): pins the GLOBAL ath counter (ath0..ath3 in
+// radio-sorted, wlan-order), radio.<n>.virtual.* rows appearing only at
+// vapIdxOnRadio>0, and br0/br0.42 membership ordering.
+func TestMultiWlanSystemCfg(t *testing.T) {
+	env := []Wlan{
+		{Name: "open", SSID: "opennet", Security: "open", Enabled: true, ID: "id00000000000000000000OA"},
+		{Name: "sec", SSID: "secnet", Security: "wpa-p", Passphrase: "correcthorse", VLAN: 42, Enabled: true, ID: "id00000000000000000000SB"},
+	}
+	s := New(Config{WirelessSource: func() []Wlan { return env }}, store.NewMemStore(), testLogger())
+	sys := s.buildSystemCfg(u7pg2Record())
+
+	// global ath counter: the vap counter assigns ath0..ath3 in radio-sorted,
+	// wlan-order (radio1: open,sec; radio2: open,sec). Pin the explicit
+	// aaa/wireless devname bindings (virtual rows come earlier in emission
+	// order and must not confound the ordering check).
+	for _, want := range []string{
+		"aaa.1.devname=ath0\n", "aaa.2.devname=ath1\n",
+		"aaa.3.devname=ath2\n", "aaa.4.devname=ath3\n",
+		"wireless.1.devname=ath0\n", "wireless.2.devname=ath1\n",
+		"wireless.3.devname=ath2\n", "wireless.4.devname=ath3\n",
+	} {
+		if !strings.Contains(sys, want) {
+			t.Fatalf("global ath counter wiring wrong, missing %q", want)
+		}
+	}
+
+	// virtual companion rows ONLY where a radio hosts its second vap:
+	for _, want := range []string{
+		"radio.1.virtual.1.devname=ath1\n", "radio.1.virtual.1.status=enabled\n",
+		"radio.2.virtual.1.devname=ath3\n", "radio.2.virtual.1.status=enabled\n",
+	} {
+		if !strings.Contains(sys, want) {
+			t.Fatalf("missing virtual companion row %q", want)
+		}
+	}
+	if strings.Contains(sys, "radio.1.virtual.0") || strings.Contains(sys, "radio.1.virtual.2") {
+		t.Fatal("unexpected virtual row indices")
+	}
+
+	// bridges: br0 gets eth0 + the two untagged aths; br0.42 the tagged ones.
+	for _, want := range []string{
+		"bridge.1.devname=br0\nbridge.1.fd=1\nbridge.1.stp.status=disabled\n" +
+			"bridge.1.port.1.devname=eth0\nbridge.1.port.2.devname=ath0\nbridge.1.port.3.devname=ath2\n",
+		"bridge.2.devname=br0.42\nbridge.2.fd=1\nbridge.2.stp.status=disabled\n" +
+			"bridge.2.port.1.devname=ath1\nbridge.2.port.2.devname=ath3\n",
+	} {
+		if !strings.Contains(sys, want) {
+			t.Fatalf("bridge wiring mismatch, missing:\n%s\n---system_cfg---\n%s", want, sys)
+		}
+	}
+	if !strings.Contains(sys, "bridge.2.port.2.devname=ath3\n") {
+		t.Fatalf("br0.42 port order wrong:\n%s", sys)
+	}
+	// aaa bridges: untagged vap on br0, tagged on br0.42
+	if strings.Contains(sys, "aaa.1.br.devname=br0.42") {
+		t.Fatal("untagged vap must sit on br0")
+	}
+	if !strings.Contains(sys, "aaa.2.br.devname=br0.42\n") ||
+		!strings.Contains(sys, "aaa.4.br.devname=br0.42\n") {
+		t.Fatal("tagged vaps (aaa.2/aaa.4) must sit on br0.42")
+	}
+	if !strings.Contains(sys, "aaa.1.authmode=") {
+		// open vap: wireless.1.authmode=0, aaa.1 has no wpa rows
+		if !strings.Contains(sys, "wireless.1.authmode=0\n") {
+			t.Fatal("open vap authmode must be 0")
+		}
+		if strings.Contains(sys, "aaa.1.wpa=") {
+			t.Fatal("open vap must not carry wpa rows")
+		}
+	}
+	if !strings.Contains(sys, "aaa.2.wpa.psk=correcthorse\n") {
+		t.Fatal("tagged wpa vap missing psk rows")
+	}
+	if !strings.Contains(sys, "vlan.1.devname=eth0\nvlan.1.id=42\n") {
+		t.Fatal("missing vlan wiring")
+	}
+}
+
+// ---- mgmt_cfg golden (§8f) --------------------------------------------------
+
+func TestMgmtCfgGolden(t *testing.T) {
+	s := New(Config{ControllerURL: "http://10.0.0.5:8080"}, store.NewMemStore(), testLogger())
+	d := store.Device{
+		MAC: testMAC, CfgVersion: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	}
+	d.CfgVersion = "aaaaaaaaaaaaaaaa"
+	d.XAuthkey = "11112222333344445555666677778888"
+	d.InformURL = "http://10.0.0.9:8080/inform"
+	got := s.buildMgmtCfg(d, "ba86f2bbe107c7c57eb5f2690775c712")
+	want := "capability=notif,notif-assoc-stat\n" +
+		"selfrun_guest_mode=pass\n" +
+		"cfgversion=aaaaaaaaaaaaaaaa\n" +
+		"led_enabled=true\n" +
+		"stun_url=stun://10.0.0.5:3478/\n" +
+		"mgmt_url=https://10.0.0.5:8443/manage/site/default\n" +
+		"authkey=11112222333344445555666677778888\n" +
+		"inform_url=http://10.0.0.5:8080/inform\n" +
+		"use_aes_gcm=true\n" +
+		"report_crash=true\n"
+	if got != want {
+		t.Fatalf("mgmt_cfg golden mismatch:\n got %q\nwant %q", got, want)
+	}
+	// same-key inform → no authkey line
+	got2 := s.buildMgmtCfg(d, d.XAuthkey)
+	if strings.Contains(got2, "authkey=") {
+		t.Fatalf("authkey line must be omitted when keys match: %q", got2)
+	}
+}
+
+// ---- server_time shape (§8g) ------------------------------------------------
+
+func TestServerTimeDigits(t *testing.T) {
+	ts := nowMS()
+	if ts == "" || strings.Trim(ts, "0123456789") != "" {
+		t.Fatalf("server_time_in_utc must be a digit string: %q", ts)
+	}
+	// and the JSON responses carry it (framed + unframed paths)
+	h, st := newServerWith(Config{AllowPlainText: true})
+	registerPending(t, st)
+	resp := post(t, h, mustJSON(t, infoBody(""))) // plaintext JSON
+	var jm map[string]any
+	if err := json.Unmarshal(resp.Body.Bytes(), &jm); err != nil {
+		t.Fatal(err)
+	}
+	if ts, ok := jm["server_time_in_utc"].(string); !ok || strings.Trim(ts, "0123456789") != "" {
+		t.Fatalf("plaintext server_time_in_utc bad: %v", jm["server_time_in_utc"])
+	}
+}
+
+// ---- users.1 identity across provisionings (§8h) ----------------------------
+
+// Two FULL provisionings separated by inform cycles emit the byte-identical
+// users.1.password: the ssh_sha512passwd cache survives the inform pattern
+// (reserved Extra key), not just the direct-call transitively pinned case.
+func TestUsers1PasswordIdenticalAcrossProvisionings(t *testing.T) {
+	st := store.NewMemStore()
+	xk := "11112222333344445555666677778888"
+	if err := st.Put(store.Device{MAC: testMAC, State: store.StateAdopted,
+		CfgVersion: "aaaa", AppliedCfg: "aaaa", XAuthkey: xk, Authkeys: []string{xk}}); err != nil {
+		t.Fatal(err)
+	}
+	env := []Wlan{{Name: "net", SSID: "net", Security: "open", Enabled: true}}
+	s := New(Config{WirelessSource: func() []Wlan { return env }}, st, testLogger())
+	h := s.InformHandler()
+
+	pw := ""
+	for i := 0; i < 2; i++ {
+		if i == 1 {
+			// A heartbeat inform runs absorbInform (an Extra overwrite →
+			// the cache would be lost without preservation).
+			resp := post(t, h, encryptCBC(t, mustJSON(t, infoBody("aaaa")), hexKey(t, xk), testIV))
+			if resp.Code != http.StatusOK {
+				t.Fatalf("heartbeat: %d", resp.Code)
+			}
+			// admin changes the envelope → drift bump → full provisioning again.
+			env[0].SSID = "net" + strconv.Itoa(i)
+		} else {
+			// initial: AppliedCfg mismatch triggers provisioning.
+		}
+		resp := post(t, h, encryptCBC(t, mustJSON(t, infoBody("zzz-drift")), hexKey(t, xk), testIV))
+		if resp.Code != http.StatusOK {
+			t.Fatalf("prov#%d: %d", i+1, resp.Code)
+		}
+		_, jm := decryptResponse(t, resp.Body.Bytes(), hexKey(t, xk))
+		sys := jm["system_cfg"].(string)
+		pwI := systemCfgUsersPassword(t, sys)
+		if pw != "" && pw != pwI {
+			t.Fatalf("users.1.password changed across provisionings: %q vs %q", pw, pwI)
+		}
+		pw = pwI
+	}
+	if !sha512BodyRx.MatchString(pw) {
+		t.Fatalf("users.1.password shape broken: %q", pw)
+	}
+}
+
+// ---- radio_table preservation / refresh (§8i) -------------------------------
+
+func TestRadioTablePreserveAndRefresh(t *testing.T) {
+	h, st := newServerWith(Config{AllowPlainText: true})
+	registerAdopted(t, st, "aaaa", "11112222333344445555666677778888")
+	xk := "11112222333344445555666677778888"
+
+	// full inform WITH radio_table.
+	full := infoBody("aaaa")
+	full["_authkey"] = xk
+	full["radio_table"] = u7pg2Record().Extra["radio_table"]
+	resp := post(t, h, mustJSON(t, full))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("full inform: %d %q", resp.Code, resp.Body.String())
+	}
+	rec, err := st.Get(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Extra["radio_table"] == nil {
+		t.Fatal("radio_table missing after full inform")
+	}
+
+	// sparse heartbeat WITHOUT radio_table → preserved (fillIfAbsent).
+	sparse := infoBody("aaaa")
+	sparse["_authkey"] = xk
+	delete(sparse, "radio_table") // infoBody has none anyway; be explicit
+	resp = post(t, h, mustJSON(t, sparse))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("sparse inform: %d", resp.Code)
+	}
+	rec, err = st.Get(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Extra["radio_table"] == nil {
+		t.Fatal("radio_table wiped by sparse heartbeat")
+	}
+
+	// full inform with an UPDATED radio_table → refreshed (prev must NOT win).
+	updated := infoBody("aaaa")
+	updated["_authkey"] = xk
+	updated["radio_table"] = []any{map[string]any{"name": "ra0", "radio": "ng", "channel": 6.0}}
+	resp = post(t, h, mustJSON(t, updated))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("refresh inform: %d", resp.Code)
+	}
+	rec, err = st.Get(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt, _ := rec.Extra["radio_table"].([]any)
+	if len(rt) != 1 {
+		t.Fatalf("radio_table not refreshed (len %d): %v", len(rt), rec.Extra["radio_table"])
+	}
+	first, _ := rt[0].(map[string]any)
+	if first["name"] != "ra0" || first["channel"] != 6.0 {
+		t.Fatalf("refreshed radio_table wrong: %v", first)
 	}
 }

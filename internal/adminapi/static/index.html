@@ -225,9 +225,18 @@
   }
 
   function esc(s) {
-    var d = document.createElement("div");
-    d.textContent = s == null ? "" : String(s);
-    return d.innerHTML;
+    // HTML-escape via a deterministic string-replace chain — NOT the
+    // textContent/innerHTML trick: that does NOT escape quotes, and esc()
+    // output is interpolated inside DOUBLE-QUOTED value="..." attributes
+    // (wlanRowInputs), so an SSID like `x" onfocus=...` would break out of
+    // the attribute (stored XSS in this console). Quotes MUST be escaped.
+    // & first, so the entities introduced below are not double-escaped.
+    return (s == null ? "" : String(s))
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
   }
 
   function renderDevices(devices) {

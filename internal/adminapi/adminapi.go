@@ -10,6 +10,7 @@ package adminapi
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -17,12 +18,19 @@ import (
 	"github.com/lucabecker/open-unifi/internal/metrics"
 )
 
-// DegenerateConfig is the minimal wiring input for New.
-type DegenerateConfig struct {
-	// AdminToken: when non-empty, ALL /api requests (GET included) must carry
-	// "Authorization: Bearer <token>"; /healthz and / stay open.
+// Config is the minimal wiring input for New.
+type Config struct {
+	// AdminToken: when non-empty, ALL /api requests (GET included) AND
+	// /metrics must carry "Authorization: Bearer <token>"; only /healthz and
+	// / (web console) stay open.
 	// Empty string disables authentication entirely.
 	AdminToken string
+
+	// Logger receives server-side diagnostics for events that are
+	// deliberately NOT echoed to the client (opaque 500 bodies — see
+	// handleBackendErr). Optional: nil ⇒ slog.Default(), so callers that
+	// construct Config{} unchanged keep compiling.
+	Logger *slog.Logger
 }
 
 // DeviceView is the read model for one managed device.
@@ -116,7 +124,14 @@ func classifyRoute(method, pattern, path string) string {
 }
 
 // New returns the root HTTP handler for the admin API.
-func New(cfg DegenerateConfig, be Backend) http.Handler {
+func New(cfg Config, be Backend) http.Handler {
+	// Logger is optional: nil ⇒ process default (callers constructing
+	// Config{} keep working).
+	lg := cfg.Logger
+	if lg == nil {
+		lg = slog.Default()
+	}
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /api/v1/devices", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
@@ -136,7 +151,7 @@ func New(cfg DegenerateConfig, be Backend) http.Handler {
 		up.MAC = mac
 		dv, err := be.CreateDevice(r.Context(), up)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, err.Error())
+			handleBackendErr(w, lg, err)
 			return
 		}
 		writeJSON(w, http.StatusCreated, dv)
@@ -149,7 +164,7 @@ func New(cfg DegenerateConfig, be Backend) http.Handler {
 		}
 		dv, err := be.GetDevice(r.Context(), mac)
 		if err != nil {
-			handleBackendErr(w, err)
+			handleBackendErr(w, lg, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, dv)
@@ -161,7 +176,7 @@ func New(cfg DegenerateConfig, be Backend) http.Handler {
 			return
 		}
 		if err := be.DeleteDevice(r.Context(), mac); err != nil {
-			handleBackendErr(w, err)
+			handleBackendErr(w, lg, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "mac": mac})
@@ -177,8 +192,18 @@ func New(cfg DegenerateConfig, be Backend) http.Handler {
 		}
 		dv, err := be.AdoptPending(r.Context(), mac)
 		if err != nil {
-			metrics.IncAdoptFail()
-			handleBackendErr(w, err)
+			// Endpoint-counter semantics: openunifi_adopt_fail_total counts
+			// FAILED ADOPTION REQUESTS hitting this endpoint, while the app
+			// poller's inform-driven counters count real state transitions.
+			// Different things by design. A "device not found" 404 is a
+			// caller/user error (bad MAC, stale pending list), not an
+			// adoption-protocol failure — it must not inflate the failure
+			// metric, otherwise a spammer probing unknown MACs looks like a
+			// fleet of dying radios.
+			if !errors.Is(err, ErrNotFound) {
+				metrics.IncAdoptFail()
+			}
+			handleBackendErr(w, lg, err)
 			return
 		}
 		metrics.IncAdopt()
@@ -200,7 +225,7 @@ func New(cfg DegenerateConfig, be Backend) http.Handler {
 			}
 		}
 		if err := be.PutWireless(r.Context(), env); err != nil {
-			handleBackendErr(w, err)
+			handleBackendErr(w, lg, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, env)
@@ -213,9 +238,12 @@ func New(cfg DegenerateConfig, be Backend) http.Handler {
 		})
 	}))
 
-	// /metrics is served directly from the metrics package; /healthz and /
-	// (web console) are open even when a token is configured.
-	mux.Handle("GET /metrics", metrics.Handler())
+	// /metrics sits BEHIND the token when one is configured: the exposition
+	// enumerates every tracked device by MAC, which is exactly the
+	// reconnaissance data a MAC-spoofing attacker wants (unexpected 200 with
+	// no credentials would leak the whole inventory). /healthz and /
+	// (web console) remain the only open paths.
+	mux.Handle("GET /metrics", requireToken(cfg, metrics.Handler().ServeHTTP))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
@@ -244,13 +272,19 @@ func New(cfg DegenerateConfig, be Backend) http.Handler {
 
 // handleBackendErr maps well-known backend errors to response codes:
 // any error satisfying errors.Is(err, ErrNotFound) — the bare sentinel or a
-// wrapped one — becomes 404; everything else is a 500.
-func handleBackendErr(w http.ResponseWriter, err error) {
+// wrapped one — becomes 404. The 404 body carries err.Error() because those
+// messages are user-facing MAC context ("device not found: aa:bb:…") and
+// harmless. Everything else becomes an OPAQUE 500: the body is a fixed
+// string, never err.Error(), and the full error is logged server-side via
+// lg instead — internal messages can contain paths, addresses and store
+// internals and must not be serialized into an HTTP response.
+func handleBackendErr(w http.ResponseWriter, lg *slog.Logger, err error) {
 	if errors.Is(err, ErrNotFound) {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
 	}
-	writeErr(w, http.StatusInternalServerError, err.Error())
+	lg.Error("admin api backend error", "err", err)
+	writeErr(w, http.StatusInternalServerError, "internal error")
 }
 
 // statusWriter captures the response code for instrumentation.

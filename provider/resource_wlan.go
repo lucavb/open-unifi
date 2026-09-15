@@ -119,6 +119,31 @@ type wlanModel struct {
 	Enabled    types.Bool   `tfsdk:"enabled"`
 }
 
+// checkWlanConflicts enforces the name/ssid uniqueness rules the envelope
+// (and every PUT) depends on: one resource per wlan `name`, globally unique
+// SSIDs. selfIdx (the entry currently being updated; -1 on Create) is
+// excluded so an update does not collide with itself.
+func (r *wlanResource) checkWlanConflicts(env *wirelessEnvelope, name, ssid string, selfIdx int, d *diag.Diagnostics) bool {
+	for i := range env.Wlans {
+		if i == selfIdx {
+			continue
+		}
+		if env.Wlans[i].Name == name {
+			d.AddError("wlan conflict",
+				fmt.Sprintf("wlan %q already exists on the controller (id %q); import it instead of re-creating",
+					name, env.Wlans[i].ID))
+			return false
+		}
+		if env.Wlans[i].SSID == ssid {
+			d.AddError("wlan conflict",
+				fmt.Sprintf("ssid %q is already broadcast by wlan %q; SSIDs must be unique",
+					ssid, env.Wlans[i].Name))
+			return false
+		}
+	}
+	return true
+}
+
 func (r *wlanResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	if r.client == nil {
 		notConfiguredErr(&resp.Diagnostics)
@@ -138,19 +163,8 @@ func (r *wlanResource) Create(ctx context.Context, req resource.CreateRequest, r
 		resp.Diagnostics.AddError("Create wlan: read envelope", err.Error())
 		return
 	}
-	for i := range env.Wlans {
-		if env.Wlans[i].Name == plan.Name.ValueString() {
-			resp.Diagnostics.AddError("Create wlan",
-				fmt.Sprintf("wlan %q already exists on the controller (id %q); import it instead of re-creating",
-					plan.Name.ValueString(), env.Wlans[i].ID))
-			return
-		}
-		if env.Wlans[i].SSID == plan.SSID.ValueString() {
-			resp.Diagnostics.AddError("Create wlan",
-				fmt.Sprintf("ssid %q is already broadcast by wlan %q; SSIDs must be unique",
-					plan.SSID.ValueString(), env.Wlans[i].Name))
-			return
-		}
+	if !r.checkWlanConflicts(env, plan.Name.ValueString(), plan.SSID.ValueString(), -1, &resp.Diagnostics) {
+		return
 	}
 
 	entry := wlanEntryFromModel(&plan)
@@ -192,7 +206,7 @@ func (r *wlanResource) Read(ctx context.Context, req resource.ReadRequest, resp 
 		resp.State.RemoveResource(ctx)
 		return
 	}
-	entryToModel(&env.Wlans[idx], &state, true /*keepPassphrase*/)
+	entryToModel(&env.Wlans[idx], &state)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -220,9 +234,17 @@ func (r *wlanResource) Update(ctx context.Context, req resource.UpdateRequest, r
 			fmt.Sprintf("wlan %q disappeared from the controller; re-apply to re-create it", plan.Name.ValueString()))
 		return
 	}
-	// Replace in place, preserving the server-assigned id slot.
+	// Same uniqueness rules as Create must hold after the change (e.g. an
+	// SSID rename could steal another wlan's SSID); the entry being updated
+	// is excluded so it cannot collide with itself.
+	if !r.checkWlanConflicts(env, plan.Name.ValueString(), plan.SSID.ValueString(), idx, &resp.Diagnostics) {
+		return
+	}
+	// Replace in place, carrying over the server-assigned id slot.
+	entry := wlanEntryFromModel(&plan)
+	entry.ID = env.Wlans[idx].ID
+	env.Wlans[idx] = entry
 	plan.ID = types.StringValue(plan.Name.ValueString())
-	env.Wlans[idx] = wlanEntryFromModel(&plan)
 	if err := r.client.putWireless(ctx, env); err != nil {
 		resp.Diagnostics.AddError("Update wlan: PUT envelope", err.Error())
 		return
@@ -272,9 +294,9 @@ func findWlan(env *wirelessEnvelope, name string) int {
 	return -1
 }
 
-// wlanEntryFromModel converts Terraform state into a server entry. An
-// unset/unknown passphrase is dropped so the server never stores placeholder
-// secrets for open networks.
+// wlanEntryFromModel converts Terraform state into a server entry. When
+// security is "open" the passphrase is dropped: the server rejects any PUT
+// with "passphrase must be empty when security is open".
 func wlanEntryFromModel(m *wlanModel) wirelessEntry {
 	e := wirelessEntry{
 		Name:     m.Name.ValueString(),
@@ -291,14 +313,19 @@ func wlanEntryFromModel(m *wlanModel) wirelessEntry {
 	if !m.Passphrase.IsNull() && !m.Passphrase.IsUnknown() && m.Passphrase.ValueString() != "" {
 		e.Passphrase = m.Passphrase.ValueString()
 	}
+	if e.Security == "open" {
+		e.Passphrase = ""
+	}
 	return e
 }
 
-// entryToModel copies a server entry into the model. When keepPassphrase is
-// true the model's existing (sensitive) passphrase is kept if the server
-// returns an empty one — the server never echoes psk contents back for
-// wpa-p entries, so treat "server said nothing" as "unchanged".
-func entryToModel(e *wirelessEntry, m *wlanModel, keepPassphrase bool) {
+// entryToModel copies a server entry into the model. The server DOES echo
+// passphrase contents back (they are part of the stored whole-document
+// wireless config), so server truth wins: a non-empty server passphrase
+// replaces the model's sensitive value; an empty one (security=open, or the
+// operator cleared it) renders as null. The framework rewrites `sensitive`
+// in plan diffs; state round-trips the real value.
+func entryToModel(e *wirelessEntry, m *wlanModel) {
 	m.ID = types.StringValue(e.Name)
 	m.Name = types.StringValue(e.Name)
 	m.SSID = types.StringValue(e.SSID)
@@ -311,7 +338,7 @@ func entryToModel(e *wirelessEntry, m *wlanModel, keepPassphrase bool) {
 	m.Enabled = types.BoolValue(e.Enabled)
 	if e.Passphrase != "" {
 		m.Passphrase = types.StringValue(e.Passphrase)
-	} else if m.Passphrase.IsUnknown() || (!keepPassphrase) {
+	} else {
 		m.Passphrase = types.StringNull()
 	}
 }
@@ -326,12 +353,15 @@ func readWlanInto(ctx context.Context, c *apiClient, m *wlanModel) error {
 	if idx < 0 {
 		return fmt.Errorf("wlan %q not present in envelope after PUT", m.Name.ValueString())
 	}
-	entryToModel(&env.Wlans[idx], m, true)
+	entryToModel(&env.Wlans[idx], m)
 	return nil
 }
 
-// validateWlan enforces client-side invariants the server does not reject
-// politely today (bad security enum, too-short psk, out-of-range vlan).
+// validateWlan mirrors the server's rules (internal/adminapi/helpers.go
+// validateWlan: security enum, ssid length 1..32, vlan 1..4094, passphrase
+// empty for open / >=8 chars otherwise) so clients get an attribute-level
+// error at plan/validate time instead of a mid-apply HTTP 400. Keep this in
+// lockstep with the server; both sides currently reject the same payloads.
 func (r *wlanResource) validateWlan(m *wlanModel, d *diag.Diagnostics) bool {
 	sec := m.Security.ValueString()
 	switch sec {
@@ -347,17 +377,10 @@ func (r *wlanResource) validateWlan(m *wlanModel, d *diag.Diagnostics) bool {
 		d.AddAttributeError(path.Root("name"), "Invalid name", "wlan name must be non-empty")
 		return false
 	}
-	if sec == "wpa-p" {
-		psk := ""
-		if !m.Passphrase.IsNull() && !m.Passphrase.IsUnknown() {
-			psk = m.Passphrase.ValueString()
-		}
-		if len(psk) < 8 {
-			d.AddAttributeError(path.Root("passphrase"),
-				"Invalid passphrase",
-				"passphrase must be nonempty and at least 8 characters for security=wpa-p")
-			return false
-		}
+	if n := len(m.SSID.ValueString()); n < 1 || n > 32 {
+		d.AddAttributeError(path.Root("ssid"), "Invalid ssid",
+			fmt.Sprintf("ssid length must be 1..32, got %d", n))
+		return false
 	}
 	if !m.VLAN.IsNull() && !m.VLAN.IsUnknown() {
 		v := m.VLAN.ValueInt64()
@@ -366,6 +389,25 @@ func (r *wlanResource) validateWlan(m *wlanModel, d *diag.Diagnostics) bool {
 				fmt.Sprintf("vlan must be in 1..4094, got %d", v))
 			return false
 		}
+	}
+	psk := ""
+	if !m.Passphrase.IsNull() && !m.Passphrase.IsUnknown() {
+		psk = m.Passphrase.ValueString()
+	}
+	if sec == "open" {
+		if psk != "" {
+			d.AddAttributeError(path.Root("passphrase"),
+				"Invalid passphrase",
+				"passphrase must be empty when security is open")
+			return false
+		}
+		return true
+	}
+	if len(psk) < 8 {
+		d.AddAttributeError(path.Root("passphrase"),
+			"Invalid passphrase",
+			fmt.Sprintf("passphrase must be nonempty and at least 8 characters for security=%s", sec))
+		return false
 	}
 	return true
 }

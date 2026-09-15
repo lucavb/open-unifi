@@ -48,11 +48,16 @@ func (s *Server) handleDiscoveryPacket(b []byte) {
 		return
 	}
 	if err := s.st.MarkPending(mac, note); err != nil {
-		s.lg.Debug("discovery: mark pending failed", "mac", mac, "err", err)
+		s.lg.Warn("discovery: mark pending failed", "mac", mac, "note", note, "err", err)
 		return
 	}
 	s.lg.Debug("discovery: announced", "mac", mac, "note", note)
 }
+
+// seenPruneThreshold is the map size at which seeDiscovery opportunistically
+// drops entries older than the dedupe window (unbounded MAC sources could
+// otherwise grow the map forever).
+const seenPruneThreshold = 4096
 
 // seeDiscovery returns true if this MAC's last sighting was outside the
 // dedupe window (and records now as the latest sighting).
@@ -64,6 +69,13 @@ func (s *Server) seeDiscovery(mac string) bool {
 		return false
 	}
 	s.seenAt[mac] = now
+	if len(s.seenAt) > seenPruneThreshold {
+		for m, t := range s.seenAt {
+			if now.Sub(t) >= discoveryDedupWindow {
+				delete(s.seenAt, m)
+			}
+		}
+	}
 	return true
 }
 

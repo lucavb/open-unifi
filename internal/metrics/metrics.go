@@ -43,6 +43,15 @@ var apiRequestsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 // deviceState reports the current state of each tracked device as an integer
 // matching the store state enum (1=pending, 2=adopting, 3=adopted, 4=lost;
 // -1 = unknown). MACs are canonical lowercase colon-hex.
+//
+// Label caveat: the mac label is the canonical address we track (ours), but
+// the model label comes from inform bodies — i.e. DEVICE-influenced data.
+// Cardinality is therefore bounded by the set of distinct (mac, model) pairs
+// the trust domain ever reports; on a trusted LAN that is "one model per
+// device", small, and a churned repair only adds one extra series.
+// Documented residual risk: a malicious device on the network could vary its
+// reported model per inform to inflate series count until store removal
+// prunes stale label pairs.
 var deviceState = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "openunifi_device_state",
 	Help: "Device lifecycle state as an integer (-1 unknown, 1 pending, 2 adopting, 3 adopted, 4 lost).",
@@ -77,14 +86,17 @@ var staCount = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 // userTxBytes / userRxBytes are cumulative byte counters read from periodic
 // informs. They are GAUGES on purpose: a Prometheus Counter would treat a
 // controller restart (counter reset to a lower value) as a rate spike, which
-// is wrong for restart-prone periodic snapshots. Honest read: gauge.
+// is wrong for restart-prone periodic snapshots. Honest read: gauge — and the
+// name must NOT carry the Prometheus "_total" counter suffix, because
+// rate()/increase() treat _total series specially and nonsense would result.
+// They are absolute snapshot values, not monotonic client-side counters.
 var userTxBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "openunifi_user_tx_bytes_total",
+	Name: "openunifi_user_tx_bytes",
 	Help: "Cumulative transmitted bytes (gauge; read from periodic inform snapshots).",
 }, []string{"mac"})
 
 var userRxBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "openunifi_user_rx_bytes_total",
+	Name: "openunifi_user_rx_bytes",
 	Help: "Cumulative received bytes (gauge; read from periodic inform snapshots).",
 }, []string{"mac"})
 
@@ -166,11 +178,15 @@ func SetUserBytes(mac string, tx, rx float64) {
 // UpdateFromDevice is the one-shot convenience used after decoding an inform:
 // it pushes a full snapshot in one call. Use NaN for floats that are absent,
 // -1 for an unknown state, and 0 for a never-seen LastSeen.
-func UpdateFromDevice(mac, model string, state, lastSeenUnix int64, uptime, staCount, txBytes, rxBytes float64) {
+//
+// The sta parameter name must NOT shadow the package-level staCount gauge
+// var; use it via the SetStaCount helper instead (named "sta" so the
+// compiler would catch any stray naked reference to the var here anyway).
+func UpdateFromDevice(mac, model string, state, lastSeenUnix int64, uptime, sta, txBytes, rxBytes float64) {
 	SetDeviceState(mac, model, state)
 	SetLastInform(mac, lastSeenUnix)
 	SetUptime(mac, uptime)
-	SetStaCount(mac, staCount)
+	SetStaCount(mac, sta)
 	SetUserBytes(mac, txBytes, rxBytes)
 }
 

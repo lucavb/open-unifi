@@ -1,13 +1,21 @@
 package adminapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/lucabecker/open-unifi/internal/server"
 )
 
 // fakeBackend implements Backend with fixed fixtures; it records calls so
@@ -104,7 +112,7 @@ type testCase struct {
 func run(t *testing.T, tc testCase) {
 	t.Helper()
 	be := newFakeBackend()
-	h := New(DegenerateConfig{AdminToken: tc.token}, be)
+	h := New(Config{AdminToken: tc.token}, be)
 
 	req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
 	rec := httptest.NewRecorder()
@@ -163,7 +171,7 @@ func TestUnauthorizedPostWhenTokenSet(t *testing.T) {
 
 func TestAuthAcceptedAndHealthzOpen(t *testing.T) {
 	be := newFakeBackend()
-	h := New(DegenerateConfig{AdminToken: "s3cret"}, be)
+	h := New(Config{AdminToken: "s3cret"}, be)
 
 	// whoami with correct Bearer prefix on header token.
 	req := httptest.NewRequest("GET", "/api/v1/whoami", nil)
@@ -206,7 +214,7 @@ func TestWrongTokenRejected(t *testing.T) {
 		checks: func(t *testing.T, _ *fakeBackend, rec *httptest.ResponseRecorder) {
 			req := httptest.NewRequest("GET", "/api/v1/devices", nil)
 			req.Header.Set("Authorization", "Bearer s3cerx")
-			h := New(DegenerateConfig{AdminToken: "s3cret"}, newFakeBackend())
+			h := New(Config{AdminToken: "s3cret"}, newFakeBackend())
 			rec2 := httptest.NewRecorder()
 			h.ServeHTTP(rec2, req)
 			if rec2.Code != http.StatusUnauthorized {
@@ -220,7 +228,7 @@ func TestWrongTokenRejected(t *testing.T) {
 
 func TestAuthorizedFullFlow(t *testing.T) {
 	be := newFakeBackend()
-	h := New(DegenerateConfig{}, be) // auth disabled
+	h := New(Config{}, be) // auth disabled
 
 	// 1. list devices
 	req := httptest.NewRequest("GET", "/api/v1/devices", nil)
@@ -294,7 +302,7 @@ func TestAuthorizedFullFlow(t *testing.T) {
 // the canonical JSON error shape — never 500.
 func TestWrappedErrNotFoundMapsTo404(t *testing.T) {
 	be := newFakeBackend()
-	h := New(DegenerateConfig{}, be)
+	h := New(Config{}, be)
 
 	for _, tc := range []struct {
 		name, method, path, body string
@@ -339,7 +347,7 @@ func TestCreateDeleteDevice(t *testing.T) {
 
 			// delete it
 			req := httptest.NewRequest("DELETE", "/api/v1/devices/f0:9f:c2:84:8f:2a", nil)
-			h := New(DegenerateConfig{}, be)
+			h := New(Config{}, be)
 			rec2 := httptest.NewRecorder()
 			h.ServeHTTP(rec2, req)
 			if rec2.Code != http.StatusOK {
@@ -372,7 +380,7 @@ func TestMACNormalization(t *testing.T) {
 		"F0 9F C2 84 8F 2A",
 	} {
 		req := httptest.NewRequest("POST", "/api/v1/devices", strings.NewReader(`{"mac":"`+in+`"}`))
-		h := New(DegenerateConfig{}, newFakeBackend())
+		h := New(Config{}, newFakeBackend())
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		if rec.Code != http.StatusCreated {
@@ -387,7 +395,7 @@ func TestMACNormalization(t *testing.T) {
 	// garbage -> 400 JSON
 	for _, in := range []string{"FOO", "", "aa:bb:cc:dd:ee", "zz:zz:zz:zz:zz:zz", "aabbccddeefff"} {
 		req := httptest.NewRequest("POST", "/api/v1/devices", strings.NewReader(`{"mac":"`+in+`"}`))
-		h := New(DegenerateConfig{}, newFakeBackend())
+		h := New(Config{}, newFakeBackend())
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		if rec.Code != http.StatusBadRequest {
@@ -410,7 +418,7 @@ func putWireless(t *testing.T, h http.Handler, body string) *httptest.ResponseRe
 }
 
 func TestWirelessValidation(t *testing.T) {
-	h := New(DegenerateConfig{}, newFakeBackend())
+	h := New(Config{}, newFakeBackend())
 
 	// open + passphrase -> 400
 	rec := putWireless(t, h, `{"wlans":[{"ssid":"guest","security":"open","passphrase":"secret12","vlan":1}]}`)
@@ -460,7 +468,7 @@ func TestWirelessValidation(t *testing.T) {
 
 func TestWirelessGetPutRoundTrip(t *testing.T) {
 	be := newFakeBackend()
-	h := New(DegenerateConfig{}, be)
+	h := New(Config{}, be)
 
 	rec := putWireless(t, h, `{"wlans":[
 		{"name":"home","ssid":"home-net","security":"wpa-p","passphrase":"correct-horse","vlan":1,"enabled":true},
@@ -497,7 +505,7 @@ func TestWirelessGetPutRoundTrip(t *testing.T) {
 
 func TestRootServesEmbeddedConsole(t *testing.T) {
 	req := httptest.NewRequest("GET", "/", nil)
-	h := New(DegenerateConfig{}, newFakeBackend())
+	h := New(Config{}, newFakeBackend())
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -516,7 +524,7 @@ func TestRootServesEmbeddedConsole(t *testing.T) {
 
 func TestUnknownAPIPathJSON404(t *testing.T) {
 	req := httptest.NewRequest("GET", "/api/v1/inform_preview", nil)
-	h := New(DegenerateConfig{}, newFakeBackend())
+	h := New(Config{}, newFakeBackend())
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
@@ -529,7 +537,7 @@ func TestUnknownAPIPathJSON404(t *testing.T) {
 
 func TestMetricsInstrumented(t *testing.T) {
 	be := newFakeBackend()
-	h := New(DegenerateConfig{}, be)
+	h := New(Config{}, be)
 
 	req := httptest.NewRequest("GET", "/api/v1/devices", nil)
 	rec := httptest.NewRecorder()
@@ -559,4 +567,336 @@ func bodyExcerpt(body string) string {
 		return body[i:]
 	}
 	return body
+}
+
+// ---- error-injecting backend (opaque-500 / adopt-counter tests) ------------
+
+// failingBackend decorates fakeBackend with forced errors for selected
+// methods, bypassing the fixtures' happy/404 paths.
+type failingBackend struct {
+	*fakeBackend
+	getErr   error
+	adoptErr error
+}
+
+func (f *failingBackend) GetDevice(_ context.Context, mac string) (DeviceView, error) {
+	return DeviceView{}, f.getErr
+}
+
+func (f *failingBackend) AdoptPending(_ context.Context, mac string) (DeviceView, error) {
+	// Inject ONLY the generic failure; an unknown MAC still surfaces the
+	// wrapped ErrNotFound exactly like the real adapter (404 semantics).
+	for _, p := range f.pending {
+		if strings.EqualFold(p.MAC, mac) {
+			return DeviceView{}, f.adoptErr
+		}
+	}
+	return DeviceView{}, fmt.Errorf("%w: %s", ErrNotFound, mac)
+}
+
+// ---- /metrics under auth (item 1) ------------------------------------------
+
+func TestMetricsRequiresTokenWhenAuthConfigured(t *testing.T) {
+	be := newFakeBackend()
+	h := New(Config{AdminToken: "s3cret"}, be)
+
+	// No header -> 401 with the canonical JSON error shape.
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("metrics without header: got %d, want 401", rec.Code)
+	}
+	if m := decodeJSON(t, rec); m["error"] != "unauthorized" {
+		t.Fatalf("metrics 401 shape: %v", m["error"])
+	}
+	if rec.Header().Get("WWW-Authenticate") == "" {
+		t.Fatalf("metrics 401 missing WWW-Authenticate")
+	}
+
+	// Wrong token ([same length as valid) -> still 401.
+	req = httptest.NewRequest("GET", "/metrics", nil)
+	req.Header.Set("Authorization", "Bearer s3cerx")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("metrics wrong token: got %d, want 401", rec.Code)
+	}
+
+	// Valid Bearer -> 200 with the Prometheus exposition.
+	req = httptest.NewRequest("GET", "/metrics", nil)
+	req.Header.Set("Authorization", "Bearer s3cret")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("metrics with token: got %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "openunifi_api_requests_total") {
+		t.Fatalf("metrics body missing exposition")
+	}
+}
+
+func TestMetricsOpenWhenNoToken(t *testing.T) {
+	h := New(Config{}, newFakeBackend())
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("metrics without auth configured: got %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "# TYPE openunifi_informs_total") {
+		t.Fatalf("metrics body missing informs series")
+	}
+}
+
+// ---- opaque 500s (item 2) ---------------------------------------------------
+
+func TestOpaque500LogsAndHidesInternalError(t *testing.T) {
+	var logBuf bytes.Buffer
+	lg := slog.New(slog.NewJSONHandler(&logBuf, nil))
+
+	internalMsg := "db file corrupted at /var/lib/openunifi/state/xxx.db"
+	be := &failingBackend{
+		fakeBackend: newFakeBackend(),
+		getErr:      fmt.Errorf("secret-internal: %s", internalMsg),
+	}
+	h := New(Config{Logger: lg}, be)
+
+	req := httptest.NewRequest("GET", "/api/v1/devices/f0:9f:c2:84:8f:2a", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("backend error: got %d, want 500", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), internalMsg) {
+		t.Fatalf("500 body leaks internal detail: %q", rec.Body.String())
+	}
+	if m := decodeJSON(t, rec); m["error"] != "internal error" {
+		t.Fatalf("500 body: %v, want \"internal error\"", m["error"])
+	}
+	// ...but the configured logger DID receive the full error server-side.
+	if !strings.Contains(logBuf.String(), internalMsg) {
+		t.Fatalf("internal detail missing from server-side log: %q", logBuf.String())
+	}
+	if !strings.Contains(logBuf.String(), "admin api backend error") {
+		t.Fatalf("log record missing: %q", logBuf.String())
+	}
+}
+
+func Test404PathKeepsErrorTextAndDefaultLoggerWorks(t *testing.T) {
+	// Config{} (Logger nil ⇒ slog.Default) must keep compiling and working.
+	be := &failingBackend{
+		fakeBackend: newFakeBackend(),
+		getErr:      fmt.Errorf("%w: aa:bb:cc:dd:ee:66", ErrNotFound),
+	}
+	h := New(Config{}, be)
+
+	req := httptest.NewRequest("GET", "/api/v1/devices/aa:bb:cc:dd:ee:66", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("got %d, want 404", rec.Code)
+	}
+	if m := decodeJSON(t, rec); !strings.Contains(m["error"].(string), "device not found") {
+		t.Fatalf("404 body must keep the MAC context: %v", m["error"])
+	}
+}
+
+// ---- adopt 404-skip (item 3) ------------------------------------------------
+
+// adoptFailValue reads openunifi_adopt_fail_total through the handler's own
+// /metrics endpoint (in-process exposition parse; no sockets). The counter
+// delta is then attributable to ONLY the requests issued between two reads,
+// because tests in this package run sequentially (prometheus counters are
+// process-global).
+func adoptFailValue(t *testing.T, h http.Handler) float64 {
+	t.Helper()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("metrics fetch: %d", rec.Code)
+	}
+	re := regexp.MustCompile(`(?m)^openunifi_adopt_fail_total\s+([0-9.eE+-]+)$`)
+	m := re.FindStringSubmatch(rec.Body.String())
+	if m == nil {
+		t.Fatalf("no openunifi_adopt_fail_total series in exposition:\n%s", rec.Body.String())
+	}
+	v, err := strconv.ParseFloat(m[1], 64)
+	if err != nil {
+		t.Fatalf("parse adopt_fail value %q: %v", m[1], err)
+	}
+	return v
+}
+
+func TestAdoptFailCounterSkips404ButCountsRealFailures(t *testing.T) {
+	// NOTE on semantics (also in adminapi.go): openunifi_adopt_fail_total and
+	// openunifi_adopt_total count adoption REQUESTS at this endpoint; the
+	// app poller's counters count real state transitions asserted from
+	// informs. Different semantics by design. A 404 "device not found" is
+	// caller error (stale pending list / bad MAC), not an adoption failure.
+	be := &failingBackend{
+		fakeBackend: newFakeBackend(),
+		adoptErr:    errors.New("fake adopt blowup: radius socket refused"),
+	}
+	h := New(Config{}, be)
+
+	before := adoptFailValue(t, h)
+
+	// Unknown MAC -> 404 -> must NOT move the counter.
+	req := httptest.NewRequest("POST", "/api/v1/pending/aa:bb:cc:dd:ee:66/adopt", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("adopt unknown: %d, want 404", rec.Code)
+	}
+	if after := adoptFailValue(t, h); after != before {
+		t.Fatalf("404 adopt bumped adopt_fail_total: %v -> %v (must be unchanged)", before, after)
+	}
+
+	// Genuine backend failure -> 500 -> must bump the counter by exactly 1.
+	req = httptest.NewRequest("POST", "/api/v1/pending/a0:40:a0:aa:bb:cc/adopt", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("adopt failure: %d, want 500", rec.Code)
+	}
+	if after := adoptFailValue(t, h); after != before+1 {
+		t.Fatalf("real adopt failure counter: got delta %v, want 1", after-before)
+	}
+
+	// Successful adoption requires no failure counter change and reaches the backend.
+	be2 := newFakeBackend()
+	h2 := New(Config{}, be2)
+	req = httptest.NewRequest("POST", "/api/v1/pending/a0:40:a0:aa:bb:cc/adopt", nil)
+	rec = httptest.NewRecorder()
+	h2.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("healthy adopt: %d", rec.Code)
+	}
+	if len(be2.adopted) != 1 {
+		t.Fatalf("healthy adopt did not reach backend: %v", be2.adopted)
+	}
+}
+
+// ---- wlan input hardening (item 4) -----------------------------------------
+
+func TestWirelessRejectsControlCharsAndBadID(t *testing.T) {
+	h := New(Config{}, newFakeBackend())
+
+	// A raw newline inside a value is the system_cfg row separator: any of
+	// ssid / name / passphrase carrying \n or \r must be rejected; JSON
+	// escapes \n/\r decode to real control chars before validation.
+	for _, tc := range []struct {
+		name, body, wantMsg string
+	}{
+		{"ssid newline", `{"wlans":[{"ssid":"evil\nline","security":"open","vlan":1}]}`, "ssid"},
+		{"ssid carriage return", `{"wlans":[{"ssid":"bad\rcarriage","security":"open","vlan":1}]}`, "ssid"},
+		{"name newline", `{"wlans":[{"name":"row1\nfake row","ssid":"ok","security":"open","vlan":1}]}`, "name"},
+		{"passphrase newline", `{"wlans":[{"ssid":"x","security":"wpa-p","passphrase":"pass\nw0rd","vlan":1}]}`, "passphrase"},
+		{"passphrase carriage return", `{"wlans":[{"ssid":"x","security":"wpa-p","passphrase":"a\rb7cd789","vlan":1}]}`, "passphrase"},
+		{"id with space", `{"wlans":[{"id":"wlan 1","ssid":"x","security":"open","vlan":1}]}`, "id"},
+		{"id with equals", `{"wlans":[{"id":"a=b","ssid":"x","security":"open","vlan":1}]}`, "id"},
+		{"id with comma", `{"wlans":[{"id":"a,b","ssid":"x","security":"open","vlan":1}]}`, "id"},
+		{"id with newline", `{"wlans":[{"id":"row1\nrow2","ssid":"x","security":"open","vlan":1}]}`, "id"},
+		{"id too long", `{"wlans":[{"id":"` + strings.Repeat("a", 65) + `","ssid":"x","security":"open","vlan":1}]}`, "id"},
+	} {
+		rec := putWireless(t, h, tc.body)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: got %d (%s), want 400", tc.name, rec.Code, rec.Body.String())
+		}
+		if m := decodeJSON(t, rec); !strings.Contains(m["error"].(string), tc.wantMsg) {
+			t.Fatalf("%s: error %v does not mention %q", tc.name, m["error"], tc.wantMsg)
+		}
+	}
+
+	// Clean values — including a hex-style ID — still pass.
+	rec := putWireless(t, h, `{"wlans":[
+		{"id":"wlan-1","name":"home","ssid":"home-net","security":"wpa-p","passphrase":"correct-horse","vlan":1,"enabled":true},
+		{"name":"guest","ssid":"guests","security":"open","vlan":20}
+	]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("clean wlans rejected: %d %q", rec.Code, rec.Body.String())
+	}
+}
+
+// ---- web console: embedded esc() + CSP (item 5) -----------------------------
+// These are mechanical tripwires on the embedded page: they prove the fix
+// ships (quote-escaping chain present, DOM-based esc absent) and that page()
+// serves the CSP header. Real JS behavior (whether esc() survives a u001F
+// edge case, event-handler breakout attempt at runtime etc.) is browser
+// behavior and NOT unit-testable from Go.
+
+func TestEmbeddedConsoleHasQuoteEscapingAndCSP(t *testing.T) {
+	src := string(indexHTML)
+
+	if !strings.Contains(src, `.replace(/"/g, "&quot;")`) {
+		t.Fatalf("esc() does not escape double quotes (required: output lands inside value=\"...\")")
+	}
+	if !strings.Contains(src, `.replace(/&/g, "&amp;")`) {
+		t.Fatalf("esc() must escape & first so later entities are not double-escaped")
+	}
+	if !strings.Contains(src, `&apos;`) && !strings.Contains(src, `&#39;`) {
+		t.Fatalf("esc() does not escape single quotes")
+	}
+	// The old textContent->innerHTML trick has no legitimate remaining user.
+	if strings.Contains(src, "d.innerHTML") {
+		t.Fatalf("old DOM-based esc remnant present")
+	}
+
+	// page() must set the CSP defense-in-depth header.
+	h := New(Config{}, newFakeBackend())
+	req := httptest.NewRequest("GET", "/", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	csp := rec.Header().Get("Content-Security-Policy")
+	for _, want := range []string{
+		"default-src 'self'", "object-src 'none'", "base-uri 'none'",
+		"frame-ancestors 'none'", "connect-src 'self'",
+	} {
+		if !strings.Contains(csp, want) {
+			t.Fatalf("CSP header missing %q; got %q", want, csp)
+		}
+	}
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "open-unifi controller") {
+		t.Fatalf("console page broken: %d %q", rec.Code, rec.Body.String()[:80])
+	}
+}
+
+// ---- Wlan struct parity (item 7) --------------------------------------------
+//
+// adminapi.Wlan and server.Wlan are mirrored structs: the cmd/openunifi
+//converter and server's wlanListHash replicate the field list by hand.
+// ANY new field must be added to BOTH structs, the converter, AND
+// wlanListHash's map — or provisioning silently drops it. This reflect test
+// catches STRUCT drift (field name+type sets); converter/hash drift needs
+// review attention — its test lives with the server lane.
+
+func TestWlanStructParityWithServer(t *testing.T) {
+	a := reflect.TypeOf(Wlan{})
+	s := reflect.TypeOf(server.Wlan{})
+
+	if a.NumField() != s.NumField() {
+		t.Fatalf("field count drift: adminapi.Wlan has %d, server.Wlan has %d", a.NumField(), s.NumField())
+	}
+	afields := map[string]reflect.Type{}
+	for i := 0; i < a.NumField(); i++ {
+		f := a.Field(i)
+		afields[f.Name] = f.Type
+	}
+	for i := 0; i < s.NumField(); i++ {
+		sf := s.Field(i)
+		at, ok := afields[sf.Name]
+		if !ok {
+			t.Fatalf("server.Wlan field %q missing in adminapi.Wlan — add to BOTH structs, the cmd/openunifi converter AND server's wlanListHash", sf.Name)
+		}
+		if at != sf.Type {
+			t.Fatalf("field %q type drift: adminapi %v vs server %v", sf.Name, at, sf.Type)
+		}
+		delete(afields, sf.Name)
+	}
+	for name := range afields {
+		t.Fatalf("adminapi.Wlan field %q missing in server.Wlan — add to BOTH structs, the cmd/openunifi converter AND server's wlanListHash", name)
+	}
 }

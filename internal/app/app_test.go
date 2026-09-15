@@ -156,7 +156,7 @@ func TestGetDeleteUnknownMACErrors(t *testing.T) {
 // JSON error body on GET/DELETE/adopt, never 500.
 func TestHTTPNotFoundThroughRealAdapter(t *testing.T) {
 	a, _, _ := testApp(t)
-	h := adminapi.New(adminapi.DegenerateConfig{}, a) // App implements Backend
+	h := adminapi.New(adminapi.Config{}, a) // App implements Backend
 
 	for _, tc := range []struct {
 		name, method, path string
@@ -235,7 +235,7 @@ func TestWirelessRoundTripPersistence(t *testing.T) {
 
 // ---- metrics poller ------------------------------------------------------
 
-// pollerAdopted builds an adopted-device store fixture.
+// pollerSetup builds a fresh App + MemStore fixture for poller tests.
 func pollerSetup(t *testing.T) (*App, store.DeviceStore) {
 	t.Helper()
 	a, st, _ := testApp(t)
@@ -244,8 +244,10 @@ func pollerSetup(t *testing.T) (*App, store.DeviceStore) {
 
 func TestPollerSeedsAdoptedWithoutCounting(t *testing.T) {
 	a, st := pollerSetup(t)
+	// Fresh heartbeat: the lost sweep must not touch this device.
+	lastSeen := time.Now().Unix()
 	if err := st.Put(store.Device{MAC: "f09fc2848f2a", State: store.StateAdopted, Model: "U7PG2",
-		LastSeen: 1700000000, Extra: store.JSONMap{"uptime": 7231.0},
+		LastSeen: lastSeen, Extra: store.JSONMap{"uptime": 7231.0},
 		LastUps: store.JSONMap{"user-num_sta": 12.0, "user-tx_bytes": 1048576.0, "user-rx_bytes": 2097152.0},
 	}); err != nil {
 		t.Fatal(err)
@@ -265,10 +267,12 @@ func TestPollerSeedsAdoptedWithoutCounting(t *testing.T) {
 	// numeric fields must reach the gauges honestly
 	checkGauge(t, "openunifi_uptime_seconds", 7231)
 	checkGauge(t, "openunifi_sta_count", 12)
-	checkGauge(t, "openunifi_user_tx_bytes_total", 1048576)
-	checkGauge(t, "openunifi_user_rx_bytes_total", 2097152)
+	// NOTE: byte snapshots are honest GAUGES (see metrics.go) — the family
+	// names do NOT carry the Prometheus counter suffix _total.
+	checkGauge(t, "openunifi_user_tx_bytes", 1048576)
+	checkGauge(t, "openunifi_user_rx_bytes", 2097152)
 	checkGauge(t, "openunifi_device_state", 3)
-	checkGauge(t, "openunifi_last_inform_timestamp", 1700000000)
+	checkGauge(t, "openunifi_last_inform_timestamp", float64(lastSeen))
 }
 
 func checkGauge(t *testing.T, family string, want float64) {
@@ -345,5 +349,211 @@ func TestRunPollerStopsOnContextCancel(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("RunPoller did not exit after context cancel")
+	}
+}
+
+// ---- wireless cache (load-once, no per-request file I/O) ------------------
+
+func TestNewWithCorruptWirelessFileRetainsError(t *testing.T) {
+	dir := t.TempDir()
+	wpath := filepath.Join(dir, "wireless.json")
+	if err := os.WriteFile(wpath, []byte("{this is not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := New(store.NewMemStore(), wpath, quietLogger())
+
+	env, err := a.CurrentWireless()
+	if err == nil {
+		t.Fatal("corrupt wireless.json must be a retained load error at New")
+	}
+	if len(env.Wlans) != 0 {
+		t.Fatalf("corrupt load must serve the empty default, got %+v", env)
+	}
+
+	// main-style startup gate: the process must refuse the corrupt file.
+	if startupErr := func() error {
+		_, err := a.CurrentWireless()
+		return err
+	}(); startupErr == nil {
+		t.Fatal("startup check (CurrentWireless) must keep returning the error")
+	}
+}
+
+func TestNewWithMissingWirelessFileIsEmptyDefault(t *testing.T) {
+	a, _, _ := testApp(t) // wpath in a fresh tempdir: file never written
+	env := a.GetWireless(context.Background())
+	if len(env.Wlans) != 0 {
+		t.Fatalf("missing file must yield empty default, got %+v", env)
+	}
+	if _, err := a.CurrentWireless(); err != nil {
+		t.Fatalf("missing file is not an error (first boot), got %v", err)
+	}
+}
+
+// TestWirelessServedFromCacheWithoutFileIO proves GetWireless/CurrentWireless
+// hit the in-memory cache, not the disk: after PutWireless, the backing file
+// is removed and then replaced with garbage — reads keep serving the NEW
+// envelope with a nil error regardless.
+func TestWirelessServedFromCacheWithoutFileIO(t *testing.T) {
+	a, _, wpath := testApp(t)
+	ctx := context.Background()
+
+	env := adminapi.WlansEnvelope{Wlans: []adminapi.Wlan{
+		{ID: "w1", Name: "home", SSID: "home-net", Security: "wpa-p", Passphrase: "correct-horse", Enabled: true},
+	}}
+	if err := a.PutWireless(ctx, env); err != nil {
+		t.Fatalf("put wireless: %v", err)
+	}
+
+	// Destroy every trace of the file: gone, then corrupt.
+	if err := os.Remove(wpath); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.GetWireless(ctx); len(got.Wlans) != 1 || got.Wlans[0].SSID != "home-net" {
+		t.Fatalf("post-delete read must serve the cached NEW envelope, got %+v", got)
+	}
+	if _, err := a.CurrentWireless(); err != nil {
+		t.Fatalf("post-delete CurrentWireless must be nil-error, got %v", err)
+	}
+	if err := os.WriteFile(wpath, []byte("garbage"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.GetWireless(ctx); len(got.Wlans) != 1 {
+		t.Fatalf("post-corrupt read must still serve the cache, got %+v", got)
+	}
+}
+
+func TestPutWirelessFailureLeavesCacheUntouched(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	a := New(store.NewMemStore(), filepath.Join(dir, "wireless.json"), quietLogger())
+
+	if err := a.PutWireless(ctx, adminapi.WlansEnvelope{Wlans: []adminapi.Wlan{{Name: "ok", SSID: "ok"}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Make persistence impossible: the temp file lives in dir, so a 0000
+	// directory forces CreateTemp to fail AFTER the cache is populated.
+	if err := os.Chmod(dir, 0o000); err != nil {
+		t.Fatalf("chmod inject: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+
+	err := a.PutWireless(ctx, adminapi.WlansEnvelope{Wlans: []adminapi.Wlan{{Name: "fail", SSID: "fail"}}})
+	if err == nil {
+		t.Fatal("put into an unwritable directory must fail")
+	}
+	if got := a.GetWireless(ctx); len(got.Wlans) != 1 || got.Wlans[0].Name != "ok" {
+		t.Fatalf("failed persist must leave the cache unchanged, got %+v", got)
+	}
+}
+
+// ---- lost sweep (StateLost finally has a producer) ------------------------
+
+func TestLostSweepMarksStaleAdoptedDeviceLost(t *testing.T) {
+	a, st := pollerSetup(t)
+	now := time.Now().Unix()
+
+	mk := func(mac string) error {
+		return st.Put(store.Device{MAC: mac, State: store.StateAdopted, LastSeen: now - lostAfterSeconds - 121})
+	}
+	if err := mk("f09fc2848f2a"); err != nil {
+		t.Fatal(err)
+	}
+	// fresh adopted: must be untouched
+	if err := st.Put(store.Device{MAC: "010203040506", State: store.StateAdopted, LastSeen: now - 15}); err != nil {
+		t.Fatal(err)
+	}
+	// other states with ancient LastSeen: never swept
+	if err := st.Put(store.Device{MAC: "aabbccddeeff", State: store.StatePending, LastSeen: now - 9999}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Put(store.Device{MAC: "112233445566", State: store.StateAdopting, LastSeen: now - 9999}); err != nil {
+		t.Fatal(err)
+	}
+
+	bFail := counterDefault("openunifi_adopt_fail_total")
+	a.PollOnce()
+
+	if d, err := st.Get("f09fc2848f2a"); err != nil || d.State != store.StateLost {
+		t.Fatalf("stale adopted must be StateLost, got %+v err=%v", d, err)
+	}
+	if d, err := st.Get("010203040506"); err != nil || d.State != store.StateAdopted {
+		t.Fatalf("fresh adopted must stay Adopted, got %+v err=%v", d, err)
+	}
+	if d, err := st.Get("aabbccddeeff"); err != nil || d.State != store.StatePending {
+		t.Fatalf("pending must never be swept, got %+v err=%v", d, err)
+	}
+	if d, err := st.Get("112233445566"); err != nil || d.State != store.StateAdopting {
+		t.Fatalf("adopting must never be swept, got %+v err=%v", d, err)
+	}
+	if got := counterDefault("openunifi_adopt_fail_total"); got != bFail+1 {
+		t.Fatalf("sweep transition must count exactly one adopt failure: %v -> %v", bFail, got)
+	}
+}
+
+func TestLostSweepSkipsAdoptedWithZeroLastSeen(t *testing.T) {
+	a, st := pollerSetup(t)
+	if err := st.Put(store.Device{MAC: "f09fc2848f2a", State: store.StateAdopted, LastSeen: 0}); err != nil {
+		t.Fatal(err)
+	}
+	bFail := counterDefault("openunifi_adopt_fail_total")
+	a.PollOnce()
+	if d, err := st.Get("f09fc2848f2a"); err != nil || d.State != store.StateAdopted {
+		t.Fatalf("LastSeen==0 (never seen) must not be swept to Lost, got %+v err=%v", d, err)
+	}
+	if got := counterDefault("openunifi_adopt_fail_total"); got != bFail {
+		t.Fatalf("no sweep transition, no fail count: %v -> %v", bFail, got)
+	}
+}
+
+func TestPrevStatesPrunedForDeletedDevices(t *testing.T) {
+	a, st := pollerSetup(t)
+	if err := st.Put(store.Device{MAC: "f09fc2848f2a", State: store.StateAdopted, LastSeen: time.Now().Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	a.PollOnce() // seeds prevStates
+	a.prevMu.Lock()
+	seeded := len(a.prevStates)
+	a.prevMu.Unlock()
+	if seeded != 1 {
+		t.Fatalf("expected exactly one prevStates entry, got %d", seeded)
+	}
+
+	if err := st.Delete("f09fc2848f2a"); err != nil {
+		t.Fatal(err)
+	}
+	a.PollOnce() // device gone: prevStates entry must be pruned, not leak
+	a.prevMu.Lock()
+	left := len(a.prevStates)
+	a.prevMu.Unlock()
+	if left != 0 {
+		t.Fatalf("prevStates entry for deleted device must be pruned, %d left", left)
+	}
+}
+
+// ---- MAC consolidation (store.CanonicalMAC is the single normalizer) -----
+
+func TestInvalidMACIsRejectedOrNotFound(t *testing.T) {
+	a, _, _ := testApp(t)
+	ctx := context.Background()
+
+	for _, bad := range []string{"zz", "not a mac at all"} {
+		if _, err := a.GetDevice(ctx, bad); !errors.Is(err, adminapi.ErrNotFound) {
+			t.Fatalf("get %q: want not-found, got %v", bad, err)
+		}
+		if err := a.DeleteDevice(ctx, bad); !errors.Is(err, adminapi.ErrNotFound) {
+			t.Fatalf("delete %q: want not-found, got %v", bad, err)
+		}
+		if _, err := a.AdoptPending(ctx, bad); err == nil {
+			t.Fatalf("adopt %q: want error", bad)
+		}
+	}
+	if _, err := a.CreateDevice(ctx, adminapi.DeviceUpsert{MAC: "zz"}); err == nil {
+		t.Fatal("create with unparseable mac must reject")
+	}
+	// valid input is behavior-identical to the old private normalizer
+	if _, err := a.CreateDevice(ctx, adminapi.DeviceUpsert{MAC: "A0.40.A0.AA.BB.CC"}); err != nil {
+		t.Fatalf("dot-separated mac must normalize: %v", err)
 	}
 }

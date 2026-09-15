@@ -33,19 +33,26 @@ Payload processing (request):
    tag = last 16 bytes of payload (128-bit tag, appended). Java: AES/GCM/NoPadding.
 2. Else if flag 0x01 (and not GCM): AES-CBC. Bytecode attempts PKCS5 paddingBottom first
    and falls back to AES/CBC/NoPadding on BadPaddingException (lenient legacy support).
-3. If flag 0x04: zlib-inflate (wallet flag 0x02 = snappy uncompress) — order:
-   zlib if 0x02 set, snappy if 0x04 set. (Device gen2 sends zlib.)
+3. If flag 0x02: zlib-inflate. If flag 0x04: snappy — UNSUPPORTED by this controller
+   (rejected with an error); gen2 devices use zlib, never snappy.
 4. Result is JSON (see §3).
 
 Response construction (controller → device):
 - If the request was *encrypted*, the response MUST be encrypted (same header plumbing):
-  reuse the request header shape, generate a NEW random 16-byte IV,
-  `flags = 0x0009` (GCM) when device signaled GCM capability or request was GCM, else
-  `flags = 0x0001` (CBC). GCM response: AAD = 40-byte header, tag appended,
-  payloadLen = ciphertext+tag length. CBC response: payloadLen = ciphertext length.
-- If the request was *plaintext JSON* (only allowed when device is in pre-adoption and
-  "plain text inform" enabled — classic controllers reject it), respond with plain JSON
-  serialized into the response body.
+  reuse the request header shape, generate a NEW random 16-byte IV, and set
+  `flags = 0x0009` (GCM) iff the REQUEST itself carried flag 0x08, else `flags = 0x0001`
+  (CBC). The device's advertised `x_aes_gcm` capability does NOT influence the response
+  cipher — only the request's own flags do (PROTOCOL-mgmt.md §5: response GCM ⇔ request
+  flags & 8; a CBC request that merely advertises `x_aes_gcm:true` gets a CBC response).
+  dataVersion is echoed unchanged (= 1). GCM response: AAD = the RESPONSE's own
+  40-byte header (the exact bytes transmitted on the wire), tag appended, payloadLen =
+  ciphertext+tag length. CBC response: payloadLen = ciphertext length.
+- Unencrypted informs — TNBU-framed packets without flags 0x01/0x08 (including zlib-only
+  0x02) as well as unframed JSON bodies — are REJECTED with 400 "Plain text inform is
+  not supported" unless the controller runs with `--allow-plaintext-inform` (mirrors the
+  classic servlet's debug-build gate, PROTOCOL-mgmt.md §5). When allowed, the response
+  is plain JSON. Open-unifi deviation from classic debug behavior: plaintext informs
+  never initiate adoption and never rotate keys (PROTOCOL-mgmt.md §9).
 - JSON body keys for every response: at minimum `server_time_in_utc` (ms epoch, string).
 
 ## 2. Encryption keys
@@ -61,8 +68,10 @@ Response construction (controller → device):
 - Post-adoption the controller generates a NEW per-device key:
   `x_authkey` = 32 random hex chars from alphabet `0123456789abcdef`
   (`C.o00000("0123456789abcdef", 32)`), stored `device.x_authkey` and pushed to the
-  device inside `mgmt_cfg` (`unifi.x_authkey=...`), after which the device encrypts
-  with it (and includes an `x_aes_gcm` capability flag).
+  device inside `mgmt_cfg` (the `authkey=` line — exact 10-line blob in
+  PROTOCOL-mgmt.md §2; the historical `unifi.x_authkey=` spelling is superseded),
+  after which the device encrypts with it (and includes an `x_aes_gcm` capability
+  flag).
 - Devices that keep using the default key after adoption are recorded as
   `default:true` and put back into adoption.
 - A device may have MULTIPLE valid keys (`device.authkeys` list); controller tries each
@@ -125,25 +134,28 @@ Adoption handshake (factory AP pointing at controller, verified paths):
 2. Admin registers the MAC (UI/API/terraform) → device record with
    `state=1 (PENDING)`, `default` key accepted.
 3. AP inform (state 1, default key) → controller responds `setparam` with:
-   - `cfgversion` = new 16-hex random
-   - `mgmt_cfg` = management config blob (see §5):
-     contains `unifi.cfg_version`, `unifi.adopted=<id>`? `unifi.x_authkey=<hex>`
+   - `mgmt_cfg` ONLY (adoption push — PROTOCOL-mgmt.md §6.2 rows c/f): the 10-line
+     blob of §2 (PROTOCOL-mgmt.md §2) with a fresh 16-hex `cfgversion=` line and
+     `authkey=<new x_authkey>`
    - (response encrypted with default key)
-4. AP applies mgmt config, now uses `x_authkey`, re-informs. If a second inform
-   arrives still encrypted with the default key, regenerate `x_authkey` (16→32 char)
-   and re-push (`[device authkey] send non-default authkey` path).
+4. AP applies mgmt config, now uses `x_authkey` (32 hex), re-informs. If a second
+   inform arrives still encrypted with the default key, rotate `x_authkey` +
+   cfgversion again and re-push (the "send non-default authkey" path,
+   PROTOCOL-mgmt.md §6.2 row f).
 5. Next inform with new key + matching `cfgversion` → device considered CONNECTED
    (state 0). Response `noop` with `interval` (e.g. 15-60 s).
-6. Subsequent informs w/ `cfgversion` mismatch → `setparam` + new
-   `cfgversion` + `mgmt_cfg` + optionally `system_cfg` (full site config text for
-   diag/cache; also sent as `system.config.system_cfg` entries inside mgmt_cfg).
+6. Subsequent informs w/ `cfgversion` mismatch → full-provisioning `setparam`:
+   new `cfgversion` (16-hex) + `system_cfg` (full system config text —
+   PROTOCOL-mgmt.md §3 / PROTOCOL-systemcfg-wireless.md) + `blocked_sta` + `mgmt_cfg`
+   (always all four keys — PROTOCOL-mgmt.md §6.2 row d).
 
-Device state table (from `Device.getStateName` usage): 0? = connected,
-1 = pending/adopting, 2 = adopted?, 4 = upgrading, 5 = provisioning,
-8 = "adopt pending factory reset", 9 = ? (INFORM_ERROR); classic states include
-FLASHING/UPGRADING/PROVISIONING/HEARTBEAT_MISSED/DISCONNECTED/ADOPTING/GETTING_STATUS/
-INFORM_ERROR. Our store maps raw numbers; exact enum lives in Device class (TODO verify
-tomorrow against device messages).
+Device-REPORTED `state` field (distinct from our controller-side store states
+1=pending/2=adopting/3=adopted/4=lost, which are a controller-side lifecycle enum):
+0 = connected, 1 = adopting, 4 = upgrading, 5 = provisioning,
+8 = "adopt pending factory reset", 9 = inform error (from `Device.getStateName` usage;
+verify against real device messages during the acceptance window). Classic controller
+state strings include FLASHING/UPGRADING/PROVISIONING/HEARTBEAT_MISSED/DISCONNECTED/
+ADOPTING/GETTING_STATUS/INFORM_ERROR.
 
 ## 4. UDP 10001 discovery ("LiteStationQueryServer")
 
@@ -177,23 +189,17 @@ device records (max_pending devices), optionally replies like O0oO does (mac+ip,
 21/22/23 TLVs). Adoption primarily happens via SSH set-inform; discovery UI shows
 candidates.
 
-## 5. Config blobs (`mgmt_cfg` / `system_cfg`) — OPEN QUESTIONS
+## 5. Config blobs (`mgmt_cfg` / `system_cfg`) — RESOLVED
 
-- `mgmt_cfg`: built per-device-type by `com.ubnt.service.config.nullsuper#forsuper(Device)`
-  → dispatch to type-specific writer (`S` for generic APs, `R` UDM, `o0Oo` Cavium,
-  `M`, returnsuper/OoOo for MediaTek/Espressif...). For classic APs the writer chain is
-  `OoOo` (abstract) → `S` (empty overrides seen in CFR with feared renames — treat as
-  unresolved). Content is a TEXT config in "unifi.*" key=value lines (device-side
-  `/var/etc/persistent/cfg/mgmt` syntax), historically:
-  ```
-  unifi.cfg_version=<32 hex>
-  unifi.x_authkey=<32 hex>
-  unifi.<MANY OPTIONS>=...
-  ```
-  ⇒ **Lane A** must finish this trace from decompiles and write docs/PROTOCOL-mgmt.md.
-- `system_cfg`: full AP system config text (`wireless.*`, `rmon.*`, …) built by
-  `com/ubnt/service/config/int.class` (~"StringBuilder" lines seen) — same lane.
-- `blocked_sta`: list of blocked client MACs (array of strings).
+- `mgmt_cfg`: 10-line text blob (exact line order + the conditional `authkey=` rule):
+  **PROTOCOL-mgmt.md §2** (bytecode-cited from the B-writer decompile). Historical
+  `unifi.*`-prefixed spellings are superseded.
+- `system_cfg`: full AP system config text — sections `# system`, `# unifi`, `# users`,
+  the wireless compound (`# wlans (radio)`, `radio.<n>.*`, `aaa.<n>.*`,
+  `wireless.<n>.*`, `# vlan`, `# bridge`, `# netconf`, `# dhcpc`), `# sshd`, `# misc`:
+  **PROTOCOL-mgmt.md §3** for the frame and **PROTOCOL-systemcfg-wireless.md** for the
+  complete wireless schema, worked example and Go mapping.
+- `blocked_sta`: blocked client MACs (newline-joined string; empty when none).
 
 ## 6. Go implementation contract (lanes write exactly these)
 
@@ -216,33 +222,40 @@ Package `internal/server` (lane C) — HTTP handler semantics:
 - UDP :10001 listener per §4 (declare+store pending announcers).
 - Adoption FSM per §3; emits Prometheus events via `internal/metrics`.
 
-Package `internal/store`: JSON-backed file store (interface below) — lane C may use
-anything as long as `Get/mac` + `Put` + optimistic locking stays.
-```go
-type Device struct { MAC, Model, Firmware string; State int; Authkeys []string; SiteID string;
-  IP, InformURL string; LastSeen int64; CfgVersion string; Tags []string; Warnings []string }
-```
+Package `internal/store`: JSON-backed file store (internal/store/store.go is the
+contract; in-memory impl exists for tests). Per-device read-modify-write goes through
+`Update(mac, fn func(*Device) error) error` (per-MAC serialization; upserts when the
+record is absent); `Get` returns a deep copy. `Device` fields as implemented: MAC
+(canonical lowercase 12-hex string), Name, Model, Firmware, Serial, SiteID, State
+(controller-side lifecycle: 1=pending, 2=adopting, 3=adopted, 4=lost), IP, InformURL,
+LastSeen, FirstSeen, CfgVersion, AppliedCfg, Authkeys (assigned-key history, newest
+last, capped at 2 — the factory default key is NEVER stored here), XAuthkey, AESGCM,
+LastUps, Extra (inform-body passthrough; controller-owned `wlan_cfg_sha`/
+`ssh_sha512passwd` and admin-owned keys are preserved/protected across informs).
 
-Package `internal/adminapi` (lane D): REST over JSON at `:8443`-style addr flag
-`--listen-admin`:
+Package `internal/adminapi`: REST over JSON at the `--listen-admin` addr:
 ```
-GET    /api/v1/devices
-POST   /api/v1/devices            {mac, name?, site_id?}  -> creates PENDING record (adopt)
+GET    /api/v1/devices            (list; state/last_seen are JSON numbers)
+POST   /api/v1/devices            {mac, name?, site_id?}  -> idempotent upsert, PENDING record
 DELETE /api/v1/devices/{mac}
-GET    /api/v1/devices/{mac}      (state, last_seen, model, fw, metrics snapshot)
+GET    /api/v1/devices/{mac}
 GET    /api/v1/pending            (discovery-found candidates)
 POST   /api/v1/pending/{mac}/adopt
-GET    /api/v1/config/healthz     -> 200 ok
-Metrics at /metrics (promhttp).
+GET    /api/v1/wireless           (whole-document WLAN envelope)
+PUT    /api/v1/wireless           (replaces the whole document)
+GET    /api/v1/whoami
+GET    /healthz                   -> 200 ok
+GET    /metrics                   (promhttp; requires the token when one is set)
 ```
-Auth: optional `--admin-token <hex>`; when set require `Authorization: Bearer <token>`
-with 401 otherwise. Terraform provider uses this.
+Auth: optional `--admin-token <hex>` (env fallback OPEN_UNIFI_ADMIN_TOKEN); when set,
+EVERY /api route AND /metrics require `Authorization: Bearer <token>` (401 otherwise) —
+only `/` (web console) and `/healthz` stay open. Terraform provider uses this.
 
 Web UI (lane D): static page at `/`:
 - list of devices & pending adopters,
 - `Adopt` button → POST /pending/{mac}/adopt,
 - textarea/dropdowns for: SSID name, passphrase, security (open/wpa-p/wpa-eap),
-  VLAN id; save → POST /api/v1/config/wireless (adminapi shape).
+  VLAN id; save → PUT /api/v1/wireless (whole-document envelope, adminapi shape).
 
 Package `provider` (lane E, at provider/ dir + cmd/tfprovider):
 resources `open-unifi_access_point` (adopt, by MAC + controller URL/token),
@@ -250,15 +263,23 @@ resources `open-unifi_access_point` (adopt, by MAC + controller URL/token),
 Provider `Configure` accepts `url`, `token` (honest: token required unless server
 started without --admin-token).
 
-## 7. Whatever is still uncertain (carry-list)
+## 7. Whatever is still uncertain (morning-verify carry-list)
 
-- Exact `mgmt_cfg` text encoding (lane A resolves).
-- `system_cfg` exact format and whether device threat-level influences provisioning.
-- Device-side state enum numeric values & `cfgversion` semantics when mismatch (we
-  handle: same → noop; different → setparam full shape).
-- What happens on `two_phase_adopt` flows (applies only to older firmware; OUR flow
-  targets 6.x which adopts in one phase).
-- Discovery response packet exact TLVs needed for the AP to acquire inform URL from
-  broadcast (O0oO builds it; not fully extracted) — lane A also should grab
-  `oooO`/`H` builders while in the jar. till the device is wired we can rely on SSH
-  set-inform; documented as tomorrow's onboarding step.
+Resolved since the first pass: `mgmt_cfg` text encoding (PROTOCOL-mgmt.md §2),
+`system_cfg` format (PROTOCOL-mgmt.md §3 + PROTOCOL-systemcfg-wireless.md), and
+cfgversion semantics (match → noop; mismatch → full-provisioning setparam,
+PROTOCOL-mgmt.md §6.2 row d).
+
+Still open — verify against the real U7PG2 during the acceptance window:
+- Device-reported state enum numeric values (see §3).
+- `noop.interval` wire type: we send `"15"` as a JSON string; the decompile's
+  `object.put("interval", nextInterval)` argument type is unresolved. If the device
+  misbehaves, switch to a JSON number.
+- `ieee_mode` ht-width guess (`11nght20`/`11naht20` — TODO in code).
+- Uplink port assumption: `# vlan` rows hardcode `eth0` as the tagged/untagged uplink —
+  confirm the U7PG2's actual trunk port (if it is eth1, tagged VLANs break).
+- `mgmt_url` port fallback when `--controller-url` is not https (we emit :8443).
+- `two_phase_adopt` flows (older firmware only; 6.x adopts in one phase — believed
+  irrelevant).
+- Discovery response packet exact TLVs (O0oO builds it; not fully extracted) — not
+  needed while onboarding goes through SSH set-inform.

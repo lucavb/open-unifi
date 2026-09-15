@@ -41,7 +41,10 @@ func run() error {
 	discovery := flag.Bool("discovery", true, "enable the UDP discovery listener")
 	dataDir := flag.String("data-dir", "data", "directory for devices.json / wireless.json")
 	controllerURL := flag.String("controller-url", "", "base URL devices are pointed at during adoption (e.g. http://10.0.0.5:8080)")
-	adminToken := flag.String("admin-token", "", "admin API bearer token (empty disables auth)")
+	apSSHPassword := flag.String("ap-ssh-password", "", "SSH password for adopted APs (empty uses the built-in site default \"ubnt\")")
+	// Default from the provider's token env var; --admin-token overrides it.
+	adminToken := flag.String("admin-token", os.Getenv("OPEN_UNIFI_ADMIN_TOKEN"),
+		"admin API bearer token (empty disables auth; defaults to $OPEN_UNIFI_ADMIN_TOKEN)")
 	allowPlainText := flag.Bool("allow-plaintext-inform", false, "accept unencrypted JSON inform bodies")
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, error")
 	flag.Parse()
@@ -67,10 +70,28 @@ func run() error {
 		return fmt.Errorf("open device store: %w", err)
 	}
 	ap := app.New(st, filepath.Join(*dataDir, "wireless.json"), logger)
-	adminH := adminapi.New(adminapi.DegenerateConfig{AdminToken: *adminToken}, ap)
+	// The wireless document is loaded ONCE in app.New; a corrupt
+	// wireless.json must refuse startup here (same as a corrupt
+	// devices.json already does) — otherwise the provisioning side would
+	// degrade to zero WLANs and, on the next TF plan PUT, wipe every other
+	// WLAN off every AP.
+	if _, err := ap.CurrentWireless(); err != nil {
+		return fmt.Errorf("wireless config: %w", err)
+	}
+	adminH := adminapi.New(adminapi.Config{AdminToken: *adminToken}, ap)
+
+	if *adminToken == "" {
+		// Prominent, not debug: without a token any LAN peer can read WLAN
+		// passphrases through the admin API and adopt devices through the
+		// metrics side of the house.
+		logger.Warn("admin API and metrics are UNAUTHENTICATED: any LAN peer can read WLAN passphrases and adopt devices; set --admin-token or $OPEN_UNIFI_ADMIN_TOKEN")
+	}
 
 	// WirelessSource feeds the admin-API WLAN envelope into inform-side
-	// provisioning (system_cfg wireless/VLAN emission + drift hash).
+	// provisioning (system_cfg wireless/VLAN emission + drift hash). After
+	// the CurrentWireless check above the error branch is nil in practice —
+	// the envelope is served from App's cache, which cannot fail — but it
+	// stays as the documented behavior before startup.
 	wirelessSource := func() []server.Wlan {
 		env, err := ap.CurrentWireless()
 		if err != nil {
@@ -93,24 +114,26 @@ func run() error {
 	}
 
 	srv := server.New(server.Config{
-		InformListenAddr:  *listenInform,
-		DiscoveryListen:   *discovery,
-		DiscoveryPort:     dport,
-		FederationDefault: false,
-		ControllerURL:     *controllerURL,
-		AdminToken:        *adminToken,
-		AllowPlainText:    *allowPlainText,
-		WirelessSource:    wirelessSource,
+		InformListenAddr: *listenInform,
+		DiscoveryListen:  *discovery,
+		DiscoveryPort:    dport,
+		ControllerURL:    *controllerURL,
+		SSHPassword:      *apSSHPassword,
+		AllowPlainText:   *allowPlainText,
+		WirelessSource:   wirelessSource,
 	}, st, logger)
 	if *controllerURL == "" {
 		logger.Warn("no --controller-url configured: discovery/adopt replies cannot point the device at an inform URL; prefer SSH 'set-inform <this controller>/inform'")
 	}
 
 	// Every inform request increments the inform counter, then the server
-	// lane handler takes over (parse, key selection, adoption state machine).
+	// lane handler takes over. InformHandler() is fetched ONCE here — the
+	// bare per-request call in the wrapper would allocate a fresh handler
+	// on the hot path of every inform.
+	inform := srv.InformHandler()
 	informH := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		metrics.IncInform()
-		srv.InformHandler().ServeHTTP(w, r)
+		inform.ServeHTTP(w, r)
 	})
 
 	// ---- serving ---------------------------------------------------------
@@ -141,6 +164,13 @@ func run() error {
 			return fmt.Errorf("bind discovery udp :%d: %w (is another controller running?)", dport, err)
 		}
 	}
+	// closeUDP closes the discovery socket (nil-safe so both the error and
+	// the graceful shutdown path share one exit).
+	closeUDP := func() {
+		if udp != nil {
+			_ = udp.Close()
+		}
+	}
 
 	logger.Info("open-unifi starting",
 		"inform", *listenInform,
@@ -148,6 +178,7 @@ func run() error {
 		"discovery", *discovery,
 		"discovery_port", dport,
 		"data_dir", *dataDir,
+		"ssh_password_configured", *apSSHPassword != "",
 		"auth", *adminToken != "",
 		"plaintext_inform", *allowPlainText,
 		"controller_url", *controllerURL,
@@ -190,9 +221,7 @@ func run() error {
 	case err := <-errCh:
 		logger.Error("server error", "err", err)
 		drainShutdown(adminSrv, informSrv)
-		if udp != nil {
-			_ = udp.Close()
-		}
+		closeUDP()
 		return err
 	case <-ctx.Done(): // SIGINT/SIGTERM
 	}
@@ -209,12 +238,7 @@ func run() error {
 	ectx, ecancel := shutdownCtx()
 	defer ecancel()
 	noerr := srv.Shutdown(ectx) // drains inform state if wired that way
-	if udp != nil {
-		_ = udp.Close()
-	}
-	if udp != nil {
-		_ = udp.Close()
-	}
+	closeUDP()                  // nil-safe single discovery-socket close (shared with the error path)
 	if aerr != nil || ierr != nil || noerr != nil {
 		logger.Warn("incomplete shutdown", "admin_err", aerr, "inform_err", ierr, "srv_err", noerr)
 	}

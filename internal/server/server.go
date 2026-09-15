@@ -34,7 +34,7 @@ const defaultKeyHex = "ba86f2bbe107c7c57eb5f2690775c712"
 
 // Config describes the runtime configuration of the inform server.
 type Config struct {
-	// InformListenAddr is the TCP listen address for the inform endpoint (" :8080").
+	// InformListenAddr is the TCP listen address for the inform endpoint (":8080").
 	InformListenAddr string
 
 	// DiscoveryListen enables the UDP discovery listener.
@@ -43,16 +43,9 @@ type Config struct {
 	// DiscoveryPort is the UDP port for discovery (classically 10001).
 	DiscoveryPort int
 
-	// FederationDefault is reserved for the multi-controller federation
-	// milestone; keep false.
-	FederationDefault bool
-
 	// ControllerURL is the base URL devices are pointed at during adoption,
 	// e.g. "http://10.0.0.5:8080".
 	ControllerURL string
-
-	// AdminToken is unused here (only admin API / metrics wiring sees it).
-	AdminToken string
 
 	// AllowPlainText permits unencrypted JSON inform bodies (classic
 	// controllers reject these unless pre-adoption plain text inform is on).
@@ -63,6 +56,13 @@ type Config struct {
 	// struct) that system_cfg provisioning renders and hashes for drift
 	// detection. nil ⇒ empty list ⇒ no wlans provisioned.
 	WirelessSource func() []Wlan
+
+	// SSHPassword overrides the default SSH password ("ubnt") hashed into
+	// system_cfg users.1. SECURITY NOTE: this string lives in server memory
+	// and, by protocol design, travels VERBATIM (hashed) inside the
+	// provisioned config; the passphrase itself never appears in mgmt_cfg.
+	// Treat records/config containing the hash as credentials.
+	SSHPassword string
 }
 
 // Server serves the UniFi inform protocol used for AP adoption.
@@ -118,14 +118,17 @@ func randKeyChars(n int) (string, error) {
 	return string(out), nil
 }
 
-// mustKeyChars logs-and-empties on the (effectively impossible) rand failure.
-func mustKeyChars(s *Server, n int) string {
+// mustKeyChars is gone: rand failures must surface as errors (advance →
+// HTTP 500) instead of silently emitting empty authkey=/cfgversion= lines.
+// keyChars returns n random lowercase hex chars, logging the (effectively
+// impossible) crypto/rand failure as an error.
+func (s *Server) keyChars(n int) (string, error) {
 	v, err := randKeyChars(n)
 	if err != nil {
 		s.lg.Error("key generation failed", "err", err)
-		return ""
+		return "", fmt.Errorf("key generation: %w", err)
 	}
-	return v
+	return v, nil
 }
 
 // str fetches a string field from the inform body map.
@@ -142,20 +145,6 @@ func canonMACFromHeader(raw []byte) string {
 		return ""
 	}
 	return strings.ToLower(hex.EncodeToString(raw))
-}
-
-// canonJSONMAC normalizes a wire "mac" string ("24:a5:e2:...") to canonical
-// lowercase 12-hex (mirrors store.CanonicalMAC without an import cycle of care).
-func canonJSONMAC(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		switch r {
-		case ':', '-', '.', ' ':
-			continue
-		}
-		b.WriteRune(r)
-	}
-	return strings.ToLower(b.String())
 }
 
 // keyCandidates lists lowercase deduped hex keys to try for decryption:
@@ -214,6 +203,18 @@ func (s *Server) handleInform(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if pkt, perr := inform.ParsePacket(body); perr == nil {
+		// Plaintext GATE (classic: InformServlet refuses plain informs
+		// outside debug builds, docs/PROTOCOL-mgmt.md §5 L262-265 — that
+		// check covers framed packets with no encryption flags too, since
+		// §5 derives _encrypted from the header):
+		if pkt.Flags&(inform.FlagEncCBC|inform.FlagGCM) == 0 && !s.cfg.AllowPlainText {
+			writeJSONErr(w, http.StatusBadRequest, "Plain text inform is not supported")
+			return
+		}
+		if pkt.Flags&(inform.FlagEncCBC|inform.FlagGCM) == 0 {
+			s.handlePacketPlain(w, pkt)
+			return
+		}
 		s.handlePacket(w, pkt, body)
 		return
 	}
@@ -229,7 +230,53 @@ func (s *Server) handleInform(w http.ResponseWriter, r *http.Request) {
 		writeJSONErr(w, http.StatusBadRequest, "Plain text inform is not supported")
 		return
 	}
-	s.handlePlain(w, jm)
+	mac, merr := store.CanonicalMAC(str(jm, "mac"))
+	if merr != nil {
+		s.lg.Debug("inform-plain: unparseable mac in body", "err", merr)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	s.handlePlain(w, mac, jm)
+}
+
+// plainGateKeyBytes returns a usable-length AES key for the PLAIN framed
+// path: DecryptPayload's no-encryption-flags branch ignores the key entirely
+// and only inflates zlib/parses snappy — any valid key works.
+func plainGateKeyBytes() ([]byte, error) {
+	return inform.DecodeKeyHex(inform.DefaultKeyHex)
+}
+
+// handlePacketPlain processes a FRAMED packet that carries no encryption
+// flags (plain inform, possibly zlib-compressed). MAC comes from the packet
+// header; payload goes through pkt.DecryptPayload so zlib-only (0x02)
+// packets are inflated and snappy-flagged ones are rejected with the
+// classic error.
+func (s *Server) handlePacketPlain(w http.ResponseWriter, pkt *inform.Packet) {
+	mac := canonMACFromHeader(pkt.MAC)
+	if mac == "" {
+		s.lg.Debug("inform-plain: empty MAC in header")
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	kb, kerr := plainGateKeyBytes()
+	if kerr != nil {
+		s.lg.Error("inform-plain: gate key decode failed", "err", kerr)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	p, derr := pkt.DecryptPayload(kb)
+	if derr != nil {
+		s.lg.Debug("inform-plain: payload parse failed", "err", derr)
+		writeJSONErr(w, http.StatusBadRequest, "unable to parse inform payload")
+		return
+	}
+	var jm map[string]any
+	if uerr := json.Unmarshal(p, &jm); uerr != nil || jm == nil {
+		s.lg.Debug("inform-plain: payload not a JSON object")
+		writeJSONErr(w, http.StatusBadRequest, "unable to parse inform payload")
+		return
+	}
+	s.handlePlain(w, mac, jm)
 }
 
 // handlePacket processes one binary (CBC or GCM) inform.
@@ -246,7 +293,9 @@ func (s *Server) handlePacket(w http.ResponseWriter, pkt *inform.Packet, body []
 		// Un-registered factory device: classic controller 404s and the AP
 		// keeps retrying. Record the sighting for the adoption UI.
 		s.lg.Debug("inform: unregistered device", "mac", mac)
-		_ = s.st.MarkPending(mac, "inform:factory")
+		if merr := s.st.MarkPending(mac, "inform:factory"); merr != nil {
+			s.lg.Warn("inform: mark pending failed", "mac", mac, "err", merr)
+		}
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
@@ -287,20 +336,81 @@ func (s *Server) handlePacket(w http.ResponseWriter, pkt *inform.Packet, body []
 		return
 	}
 
-	resp, kind := s.advance(mac, &rec, jm, usedKey, gcmReq)
-	if err := s.st.Put(rec); err != nil {
-		s.lg.Error("inform: store put error", "err", err)
+	// Read-modify-write is serialized per-MAC inside the store: advance
+	// never races a concurrent inform rotation or admin mutation for the
+	// same device (a lost rotation bricks the device's key).
+	var outcome advanceResult
+	uerr := s.st.Update(mac, func(rec *store.Device) error {
+		resp, kind, aerr := s.advance(mac, rec, jm, usedKey, gcmReq)
+		if aerr != nil {
+			return aerr
+		}
+		outcome = advanceResult{resp: resp, kind: kind}
+		return nil
+	})
+	if uerr != nil {
+		s.lg.Error("inform: store update error", "mac", mac, "err", uerr)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
 	}
 
-	out, _ := json.Marshal(resp)
+	s.writeInformResponse(w, pkt, keyBytes, outcome, mac, usedKey, gcmReq)
+}
 
-	// Classic servlet (docs/PROTOCOL-mgmt.md §5): only encrypted requests get
-	// an encrypted response; plain-mode informs receive plain JSON.
-	if pkt.Flags&(inform.FlagEncCBC|inform.FlagGCM) == 0 {
-		s.lg.Debug("inform: plain-mode reply", "mac", mac, "kind", kind)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(out)
+// advanceResult carries the inform response built inside the store's
+// read-modify-write cycle out to the HTTP writer.
+type advanceResult struct {
+	resp map[string]any
+	kind string
+}
+
+// plainAdvance is the PLAINTEXT inform state machine. It NEVER rotates
+// keys (deviation from the classic debug-build rotation path — we treat
+// plaintext claims as assertions, not authenticators):
+//
+//   - XAuthkey unset  → noop; the record stays StatePending (plaintext can
+//     never initiate adoption — rotating/adopting from an unauthenticated
+//     channel would let any network observer seed a device's mgmt_cfg with
+//     an empty cfgversion/authkey);
+//   - claim ≠ XAuthkey → mgmt_cfg-only push carrying the CURRENT XAuthkey
+//     via the authkey= line (re-key me), no rotation, no cfgversion regen;
+//   - claim == XAuthkey → the normal assigned-key flow (cfgversion match →
+//     noop + StateAdopted; mismatch → full provisioning, incl. the wireless
+//     drift hash bump).
+func (s *Server) plainAdvance(mac string, rec *store.Device, body map[string]any, claim string) (map[string]any, string, error) {
+	s.absorbInform(mac, rec, body, time.Now(), false)
+	known := map[string]bool{
+		"info": true, "heartbeat": true, "cmd": true,
+		"setparam": true, "setparam-ack": true, "cmd-ack": true,
+		"alarms": true, "disconnect": true,
+	}
+	rtype, _ := body["_type"].(string)
+	if !known[rtype] {
+		s.lg.Debug("inform-plain: gentle noop for _type", "mac", mac, "type", rtype)
+		return s.noopResp(), "noop", nil
+	}
+
+	switch {
+	case rec.XAuthkey == "":
+		s.lg.Debug("inform-plain: noop without assignment", "mac", mac)
+		return s.noopResp(), "noop", nil
+
+	case !strings.EqualFold(rec.XAuthkey, claim):
+		s.lg.Debug("inform-plain: re-send current assignment", "mac", mac)
+		return s.adoptionPushResp(*rec, claim), "setparam", nil
+
+	default:
+		return s.assignedKeyFlow(mac, rec, body)
+	}
+}
+
+// writeInformResponse renders outcome over the wire: plaintext informs get
+// plain JSON; encrypted ones get the classic sealed envelope.
+func (s *Server) writeInformResponse(w http.ResponseWriter, pkt *inform.Packet, keyBytes []byte, outcome advanceResult, mac, usedKey string, gcmReq bool) {
+	out, err := json.Marshal(outcome.resp)
+	if err != nil {
+		s.lg.Error("inform: response marshal failed", "err", err)
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
@@ -326,13 +436,7 @@ func (s *Server) handlePacket(w http.ResponseWriter, pkt *inform.Packet, body []
 	// ciphertext is AAD-bound to the response header's 40 bytes in this
 	// exact state (IV/flags/length already mutated), which the device
 	// reproduces from the plaintext header it receives.
-	var eerr error
-	if gcmReq {
-		eerr = rpkt.EncryptPayloadGCM(keyBytes, out, nil)
-	} else {
-		eerr = rpkt.EncryptPayload(keyBytes, out)
-	}
-	if eerr != nil {
+	if eerr := rpkt.EncryptPayload(keyBytes, out); eerr != nil {
 		s.lg.Error("inform: response encryption failed", "err", eerr)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -343,23 +447,27 @@ func (s *Server) handlePacket(w http.ResponseWriter, pkt *inform.Packet, body []
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	s.lg.Debug("inform: reply", "mac", mac, "kind", kind, "key", usedKey, "gcm", gcmReq)
+	s.lg.Debug("inform: reply", "mac", mac, "kind", outcome.kind, "key", usedKey, "gcm", gcmReq)
 	w.Header().Set("Content-Type", "application/x-binary")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(serialized)
 }
 
-// handlePlain processes a plaintext JSON inform (AllowPlainText only).
-func (s *Server) handlePlain(w http.ResponseWriter, jm map[string]any) {
-	mac := canonJSONMAC(str(jm, "mac"))
+// handlePlain processes a plaintext inform (AllowPlainText only): either an
+// unframed JSON body (mac from the body) or a framed no-flags packet
+// (mac from the header, section-1 gating upstream in handleInform).
+func (s *Server) handlePlain(w http.ResponseWriter, mac string, jm map[string]any) {
 	if mac == "" {
+		s.lg.Debug("inform-plain: empty MAC")
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	rec, err := s.st.Get(mac)
+	_, err := s.st.Get(mac) // existence check only; the RMW cycle runs under store.Update
 	if errors.Is(err, store.ErrNotFound) {
 		s.lg.Debug("inform-plain: unregistered device", "mac", mac)
-		_ = s.st.MarkPending(mac, "inform:factory")
+		if merr := s.st.MarkPending(mac, "inform:factory"); merr != nil {
+			s.lg.Warn("inform-plain: mark pending failed", "mac", mac, "err", merr)
+		}
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
@@ -369,37 +477,52 @@ func (s *Server) handlePlain(w http.ResponseWriter, jm map[string]any) {
 		return
 	}
 
-	// Plaintext devices authenticate via the reported _authkey if present.
-	usedKey := strings.ToLower(str(jm, "_authkey"))
-	if usedKey == "" {
-		usedKey = defaultKeyHex
+	// Plaintext devices authenticate via the reported _authkey claim.
+	claim := strings.ToLower(str(jm, "_authkey"))
+	if claim == "" {
+		claim = defaultKeyHex
 	}
-	resp, kind := s.advance(mac, &rec, jm, usedKey, false)
-	if err := s.st.Put(rec); err != nil {
-		s.lg.Error("inform-plain: store put error", "err", err)
+	var outcome advanceResult
+	uerr := s.st.Update(mac, func(rec *store.Device) error {
+		resp, kind, aerr := s.plainAdvance(mac, rec, jm, claim)
+		if aerr != nil {
+			return aerr
+		}
+		outcome = advanceResult{resp: resp, kind: kind}
+		return nil
+	})
+	if uerr != nil {
+		s.lg.Error("inform-plain: store update error", "mac", mac, "err", uerr)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
 	}
-
-	out, _ := json.Marshal(resp)
-	s.lg.Debug("inform-plain: reply", "mac", mac, "kind", kind)
+	out, merr := json.Marshal(outcome.resp)
+	if merr != nil {
+		s.lg.Error("inform-plain: response marshal failed", "err", merr)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	s.lg.Debug("inform-plain: reply", "mac", mac, "kind", outcome.kind, "claim", claim)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(out)
 }
 
-// advance applies the adoption state machine (docs/PROTOCOL-mgmt.md §6.2) and
-// returns the response body map plus a response kind label. It mutates rec;
-// the caller persists.
+// advance applies the adoption state machine (docs/PROTOCOL-mgmt.md §6.2) for
+// ENCRYPTED informs and returns the response body map plus a response kind
+// label (and an error for unrecoverable internal conditions mapped to 500).
+// It mutates rec; the caller-side store.Update persists.
 //
 //	setparam variants (exactly three shapes):
 //	  - adoption push:  {"_type":"setparam","mgmt_cfg":...} + server_time
 //	    (mgmt_cfg ONLY; fresh 16-hex cfgversion stored on the record first,
 //	    carried in the mgmt_cfg "cfgversion=" line).
-//	  - full provisioning: {"_type":"setparam","cfgversion":...,
+//	  - full provisioning: {"_type":"setparam","cfgversion":...,\
 //	    "system_cfg":...,"blocked_sta":...,"mgmt_cfg":...} + server_time.
 //	  - noop: {"_type":"noop","interval":"15"} + server_time.
 //
 // usedKey is the lowercase hex key that authenticated the inform.
-func (s *Server) advance(mac string, rec *store.Device, body map[string]any, usedKey string, gcmReq bool) (map[string]any, string) {
+func (s *Server) advance(mac string, rec *store.Device, body map[string]any, usedKey string, gcmReq bool) (map[string]any, string, error) {
 	now := time.Now()
 	s.absorbInform(mac, rec, body, now, gcmReq)
 
@@ -411,7 +534,7 @@ func (s *Server) advance(mac string, rec *store.Device, body map[string]any, use
 	rtype, _ := body["_type"].(string)
 	if !known[rtype] {
 		s.lg.Debug("inform: gentle noop for _type", "mac", mac, "type", rtype)
-		return s.noopResp(), "noop"
+		return s.noopResp(), "noop", nil
 	}
 
 	// Wireless envelope drift (FSM hash bump): BEFORE the cfgversion drift
@@ -423,7 +546,11 @@ func (s *Server) advance(mac string, rec *store.Device, body map[string]any, use
 	// (stored below). No stored hash ⇒ nothing to bump.
 	if prev, _ := rec.Extra["wlan_cfg_sha"].(string); prev != "" {
 		if cur := wlanListHash(s.currentWireless()); cur != prev {
-			rec.CfgVersion = mustKeyChars(s, 16)
+			nv, kerr := s.keyChars(16)
+			if kerr != nil {
+				return nil, "", kerr
+			}
+			rec.CfgVersion = nv
 			s.lg.Debug("inform: wireless envelope drift", "mac", mac)
 		}
 	}
@@ -436,65 +563,107 @@ func (s *Server) advance(mac string, rec *store.Device, body map[string]any, use
 	// authkey while the device still holds the default — §8 of the doc).
 	case usedKey == defaultKeyHex:
 		prev := rec.State
-		s.rotateKeys(mac, rec)
-		s.lg.Debug("inform: adoption push (default key)", "mac", mac,
-			"prevState", prev)
-		return s.adoptionPushResp(*rec, usedKey), "setparam"
+		if err := s.rotateKeys(mac, rec); err != nil {
+			return nil, "", err
+		}
+		s.lg.Debug("inform: adoption push (default key)", "mac", mac, "prevState", prev)
+		return s.adoptionPushResp(*rec, usedKey), "setparam", nil
 
 	// A non-default key that is neither the default nor our current
 	// assignment: a stale or rogue x_authkey. Regenerate and push the new
 	// assignment the same way (mgmt_cfg with the authkey= rotation line).
 	case !onAssigned:
-		s.rotateKeys(mac, rec)
+		if err := s.rotateKeys(mac, rec); err != nil {
+			return nil, "", err
+		}
 		s.lg.Debug("inform: adoption push (stale/rogue key)", "mac", mac)
-		return s.adoptionPushResp(*rec, usedKey), "setparam"
+		return s.adoptionPushResp(*rec, usedKey), "setparam", nil
 
 	// Authenticated with our per-device key and the config applied → noop.
 	case rec.CfgVersion != "" && rec.AppliedCfg == rec.CfgVersion:
 		rec.State = store.StateAdopted
-		rec.Adopted = true
 		s.lg.Debug("inform: connected noop", "mac", mac, "cfg", rec.CfgVersion)
-		return s.noopResp(), "noop"
+		return s.noopResp(), "noop", nil
 
 	default:
-		// Full provisioning: device holds its assigned x_authkey but the
-		// inform payload's cfgversion differs from the record — push the
-		// complete config (cfgversion + system_cfg + blocked_sta + mgmt_cfg).
-		if rec.CfgVersion == "" {
-			rec.CfgVersion = mustKeyChars(s, 16)
+		resp, kind, err := s.assignedKeyFlow(mac, rec, body)
+		if err != nil {
+			return nil, "", err
 		}
-		rec.State = store.StateAdopting
-		s.cacheSSHPasswordHash(mac, rec)
-		// capture the emitted wireless envelope hash: the next inform with
-		// matching cfgversion AND identical envelope must noop.
-		if cur := wlanListHash(s.currentWireless()); cur != "" {
-			rec.Extra["wlan_cfg_sha"] = cur
-		} else {
-			delete(rec.Extra, "wlan_cfg_sha")
-		}
-		s.lg.Debug("inform: full provisioning", "mac", mac,
-			"ours", rec.CfgVersion, "device", rec.AppliedCfg)
-		return s.fullProvisionResp(*rec, usedKey), "setparam"
+		s.lg.Debug("inform: full provisioning", "mac", mac, "ours", rec.CfgVersion, "device", rec.AppliedCfg)
+		return resp, kind, nil
 	}
+}
+
+// assignedKeyFlow is the shared tail of the assigned-key (x_authkey-held)
+// path: at CFGVERSION MATCH it is unreachable (handled by the noop branch),
+// here it emits FULL PROVISIONING — fresh cfgversion when unset, adopting
+// state, ssh password-hash cache, and capture of the emitted wireless
+// envelope hash (the next identical-envelope inform after apply must noop).
+func (s *Server) assignedKeyFlow(mac string, rec *store.Device, body map[string]any) (map[string]any, string, error) {
+	if rec.CfgVersion == "" {
+		nv, err := s.keyChars(16)
+		if err != nil {
+			return nil, "", err
+		}
+		rec.CfgVersion = nv
+	}
+	rec.State = store.StateAdopting
+	s.cacheSSHPasswordHash(mac, rec)
+	if cur := wlanListHash(s.currentWireless()); cur != "" {
+		rec.Extra["wlan_cfg_sha"] = cur
+	} else {
+		delete(rec.Extra, "wlan_cfg_sha")
+	}
+	return s.fullProvisionResp(*rec), "setparam", nil
 }
 
 // rotateKeys assigns a fresh per-device key and config version to rec and
-// moves it back into the adopting state.
-func (s *Server) rotateKeys(mac string, rec *store.Device) {
-	rec.XAuthkey = mustKeyChars(s, 32)
-	rec.CfgVersion = mustKeyChars(s, 16)
-	rec.Authkeys = addKey(rec.Authkeys, rec.XAuthkey)
-	rec.State = store.StateAdopting
-	if rec.XAuthkey == "" || rec.CfgVersion == "" {
-		// crypto/rand failure (never happens in practice); the record
-		// below stays otherwise intact.
-		s.lg.Error("inform: could not generate keys", "mac", mac)
+// moves it back into the adopting state. An error here (crypto/rand
+// failure, practically impossible) maps the inform to HTTP 500 — the
+// caller must never persist half-rotated records.
+func (s *Server) rotateKeys(mac string, rec *store.Device) error {
+	xk, err := s.keyChars(32)
+	if err != nil {
+		return err
 	}
+	cv, err := s.keyChars(16)
+	if err != nil {
+		return err
+	}
+	rec.XAuthkey = xk
+	rec.CfgVersion = cv
+	rec.Authkeys = addKey(rec.Authkeys, xk)
+	// Keep only the NEWEST TWO assigned keys: the device might still be
+	// finishing one rotation cycle when the next starts, so its previous
+	// key must keep decrypting, but everything older is useless ballast.
+	// The factory default key is never stored in this list — keyCandidates
+	// appends it at decrypt time — so factory-reset recovery is unaffected.
+	if len(rec.Authkeys) > 2 {
+		rec.Authkeys = rec.Authkeys[len(rec.Authkeys)-2:]
+	}
+	rec.State = store.StateAdopting
+	return nil
 }
 
-// reservedExtraKeys survive an inform overwriting the Extra passthrough
-// (absorbInform replaces Extra with the whole inform body).
-var reservedExtraKeys = []string{"wlan_cfg_sha", "ssh_sha512passwd"}
+// Extra preservation classes when an inform body replaces rec.Extra:
+//
+//	prevWins     — controller-owned caches that must survive ANY inform
+//	               (forward/push bookkeeping);
+//	fillIfAbsent — device-sided data the device may refresh at any time;
+//	               copy from the previous record ONLY when the incoming body
+//	               omits the key (a sparse heartbeat must not wipe the
+//	               radio_table, but prev-WINS would pin device-side channel
+//	               reselection forever);
+//	adminOwned   — never sourced from a device body: value comes from the
+//	               previous record if present, otherwise the key is DELETED
+//	               (the device can never introduce them).
+var (
+	extraPrevWins     = []string{"wlan_cfg_sha", "ssh_sha512passwd"}
+	extraFillIfAbsent = []string{"radio_table"}
+	extraAdminOwned   = []string{"system_cfg_extra_lines", "mgmt_dev",
+		"anonymous_controller_id", "anonymous_site_id"}
+)
 
 // absorbInform copies interesting fields from the inform body into the record.
 func (s *Server) absorbInform(mac string, rec *store.Device, body map[string]any, now time.Time, gcmReq bool) {
@@ -503,11 +672,28 @@ func (s *Server) absorbInform(mac string, rec *store.Device, body map[string]any
 	rec.Serial = str(body, "serial")
 	rec.IP = str(body, "ip")
 	rec.InformURL = str(body, "inform_url")
-	prevExtra := rec.Extra          // reserved caches live here
-	rec.Extra = store.JSONMap(body) // full raw passthrough
-	for _, k := range reservedExtraKeys {
+	prevExtra := rec.Extra          // caches / admin-owned values live here
+	rec.Extra = store.JSONMap(body) // full raw passthrough (freshly unmarshal'd per request)
+	if prevExtra == nil {
+		prevExtra = store.JSONMap{}
+	}
+	for _, k := range extraPrevWins {
 		if v, ok := prevExtra[k]; ok {
 			rec.Extra[k] = v
+		}
+	}
+	for _, k := range extraFillIfAbsent {
+		if _, ok := body[k]; !ok {
+			if v, ok := prevExtra[k]; ok {
+				rec.Extra[k] = v
+			}
+		}
+	}
+	for _, k := range extraAdminOwned {
+		if v, ok := prevExtra[k]; ok {
+			rec.Extra[k] = v
+		} else {
+			delete(rec.Extra, k)
 		}
 	}
 	if stat, ok := body["stat"].(map[string]any); ok {
@@ -529,6 +715,35 @@ func (s *Server) absorbInform(mac string, rec *store.Device, body map[string]any
 }
 
 // ---- config blob builders (docs/PROTOCOL-mgmt.md §2, §3) ------------------
+
+// lineWriter returns the shared INJECTION-GUARDED key=value line writer used
+// by every system_cfg/mgmt_cfg emission site. Any VALUE containing \n or \r
+// makes the whole row skipped (with a warn) instead of emitted — a newline
+// smuggled in from an inform body (forged radio fields, timezone strings,
+// cookie comments) would terminate the row early and inject attacker-chosen
+// key=value rows into the device's config. "Fail loud, never emit."
+// (raw() admin passthrough lines in buildSystemCfg are the ONLY unguarded
+// writer: admin-owned by definition.)
+func (s *Server) lineWriter(b *strings.Builder, where string) func(k, v string) {
+	return func(k, v string) {
+		if strings.ContainsAny(v, "\n\r") {
+			s.lg.Warn("config blob: row skipped, newline in value", "where", where, "key", k)
+			return
+		}
+		b.WriteString(k)
+		b.WriteString("=")
+		b.WriteString(v)
+		b.WriteString("\n")
+	}
+}
+
+// sshPassword is the effective SSH password ("ubnt" default, cfg override).
+func (s *Server) sshPassword() string {
+	if s.cfg.SSHPassword != "" {
+		return s.cfg.SSHPassword
+	}
+	return defaultSSHPassword
+}
 
 // addrHost extracts the hostname/IP of u, tolerating unparseable input.
 func addrHost(raw string) string {
@@ -595,7 +810,7 @@ func (s *Server) buildMgmtCfg(d store.Device, usedKey string) string {
 		site = "default"
 	}
 	var b strings.Builder
-	line := func(k, v string) { b.WriteString(k); b.WriteString("="); b.WriteString(v); b.WriteString("\n") }
+	line := s.lineWriter(&b, "mgmt_cfg")
 
 	// AP capabilities: notif + notif-assoc-stat. fastapply-bg is USW-only
 	// and is never emitted for an AP (B decompile: "usw".equals(type)).
@@ -633,7 +848,7 @@ func (s *Server) buildMgmtCfg(d store.Device, usedKey string) string {
 // reverse-engineering and must NOT be invented here.
 func (s *Server) buildSystemCfg(d store.Device) string {
 	var b strings.Builder
-	line := func(k, v string) { b.WriteString(k); b.WriteString("="); b.WriteString(v); b.WriteString("\n") }
+	line := s.lineWriter(&b, "system_cfg")
 	raw := func(l string) {
 		if l != "" {
 			b.WriteString(l)
@@ -667,8 +882,14 @@ func (s *Server) buildSystemCfg(d store.Device) string {
 	// 3. # users — config_String.java §197-206 / PROTOCOL-systemcfg-Config.
 	cached, _ := d.Extra["ssh_sha512passwd"].(string)
 	users1pw := cached
-	if users1pw == "" {
-		users1pw, _ = sha512Crypt(defaultSSHPassword)
+	if users1pw == "" || !sha512CryptMatches(s.sshPassword(), users1pw) {
+		// empty or stale cache (password changed → self-heals via the
+		// crypt self-check, mirroring the controller's site-setting cache
+		// semantics at per-device scope)
+		nv, gerr := sha512Crypt(s.sshPassword())
+		if gerr == nil {
+			users1pw = nv
+		}
 	}
 	b.WriteString("# users\n")
 	line("users.status", "enabled")
@@ -733,10 +954,10 @@ const defaultSSHPassword = "ubnt"
 func (s *Server) cacheSSHPasswordHash(mac string, rec *store.Device) {
 	if cached, ok := rec.Extra["ssh_sha512passwd"].(string); ok &&
 		sha512BodyRx.MatchString(cached) &&
-		sha512CryptMatches(defaultSSHPassword, cached) {
+		sha512CryptMatches(s.sshPassword(), cached) {
 		return
 	}
-	fresh, err := sha512Crypt(defaultSSHPassword)
+	fresh, err := sha512Crypt(s.sshPassword())
 	if err != nil {
 		s.lg.Error("inform: sha512crypt generation failed", "mac", mac, "err", err)
 		return
@@ -757,15 +978,18 @@ func (s *Server) adoptionPushResp(d store.Device, usedKey string) map[string]any
 }
 
 // fullProvisionResp is the §6.2 d setparam variant: all four config keys,
-// always (blocked_sta is "" while we have no client block list).
-func (s *Server) fullProvisionResp(d store.Device, usedKey string) map[string]any {
+// always (blocked_sta is "" while we have no client block list). Full
+// provisioning is only ever reached while the device already holds
+// its assigned XAuthkey (= the encrypt key), so buildMgmtCfg takes that as
+// usedKey and the authkey= rotation line is correctly omitted.
+func (s *Server) fullProvisionResp(d store.Device) map[string]any {
 	return map[string]any{
 		"_type":              "setparam",
 		"server_time_in_utc": nowMS(),
 		"cfgversion":         d.CfgVersion,
 		"system_cfg":         s.buildSystemCfg(d),
 		"blocked_sta":        "",
-		"mgmt_cfg":           s.buildMgmtCfg(d, usedKey),
+		"mgmt_cfg":           s.buildMgmtCfg(d, d.XAuthkey),
 	}
 }
 

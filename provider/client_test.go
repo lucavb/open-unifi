@@ -3,10 +3,12 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -19,7 +21,9 @@ import (
 // method semantics) is identical to loopback httptest; only the TCP layer
 // itself differs.
 
-// fakeBackend is an in-memory stand-in for the admin API. It implements:
+// fakeBackend is an in-memory stand-in for the admin API. Its shapes mirror
+// internal/adminapi (DeviceView wire shape, {"devices":[...]} envelope,
+// {"error":"..."} error bodies, idempotent-upsert POST /api/v1/devices):
 //
 //	GET/POST     /api/v1/devices
 //	GET/DELETE   /api/v1/devices/{mac}
@@ -27,10 +31,13 @@ import (
 //	GET          /api/v1/whoami
 type fakeBackend struct {
 	token    string            // required bearer token; "" means anonymous allowed
-	devices  map[string]string // mac -> raw device JSON
+	devices  map[string]string // mac -> raw device JSON (DeviceView shape)
 	wireless string            // raw wireless envelope JSON
 	lastAuth string            // observed Authorization header of the last request
 }
+
+// lastSeenFixture is a fixed unix timestamp used in device fixtures.
+const lastSeenFixture = int64(1726432000)
 
 func newFakeBackend(token string) *fakeBackend {
 	fb := &fakeBackend{
@@ -49,8 +56,8 @@ func (fb *fakeBackend) handler() http.Handler {
 		return func(w http.ResponseWriter, r *http.Request) {
 			fb.lastAuth = r.Header.Get("Authorization")
 			if fb.token != "" && fb.lastAuth != "Bearer "+fb.token {
-				w.WriteHeader(http.StatusUnauthorized)
-				_, _ = w.Write([]byte("bad token"))
+				// Canonical adminapi error shape: {"error":"..."}.
+				writeFakeErr(w, http.StatusUnauthorized, "unauthorized")
 				return
 			}
 			next(w, r)
@@ -58,55 +65,55 @@ func (fb *fakeBackend) handler() http.Handler {
 	}
 
 	mux.HandleFunc("/api/v1/whoami", auth(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"server":"open-unifi","authConfigured":` + boolJSON(fb.token != "") + `}`))
+		// adminapi.whoAmI wire shape.
+		_, _ = w.Write([]byte(`{"server":"open-unifi","version":"0.1.0-dev","authConfigured":` +
+			boolJSON(fb.token != "") + "}\n"))
 	}))
 
 	mux.HandleFunc("/api/v1/devices", auth(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
+			// adminapi returns a {"devices":[...]} (devicesEnvelope).
 			vals := mapValuesSorted(fb.devices)
-			_, _ = w.Write([]byte(`{"devices":[` + strings.Join(vals, ",") + `]}`))
+			_, _ = w.Write([]byte(`{"devices":[` + strings.Join(vals, ",") + "]}\n"))
 		case http.MethodPost:
+			// DeviceUpsert: {mac, name?, site_id?}; idempotent upsert —
+			// duplicates are overwritten (name refreshed) and still 201.
 			var body map[string]string
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				w.WriteHeader(http.StatusBadRequest)
+				writeFakeErr(w, http.StatusBadRequest, "invalid JSON body")
 				return
 			}
-			mac := body["mac"]
-			if mac == "" {
-				w.WriteHeader(http.StatusBadRequest)
+			mac := strings.ToLower(strings.ReplaceAll(body["mac"], ":", ""))
+			if len(mac) != 12 {
+				writeFakeErr(w, http.StatusBadRequest, "invalid mac")
 				return
 			}
-			if _, ok := fb.devices[mac]; ok {
-				w.WriteHeader(http.StatusConflict)
-				_, _ = w.Write([]byte("device exists"))
-				return
-			}
-			fb.devices[mac] = deviceJSON(mac, body["name"], "pending")
 			w.WriteHeader(http.StatusCreated)
+			fb.devices[mac] = deviceJSON(mac, body["name"])
+			_, _ = w.Write([]byte(fb.devices[mac] + "\n"))
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
 	}))
 
 	mux.HandleFunc("/api/v1/devices/", auth(func(w http.ResponseWriter, r *http.Request) {
-		mac := strings.TrimPrefix(r.URL.Path, "/api/v1/devices/")
+		mac := strings.ToLower(strings.ReplaceAll(strings.TrimPrefix(r.URL.Path, "/api/v1/devices/"), ":", ""))
 		dev, ok := fb.devices[mac]
 		switch r.Method {
 		case http.MethodGet:
 			if !ok {
-				w.WriteHeader(http.StatusNotFound)
-				_, _ = w.Write([]byte("device not found"))
+				writeFakeErr(w, http.StatusNotFound, "device not found")
 				return
 			}
-			_, _ = w.Write([]byte(dev))
+			_, _ = w.Write([]byte(dev + "\n"))
 		case http.MethodDelete:
 			if !ok {
-				w.WriteHeader(http.StatusNotFound)
-				_, _ = w.Write([]byte("device not found"))
+				writeFakeErr(w, http.StatusNotFound, "device not found")
 				return
 			}
 			delete(fb.devices, mac)
+			_, _ = w.Write([]byte(`{"status":"deleted","mac":"` + mac + `"}` + "\n"))
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
@@ -115,23 +122,33 @@ func (fb *fakeBackend) handler() http.Handler {
 	mux.HandleFunc("/api/v1/wireless", auth(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			_, _ = w.Write([]byte(fb.wireless))
+			_, _ = w.Write([]byte(fb.wireless + "\n"))
 		case http.MethodPut:
 			var env struct {
 				Wlans []map[string]any `json:"wlans"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&env); err != nil {
-				w.WriteHeader(http.StatusBadRequest)
+				writeFakeErr(w, http.StatusBadRequest, "invalid JSON body")
 				return
 			}
 			buf, _ := json.Marshal(env)
 			fb.wireless = string(buf)
+			// adminapi echoes the accepted envelope.
+			_, _ = w.Write([]byte(fb.wireless + "\n"))
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
 	}))
 
 	return mux
+}
+
+// writeFakeErr writes the adminapi canonical error shape {"error":"..."}.
+func writeFakeErr(w http.ResponseWriter, code int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	enc, _ := json.Marshal(map[string]string{"error": msg})
+	_, _ = w.Write(append(enc, '\n'))
 }
 
 // clientFor returns an apiClient against fb using an in-process transport.
@@ -170,8 +187,12 @@ func boolJSON(b bool) string {
 	return "false"
 }
 
-func deviceJSON(mac, name, state string) string {
-	return `{"mac":"` + mac + `","name":"` + name + `","state":"` + state + `","ip":"192.168.1.50","firmware":"6.6.55","last_seen":"now"}`
+// deviceJSON renders the adminapi.DeviceView wire shape. State is a JSON
+// NUMBER (state 1 = pending: registered via the adopt whitelist but not yet
+// seen on the inform channel) and last_seen is a unix-seconds int64.
+func deviceJSON(mac, name string) string {
+	return `{"mac":"` + mac + `","name":"` + name + `","model":"UAP-AC-Pro-Gen2","firmware":"6.6.55","ip":"192.168.1.50","state":1,"last_seen":` +
+		strconv.FormatInt(lastSeenFixture, 10) + `,"actions":["delete"]}`
 }
 
 func mapValuesSorted(m map[string]string) []string {
@@ -300,6 +321,40 @@ func TestWlanEnvelopeRoundTrip(t *testing.T) {
 	}
 }
 
+// TestWhoamiProbe pins fix 4: checkConnectivity (Configure-time probe) must
+// succeed against a real whoami route and fail — typed 404 — when the route
+// is missing (wrong server, wrong port, older build).
+func TestWhoamiProbe(t *testing.T) {
+	ctx := context.Background()
+
+	// Probe against the fake full backend: nil error expected.
+	if err := clientFor(newFakeBackend("secret"), "secret").checkConnectivity(ctx); err != nil {
+		t.Fatalf("whoami probe against known-good backend: %v", err)
+	}
+
+	// Probe against a server WITHOUT the whoami route: typed 404.
+	bare := http.NewServeMux()
+	bare.HandleFunc("/api/v1/devices", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"devices":[]}`))
+	})
+	tripper := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		rec := httptest.NewRecorder()
+		bare.ServeHTTP(rec, req)
+		return rec.Result(), nil
+	})
+	c := (&apiClient{baseURL: "http://bare"}).withHTTPClient(&http.Client{Transport: tripper})
+	err := c.checkConnectivity(ctx)
+	if err == nil || !errNotFound(err) {
+		t.Fatalf("missing whoami route must fail the probe with a typed 404, got %v", err)
+	}
+
+	// whoami also reports whether the server expects a token.
+	authConfigured, err := clientFor(newFakeBackend("secret"), "secret").whoami(ctx)
+	if err != nil || !authConfigured {
+		t.Fatalf("whoami authConfigured: got (%v, %v)", authConfigured, err)
+	}
+}
+
 func TestDeviceLifecycleErrors(t *testing.T) {
 	fb := newFakeBackend("")
 	ctx := context.Background()
@@ -321,8 +376,15 @@ func TestDeviceLifecycleErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get device: %v", err)
 	}
-	if dev.State != "pending" {
-		t.Fatalf("expected pending device, got %+v", dev)
+	if dev.State != 1 { // store.StatePending
+		t.Fatalf("expected numeric pending state 1, got %+v", dev)
+	}
+	if dev.LastSeen != lastSeenFixture {
+		t.Fatalf("expected last_seen %d (unix seconds), got %d", lastSeenFixture, dev.LastSeen)
+	}
+	// Duplicate POST is an idempotent upsert (200/201 family), never a 409.
+	if err := c.do(ctx, http.MethodPost, "/api/v1/devices", map[string]string{"mac": "aa:bb:cc:dd:ee:ff", "name": "renamed-ap"}, nil); err != nil {
+		t.Fatalf("duplicate create should be an idempotent upsert, got err: %v", err)
 	}
 	// listDevices now contains exactly one device.
 	if devs, err := c.listDevices(ctx); err != nil || len(devs) != 1 {
@@ -334,6 +396,91 @@ func TestDeviceLifecycleErrors(t *testing.T) {
 	}
 	if _, err := c.getDevice(ctx, "aa:bb:cc:dd:ee:ff"); !errNotFound(err) {
 		t.Fatalf("expected gone device, got %v", err)
+	}
+}
+
+// TestDeviceDecodeNumbers pins the BLOCKER wire contract: the server sends
+// the DeviceView numeric vocabulary (state JSON number, last_seen unix
+// seconds int64), and the provider decodes both plus maps state names,
+// including the unknown(n) fallback.
+func TestDeviceDecodeNumbers(t *testing.T) {
+	fb := newFakeBackend("")
+	fb.devices["aabbccddeeff"] = `{"mac":"aa:bb:cc:dd:ee:ff","name":"adopted-ap","model":"UAP-AC-Pro-Gen2","firmware":"6.6.55","ip":"192.168.1.60","state":3,"last_seen":1726432000,"actions":["delete"]}`
+	fb.devices["112233445566"] = `{"mac":"11:22:33:44:55:66","state":9}`
+	fb.devices["778899aabbcc"] = `{"mac":"77:88:99:aa:bb:cc","name":"gone","state":4}`
+	c := clientFor(fb, "")
+	ctx := context.Background()
+
+	dev, err := c.getDevice(ctx, "aabbccddeeff")
+	if err != nil {
+		t.Fatalf("getDevice: %v", err)
+	}
+	if dev.State != 3 || dev.LastSeen != 1726432000 {
+		t.Fatalf("wire decode mismatch: got state=%d last_seen=%d, want 3/1726432000", dev.State, dev.LastSeen)
+	}
+	if got := stateName(dev.State); got != "adopted" {
+		t.Fatalf("stateName(3) = %q, want adopted", got)
+	}
+
+	lost, err := c.getDevice(ctx, "778899aabbcc")
+	if err != nil {
+		t.Fatalf("getDevice lost: %v", err)
+	}
+	if got := stateName(lost.State); got != "lost" {
+		t.Fatalf("stateName(4) = %q, want lost", got)
+	}
+
+	unknown, err := c.getDevice(ctx, "112233445566")
+	if err != nil {
+		t.Fatalf("getDevice unknown: %v", err)
+	}
+	if got := stateName(unknown.State); got != "unknown(9)" {
+		t.Fatalf("stateName(9) = %q, want unknown(9)", got)
+	}
+
+	for n, want := range map[int]string{1: "pending", 2: "adopting", 3: "adopted", 4: "lost"} {
+		if got := stateName(n); got != want {
+			t.Fatalf("stateName(%d) = %q, want %q", n, got, want)
+		}
+	}
+}
+
+// TestAPIErrorTyped404 pins fix 3: non-2xx responses yield a typed
+// *apiError whose NotFound() is probeable via errors.As, and whose message
+// extracts the server's {"error":"..."} JSON field.
+func TestAPIErrorTyped404(t *testing.T) {
+	fb := newFakeBackend("")
+	c := clientFor(fb, "")
+	_, err := c.getDevice(context.Background(), "00:11:22:33:44:55")
+	if err == nil {
+		t.Fatal("expected error for unknown device")
+	}
+	var ae *apiError
+	if !errors.As(err, &ae) {
+		t.Fatalf("expected typed *apiError, got %T: %v", err, err)
+	}
+	if !ae.NotFound() {
+		t.Fatalf("expected NotFound() for status 404, got %d", ae.status)
+	}
+	if ae.status != http.StatusNotFound {
+		t.Fatalf("expected status 404, got %d", ae.status)
+	}
+	// Message must be the clean extracted error text, not the raw body.
+	if want := "not found: device not found"; err.Error() != want {
+		t.Fatalf("error message = %q, want %q", err.Error(), want)
+	}
+
+	// Non-JSON bodies keep their trimmed text as the diagnostic.
+	e := doErr(http.StatusInternalServerError, []byte("  boom  \n"))
+	ae2 := e.(*apiError)
+	if ae2.status != 500 || ae2.message != "boom" || ae2.NotFound() {
+		t.Fatalf("5xx apiError mismatch: %#v", ae2)
+	}
+
+	// 401s still render the checkpoint-token message.
+	e401 := doErr(http.StatusUnauthorized, []byte(`{"error":"unauthorized"}`))
+	if got := e401.Error(); got != "unauthorized: check token" {
+		t.Fatalf("401 message = %q", got)
 	}
 }
 
