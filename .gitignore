@@ -1,0 +1,13 @@
+unifi_sysvinit_all.deb
+*.deb
+tmpwork/
+f730-*
+ghidra.rep/
+ghidra.lock
+ghidra.lock~
+ghidra.gpr
+*.jar
+*.class
+dist/
+data/
+.DS_Store
