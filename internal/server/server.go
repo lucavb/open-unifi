@@ -43,13 +43,26 @@ const (
 	informFactoryNotype = "inform:factory"
 )
 
-// informKnownTypes labels the request _type values the inform state machine
-// should process; anything else gets the gentle noop (shared by the
-// plaintext and encrypted dispatchers).
+// informKnownTypes labels the NON-EMPTY request _type values the inform
+// state machine processes specially. Real firmware sends its periodic
+// status informs with an EMPTY _type (live evidence: U7PG2 on BZ.6.8.2,
+// captured during the 2026-09-16 acceptance session), and the jar runs its
+// main dispatcher (voidsuper — docs/PROTOCOL-mgmt.md §6.2) on exactly those
+// informs: adoption, re-key, and provisioning all ride the empty-_type
+// status inform. informTypeGentleNoop therefore lets "" through and only
+// noops unknown NON-EMPTY types.
 var informKnownTypes = map[string]bool{
 	"info": true, "heartbeat": true, "cmd": true,
 	"setparam": true, "setparam-ack": true, "cmd-ack": true,
 	"alarms": true, "disconnect": true,
+}
+
+// informTypeGentleNoop reports whether the request _type falls outside the
+// inform state machine: the empty _type IS the main-dispatcher status
+// inform (see informKnownTypes), so only unknown NON-EMPTY types get the
+// gentle noop.
+func informTypeGentleNoop(rtype string) bool {
+	return rtype != "" && !informKnownTypes[rtype]
 }
 
 // Config describes the runtime configuration of the inform server.
@@ -480,7 +493,7 @@ type advanceResult struct {
 func (s *Server) plainAdvance(mac string, rec *store.Device, body map[string]any, claim string) (map[string]any, string, error) {
 	s.absorbInform(mac, rec, body, time.Now(), false)
 	rtype, _ := body["_type"].(string)
-	if !informKnownTypes[rtype] {
+	if informTypeGentleNoop(rtype) {
 		s.lg.Debug("inform-plain: gentle noop for _type", "mac", mac, "type", rtype)
 		return s.noopResp(), "noop", nil
 	}
@@ -684,7 +697,7 @@ func (s *Server) advance(mac string, rec *store.Device, body map[string]any, use
 	s.absorbInform(mac, rec, body, now, gcmReq)
 
 	rtype, _ := body["_type"].(string)
-	if !informKnownTypes[rtype] {
+	if informTypeGentleNoop(rtype) {
 		s.lg.Debug("inform: gentle noop for _type", "mac", mac, "type", rtype)
 		return s.noopResp(), "noop", nil
 	}
@@ -692,10 +705,17 @@ func (s *Server) advance(mac string, rec *store.Device, body map[string]any, use
 	// Wireless envelope drift (FSM hash bump): BEFORE the cfgversion drift
 	// check, compare sha256(canonical wireless envelope) with the stored
 	// Extra["wlan_cfg_sha"]. A mismatch regenerates CfgVersion, which the
-	// drift check then sees as unknown → full provisioning. Adoption
-	// pushes leave the hash untouched: the device has not received
-	// system_cfg yet, so the hash is first captured by full provisioning
-	// (stored below). No stored hash ⇒ nothing to bump.
+	// drift check then sees as unknown → full provisioning. The hash is
+	// minted together with the cfgversion it belongs to: the adoption push
+	// seeds it (rotateKeys case below) and full provisioning refreshes it
+	// (assignedKeyFlow). Live finding (2026-09-16 acceptance session, U7PG2
+	// on BZ.6.8.2): real firmware echoes the adoption mgmt_cfg's cfgversion
+	// back on its first re-keyed inform — matching the jar's equal path
+	// (voidsuper bytes 3287-3306 jump to 3549) — so full provisioning never
+	// follows adoption on its own, and the drift baseline must NOT depend on
+	// assignedKeyFlow having run first. The jar bumps device.cfgversion on
+	// operator config saves ("CONFIG changed" log); this hash comparison is
+	// open-unifi's equivalent trigger.
 	if prev, _ := rec.Extra["wlan_cfg_sha"].(string); prev != "" {
 		if cur := wlanListHash(s.currentWireless()); cur != prev {
 			nv, kerr := s.keyChars(16)
@@ -729,6 +749,15 @@ func (s *Server) advance(mac string, rec *store.Device, body map[string]any, use
 		if err := s.rotateKeys(mac, rec); err != nil {
 			return nil, "", err
 		}
+		// Seed the wireless-envelope baseline for the cfgversion just
+		// minted (see the drift block above): the device would reach
+		// connected-noop on its very next inform (mgmt_cfg echo) without
+		// ever seeing system_cfg, and without a baseline a later WLAN
+		// change could never be detected as drift. Envelope changes made
+		// AFTER this push then mismatch the seed → full provisioning.
+		if cur := wlanListHash(s.currentWireless()); cur != "" {
+			rec.Extra["wlan_cfg_sha"] = cur
+		}
 		s.lg.Debug("inform: adoption push (default key)", "mac", mac, "prevState", prev)
 		return s.adoptionPushResp(*rec, usedKey), "setparam", nil
 
@@ -742,6 +771,20 @@ func (s *Server) advance(mac string, rec *store.Device, body map[string]any, use
 
 	// Authenticated with our per-device key and the config applied → noop.
 	case rec.CfgVersion != "" && rec.AppliedCfg == rec.CfgVersion:
+		// Self-heal for records without a drift baseline (e.g. adopted
+		// before the hash was seeded at adoption time): mint a fresh
+		// cfgversion so the NEXT inform mismatches and flows through
+		// full provisioning, which captures the hash. Terminates: the
+		// provisioning path always stores it.
+		if prev, _ := rec.Extra["wlan_cfg_sha"].(string); prev == "" {
+			nv, kerr := s.keyChars(16)
+			if kerr != nil {
+				return nil, "", kerr
+			}
+			rec.CfgVersion = nv
+			s.lg.Debug("inform: no envelope baseline, forcing provisioning", "mac", mac)
+			return s.noopResp(), "noop", nil
+		}
 		rec.State = store.StateAdopted
 		s.lg.Debug("inform: connected noop", "mac", mac, "cfg", rec.CfgVersion)
 		return s.noopResp(), "noop", nil
