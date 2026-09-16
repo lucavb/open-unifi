@@ -13,6 +13,16 @@ vap factory), `decomp/configB_M.java` (`config/B/M` = devname naming),
 `com/ubnt/data/Chipset` + `Model` (bean dispatch), plus the established
 `config_int.java` / `config_String.java`.
 
+**Provenance (decompilation artifacts):** the `decomp/…` file names throughout
+this doc family refer to the original proguard-renamed `.java` outputs of the
+CFR decompiler, produced in a **local, untracked decompilation workspace** —
+there is no `decomp/` directory in the tracked tree. The source jar lives at
+`tmpwork/data/usr/lib/unifi/lib/ace.jar` and the canonical, reproducible
+bytecode citations are the `javap -c -v` dumps under `tmpwork/javap/**` (also
+gitignored by design, since the decompiled controller jar is Ubiquiti's
+copyrighted artifact). Keep this in mind when following any `decomp/…`
+reference: it is reproducible only from the same jar dump, not from git.
+
 ## 0. U7PG2 really takes the `ath`/`wifi` (atheros·madwifi) branch
 
 - `nullsuper.\u00f4o0000(Device)` → `isAtherosAP()` → bean `_if`
@@ -126,7 +136,7 @@ If the device has no radios: `# no wlan provisioned as no radio found` +
 | `forbiasauto` | 0 | literal |
 | `channel` | 0 = auto | radio_table `channel` |
 | `backup_channel` | 0 | radio_table `backup_channel` |
-| `ieee_mode` | `11n` | `_int.cfr_renamed_1(isNg, chanWidth)` §737-743 = `"11n" + (isNg ? "g" : "a") + "ht" + <width>`; width source `cfr_renamed_2(radio, country)` — UNRESOLVED (§9) |
+| `ieee_mode` | `11n` | `_int.cfr_renamed_1(isNg, chanWidth)` §737-743 = `"11n" + (isNg ? "g" : "a") + "ht" + <width>`; width = `devmgr/c` resolver: **min(country limit, HT-mode cap, device-reported caps)** — RESOLVED, see §3.1 |
 | `mode` | master | `managed` only when a vport wds-aplink is provisioned on this radio (`create_vport`, §1310) |
 | `rate.auto` | enabled | literal |
 | `rate.mcs` | auto | `\u00f4\u00f40000 = "auto"` (int §151) |
@@ -140,11 +150,57 @@ If the device has no radios: `# no wlan provisioned as no radio found` +
 | `hard_noisefloor.*` | `status=disabled` | when `sens_level_enabled` + advanced: `enabled, max_sens=-40, minrssi.value=…, minrssi_backoff=0` (§519-525) |
 | `stamgr.<n4>.*` | (separate key, radio-index) | only when `advanced_feature_enabled` + any of min-rssi/load-balance: `status=true, radio=ng, minrssi.status, minrssi.rssi, loadbalance.status, loadbalance.maxsta` (§527-531) |
 
-Per-vap companion (only when `vapIdxOnRadio > 0`, int §536-542):
+Per-vap companion rows (int:6124-6204, javap `com__ubnt__service__config__int.txt`):
+the jar emits a `devname`+`status` row pair for **EVERY vap** on the radio — the
+`.virtual.<d>` suffix is only inserted when `vapIdxOnRadio > 0`:
 ```
-radio.<n4>.virtual.<vapIdx>.devname=athX
-radio.<n4>.virtual.<vapIdx>.status=enabled
+radio.<n4>.devname=athX                (first vap on the radio: plain `radio.<n4>` prefix)
+radio.<n4>.status=enabled
+radio.<n4>.virtual.<vapIdxOnRadio>.devname=athY          (2nd+ vap only)
+radio.<n4>.virtual.<vapIdxOnRadio>.status=enabled
 ```
+(An earlier revision claimed these rows exist only for vapIdx>0; the bytecode loop
+at com__ubnt__service__config__int.txt:6124-6204 shows the loop runs per vap over
+the whole vap list and only switches to the `.virtual.<d>` prefix when
+`WlanConf.getInt("vapIdxOnRadio", 0) > 0`.)
+
+### 3.1 RESOLVED — the `radio.<n>.ieee_mode` `<ht>` width resolver (was §9 UNRESOLVED)
+
+An earlier revision claimed the resolver class was never decompiled. It is — it is
+`com.ubnt.service.devmgr.c` (javap dump `tmpwork/javap/com__ubnt__service__devmgr__c.txt:1242-1380`,
+full class verified). Semantics, from the bytecode:
+
+```java
+int resolve(X radio, String countrycode) {                  // c.new(X,String), :1242-1296
+    X country = find in system R.forfloat() list by {code, countrycode};  // :1247-1292
+    int  bandLimit = countryLimit(radio.getString("radio", "ng"), country);  // :1307
+    int  htCap     = radio.getInt("ht", radio.radio == "ng" ? 20 : 40);     // :1249-1268 — ng→20, na→40 MHz default
+    int  devCap    = deviceCaps(radio);                      // :1382-1415
+    return Math.min(Math.min(bandLimit, htCap), devCap);
+}
+
+int countryLimit(String band, X country) {                   // o00000(String,X), e.g. :1463-1518
+    // widest w with a non-empty country record list `channels_<band>_<w>`:
+    // tries w=2160→1080→160→80→40→20; empty everywhere → 20
+}
+
+int deviceCaps(X radio) {                                   // o00000(X), :1382-1415
+    if (radio.radio == "ad")                    return 2160;
+    if (radio.is("has_ht160", false))           return 160;
+    if (radio.is("is_11ac", false) || radio.is("is_11ax", false)) return 80;
+    return radio.is("spectrum_enabled", false) ? 20 : 40;    // rf-scan (AirView) forces 20
+}
+```
+
+The emitter (`int.cfr_renamed_1(isNg, width)`) then renders `"11n" + (ng?"g":"a") +
+"ht" + <width>`. For a `UAP-AC-Pro-Gen2` (U7PG2 = 11n radios: no `is_11ac`/`is_11ax`,
+no `has_ht160`, `ht` fields unset ⇒ ng cap 20 / na cap 40, device caps 40/40) the
+resolver yields **`11nght20` on the ng radio and `11naht40` on the na radio**
+(country limits permitting) — replacing the earlier `<UNRESOLVED>` placeholder and
+the "`11nght20/11naht20` TODO" in `docs/PROTOCOL.md` §7.
+
+open-unifi status: aligned in this change (Go builder now implements min(3 caps)
+instead of a hardcoded `20`).
 
 ## 4. Per-WLAN `aaa.<n>` rows (order = call order in the emitter)
 
@@ -183,7 +239,7 @@ Fixed block (§597, one `C.o00000` call with pairs → each pair becomes one row
 aaa.<n>.br.devname=…        aaa.<n>.devname=ath<X>       aaa.<n>.driver=madwifi
 aaa.<n>.ssid=<name>         aaa.<n>.status=enabled        (only is_wds_uplink → "disabled")
 aaa.<n>.verbose=2                                        (4 on debug builds, R.\u00d8\u00d2O000())
-aaa.<n>.wpa=<int>                                        WpaMode.getMode(): AUTO=3, WPA1=1, WPA2=2 (enum javap)
+aaa.<n>.wpa=<int>                                        WpaMode.getMode(): WPA1=1, WPA2=2, AUTO=3 (AUTO ctor passes iconst_3 — WpaMode static-init javap, `com__ubnt__model__api__wlan__WpaMode.txt:197-211`); default when `wpa_mode` unset is AUTO ⇒ **3**
 aaa.<n>.eapol_version=1|2                                1 iff WPA1 else 2 (enum getEapolVersion)
 aaa.<n>.wpa.group_rekey=3600                             getInt("group_rekey", 3600)
 aaa.<n>.p2p=disabled / .p2p_cross_connect=disabled / .proxy_arp=disabled
@@ -377,7 +433,7 @@ radio.1.cwm.mode=0
 radio.1.forbiasauto=0
 radio.1.channel=0
 radio.1.backup_channel=0
-radio.1.ieee_mode=11nght<UNRESOLVED>         (chanWidth helper; commonly "20" default)
+radio.1.ieee_mode=11nght20                  (resolver §3.1: 11n AP, ng band → 20 MHz)
 radio.1.mode=master
 radio.1.rate.auto=enabled
 radio.1.rate.mcs=auto
@@ -389,7 +445,13 @@ radio.1.antenna=-1
 radio.1.txpower_mode=auto
 radio.1.txpower=auto
 radio.1.hard_noisefloor.status=disabled
-# radio.2.* = same field set; phyname=rai0, ieee_mode=11naht<UNRESOLVED>, antenna values per na row
+# per-vap companions: EVERY vap gets `radio.<n4>.devname`+`radio.<n4>.status`;
+# `.virtual.<d>` suffix only when vapIdxOnRadio>0 (int.txt:6124-6204)
+radio.1.devname=ath0
+radio.1.status=enabled
+# radio.2.* = same field set; phyname=rai0, ieee_mode=11naht40 (§3.1), antenna values per na row
+radio.2.devname=ath1
+radio.2.status=enabled
 
 # vap corp on ng → wireless.1 / aaa.1 / ath0 (global counter starts at 0)
 aaa.1.pmf.status=disabled
@@ -453,7 +515,9 @@ wireless.1.dtim_period=3
 # vap corp on na → wireless.2 / aaa.2 / ath1: identical row set with
 #   aaa.2.devname=ath1 (same br.devname=br0.42), wireless.2.devname=ath1, parent=rai0;
 #   the site WLAN's _id is the SAME on both rows (band instantiation duplicates the conf).
-# (No `radio.<n>.virtual.*` lines here because vapIdxOnRadio == 0 on each radio.)
+# (No `radio.<n>.virtual.*` lines here because vapIdxOnRadio == 0 on each radio —
+#  the companions are plain `radio.<n4>.devname/.status` for the first vap,
+#  see §3 note at int.txt:6124-6204.)
 
 # WLAN b (guest, enabled=false) → NOTHING. decomp/configB_F.java §44:
 #   "if (!wlanConf.isEnabled()) return null;"   — no wireless.3 / aaa.3 / ath2 /
@@ -482,8 +546,18 @@ netconf.<k>.netmask=<null-filtered>
 netconf.<k>.promisc=enabled
 netconf.<k>.up=enabled
 
-# dhcpc (rows for GUEST vlans only; none here since guest wlan disabled; mgmt row only when device IP is DHCP)
+# dhcpc — the `# dhcpc` header + `dhcpc.status=enabled` are ALWAYS emitted
+# (B/P.txt o00000, config__B__P.txt:162-176). Additionally, whenever the device's
+# netconf is DHCP (`config_network.type` != "static"; default "dhcp"), a
+# mgmt-interface row with BOTH keys is emitted: `dhcpc.<m>.status=enabled` +
+# `dhcpc.<m>.devname=<Device.getMgmtDev()>` (config__B__P.txt:178-217). Guest-vlan
+# bridge rows (guestFlag caller arg) also carry both keys + ip_only: see §6.
+# (In this example the device IP is assumed DHCP, and the guest WLAN is disabled,
+# so the only occurrence is the mgmt row.)
 dhcpc.status=enabled
+dhcpc.1.status=enabled
+dhcpc.1.devname=<getMgmtDev() of the device>
+
 
 # (adjacent sections, out of excerpt scope: "# bandsteering", "# airtime fairness",
 #  "# stamgr", "# qos", "# mac acl", "# mesh", "# connectivity" — order per
@@ -496,7 +570,7 @@ dhcpc.status=enabled
 |---|---|---|
 | `name` | `name` (same value used for `ssid`) | `wireless.<n>.name`/`ssid`, `aaa.<n>.ssid` |
 | `security=open` | `security=open` | NO `aaa.<n>.wpa.*`; `wireless.<n>.authmode=0`, `security=none`; `aaa.<n>.status` = enabled iff device `wifi_caps` bit `0x2000` (`supportOpenHostapd`, Device.java §1275 & §1247) — **device-record dependent; check per adopter** |
-| `security=wpa-p` | `security=wpapsk` (wpa_mode AUTO→2, wpa_enc AUTO→CCMP) | `aaa.<n>.wpa=2`, `.eapol_version=2`, `.wpa.key.1.mgmt=WPA-PSK`, `.wpa.psk=<passphrase>` (plaintext), `.wpa.1.pairwise=CCMP`, `.pmf.cipher=AES-128-CMAC`, `.wpa.group_rekey=3600`, `wireless.<n>.authmode=1`, `security=none` |
+| `security=wpa-p` | `security=wpapsk` (wpa_mode AUTO→3, wpa_enc AUTO→CCMP) | `aaa.<n>.wpa=3` (AUTO; jar truth — WPA1=1/WPA2=2/AUTO=3, WpaMode static-init `WpaMode.txt:197-211`), `.eapol_version=2`, `.wpa.key.1.mgmt=WPA-PSK`, `.wpa.psk=<passphrase>` (plaintext), `.wpa.1.pairwise=CCMP`, `.pmf.cipher=AES-128-CMAC`, `.wpa.group_rekey=3600`, `wireless.<n>.authmode=1`, `security=none` |
 | `security=wpa-eap` | `security=wpaeap` | `wpa.key.1.mgmt=WPA-EAP` + `wpa.psk` (⚠ same fallback "letmeinnow" if not set) + `radius.auth.<i>.{ip,port,secret}` + `dynamic_vlan=0` + `auth_cache=enabled`; acct servers need the RADIUS profile (int §1401-1405 copyAttrsIfPresent) |
 | `passphrase` | `x_passphrase` (fallback literal `"letmeinnow"`) | `aaa.<n>.wpa.psk` verbatim — **never hashed/obfuscated on this writer** |
 | `vlan=<vid>` | `vlan` (or bound `networkconf_id`) | new `br0.<vid>`: `# vlan` row(s), `# bridge` row + `port.*.devname=ath…`, `# netconf` row, `aaa.<n>.br.devname=br0.<vid>`; guard `vid != 1` (else br-trunk). For EAP: `aaa.<n>.dynamic_vlan=1|2` + DAS/DAD rows (optional) |
@@ -510,19 +584,18 @@ dhcpc.status=enabled
 
 Defaults the Go builder must reproduce (`WlanConf.java` getters, cited):
 `hide_ssid=false`, `b_supported=false` ⇒ `pureg=1`, `group_rekey=3600`,
-`dtim=3`, `wpa_enc=auto` ⇒ `CCMP`, `wpa_mode=auto` ⇒ `wpa=2 / eapol 2`,
+`dtim=3`, `wpa_enc=auto` ⇒ `CCMP`, `wpa_mode=auto` ⇒ `wpa=3 / eapol 2`
+(WpaMode AUTO ctor passes `iconst_3` — `com__ubnt__model__api__wlan__WpaMode.txt:197-211`),
 `x_passphrase` fallback `"letmeinnow"`, `auth_cache=true` (EAP),
 `vlan_wlan_mode=disabled` ⇒ `dynamic_vlan=0`.
 
 ## 9. UNRESOLVED / explicitly searched & not found
 
-- `radio.<n>.ieee_mode` `<ht>` value: source = `com.ubnt.service.devmgr.c
-  \u00f6\u00f60000.cfr_renamed_2(radio, countrycode)` (int §514, width check
-  `n2 != 20` §515). Searched device-manager decompiles present in the lane
-  (`devmgr/ooOo`, `devmgr/privatesuper`, `devmgr/command/general/public`) — no
-  such resolver body found; the class `com/ubnt/service/devmgr/c.class` was not
-  decompiled in this pass. Go can emit `"20"`-suffixed form for default sites;
-  verify against a live device cfg dump before shipping.
+- ~~`radio.<n>.ieee_mode` `<ht>` value~~ **RESOLVED** (moved to §3.1): the resolver
+  class `com/ubnt/service/devmgr/c.class` is now decompiled
+  (`tmpwork/javap/com__ubnt__service__devmgr__c.txt:1242-1380`); semantics =
+  min(country limit, HT-mode cap ng→20/na→40, device-reported caps). Earlier
+  revision wrongly stated "the class was not decompiled in this pass" — superseded.
 - `<int-field B-type>.o00000(wlanConf, networks)` resolver class identity
   (Optional<NetworkConf> provider used in §6): field declared `protected final B
   \u00f6\u00f40000` (int §165) — but the decompile named `com.ubnt.service.config.B`

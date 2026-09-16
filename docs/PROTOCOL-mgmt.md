@@ -4,6 +4,16 @@ Companion to `docs/PROTOCOL.md` (which it amends where noted). Every fact below 
 derived from CFR 0.152 decompiles of `ace.jar` classes; each claim cites the class
 and a verbatim snippet. Decompiled sources used:
 
+**Provenance (decompilation artifacts):** the `decomp/…` file names in the table
+below refer to the original proguard-renamed `.java` outputs of the CFR
+decompiler, produced in a **local, untracked decompilation workspace** — no
+`decomp/` directory is committed to this repository. The source jar lives at
+`tmpwork/data/usr/lib/unifi/lib/ace.jar`; the canonical, reproducible bytecode
+citations are the `javap -c -v` dumps under `tmpwork/javap/**` (also deliberately
+gitignored — the decompiled Ubiquiti jar is not our artifact to redistribute).
+The existing `decomp/…` citations are kept for historical traceability; to
+re-verify any claim, locate the class in `tmpwork/javap/INDEX.txt`.
+
 | name | jar class | formal name |
 |------|-----------|-------------|
 | `decomp/voidsuper.java`, `c_956a5d5649fe.class.java` | `com/ubnt/service/devmgr/voidsuper.class` | inform dispatcher |

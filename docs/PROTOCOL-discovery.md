@@ -1,7 +1,17 @@
 # PROTOCOL-discovery — UDP/10001 discovery TLVs (controller ⇄ device)
 
 Companion to `docs/PROTOCOL.md` §4, sharpened to bytecode certainty.
-Sources (CFR 0.152 decompiles of `ace.jar`):
+Sources (CFR 0.152 decompiles of `ace.jar` — see the provenance note below):
+
+**Provenance (decompilation artifacts):** the `decomp/…` file names in the table
+below refer to the original proguard-renamed `.java` outputs of the CFR
+decompiler, produced in a **local, untracked decompilation workspace** — no
+`decomp/` directory is committed. The source jar is the controller deb's
+`tmpwork/data/usr/lib/unifi/lib/ace.jar`; the canonical, reproducible bytecode
+citations are the `javap -c -v` dumps under `tmpwork/javap/**` (also deliberately
+gitignored — the decompiled Ubiquiti jar is not our artifact to redistribute).
+These `decomp/…` names are kept because line-level claims in the older
+revisions trace back to them; re-find any given class via `tmpwork/javap/INDEX.txt`.
 
 | file | formal class | role |
 |------|--------------|------|
@@ -83,8 +93,13 @@ So on the wire: `[ver:1][cmd:1][payloadLen:2 BE]` then a flat TLV stream of
 `String.getBytes("ISO-8859-1")`.
 
 Parser (`O0oO.o00000(SocketAddress,byte[],int)`) dispatches `by` (=ver):
-- `0` → legacy V0 packet, `if (n < 15 && byArray[0] != 0) return null;` then reads
-  `[mac:6][ip:4][len:2][version-string…]`.
+- `0` → legacy V0 packet; gate `if (n < 15 && byArray[0] != 0) return null;`
+  (O0oO_regen.txt:2256-2264) then reads the flat layout **[mac:6][ip:4][len:4][version-string…]**
+  — the length field is a **4-byte big-endian int** parsed with the same
+  `OOoO.class([B)` helper as other int fields (O0oO_regen.txt:2256-2320:
+  6-byte copy at offsets 14-37, 4-byte copy/`InetAddress.getByAddress` at
+  offsets 39-74, 4-byte length read at offsets 76-103, then a length-prefixed
+  version string). An earlier revision wrote "[len:2]"; that field is 4 bytes.
 - `1` / `2` → TLV packet with `[cmd:1][dataLen:2BE][TLV…]` (dataLen must fit, else
   invalid V2). `int n4 = n3 + 1 + 1 + 2;` bounds the stream.
 

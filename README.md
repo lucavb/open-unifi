@@ -126,6 +126,13 @@ See `examples/terraform/` (includes filesystem-mirror dev overrides so
 - `docs/PROTOCOL-discovery.md` — UDP/10001 packet + TLV tables.
 - `docs/PROTOCOL-systemcfg-wireless.md` — `radio.*`/`aaa.*`/`wireless.*` schema, VLAN/bridge wiring, `users.1` password format.
 
+Note on provenance: the protocol docs occasionally cite `decomp/…` source names
+from the untracked local decompilation workspace (source jar
+`tmpwork/data/usr/lib/unifi/lib/ace.jar`, canonical `javap` dumps
+`tmpwork/javap/**`); neither the decomp/ outputs nor the decompiled jar are
+committed — they are derivative works of Ubiquiti's controller and deliberately
+stay out of the tree.
+
 ## Threat model
 
 The inform protocol has no device certificates: pre-adoption identity is the
@@ -145,14 +152,49 @@ is plain HTTP with bearer auth only.
 
 ## Status & limitations
 
-- Byte-exact against the official Linux controller's bytecode for the
-  implemented surface (magic `TNBU`, factory key, CBC/GCM envelopes,
-  adoption handshake, config builders). Six-lens adversarial review with a
-  validator round complete; real-device acceptance test: pending — open
-  verify-items are tracked in `docs/PROTOCOL.md` §7.
-- `wpa-eap` is emitted structurally; RADIUS server fields are not yet part
-  of the API surface.
+Byte-exactness, scoped: parts of open-unifi are **verified byte-exact against
+the official Linux controller's bytecode** — the crypto layer (AES-128-CBC
+including the lenient-padding fallback, AES-GCM with header-bound AAD,
+sha512crypt-vs-commons-codec password format), the response envelope, and the
+discovery framing. A jar-anchored differential test harness does not exist yet
+(see Limitations), so "byte-exact" claims are scoped this way rather than
+end-to-end verified.
+
+Known deviations from the classic controller, **fixed in the current fix
+wave** (documents updated accordingly): the `radio.<n>.ieee_mode` resolver
+(`docs/PROTOCOL-systemcfg-wireless.md` §3.1), `wpa` default 3 (jar AUTO=3), the
+per-vap `radio.<n>`/`radio.<n>.virtual.<d>` companion rows, `dhcpc.<n>`
+status+devname rows, the `noop.interval` JSON-number type (open-unifi sends a
+fixed 15), `inform_url` gating, invented `# sshd`/`# misc` config headers, and
+the device-lost window.
+
+Still open (classic behavior vs open-unifi):
+- snappy inform payloads (flag `0x04`): the **classic controller decompresses
+  them** (`org.xerial.snappy`, `docs/PROTOCOL.md` §1); open-unifi rejects them.
+- discovery replies (cmd-8 announce replies and the "invoke sshd" cmd-10 push):
+  classic replies when discoverable (`docs/PROTOCOL.md` §4); open-unifi is
+  announce-only.
+- WPA-EAP/RADIUS profiles are emitted structurally; server fields are not yet
+  part of the API surface.
+- No firmware upgrade / `upgrade` responses; no hotspot2/WPA3/SAE emission.
+- `system.analytics.status` is not emitted (see Limitations).
+- Real-device acceptance test pending; open verify-items are tracked in
+  `docs/PROTOCOL.md` §7.
 - Admin port is plain HTTP (token auth) — TLS is a TODO; run on a trusted LAN.
-- No firmware upgrade / `upgrade` responses, no hotspot2/WPA3/SAE, no
-  discovery replies from the controller (announce-only), snappy inform
-  payloads rejected.
+
+### Limitations
+
+- **No jar-anchored differential test harness.** Byte-exactness claims are
+  grounded in bytecode citation, not yet in an automated golden-comparison
+  against captures from a real classic controller (FID-57).
+- **Single-process assumption.** There is no advisory file locking on the JSON
+  store — running two controller processes against one `--data-dir` is
+  unsupported and will lose updates (FID-63).
+- **Plaintext inform mode (`--allow-plaintext-inform`).** The response to a
+  re-key push echoes the device's *current* authkey as cleartext on the wire.
+  Opt-in flag for a reason; trusted lab segments only (FID-42).
+- **`system.analytics.status` is not emitted.** The classic controller emits
+  this system_cfg row only when the device reports analytics-toggle support
+  (`Device.supportAnalyticsToggle()` — model capability + minimum firmware
+  version gate, tmpwork/javap/com__ubnt__data__Device.txt:7552-7576). Not yet in
+  the open-unifi builder (FID-72).
