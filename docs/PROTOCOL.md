@@ -299,39 +299,90 @@ resources `open-unifi_access_point` (adopt, by MAC + controller URL/token),
 Provider `Configure` accepts `url`, `token` (honest: token required unless server
 started without --admin-token).
 
-## 7. Whatever is still uncertain (morning-verify carry-list)
+## 7. Carry-list — closed by live acceptance (2026-09-16)
 
 Resolved since the first pass: `mgmt_cfg` text encoding (PROTOCOL-mgmt.md §2),
 `system_cfg` format (PROTOCOL-mgmt.md §3 + PROTOCOL-systemcfg-wireless.md), and
 cfgversion semantics (match → noop; mismatch → full-provisioning setparam,
 PROTOCOL-mgmt.md §6.2 row d).
 
-Still open — verify against the real U7PG2 during the acceptance window:
+Resolved against a real U7PG2 (see the acceptance log at the end of this
+section):
 - ~~Device-reported state enum numeric values~~ RESOLVED (see §3 "state field
   semantics"): 0=UNKNOWN … 11=ISOLATED (Device.txt:11897-11947).
 - ~~`noop.interval` wire type~~ RESOLVED: JSON **number** (details below).
 - ~~`ieee_mode` ht-width guess~~ RESOLVED (PROTOCOL-systemcfg-wireless.md §3.1:
   resolver min(country limit, HT-mode cap, device caps) ⇒ `11nght20` / `11naht40`;
   tmpwork/javap/com__ubnt__service__devmgr__c.txt:1242-1380).
-- `noop.interval` classic value algorithm (documented for reference, open-unifi
-  simplified): `interval` is emitted as a JSON number — `Integer.valueOf(10)` on
-  the exception-path noop (tmpwork/javap/com__ubnt__service__devmgr__voidsuper.txt:9945-9955)
-  and `Long.valueOf(computed)` in the main noop builder (voidsuper.txt:11412-11422).
-  The value is load-tiered from the device's last `system-stats` (cpu/mem double
-  fields, voidsuper.txt:11182-11226): cpu<50 ∧ mem<90 → 1 s; cpu<50 ∧ mem≥90 → 5 s;
-  cpu<75 ∧ mem<95 → 5 s; else the static default 10 s. Steady-state target:
-  `max(lastInform + 5, now + 10) + random[0,5)` (voidsuper.txt:11235-11292).
-  The servlet response writer itself adds only `server_time_in_utc` — a **string**
-  (`Long.toString(epochMillis)`, tmpwork/javap/com__ubnt__net__InformServlet.txt:1569-1580)
-  and no interval of its own (InformServlet.txt:1568-1624).
-  open-unifi note: simplified to a fixed number (15) for now; load tiering is
-  future work.
-- Uplink port assumption: `# vlan` rows hardcode `eth0` as the tagged/untagged uplink —
-  confirm the U7PG2's actual trunk port (if it is eth1, tagged VLANs break).
-- `mgmt_url` port fallback when `--controller-url` is not https (we emit :8443).
-- `two_phase_adopt` flows (older firmware only; 6.x adopts in one phase — believed
-  irrelevant).
+- ~~Uplink port assumption (`# vlan` rows hardcode `eth0`)~~ RESOLVED: the live
+  U7PG2 reports a single eth interface — `if_table` = `[{name: "eth0", up:
+  true}]`, `uplink = eth0`, `has_eth1 = false` — so eth0 is the trunk uplink and
+  the hardcoded eth0 rows are correct. `port_table` does list a second port
+  (port_idx 2, `Secondary`, `is_uplink: false`, media GE) but its names are
+  labels, not ifaces, and the device reports no eth1 interface; deriving a port
+  count from it would invent one. 6.8.2 sends **no** `ethernet_table` in
+  informs, so `ethPortNames` derives real `ethN` names from `if_table` (falling
+  back to the learned `uplink`) before the last-resort eth0 default (FID-2).
+- ~~`mgmt_url` port fallback when `--controller-url` is not https (we emit
+  :8443)~~ RESOLVED: the device never contacts :8443. A live 60 s watch on the
+  controller host saw zero packets to the mgmt port; the U7PG2 stays connected
+  purely via `:8080` informs (adoption and steady state).
+- ~~`two_phase_adopt` flows (older firmware only; 6.x adopts in one phase —
+  believed irrelevant)~~ RESOLVED: 6.8.2 adopts in one phase. Observed a single
+  `setparam` adoption push encrypted with the factory default key, then key
+  rotation (`ba86…` → `a066…`) and a re-inform 476 ms later; no second phase.
 - ~~Discovery response packet exact TLVs~~ — extracted (docs/PROTOCOL-discovery.md
   §2.3/§2.4: `oooO(9,2)` reply = TLV 1 (our MAC) + TLV 2 × interfaces (mac+ip) +
   TLV 3 (FW version) + TLV 21 (shortname-subtype) + TLV 22 (version) + TLV 23
   (setup flag)); open-unifi still sends no discovery replies (TODO, see §4).
+  Live note: replies are **not required** for adoption — the device adopted via
+  set-inform with zero server-side UDP/10001 traffic (announcements were parsed
+  correctly and ceased after adoption).
+- ~~Snappy inform payloads (flag `0x04`)~~ RESOLVED: 6.8.2 never sets the bit.
+  Flags were `0x0003` (encrypted + zlib, CBC) pre-adoption and `0x000b`
+  (encrypted + zlib + AES-GCM) post-adoption; `ErrSnappyUnsupported` never
+  fired.
+
+`noop.interval` classic value algorithm (documented for reference; open-unifi
+simplified): `interval` is emitted as a JSON number — `Integer.valueOf(10)` on
+the exception-path noop (tmpwork/javap/com__ubnt__service__devmgr__voidsuper.txt:9945-9955)
+and `Long.valueOf(computed)` in the main noop builder (voidsuper.txt:11412-11422).
+The value is load-tiered from the device's last `system-stats` (cpu/mem double
+fields, voidsuper.txt:11182-11226): cpu<50 ∧ mem<90 → 1 s; cpu<50 ∧ mem≥90 → 5 s;
+cpu<75 ∧ mem<95 → 5 s; else the static default 10 s. Steady-state target:
+`max(lastInform + 5, now + 10) + random[0,5)` (voidsuper.txt:11235-11292).
+The servlet response writer itself adds only `server_time_in_utc` — a **string**
+(`Long.toString(epochMillis)`, tmpwork/javap/com__ubnt__net__InformServlet.txt:1569-1580)
+and no interval of its own (InformServlet.txt:1568-1624).
+open-unifi note: simplified to a fixed number (15); **live 2026-09-16**: the
+U7PG2 accepted the fixed 15 s interval across the whole session (inform gaps
+15 s ×113, 16 s ×70, outliers only at controller restarts) — no firmware-side
+demand for load tiering observed. Load tiering remains future work.
+
+### Live acceptance log (2026-09-16)
+
+Device: UAP-AC-Pro-Gen2 (U7PG2), firmware 6.8.2.15592
+(`BZ.qca956x_6.8.2+15592.260126.1358`), MAC `aa:bb:cc:dd:ee:02`.
+Controller: open-unifi on 10.10.10.10 with `--controller-url http://10.10.10.10:8080`,
+`--discovery`, admin `:8443` (plain HTTP + token).
+
+Sequence observed (server.log, UTC+2):
+1. 12:48:13–12:49:03 — the device broadcasts 243-byte discovery announcements
+   every 10 s (`255.255.255.255:10001` + `ff02::1:10001`), `factory=true`; the
+   listener parses uptime/model/ip/factory correctly.
+2. 12:49:06 — promoted to pending (state 1).
+3. 12:54:30 — adoption push (`setparam`) encrypted with the factory default key.
+4. 12:54:31 — the device re-informs with the rotated per-device key 476 ms
+   later; flags switch `0x0003` → `0x000b` (GCM on). Adoption complete (state 3).
+5. 12:56:10 — test WLAN provisioned (`wireless config replaced, wlans=1`); the
+   device's `vap_table` reports state RUN.
+6. 13:02:30 — post-restart full `system_cfg` push (`ours=5ffc2d4136d8a5c6`
+   replacing `device=401faa42ae99784b`); every subsequent device inform echoes
+   `cfg=5ffc2d4136d8a5c6`, i.e. the device confirmed running the generated
+   config.
+7. Steady state since — connected noops at the server-set 15 s interval;
+   discovery announcements ceased after adoption.
+
+Evidence artifacts: the controller log plus a full session capture (`tcp port
+8080 or udp port 10001`) on the controller host — candidate input for the
+FID-57 jar-anchored differential harness.

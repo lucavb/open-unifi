@@ -171,15 +171,21 @@ the device-lost window.
 Still open (classic behavior vs open-unifi):
 - snappy inform payloads (flag `0x04`): the **classic controller decompresses
   them** (`org.xerial.snappy`, `docs/PROTOCOL.md` §1); open-unifi rejects them.
+  Live note (2026-09-16): 6.8.2 never sets the bit — flags stayed `0x0003`
+  (zlib, CBC) pre-adoption and `0x000b` (zlib + AES-GCM) after, so the
+  rejection path never fired.
 - discovery replies (cmd-8 announce replies and the "invoke sshd" cmd-10 push):
   classic replies when discoverable (`docs/PROTOCOL.md` §4); open-unifi is
-  announce-only.
+  announce-only. Live note (2026-09-16): replies are not required for adoption
+  — the U7PG2 adopted via set-inform with zero server-side UDP/10001 traffic.
 - WPA-EAP/RADIUS profiles are emitted structurally; server fields are not yet
   part of the API surface.
 - No firmware upgrade / `upgrade` responses; no hotspot2/WPA3/SAE emission.
 - `system.analytics.status` is not emitted (see Limitations).
-- Real-device acceptance test pending; open verify-items are tracked in
-  `docs/PROTOCOL.md` §7.
+- Real-device acceptance test **passed 2026-09-16** (UAP-AC-Pro-Gen2 / U7PG2,
+  firmware 6.8.2.15592): adoption, default-key push + key rotation,
+  provisioning, WLAN push and steady-state noops all live-verified; the §7
+  verify-items are closed with evidence (`docs/PROTOCOL.md` §7).
 - Admin port is plain HTTP (token auth) — TLS is a TODO; run on a trusted LAN.
 
 ### Limitations
