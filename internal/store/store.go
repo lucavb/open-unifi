@@ -69,7 +69,7 @@ type DeviceStore interface {
 	// discovery beacon channel (MAC -> body/annotation map).
 	Pending() (map[string]string, error)
 	// MarkPending records a discovery beacon sighting for adoption UI.
-	// The pending map is capped (512); inserting beyond the cap for a NEW
+	// The pending map is capped (100); inserting beyond the cap for a NEW
 	// MAC is an error.
 	MarkPending(mac, note string) error
 	// Update serializes a per-MAC read-modify-write cycle: Promise-style
@@ -318,8 +318,9 @@ func (m *db) update(mac string, fn func(*Device) error, upsert bool) error {
 }
 
 // maxPending caps the unadopted-candidate map (discovery beacons can churn;
-// the cap bounds memory on hostile/misconfigured networks).
-const maxPending = 512
+// the cap bounds memory on hostile/misconfigured networks). Jar default
+// from the pending-adoption feed (voidsuper.txt:13925-13946): 100.
+const maxPending = 100
 
 // pendingTTL bounds how long an unpurged sighting may linger: beacons for
 // MACs that never appear on the inform channel are evicted (lazily) after

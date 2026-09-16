@@ -94,9 +94,9 @@ So on the wire: `[ver:1][cmd:1][payloadLen:2 BE]` then a flat TLV stream of
 
 Parser (`O0oO.o00000(SocketAddress,byte[],int)`) dispatches `by` (=ver):
 - `0` → legacy V0 packet; gate `if (n < 15 && byArray[0] != 0) return null;`
-  (O0oO_regen.txt:2256-2264) then reads the flat layout **[mac:6][ip:4][len:4][version-string…]**
+  (O0oO_discovery_redump.txt:1331-1341) then reads the flat layout **[mac:6][ip:4][len:4][version-string…]**
   — the length field is a **4-byte big-endian int** parsed with the same
-  `OOoO.class([B)` helper as other int fields (O0oO_regen.txt:2256-2320:
+  `OOoO.class([B)` helper as other int fields (O0oO_discovery_redump.txt:1331-1461:
   6-byte copy at offsets 14-37, 4-byte copy/`InetAddress.getByAddress` at
   offsets 39-74, 4-byte length read at offsets 76-103, then a length-prefixed
   version string). An earlier revision wrote "[len:2]"; that field is 4 bytes.

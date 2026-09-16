@@ -14,7 +14,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -1644,110 +1643,268 @@ func TestCBCLegacyZeroPadFallback(t *testing.T) {
 
 // ---- discovery table tests (§8a) -------------------------------------------
 
-// mkTLV frames a TLV [type:1][len:2 BE][value] (unused by the discovery
-// tests after the real-layout rewrite, kept for §4 reply work).
+// mkTLV frames one TLV entry [type:1][len:2 BE][value] (oooO.o00000(B,[B)).
 func mkTLV(typ byte, val []byte) []byte {
 	out := []byte{typ, byte(len(val) >> 8), byte(len(val) & 0xff)}
 	return append(out, val...)
 }
 
-// mkDiscoveryAnnounce frames an announce in the real on-wire layout
-// (FID-12, D.<init>(java.lang.String, byte[], InetAddress, String)):
-// [ver:1][mac:6][ip:4][len:2 BE][version:1][extra...]. The len half is
-// the extra-byte count and the version byte is ver==0's "epoch" float.
-func mkDiscoveryAnnounce(ver byte, mac [6]byte, ip [4]byte, version byte, extra []byte) []byte {
-	ln := uint16(len(extra))
-	out := make([]byte, 0, 14+len(extra))
-	out = append(out, ver)
-	out = append(out, mac[:]...)
-	out = append(out, ip[:]...)
-	out = append(out, byte(ln>>8), byte(ln&0xff))
-	out = append(out, version)
-	return append(out, extra...)
+// mkDiscoveryPacket frames a modern packet [ver:1][cmd:1][len:2 BE][TLVs…]
+// (oooO.o00000() finalize: bytes 2-3 carry the total TLV payload length).
+func mkDiscoveryPacket(ver, cmd byte, tlvs ...[]byte) []byte {
+	var payload []byte
+	for _, t := range tlvs {
+		payload = append(payload, t...)
+	}
+	n := len(payload)
+	return append([]byte{ver, cmd, byte(n >> 8), byte(n & 0xff)}, payload...)
+}
+
+// mkDiscoveryV2 mirrors the real emulator beacon (docs/PROTOCOL-discovery.md
+// §2.3: the v2 builder auto-adds TLV 18 seq then TLV 19 sender MAC before
+// the caller TLVs).
+func mkDiscoveryV2(seq int, outer [6]byte, ipAdd []byte, extra ...[]byte) []byte {
+	tlvs := [][]byte{
+		// TLV2: alias, MAC(6)+IP(4) — 10.2.2.1 documented shape
+		mkTLV(2, append([]byte{0x00, 0x15, 0x6d, 0x01, 0x00, 0x01}, ipAdd...)),
+		mkTLV(1, []byte{0x00, 0x15, 0x6d, 0x01, 0x00, 0x01}), // TLV1 device MAC
+	}
+	tlvs = append(tlvs, extra...)
+	seqB := make([]byte, 4)
+	binary.BigEndian.PutUint32(seqB, uint32(seq))
+	tlvs = append(tlvs, mkTLV(18, seqB))
+	tlvs = append(tlvs, mkTLV(19, outer[:]))
+	return mkDiscoveryPacket(2, 6, tlvs...)
+}
+
+// BEacon1988 Beacon fixture is TLV11/12/13 extras; discovery_test helpers.
+func beaconTLV11(value string) []byte { return mkTLV(11, []byte(value)) }
+func beaconTLV21(value string) []byte { return mkTLV(21, []byte(value)) }
+func beaconTLV3(value string) []byte  { return mkTLV(3, []byte(value)) }
+
+// beaconAround asserts the pending map content for a given MAC or emptiness.
+func beaconPending(t *testing.T, st store.DeviceStore) map[string]string {
+	t.Helper()
+	pending, err := st.Pending()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pending
 }
 
 func TestParseDiscovery(t *testing.T) {
-	mac := [6]byte{0x24, 0xa4, 0x3c, 0x11, 0x22, 0x33}
-	ip := [4]byte{192, 168, 1, 50}
+	devMAC := [6]byte{0x00, 0x15, 0x6d, 0x01, 0x00, 0x01}
+	outer := [6]byte{0x24, 0xa4, 0x3c, 0xaa, 0xbb, 0xcc}
+	ip := []byte{10, 2, 2, 1}
 
 	cases := []struct {
 		name   string
 		body   []byte
 		mac    string
-		note   string
 		reject bool
 	}{
-		{"v0 legacy valid", mkDiscoveryAnnounce(0, mac, ip, 0x01, []byte("abcd")), "24a43c112233", "discovery:platform=unknown", false},
-		{"v0 too short", mkDiscoveryAnnounce(0, mac, ip, 0x01, nil), "", "", true},
-		{"v0 non-1 version byte", mkDiscoveryAnnounce(0, mac, ip, 0x02, []byte("abcd")), "", "", true},
-		{"v1 fold with extra bytes", mkDiscoveryAnnounce(1, mac, ip, 0x01, []byte{9, 9}), "24a43c112233", "discovery:platform=unknown", false},
-		{"v1 zero length half", mkDiscoveryAnnounce(1, mac, ip, 0x01, nil), "", "", true},
-		{"0x80 flag shares the 0x00 path (FID-28)", mkDiscoveryAnnounce(0x80, mac, ip, 0x01, []byte("abcd")), "24a43c112233", "discovery:platform=unknown", false},
-		{"header too short", bytes.Repeat([]byte{1}, 12), "", "", true},
+		{"v2 valid beacon (docs §2.3)", mkDiscoveryV2(1, outer, ip,
+			beaconTLV3("BZ.ar7240.v3.1.0.15.150311.1401"),
+			beaconTLV21("BZ2"),
+			mkTLV(22, []byte("3.1.0")),
+			mkTLV(23, []byte{1}),
+			mkTLV(10, []byte{0, 0, 0x0e, 0x10}),
+		), "00156d010001", false},
+		{"byte 0 0x80 rejected (no 0x7f mask)", append([]byte{0x80}, mkDiscoveryV2(1, outer, ip)[1:]...), "", true},
+		{"v2 missing TLV19", func() []byte {
+			// v2 + TLV1 + TLV18 but no TLV19: decode the frame back and
+			// remove the sender-MAC TLV.
+			return mkDiscoveryPacket(2, 6,
+				mkTLV(1, devMAC[:]), mkTLV(18, []byte{0, 0, 0, 1}))
+		}(), "", true},
+		{"v2 missing TLV1", mkDiscoveryPacket(2, 6,
+			mkTLV(18, []byte{0, 0, 0, 1}), mkTLV(19, outer[:])), "", true},
+		{"v2 seq 0", mkDiscoveryV2(0, outer, ip), "", true},
+		{"v2 cmd8 parses for reply handling", mkDiscoveryPacket(2, 8,
+			mkTLV(1, devMAC[:]), mkTLV(18, []byte{0, 0, 0, 1}), mkTLV(19, outer[:])), "00156d010001", false},
+		{"v1 challenge parses (dropped at dispatch)", mkDiscoveryPacket(1, 2,
+			mkTLV(1, devMAC[:])), "00156d010001", false},
+		{"v0 legacy valid", append(append([]byte{0,
+			0x24, 0x5a, 0x4c, 0x11, 0x22, 0x33,
+			192, 168, 1, 50,
+			0, 0, 0, 1,
+		}, []byte("BZ.ar7240.v3.1.0.15.150311.1401")...), 0), "245a4c112233", false},
+		{"v0 too short", []byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}, "", true},
+		{"unknown version 3", []byte{3, 6, 0, 0}, "", true},
+		{"header too short", []byte{1, 6, 0}, "", true},
+		{"payload len beyond datagram", []byte{2, 6, 0xff, 0xff}, "", true},
+		{"TLV len overruns payload", mkDiscoveryPacket(2, 6,
+			mkTLV(1, devMAC[:]), mkTLV(18, []byte{0, 0, 0, 1}), mkTLV(19, outer[:]),
+			mkTLV(9, nil)), "", true},
 	}
+	s := New(Config{}, store.NewMemStore(), testLogger())
+	s.setDiscoveryTestIdentity("5a:5a:5a:5a:5a:5a")
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			mac, note, ok := parseDiscovery(tc.body)
-			if tc.reject && ok {
-				t.Fatalf("expected rejection, got mac=%q note=%q", mac, note)
+			info, ok := s.parseDiscovery(nil, tc.body)
+			if tc.reject {
+				if ok {
+					t.Fatalf("expected rejection, got %+v", info)
+				}
+				return
 			}
-			if !tc.reject {
-				if !ok {
-					t.Fatalf("expected acceptance, got rejection")
-				}
-				if mac != tc.mac || note != tc.note {
-					t.Fatalf("mac=%q note=%q, want %q/%q", mac, note, tc.mac, tc.note)
-				}
+			if !ok {
+				t.Fatalf("expected acceptance, got rejection")
+			}
+			if got := discoveryCanonicalMAC(info.mac); got != tc.mac {
+				t.Fatalf("mac=%q, want %q", got, tc.mac)
 			}
 		})
 	}
 }
 
-// seeDiscovery: dedupe window and opportunistic pruning above the threshold.
+// TestDiscoveryV2Gates walks the pending feed (handleDiscoveryPacket) with
+// the real v2 wire shape — verdict item 4/6/7.
+func TestDiscoveryV2Gates(t *testing.T) {
+	deviceMAC := [6]byte{0x00, 0x15, 0x6d, 0x01, 0x00, 0x01}
+	ip := []byte{10, 2, 2, 1}
+
+	t.Run("self-MAC echo dropped", func(t *testing.T) {
+		st := store.NewMemStore()
+		s := New(Config{}, st, testLogger())
+		s.setDiscoveryTestIdentity("24:a4:3c:aa:bb:cc")
+		s.handleDiscoveryPacket(nil, mkDiscoveryV2(1, [6]byte{0x24, 0xa4, 0x3c, 0xaa, 0xbb, 0xcc}, ip))
+		if got := beaconPending(t, st); len(got) != 0 {
+			t.Fatalf("self-MAC echo must not record: %v", got)
+		}
+	})
+	t.Run("blocklisted mFi model dropped", func(t *testing.T) {
+		st := store.NewMemStore()
+		s := New(Config{}, st, testLogger())
+		s.handleDiscoveryPacket(nil, mkDiscoveryV2(1, [6]byte{0x24, 0xa4, 0x3c, 0xaa, 0xbb, 0xcc}, ip, beaconTLV21("M2M")))
+		if got := beaconPending(t, st); len(got) != 0 {
+			t.Fatalf("mFi blocklist must not record: %v", got)
+		}
+	})
+	t.Run("cmd8 dropped", func(t *testing.T) {
+		st := store.NewMemStore()
+		s := New(Config{}, st, testLogger())
+		s.handleDiscoveryPacket(nil, mkDiscoveryPacket(2, 8,
+			mkTLV(1, deviceMAC[:]), mkTLV(18, []byte{0, 0, 0, 1}),
+			mkTLV(19, []byte{0x24, 0xa4, 0x3c, 0xaa, 0xbb, 0xcc})))
+		if got := beaconPending(t, st); len(got) != 0 {
+			t.Fatalf("cmd8 handled outside the announce path: %v", got)
+		}
+	})
+	t.Run("v1 cmd2 challenge records nothing", func(t *testing.T) {
+		st := store.NewMemStore()
+		s := New(Config{}, st, testLogger())
+		s.handleDiscoveryPacket(nil, mkDiscoveryPacket(1, 2, mkTLV(1, deviceMAC[:])))
+		if got := beaconPending(t, st); len(got) != 0 {
+			t.Fatalf("cmd2 challenge must not record: %v", got)
+		}
+	})
+	t.Run("v2 valid beacon pending with keyed note (cmd6 on X feed)", func(t *testing.T) {
+		st := store.NewMemStore()
+		s := New(Config{}, st, testLogger())
+		s.handleDiscoveryPacket(nil, mkDiscoveryV2(1, [6]byte{0x24, 0xa4, 0x3c, 0xaa, 0xbb, 0xcc}, ip,
+			beaconTLV3("BZ.ar7240.v3.1.0.15.150311.1401"),
+			beaconTLV21("BZ2"),
+			mkTLV(22, []byte("3.1.0")),
+			beaconTLV11("uap-lab"),
+			mkTLV(10, []byte{0, 0, 0x0e, 0x10}),
+			mkTLV(28, []byte{0, 0, 0, 22}),
+		))
+		pending := beaconPending(t, st)
+		note := pending["00156d010001"]
+		for key, want := range map[string]bool{
+			"discovery:":  true,
+			"uptime=3600": true,
+			"version=BZ.ar7240.v3.1.0.15.150311.1401": true,
+			"model=BZ2":        true,
+			"sshd_port=22":     true,
+			"ip=10.2.2.1":      true,
+			"hostname=uap-lab": true,
+		} {
+			if want && !strings.Contains(note, key) {
+				t.Fatalf("pending note %q missing %q", note, key)
+			}
+		}
+	})
+}
+
+// TestDiscoveryAntiReplay pins the anti-replay contract (item 5/:862-928).
+func TestDiscoveryAntiReplay(t *testing.T) {
+	outer := [6]byte{0x24, 0xa4, 0x3c, 0xaa, 0xbb, 0xcc}
+	ip := []byte{10, 2, 2, 1}
+	t.Run("same seq inside window dropped, higher seq accepted", func(t *testing.T) {
+		st := store.NewMemStore()
+		s := New(Config{}, st, testLogger())
+		first := mkDiscoveryV2(5, outer, ip)
+		s.handleDiscoveryPacket(nil, first)
+		if len(beaconPending(t, st)) != 1 {
+			t.Fatal("first sighting must record")
+		}
+		// same beacon again: drop (seq<=lastSeq inside window)
+		s.handleDiscoveryPacket(nil, first)
+		if n := len(beaconPending(t, st)); n != 1 {
+			t.Fatalf("same-seq repeat inside window must drop; pending=%d", n)
+		}
+		// higher seq: accept
+		s.handleDiscoveryPacket(nil, mkDiscoveryV2(6, outer, ip))
+		if n := len(beaconPending(t, st)); n != 1 {
+			t.Fatalf("higher seq must re-record same candidate; pending=%d", n)
+		}
+	})
+	t.Run("stale window resets", func(t *testing.T) {
+		st := store.NewMemStore()
+		s := New(Config{}, st, testLogger())
+		st2 := s.discoverySightings()
+		st2.mu.Lock()
+		st2.byMAC["00:15:6d:01:00:01"] = discoverySighting{lastSeq: 5, lastSeen: time.Now().Add(-6 * time.Second)}
+		st2.mu.Unlock()
+		if !s.seeDiscovery(discoveryInfo{ver: 2, mac: []byte{0x00, 0x15, 0x6d, 0x01, 0x00, 0x01}, seq: 1}) {
+			t.Fatal("stale last-seen must reset and accept")
+		}
+	})
+}
+
+// seeDiscovery: the anti-replay map is keyed by MAC (equality by string
+// key), pruning above discoveryPruneThreshold is the documented deviation.
 func TestSeeDiscoveryDedupe(t *testing.T) {
 	s := New(Config{}, store.NewMemStore(), testLogger())
-	if !s.seeDiscovery("24a43c112233") {
+	info := discoveryInfo{ver: 2, mac: []byte{0x24, 0xa4, 0x3c, 0x11, 0x22, 0x33}}
+	if !s.seeDiscovery(mkInfo(info, 5)) {
 		t.Fatal("first sighting must pass")
 	}
-	if s.seeDiscovery("24a43c112233") {
-		t.Fatal("second sighting inside window must dedupe")
+	if s.seeDiscovery(mkInfo(info, 5)) {
+		t.Fatal("same seq inside window must drop")
 	}
-	// prune: fill with stale entries then exceed the threshold.
-	now := time.Now()
-	s.seenMu.Lock()
-	for i := 0; i < 4100; i++ {
-		s.seenAt[fmt.Sprintf("%012x", i)] = now.Add(-discoveryDedupWindow * 2)
-	}
-	s.seenMu.Unlock()
-	if !s.seeDiscovery("999999999999") {
-		t.Fatal("new MAC must pass")
-	}
-	s.seenMu.Lock()
-	_, staleLeft := s.seenAt["000000000000"]
-	_, freshLeft := s.seenAt["24a43c112233"]
-	s.seenMu.Unlock()
-	if staleLeft {
-		t.Fatal("stale entries not pruned")
-	}
-	if !freshLeft {
-		t.Fatal("recent entry must survive pruning")
+	if !s.seeDiscovery(mkInfo(info, 6)) {
+		t.Fatal("higher seq inside window must pass")
 	}
 }
 
-// full discovery-record path: MarkPending note shape (real layout).
+// mkInfo clones a discoveryInfo so mutation in seeDiscovery state stays nil.
+func mkInfo(base discoveryInfo, seq int) discoveryInfo {
+	out := base
+	out.seq = seq
+	out.mac = append([]byte(nil), base.mac...)
+	return out
+}
+
+// full discovery-record path: MarkPending note shape (real v2 packet).
 func TestDiscoveryMarkPendingNote(t *testing.T) {
 	st := store.NewMemStore()
 	s := New(Config{}, st, testLogger())
-	pkt := mkDiscoveryAnnounce(0,
-		[6]byte{0x24, 0xa4, 0x3c, 0x11, 0x22, 0x33}, [4]byte{192, 168, 1, 50},
-		0x01, []byte("abcd"))
-	s.handleDiscoveryPacket(pkt)
+	s.handleDiscoveryPacket(nil, mkDiscoveryV2(1, [6]byte{0x24, 0xa4, 0x3c, 0xaa, 0xbb, 0xcc},
+		[]byte{10, 2, 2, 1},
+		beaconTLV21("BZ2"), beaconTLV11("uap-lab"), mkTLV(10, []byte{0, 0, 0x0e, 0x10})))
 	pending, err := st.Pending()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pending["24a43c112233"] != "discovery:platform=unknown" {
-		t.Fatalf("pending note = %q", pending["24a43c112233"])
+	note := pending["00156d010001"]
+	if !strings.Contains(note, "discovery:") {
+		t.Fatalf("pending note = %q", note)
+	}
+	if !strings.Contains(note, "model=BZ2") || !strings.Contains(note, "hostname=uap-lab") {
+		t.Fatalf("pending note = %q", note)
 	}
 }
 

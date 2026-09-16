@@ -193,8 +193,8 @@ setup mode (`supersuper.StringObject()`) OR the cached
 default false) — then requires the source socket address to be a site-local
 `InetSocketAddress`, and only then sends the cmd-9 reply packet to that address
 (gate: tmpwork/javap/com__ubnt__net__K.txt:620-646; reply path:
-/tmp/68d31a2d53c33608/opencode/O0oO_regen.txt:1566-1582; site-local check
-`Ó00000(SocketAddress)`: /tmp/68d31a2d53c33608/opencode/O0oO_regen.txt:2136-2152;
+tmpwork/javap/regen/O0oO_discovery_redump.txt:1462-1564; site-local check
+`Ó00000(SocketAddress)`: tmpwork/javap/regen/O0oO_discovery_redump.txt:1232-1252;
 full reply layout in docs/PROTOCOL-discovery.md §2.3/§2.4).
 "cmd-8 ignored" was an open-unifi limitation (announce-only listener); replying is
 still TODO in open-unifi.
@@ -205,12 +205,12 @@ Controller announce response packet: ver/cmd built from `oooO(9, 2)` … importa
 |------|-------|
 | 1 | 6-byte MAC (local interfaces each, repeatable as type 2 = mac6+ip4) |
 | 3 | firmware version string |
-| 10 | uptime — 4-byte big-endian int via the shared `OOoO.class([B)` helper (O0oO_regen.txt:1296-1299) |
+| 10 | uptime — 4-byte big-endian int via the shared `OOoO.class([B)` helper (O0oO_discovery_redump.txt TLV switch) |
 | 11 | hostname |
 | 12 | platform / hardware id |
 | 13/14 | essid / wmode |
 | 16 | hex hash |
-| 18 | seq — 4-byte BE int, anti-replay: the jar drops a packet only when **(now − last < 5 s AND seq ≤ lastSeq)**; a higher seq within the 5 s window IS accepted (O0oO_regen.txt:1627-1641) |
+| 18 | seq — 4-byte BE int, anti-replay: the jar drops a packet only when **(now − last < 5 s AND seq ≤ lastSeq)**; a higher seq within the 5 s window IS accepted (O0oO_discovery_redump.txt:862-928) |
 | 19 | sender MAC |
 | 21..26 | model, name, supported-bools |
 | 27 | ssh username |
