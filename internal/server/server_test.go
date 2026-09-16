@@ -212,8 +212,11 @@ func infoBody(appliedCfg string) map[string]any {
 		"inform_url": "http://10.0.0.5:8080/inform",
 		"uptime":     1234,
 		"x_aes_gcm":  true,
-		"hash_id":    "32hexhashid",
-		"stat":       map[string]any{"user-num_sta": 4.0},
+		// SHA-512 password capability bit (real U7PG2 informs carry it;
+		// FID-22 users.1 branch).
+		"fw_caps": 0x400,
+		"hash_id": "32hexhashid",
+		"stat":    map[string]any{"user-num_sta": 4.0},
 	}
 	if appliedCfg != "" {
 		jm["cfgversion"] = appliedCfg
@@ -288,6 +291,17 @@ func hexKey(t *testing.T, s string) []byte {
 		t.Fatalf("bad key hex %q: %v", s, err)
 	}
 	return b
+}
+
+// mustBuildSys renders system_cfg for tests; a build error (FID-23 path)
+// fails the test unless the test specifically asserts the failure.
+func mustBuildSys(t *testing.T, s *Server, rec store.Device) string {
+	t.Helper()
+	sys, err := s.buildSystemCfg(rec)
+	if err != nil {
+		t.Fatalf("system_cfg build: %v", err)
+	}
+	return sys
 }
 
 // ---- tests ---------------------------------------------------------------
@@ -528,8 +542,9 @@ func TestHappyAdoption(t *testing.T) {
 	if jm["_type"] != "noop" {
 		t.Fatalf("inform#2 type = %v, want noop", jm["_type"])
 	}
-	if jm["interval"] != "15" {
-		t.Fatalf("interval = %v, want string \"15\"", jm["interval"])
+	// FID-11: interval is a JSON number of seconds.
+	if iv, ok := jm["interval"].(float64); !ok || iv != 15 {
+		t.Fatalf("interval = %v (%T), want number 15", jm["interval"], jm["interval"])
 	}
 	flags2 := binary.BigEndian.Uint16(resp.Body.Bytes()[14:16])
 	if flags2&testFlagGCM != 0 {
@@ -598,15 +613,20 @@ func TestCfgVersionDriftFullProvisioning(t *testing.T) {
 	}
 	sys, _ := jm["system_cfg"].(string)
 	for _, want := range []string{
-		"# system\n", "system.timezone=UTC\n",
-		"# unifi\n", "unifi.version=0.1.0-dev\n",
+		"# system\n", "system.timezone=UTC\n", "locale.timezone=UTC\n",
+		"# unifi\n", "unifi.version=0.1.0-dev\n", "unifi.siteid=default\n",
 		"# users\n", "users.status=enabled\n", "users.1.name=ubnt\n",
 		"users.2.name=nobody\n",
-		"# sshd\n", "sshd.status=enabled\n", "sshd.1.status=enabled\n",
-		"# misc\n",
+		"sshd.status=enabled\n", "sshd.1.status=enabled\n",
 	} {
 		if !strings.Contains(sys, want) {
 			t.Fatalf("system_cfg missing %q:\n%s", want, sys)
+		}
+	}
+	// FID-20/FID-62: no invented "# sshd"/"# misc" section headers.
+	for _, wrong := range []string{"# sshd\n", "# misc\n"} {
+		if strings.Contains(sys, wrong) {
+			t.Fatalf("system_cfg must not carry the invented header %q:\n%s", wrong, sys)
 		}
 	}
 	if strings.Contains(sys, "wireless.") || strings.Contains(sys, "aaa.") {
@@ -626,13 +646,17 @@ func TestCfgVersionDriftFullProvisioning(t *testing.T) {
 		"led_enabled=true\n",
 		"stun_url=stun://10.0.0.5:3478/\n",
 		"mgmt_url=https://10.0.0.5:8443/manage/site/default\n",
-		"inform_url=http://10.0.0.5:8080/inform\n",
+		// FID-16: no inform_url row — the row is emitted only when the
+		// controller URL is explicitly overridden (this Config{} is not).
 		"use_aes_gcm=true\n",
 		"report_crash=true\n",
 	} {
 		if !strings.Contains(mgmt, want) {
 			t.Fatalf("mgmt_cfg missing %q:\n%s", want, mgmt)
 		}
+	}
+	if strings.Contains(mgmt, "inform_url=") {
+		t.Fatalf("unoverridden mgmt_cfg must omit the inform_url row:\n%s", mgmt)
 	}
 	if strings.Contains(mgmt, "is_setup_completed") {
 		t.Fatalf("mgmt_cfg is UDM-only line: %q", mgmt)
@@ -649,45 +673,39 @@ func TestCfgVersionDriftFullProvisioning(t *testing.T) {
 	}
 }
 
-// (e) inform with the forbidden default key after adoption → regenerate
-// x_authkey, put device back into adoption, respond setparam (default key).
-func TestDefaultKeyAfterAdoptionRegenerates(t *testing.T) {
+// (e) inform with the forbidden default key AFTER adoption → REJECTED: the
+// state-gated factory key (FID-1) maps to the classic 404 marker (devmgr
+// "used default key in ADOPTED state, reject it!" → ÖoÓ000 → servlet 404)
+// and the record must stay completely untouched.
+func TestDefaultKeyAfterAdoptionRejected(t *testing.T) {
 	h, st := newServerWith(Config{})
 	const k = "99998888777766665555444433332222"
 	registerAdopted(t, st, "aaaa", k)
 
 	body := encryptCBC(t, mustJSON(t, infoBody("aaaa")), hexKey(t, testDefaultKey), testIV)
 	resp := post(t, h, body)
-	if resp.Code != http.StatusOK {
-		t.Fatalf("status %d", resp.Code)
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (default key rejected post-adoption)", resp.Code)
 	}
-	_, jm := decryptResponse(t, resp.Body.Bytes(), hexKey(t, testDefaultKey))
-	if jm["_type"] != "setparam" {
-		t.Fatalf("type = %v, want setparam", jm["_type"])
-	}
-	// Adoption-push shape: no top-level cfgversion.
-	exactKeys(t, jm, "_type", "server_time_in_utc", "mgmt_cfg")
 	rec, err := st.Get(testMAC)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec.XAuthkey == k {
-		t.Fatal("x_authkey not regenerated")
+	if rec.XAuthkey != k || rec.CfgVersion != "aaaa" || rec.State != store.StateAdopted {
+		t.Fatalf("rejected default-key inform mutated the record: %+v", rec)
 	}
-	if rec.State != store.StateAdopting {
-		t.Fatalf("state = %d, want adopting (back into adoption)", rec.State)
+	if !containsKey(rec.Authkeys, k) {
+		t.Fatalf("authkeys touched by rejection: %v", rec.Authkeys)
 	}
-	if !containsKey(rec.Authkeys, rec.XAuthkey) {
-		t.Fatalf("authkeys missing new x_authkey: %v", rec.Authkeys)
-	}
-	mgmt, _ := jm["mgmt_cfg"].(string)
-	if !strings.Contains(mgmt, "authkey="+rec.XAuthkey+"\n") {
-		t.Fatalf("regenerated mgmt_cfg %q missing new x_authkey %q", mgmt, rec.XAuthkey)
-	}
+
+	// Pending and adopting records still accept the default key (the
+	// UNKNOWN/two-phase acceptance window), covered by TestHappyAdoption,
+	// TestGCMAdoptionMatrix and TestAuthkeysPrunedToTwo.
 }
 
 // A known-but-stale authkey (≠ x_authkey) used during adoption → hostile/
-// unexpected: regenerate x_authkey, respond setparam encrypted in usedKey.
+// unexpected, but FID-36 (jar rotation-pending push): the broker RE-PUSHES
+// the existing per-device key via the authkey= line WITHOUT rotating it.
 func TestUnexpectedKeyDuringAdoption(t *testing.T) {
 	h, st := newServerWith(Config{})
 	// Seeded mid-adoption record: our assigned x_authkey is "deadbeef...", but
@@ -713,25 +731,25 @@ func TestUnexpectedKeyDuringAdoption(t *testing.T) {
 	if jm["_type"] != "setparam" {
 		t.Fatalf("type = %v, want setparam", jm["_type"])
 	}
-	// Stale-x_authkey inform → same adoption-push shape (mgmt_cfg only),
-	// carrying the freshly rotated authkey line.
+	// Stale-x_authkey inform → adoption-push shape (mgmt_cfg only) carrying
+	// the CURRENT assignment, no rotation (FID-36).
 	exactKeys(t, jm, "_type", "server_time_in_utc", "mgmt_cfg")
 	mgmt, _ := jm["mgmt_cfg"].(string)
 	rec, err := st.Get(testMAC)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec.XAuthkey == xauth {
-		t.Fatal("x_authkey not regenerated on unexpected key")
+	if rec.XAuthkey != xauth {
+		t.Fatalf("x_authkey must be re-pushed unchanged, got %q (want %q)", rec.XAuthkey, xauth)
 	}
 	if rec.State != store.StateAdopting {
 		t.Fatalf("state = %d, want adopting", rec.State)
 	}
-	if !containsKey(rec.Authkeys, rec.XAuthkey) {
-		t.Fatalf("authkeys missing new x_authkey: %v", rec.Authkeys)
+	if len(rec.Authkeys) != 2 || !containsKey(rec.Authkeys, stale) || !containsKey(rec.Authkeys, testDefaultKey) {
+		t.Fatalf("authkeys touched by re-push: %v", rec.Authkeys)
 	}
-	if !strings.Contains(mgmt, "authkey="+rec.XAuthkey+"\n") {
-		t.Fatalf("adoption push mgmt_cfg %q missing rotated authkey line", mgmt)
+	if !strings.Contains(mgmt, "authkey="+xauth+"\n") {
+		t.Fatalf("adoption push mgmt_cfg %q missing current assignment authkey line", mgmt)
 	}
 }
 
@@ -756,7 +774,9 @@ func u7pg2Record() store.Device {
 		MAC: testMAC, Model: "U7PG2", State: store.StateAdopted,
 		CfgVersion: "aaaa", AppliedCfg: "aaaa",
 		XAuthkey: testDefaultKey, Authkeys: []string{testDefaultKey},
-		Extra: store.JSONMap{"radio_table": []any{
+		// fw_caps = 0x0400: the SHA-512 password capability bit real U7PG2
+		// reports (drives the users.1 $6$ branch, FID-22).
+		Extra: store.JSONMap{"fw_caps": 1024.0, "radio_table": []any{
 			map[string]any{"name": "ra0", "radio": "ng", "channel": "0",
 				"tx_power_mode": "auto", "tx_power": "auto",
 				"builtin_antenna": true, "builtin_ant_gain": 0.0},
@@ -773,9 +793,11 @@ func u7pg2Record() store.Device {
 // vlan.1 eth0/42, netconf br0.42 row only; disabled guest ABSENT everywhere).
 func TestWorkedExampleWirelessSystemCfg(t *testing.T) {
 	s := New(Config{WirelessSource: func() []Wlan { return workedEnvelope() }}, store.NewMemStore(), testLogger())
-	sys := s.buildSystemCfg(u7pg2Record())
+	sys := mustBuildSys(t, s, u7pg2Record())
 	start := strings.Index(sys, "# wlans (radio)\n")
-	end := strings.Index(sys, "# sshd\n")
+	// FID-20: sshd rows follow the wireless block with no "# sshd" header
+	// row, so the block boundary is the first sshd row.
+	end := strings.Index(sys, "sshd.status=enabled\n")
 	if start < 0 || end <= start {
 		t.Fatalf("wireless block not found in system_cfg:\n%s", sys)
 	}
@@ -994,7 +1016,7 @@ func TestNoRadiosWirelessVariant(t *testing.T) {
 	s := New(Config{WirelessSource: func() []Wlan { return workedEnvelope() }}, store.NewMemStore(), testLogger())
 	rec := u7pg2Record()
 	delete(rec.Extra, "radio_table")
-	sys := s.buildSystemCfg(rec)
+	sys := mustBuildSys(t, s, rec)
 	if want := "# no wlan provisioned as no radio found\nradio.status=disabled\n"; !strings.Contains(sys, want) {
 		t.Fatalf("missing no-radio variant in:\n%s", sys)
 	}
@@ -1013,7 +1035,7 @@ func TestWpaEapWirelessMinimal(t *testing.T) {
 			{Name: "ent", SSID: "ent", Security: "wpa-eap", Enabled: true, ID: "eapident"},
 		}
 	}}, store.NewMemStore(), testWarnLogger(&logs))
-	sys := s.buildSystemCfg(u7pg2Record())
+	sys := mustBuildSys(t, s, u7pg2Record())
 	// FID-25 row order (int AAA writer): mgmt → psk → auth_cache →
 	// [radius.*] → dynamic_vlan → wpa.1.pairwise → pmf.cipher.
 	ordered := []string{
@@ -1046,7 +1068,7 @@ func TestVlanWiringStatusRowsAlwaysOn(t *testing.T) {
 	env := []Wlan{{Name: "net", SSID: "net", Security: "wpa-p",
 		Passphrase: "correcthorse", Enabled: true}} // untagged only
 	s := New(Config{WirelessSource: func() []Wlan { return env }}, store.NewMemStore(), testLogger())
-	sys := s.buildSystemCfg(u7pg2Record())
+	sys := mustBuildSys(t, s, u7pg2Record())
 	for _, want := range []string{
 		"# vlan\nvlan.status=disabled\n",
 		"bridge.status=enabled\nbridge.1.devname=br0\n",
@@ -1089,7 +1111,7 @@ func TestOpenHostapdNeedsWifiCapsBit0x2000(t *testing.T) {
 			rec.Extra["fw_caps"] = tc.fwCaps
 		}
 		s := New(Config{WirelessSource: func() []Wlan { return env }}, store.NewMemStore(), testLogger())
-		sys := s.buildSystemCfg(rec)
+		sys := mustBuildSys(t, s, rec)
 		have := "aaa.1.status=disabled\n"
 		if tc.wantEn {
 			have = "aaa.1.status=enabled\n"
@@ -1106,14 +1128,14 @@ func TestOpenHostapdNeedsWifiCapsBit0x2000(t *testing.T) {
 func TestBgaFilterGatedOnWifiCapsBit64(t *testing.T) {
 	env := workedEnvelope()
 	s := New(Config{WirelessSource: func() []Wlan { return env }}, store.NewMemStore(), testLogger())
-	sys := s.buildSystemCfg(u7pg2Record())
+	sys := mustBuildSys(t, s, u7pg2Record())
 	if strings.Contains(sys, "bga_filter") {
 		t.Fatalf("absent wifi_caps must skip the bga_filter row:\n%s", sys)
 	}
 
 	rec := u7pg2Record()
 	rec.Extra["wifi_caps"] = float64(0x40)
-	sys = s.buildSystemCfg(rec)
+	sys = mustBuildSys(t, s, rec)
 	for _, want := range []string{"wireless.1.bga_filter=enabled\n", "wireless.2.bga_filter=enabled\n"} {
 		if !strings.Contains(sys, want) {
 			t.Fatalf("wifi_caps 0x40 must emit %q in:\n%s", want, sys)
@@ -1131,7 +1153,7 @@ func TestEthInventoryInformsVlanRows(t *testing.T) {
 		map[string]any{"num_port": 2.0},
 	}
 	s := New(Config{WirelessSource: func() []Wlan { return workedEnvelope() }}, store.NewMemStore(), testLogger())
-	sys := s.buildSystemCfg(rec)
+	sys := mustBuildSys(t, s, rec)
 	for _, want := range []string{
 		"vlan.status=enabled\n",
 		"vlan.1.devname=eth0\nvlan.1.id=42\n",
@@ -1152,7 +1174,7 @@ func TestPartialEthInventoryWarns(t *testing.T) {
 	var logs strings.Builder
 	s := New(Config{WirelessSource: func() []Wlan { return workedEnvelope() }},
 		store.NewMemStore(), testWarnLogger(&logs))
-	sys := s.buildSystemCfg(u7pg2Record())
+	sys := mustBuildSys(t, s, u7pg2Record())
 	if !strings.Contains(sys, "vlan.1.devname=eth0\n") {
 		t.Fatalf("fallback eth0 uplink missing:\n%s", sys)
 	}
@@ -1166,7 +1188,7 @@ func TestDhcpcMgmtRowUsesMgmtDev(t *testing.T) {
 	rec := u7pg2Record()
 	rec.Extra["mgmt_dev"] = "br0.9"
 	s := New(Config{WirelessSource: func() []Wlan { return workedEnvelope() }}, store.NewMemStore(), testLogger())
-	sys := s.buildSystemCfg(rec)
+	sys := mustBuildSys(t, s, rec)
 	if !strings.Contains(sys, "dhcpc.1.devname=br0.9\n") {
 		t.Fatalf("dhcpc mgmt row must follow mgmt_dev:\n%s", sys)
 	}
@@ -1210,13 +1232,13 @@ func TestSha512CryptVectorTests(t *testing.T) {
 func TestUsers1CacheStability(t *testing.T) {
 	rec := u7pg2Record()
 	s := New(Config{}, store.NewMemStore(), testLogger())
-	sys1 := s.buildSystemCfg(rec)
+	sys1 := mustBuildSys(t, s, rec)
 	pw1 := systemCfgUsersPassword(t, sys1)
 	if !sha512BodyRx.MatchString(pw1) {
 		t.Fatalf("users.1.password shape not $6$salt$hash: %q", pw1)
 	}
 	rec.Extra["ssh_sha512passwd"] = pw1
-	sys2 := s.buildSystemCfg(rec)
+	sys2 := mustBuildSys(t, s, rec)
 	pw2 := systemCfgUsersPassword(t, sys2)
 	if pw1 != pw2 {
 		t.Fatalf("users.1.password not stable across pushes: %q vs %q", pw1, pw2)
@@ -1390,6 +1412,10 @@ type failingStore struct {
 	store.DeviceStore
 	failGet    bool
 	failUpdate bool
+	// goneUpdate makes UpdateExisting return store.ErrNotFound — the
+	// record-vanished-mid-flight race the inform path must answer with the
+	// jar's unknown-MAC marker (404), never a 500.
+	goneUpdate bool
 }
 
 func (f *failingStore) Get(mac string) (store.Device, error) {
@@ -1400,23 +1426,65 @@ func (f *failingStore) Get(mac string) (store.Device, error) {
 }
 
 func (f *failingStore) Update(mac string, fn func(*store.Device) error) error {
-	if f.failUpdate {
-		return errors.New("injected Update/Put failure")
-	}
-	return f.DeviceStore.Update(mac, fn)
+	return f.UpdateExisting(mac, fn)
 }
 
-func TestStoreGetError500(t *testing.T) {
+func (f *failingStore) UpdateExisting(mac string, fn func(*store.Device) error) error {
+	if f.goneUpdate {
+		return store.ErrNotFound
+	}
+	if f.failUpdate {
+		return errors.New("injected Update/UpdateExisting failure")
+	}
+	return f.DeviceStore.UpdateExisting(mac, fn)
+}
+
+// FID-71: a MAC that disappears between the existence check and the RMW
+// cycle (e.g. admin delete / expiry) must NOT resurrect, noop, or 500 — the
+// jar answers an unknown MAC with the ÖoÓ000 marker → servlet 404.
+func TestInformVanishedMACRecord404(t *testing.T) {
+	st := &failingStore{DeviceStore: store.NewMemStore(), goneUpdate: true}
+	if err := st.DeviceStore.Put(store.Device{MAC: testMAC, State: store.StatePending}); err != nil {
+		t.Fatal(err)
+	}
+	h := New(Config{}, st, testLogger()).InformHandler()
+	resp := post(t, h, encryptCBC(t, mustJSON(t, infoBody("")), hexKey(t, testDefaultKey), testIV))
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("vanished record: want 404 (unknown-MAC marker), got %d %q", resp.Code, resp.Body.String())
+	}
+
+	// plaintext path: same marker.
+	h2 := New(Config{AllowPlainText: true}, st, testLogger()).InformHandler()
+	resp = post(t, h2, mustJSON(t, infoBody("")))
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("plaintext vanished record: want 404, got %d %q", resp.Code, resp.Body.String())
+	}
+}
+
+// FID-69: internal inform failures answer HTTP 200 with a noop payload.
+// The store Get failure happens before decryption, so no key is established
+// and the noop rides out as plain JSON.
+func TestStoreGetErrorNoop(t *testing.T) {
 	st := &failingStore{DeviceStore: store.NewMemStore(), failGet: true}
 	s := New(Config{}, st, testLogger())
 	body := encryptCBC(t, mustJSON(t, infoBody("")), hexKey(t, testDefaultKey), testIV)
 	resp := post(t, s.InformHandler(), body)
-	if resp.Code != http.StatusInternalServerError {
-		t.Fatalf("want 500 on store Get error, got %d", resp.Code)
+	if resp.Code != http.StatusOK || resp.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("want 200 plain-JSON noop on store Get error, got %d %s", resp.Code, resp.Header().Get("Content-Type"))
+	}
+	var jm map[string]any
+	if err := json.Unmarshal(resp.Body.Bytes(), &jm); err != nil {
+		t.Fatal(err)
+	}
+	if jm["_type"] != "noop" {
+		t.Fatalf("internal-error payload = %v, want noop", jm["_type"])
 	}
 }
 
-func TestStorePutError500(t *testing.T) {
+// FID-69 + FID-71: a store update failure (here: UpdateExisting wrapping the
+// inform RMW) must not persist anything and answers a SEALED noop — the
+// per-device key was already established by the successful decryption.
+func TestStorePutErrorNoop(t *testing.T) {
 	st := &failingStore{DeviceStore: store.NewMemStore(), failUpdate: true}
 	if err := st.DeviceStore.Put(store.Device{MAC: testMAC, State: store.StatePending}); err != nil {
 		t.Fatal(err)
@@ -1424,15 +1492,20 @@ func TestStorePutError500(t *testing.T) {
 	s := New(Config{}, st, testLogger())
 	body := encryptCBC(t, mustJSON(t, infoBody("")), hexKey(t, testDefaultKey), testIV)
 	resp := post(t, s.InformHandler(), body)
-	if resp.Code != http.StatusInternalServerError {
-		t.Fatalf("want 500 on store Put/Update error, got %d", resp.Code)
+	if resp.Code != http.StatusOK || resp.Header().Get("Content-Type") != "application/x-binary" {
+		t.Fatalf("want 200 sealed noop on store update error, got %d %s", resp.Code, resp.Header().Get("Content-Type"))
+	}
+	flags, jm := decryptResponse(t, resp.Body.Bytes(), hexKey(t, testDefaultKey))
+	_ = flags
+	if jm["_type"] != "noop" {
+		t.Fatalf("sealed internal-error payload = %v, want noop", jm["_type"])
 	}
 	// the failed record cycle must not leak into the store
 	got, err := st.DeviceStore.Get(testMAC)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.XAuthkey != "" || got.CfgVersion != "" {
+	if got.XAuthkey != "" || got.CfgVersion != "" || got.State != store.StatePending {
 		t.Fatalf("failed cycle persisted a rotation: %+v", got)
 	}
 }
@@ -1495,7 +1568,8 @@ func TestAuthkeysPrunedToTwo(t *testing.T) {
 	if resp.Code != http.StatusBadRequest {
 		t.Fatalf("pruned key#1 still decrypts: %d", resp.Code)
 	}
-	// second-newest key still decrypts (mid-rotation tolerance), triggers rotation.
+	// second-newest key still decrypts (mid-rotation tolerance) → FID-36:
+	// the broker re-pushes the existing assignment WITHOUT rotating it.
 	resp = post(t, h, encryptGCM(t, mustJSON(t, infoBody("")), hexKey(t, keys[1]), testIV))
 	if resp.Code != http.StatusOK {
 		t.Fatalf("second-newest key rejected: %d", resp.Code)
@@ -1504,8 +1578,9 @@ func TestAuthkeysPrunedToTwo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec.XAuthkey == keys[1] || rec.XAuthkey == keys[2] {
-		t.Fatal("expected a further rotation on stale-key usage")
+	if rec.XAuthkey != keys[2] {
+		t.Fatalf("stale-key usage must re-push the assignment unchanged; x_authkey = %q, want %q",
+			rec.XAuthkey, keys[2])
 	}
 }
 
@@ -1522,7 +1597,7 @@ func TestNewlineInjectionGuarded(t *testing.T) {
 			"builtin_antenna": true, "builtin_ant_gain": 0.0},
 	}
 	s := New(Config{WirelessSource: func() []Wlan { return workedEnvelope() }}, store.NewMemStore(), testLogger())
-	sys := s.buildSystemCfg(rec)
+	sys := mustBuildSys(t, s, rec)
 	if strings.Contains(sys, "injected=1") || strings.Contains(sys, "evil=1") {
 		t.Fatalf("injected newline value leaked into system_cfg:\n%s", sys)
 	}
@@ -1757,7 +1832,7 @@ func TestMultiWlanSystemCfg(t *testing.T) {
 		{Name: "sec", SSID: "secnet", Security: "wpa-p", Passphrase: "correcthorse", VLAN: 42, Enabled: true, ID: "id00000000000000000000SB"},
 	}
 	s := New(Config{WirelessSource: func() []Wlan { return env }}, store.NewMemStore(), testLogger())
-	sys := s.buildSystemCfg(u7pg2Record())
+	sys := mustBuildSys(t, s, u7pg2Record())
 
 	// global ath counter: the vap counter assigns ath0..ath3 in radio-sorted,
 	// wlan-order (radio1: open,sec; radio2: open,sec). Pin the explicit
@@ -1987,5 +2062,195 @@ func TestRadioTablePreserveAndRefresh(t *testing.T) {
 	first, _ := rt[0].(map[string]any)
 	if first["name"] != "ra0" || first["channel"] != 6.0 {
 		t.Fatalf("refreshed radio_table wrong: %v", first)
+	}
+}
+
+// ---- FID-22: users.1 hash variant branches on the SHA-512 capability ----
+
+// Golden vectors from OpenSSL 3.x (`openssl passwd -1 -salt S P`) — the
+// glibc/Apache md5crypt the classic controller's commons-codec Md5Crypt
+// mirrors byte-for-byte.
+func TestMD5CryptVectorTests(t *testing.T) {
+	vv := []struct{ pw, salt, want string }{
+		{"ubnt", "abcd1234", "$1$abcd1234$UPyGHXXYPYzFOkGgbE7uo0"},
+		{"ubnt", "testsalt", "$1$testsalt$phdRQ10fojI.hrEiZfZVU/"},
+		{"ubnt", "01234567", "$1$01234567$vigV.l7xN3EZbzxgDJoUg."},
+		{"ubnt", "/0ab", "$1$/0ab$2Pwalw/7N95C047k71opS0"},
+		{"letmeinnow", "abcd1234", "$1$abcd1234$7IaawFGkVaJc9HfqkbLCx."},
+		{"letmeinnow", "testsalt", "$1$testsalt$YP2koC9HPVZjUpyIa288z."},
+	}
+	for _, v := range vv {
+		got := "$1$" + v.salt + "$" + md5CryptRaw([]byte(v.pw), []byte(v.salt))
+		if got != v.want {
+			t.Errorf("md5crypt(%q, %q)\n got %s\nwant %s", v.pw, v.salt, got, v.want)
+		}
+		if !md5CryptMatches(v.pw, v.want) {
+			t.Errorf("stored-hash self-check rejected %q", v.want)
+		}
+	}
+}
+
+// FID-22: the users.1 password variant follows Device.supportsSha512Password
+// ((fw_caps & 0x400) == 0x400, Default-0 semantics) — records reporting the
+// bit get $6$, the rest get $1$.
+func TestUsers1HashBranchesOnFwCaps(t *testing.T) {
+	s := New(Config{}, store.NewMemStore(), testLogger())
+
+	sys := mustBuildSys(t, s, u7pg2Record()) // fw_caps 0x0400 seeded
+	if pw := systemCfgUsersPassword(t, sys); !sha512BodyRx.MatchString(pw) {
+		t.Fatalf("fw_caps 0x400 must pick $6$ sha512: %q", pw)
+	}
+
+	rec := u7pg2Record()
+	rec.Extra["fw_caps"] = 0.0 // capability reported, bit absent → md5 branch
+	sys = mustBuildSys(t, s, rec)
+	pw1 := systemCfgUsersPassword(t, sys)
+	if !strings.HasPrefix(pw1, "$1$") || len(pw1) != len("$1$")+8+1+22 {
+		t.Fatalf("fw_caps 0 must pick $1$ md5crypt: %q", pw1)
+	}
+	// md5 cache stability: same record builds emit the same $1$ value.
+	rec.Extra["ssh_md5passwd"] = pw1
+	if pw2 := systemCfgUsersPassword(t, mustBuildSys(t, s, rec)); pw1 != pw2 {
+		t.Fatalf("md5 users.1.password not stable: %q vs %q", pw1, pw2)
+	}
+
+	rec = u7pg2Record()
+	delete(rec.Extra, "fw_caps") // absent field ⇒ capability 0 (X.getInt default)
+	if pw := systemCfgUsersPassword(t, mustBuildSys(t, s, rec)); !strings.HasPrefix(pw, "$1$") {
+		t.Fatalf("absent fw_caps must fall to the $1$ branch: %q", pw)
+	}
+}
+
+// ---- FID-23: an unrenderable SSH password fails the provisioning build ----
+
+func TestUsers1PasswordGenerationFailureFailsBuild(t *testing.T) {
+	var logs strings.Builder
+	s := New(Config{}, store.NewMemStore(), testWarnLogger(&logs))
+	rec := u7pg2Record()
+	rec.Extra["fw_caps"] = 0.0 // md5 branch so the injectable salt seam applies
+	rec.Extra["ssh_md5passwd"] = ""
+	prev := randAlphaSalt
+	randAlphaSalt = func(int) (string, error) { return "", errors.New("rand unavailable") }
+	defer func() { randAlphaSalt = prev }()
+
+	if _, err := s.buildSystemCfg(rec); err == nil {
+		t.Fatal("failed salt generation must fail the system_cfg build, not emit an empty users.1.password")
+	}
+}
+
+// ---- FID-8: an undecryptable inform never produces a pending sighting ----
+
+func TestUnknownMACRottenPayloadNotPending(t *testing.T) {
+	h, st := newServerWith(Config{})
+	// Encrypted with a non-default key on an unregistered MAC: the broker can
+	// only try the factory key at this state, so decryption fails.
+	body := encryptCBC(t, mustJSON(t, infoBody("")), hexKey(t, "99998888777766665555444433332222"), testIV)
+	resp := post(t, h, body)
+	if resp.Code != http.StatusBadRequest ||
+		!strings.Contains(resp.Body.String(), "unable to decrypt inform payload") {
+		t.Fatalf("rotten unknown-MAC payload: want 400, got %d %q", resp.Code, resp.Body.String())
+	}
+	pending, err := st.Pending()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending[testMAC] != "" {
+		t.Fatalf("MarkPending must not fire before a successful decrypt (FID-8): %v", pending)
+	}
+}
+
+// ---- FID-35: payload MAC must match the packet header MAC ----
+
+func TestPayloadMACMismatchRejected(t *testing.T) {
+	h, st := newServerWith(Config{})
+	registerPending(t, st)
+
+	body := infoBody("")
+	body["mac"] = "aa:bb:cc:dd:ee:00" // does NOT match the test header MAC aa…ff
+	resp := post(t, h, encryptCBC(t, mustJSON(t, body), hexKey(t, testDefaultKey), testIV))
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("mac mismatch: want 400, got %d %q", resp.Code, resp.Body.String())
+	}
+	// Nothing leaked into the record (no RMW cycle ran).
+	rec, err := st.Get(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.State != store.StatePending || rec.XAuthkey != "" || rec.Model != "" {
+		t.Fatalf("mismatched-MAC inform mutated the record: %+v", rec)
+	}
+
+	// Missing/invalid mac in the payload body rejects the same way.
+	body2 := infoBody("")
+	delete(body2, "mac")
+	resp = post(t, h, encryptCBC(t, mustJSON(t, body2), hexKey(t, testDefaultKey), testIV))
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("missing payload mac: want 400, got %d", resp.Code)
+	}
+
+	// FID-35 applies to UNREGISTERED MACs too (jar privatesuper runs the
+	// consistency check before any recording step): no pending sighting.
+	h2, st3 := newServerWith(Config{})
+	body3 := infoBody("")
+	body3["mac"] = "aa:bb:cc:dd:ee:00"
+	resp = post(t, h2, encryptCBC(t, mustJSON(t, body3), hexKey(t, testDefaultKey), testIV))
+	pending, _ := st3.Pending()
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("unknown-MAC mismatch: want 400, got %d", resp.Code)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("mismatched unknown-MAC inform must not record a pending sighting: %v", pending)
+	}
+}
+
+// ---- FID-17: unifi.siteid / unifi.reporterid rows ----
+
+func TestSystemCfgIdentityRows(t *testing.T) {
+	s := New(Config{}, store.NewMemStore(), testLogger())
+
+	sys := mustBuildSys(t, s, u7pg2Record())
+	if want := "\nunifi.siteid=default\n"; !strings.Contains(sys, want) {
+		t.Fatalf("missing unifi.siteid row in:\n%s", sys)
+	}
+
+	rec := u7pg2Record()
+	rec.Extra["anonymous_controller_id"] = "anonctrlid42"
+	rec.Extra["anonymous_site_id"] = "anonsiteid42"
+	sys = mustBuildSys(t, s, rec)
+	for _, want := range []string{
+		"unifi.anonymous_controller_id=anonctrlid42\n",
+		"unifi.anonymous_site_id=anonsiteid42\n",
+		// reporterid mirrors the controller anonymous id (same jar source).
+		"unifi.reporterid=anonctrlid42\n",
+	} {
+		if !strings.Contains(sys, want) {
+			t.Fatalf("missing %q in:\n%s", want, sys)
+		}
+	}
+
+	rec = u7pg2Record()
+	rec.Extra["anonymous_controller_id"] = "only-controller-id"
+	sys = mustBuildSys(t, s, rec)
+	if !strings.Contains(sys, "unifi.reporterid=only-controller-id\n") {
+		t.Fatalf("reporterid must ride the controller anonymous id:\n%s", sys)
+	}
+}
+
+// ---- FID-52: mgmt_url (and unifi.siteid, FID-17) carry the SITE NAME ----
+
+func TestMgmtCfgAndSiteidFollowSiteName(t *testing.T) {
+	s := New(Config{ControllerURL: "http://10.0.0.5:8080"}, store.NewMemStore(), testLogger())
+	d := u7pg2Record()
+	d.SiteID = "building-a"
+	got := s.buildMgmtCfg(d, d.XAuthkey)
+	if !strings.Contains(got, "mgmt_url=https://10.0.0.5:8443/manage/site/building-a\n") {
+		t.Fatalf("mgmt_url must use the site name:\n%s", got)
+	}
+	if !strings.Contains(got, "inform_url=http://10.0.0.5:8080/inform\n") {
+		t.Fatalf("explicit controller URL must emit inform_url:\n%s", got)
+	}
+	sys := mustBuildSys(t, s, d)
+	if !strings.Contains(sys, "unifi.siteid=building-a\n") {
+		t.Fatalf("unifi.siteid must use the site name:\n%s", sys)
 	}
 }

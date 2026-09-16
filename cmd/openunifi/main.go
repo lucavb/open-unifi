@@ -189,9 +189,8 @@ func run() error {
 	errCh := make(chan error, 3)
 
 	// informSrv owns the inform TCP listener: the metrics middleware happens
-	// HERE (main owns the HTTP plumbing), while srv.ServeInform would use
-	// the bare InformHandler. Inform state machine still lives in
-	// internal/server via srv.InformHandler().
+	// HERE (main owns the HTTP plumbing), directly onto srv.InformHandler().
+	// Inform state machine still lives in internal/server.
 	informSrv := &http.Server{Addr: *listenInform, Handler: informH}
 	go func() {
 		if err := informSrv.Serve(informLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -226,21 +225,17 @@ func run() error {
 	case <-ctx.Done(): // SIGINT/SIGTERM
 	}
 
-	// Shutdown order: admin API → inform server → (srv.Shutdown is a no-op
-	// when its ServeInform path isn't used) → discovery UDP close → poller
-	// (already stopped via ctx cancel) → exit 0.
+	// Shutdown order: admin API → inform server → discovery UDP close →
+	// poller (already stopped via ctx cancel) → exit 0.
 	actx, acancel := shutdownCtx()
 	defer acancel()
 	aerr := adminSrv.Shutdown(actx)
 	ictx, icancel := shutdownCtx()
 	defer icancel()
 	ierr := informSrv.Shutdown(ictx)
-	ectx, ecancel := shutdownCtx()
-	defer ecancel()
-	noerr := srv.Shutdown(ectx) // drains inform state if wired that way
-	closeUDP()                  // nil-safe single discovery-socket close (shared with the error path)
-	if aerr != nil || ierr != nil || noerr != nil {
-		logger.Warn("incomplete shutdown", "admin_err", aerr, "inform_err", ierr, "srv_err", noerr)
+	closeUDP() // nil-safe single discovery-socket close (shared with the error path)
+	if aerr != nil || ierr != nil {
+		logger.Warn("incomplete shutdown", "admin_err", aerr, "inform_err", ierr)
 	}
 	<-pollDone
 	logger.Info("open-unifi stopped")
