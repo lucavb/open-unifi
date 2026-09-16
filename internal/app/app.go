@@ -145,35 +145,41 @@ func (a *App) GetDevice(_ context.Context, mac string) (adminapi.DeviceView, err
 // returned and its name/site updated, so provider re-applies never surface
 // conflict errors. Invalid MACs are a hard reject (adminapi itself 400s at
 // the edge; this adapter-side check is the backstop for other callers).
+//
+// The whole cycle runs inside the store's per-MAC RMW closure: the previous
+// Get→mutate→Put sequence could interleave with a concurrent inform handler
+// and lose updates (e.g. resurrect an overwritten first-seen or clobber an
+// inform-written field between the Get and the Put).
 func (a *App) CreateDevice(_ context.Context, up adminapi.DeviceUpsert) (adminapi.DeviceView, error) {
 	mac, err := store.CanonicalMAC(up.MAC)
 	if err != nil {
 		return adminapi.DeviceView{}, fmt.Errorf("invalid mac %q: %w", up.MAC, err)
 	}
-	rec, err := a.st.Get(mac)
-	switch {
-	case errors.Is(err, store.ErrNotFound):
-		rec = store.Device{
-			MAC:       mac,
-			Name:      up.Name,
-			SiteID:    up.SiteID,
-			State:     store.StatePending,
-			FirstSeen: time.Now().Unix(),
+	var rec store.Device
+	created := false
+	if err := a.st.Update(mac, func(d *store.Device) error {
+		if d.State == 0 { // freshly seeded by the upsert: record did not exist
+			created = true
+			d.State = store.StatePending
+			d.FirstSeen = time.Now().Unix()
 		}
-	case err != nil:
-		return adminapi.DeviceView{}, fmt.Errorf("device store: %w", err)
-	default:
 		if up.Name != "" {
-			rec.Name = up.Name
+			d.Name = up.Name
 		}
 		if up.SiteID != "" {
-			rec.SiteID = up.SiteID
+			d.SiteID = up.SiteID
 		}
-	}
-	if err := a.st.Put(rec); err != nil {
+		// Detached snapshot for the returned view (view reads scalars only).
+		rec = store.Device{
+			MAC: d.MAC, Name: d.Name, Model: d.Model, Firmware: d.Firmware,
+			IP: d.IP, State: d.State, LastSeen: d.LastSeen,
+		}
+		return nil
+	}); err != nil {
 		return adminapi.DeviceView{}, fmt.Errorf("device store: %w", err)
 	}
-	a.lg.Debug("device created/updated via admin api", "mac", store.ColonMAC(mac), "state", rec.State)
+	a.lg.Debug("device created/updated via admin api", "mac", store.ColonMAC(mac),
+		"state", rec.State, "created", created)
 	return view(rec), nil
 }
 
@@ -192,6 +198,10 @@ func (a *App) DeleteDevice(_ context.Context, mac string) error {
 		}
 		return fmt.Errorf("device store: %w", err)
 	}
+	// Prune the deleted device's metric series: per-device gauges would
+	// otherwise survive the removal forever (with the MAC label, an inventory
+	// snapshot that has since been revoked).
+	metrics.ForgetDevice(store.ColonMAC(canon))
 	return nil
 }
 
@@ -215,39 +225,42 @@ func (a *App) ListPending(_ context.Context) []adminapi.PendingView {
 
 // AdoptPending promotes a discovery/inform candidate (or an existing PENDING
 // record) into the adopt whitelist so the inform handshake runs on next
-// inform. Unknown MACs are an error.
+// inform. Unknown MACs are an error. The decision AND the record write run
+// inside the store's per-MAC RMW closure so a concurrent inform for the same
+// device cannot interleave between the pending-existence check and the
+// record upsert.
 func (a *App) AdoptPending(_ context.Context, mac string) (adminapi.DeviceView, error) {
 	mac, cerr := store.CanonicalMAC(mac)
 	if cerr != nil {
 		return adminapi.DeviceView{}, fmt.Errorf("%w: %s (%v)", adminapi.ErrNotFound, mac, cerr)
 	}
 
-	pend, err := a.st.Pending()
-	if err != nil {
-		return adminapi.DeviceView{}, fmt.Errorf("device store: %w", err)
-	}
-	inPending := false
-	if _, ok := pend[mac]; ok {
-		inPending = true
-	}
-
-	rec, gerr := a.st.Get(mac)
-	switch {
-	case errors.Is(gerr, store.ErrNotFound):
-		if !inPending {
-			return adminapi.DeviceView{}, unknownDevice(mac)
+	var rec store.Device
+	err := a.st.Update(mac, func(d *store.Device) error {
+		if d.State == 0 { // freshly seeded by the upsert: no device record yet
+			pend, perr := a.st.Pending()
+			if perr != nil {
+				return fmt.Errorf("device store: %w", perr)
+			}
+			if _, ok := pend[mac]; !ok {
+				// Unknown AND never heard on discovery/inform: not-found.
+				return fmt.Errorf("%w: %s", adminapi.ErrNotFound, mac)
+			}
+			d.State = store.StatePending
+			d.FirstSeen = time.Now().Unix()
+		} else if d.State != store.StatePending {
+			return fmt.Errorf("adopt: device %s is already in state %d", store.ColonMAC(mac), d.State)
 		}
-		rec = store.Device{MAC: mac, State: store.StatePending, FirstSeen: time.Now().Unix()}
-	case gerr != nil:
-		return adminapi.DeviceView{}, fmt.Errorf("device store: %w", gerr)
-	case rec.State != store.StatePending:
-		return adminapi.DeviceView{}, fmt.Errorf("adopt: device %s is already in state %d", store.ColonMAC(mac), rec.State)
-	}
-	// Existing records in any non-PENDING state already returned above; only
-	// fresh candidates (pending map only) and PENDING records reach here.
-
-	if err := a.st.Put(rec); err != nil {
-		return adminapi.DeviceView{}, fmt.Errorf("device store: %w", err)
+		// Records in any non-PENDING state already returned above; only
+		// fresh candidates (pending map only) and PENDING records persist.
+		rec = store.Device{
+			MAC: d.MAC, Name: d.Name, Model: d.Model, Firmware: d.Firmware,
+			IP: d.IP, State: d.State, LastSeen: d.LastSeen,
+		}
+		return nil
+	})
+	if err != nil {
+		return adminapi.DeviceView{}, err
 	}
 	a.lg.Debug("device promoted to pending", "mac", store.ColonMAC(mac))
 	return view(rec), nil
@@ -284,8 +297,12 @@ func (a *App) CurrentWireless() (adminapi.WlansEnvelope, error) {
 
 // loadWirelessFile reads and decodes the wireless config document exactly
 // once (called from New): a missing file yields the empty default with a nil
-// error; an unreadable or corrupt file yields the empty default PLUS a real
-// error that App retains until process exit.
+// error; an unreadable, corrupt, or INVALID file yields the empty default
+// PLUS a real error that App retains until process exit.
+//
+// Validation runs the exact same rules as PUT /api/v1/wireless
+// (adminapi.ValidateWlan): a document that would be rejected at the API must
+// not be loaded silently and then provisioned to devices.
 func loadWirelessFile(path string) (adminapi.WlansEnvelope, error) {
 	def := adminapi.WlansEnvelope{Wlans: []adminapi.Wlan{}}
 	raw, err := os.ReadFile(path)
@@ -301,6 +318,14 @@ func loadWirelessFile(path string) (adminapi.WlansEnvelope, error) {
 	}
 	if env.Wlans == nil {
 		env.Wlans = []adminapi.Wlan{}
+	}
+	for i := range env.Wlans {
+		wl := &env.Wlans[i]
+		if msg := adminapi.ValidateWlan(wl); msg != "" {
+			return def, fmt.Errorf(
+				"wireless file %s: invalid wlan[%d] (name=%q ssid=%q): %s; remove or convert it (e.g. via PUT /api/v1/wireless) and restart",
+				path, i, wl.Name, wl.SSID, msg)
+		}
 	}
 	return env, nil
 }
@@ -349,9 +374,24 @@ func (a *App) PutWireless(_ context.Context, env adminapi.WlansEnvelope) error {
 		return fmt.Errorf("wireless rename: %w", err)
 	}
 	tmpName = ""
+	syncDir(dir)           // best effort: make the rename itself durable
 	a.cachedWireless = env // persist succeeded: swap the cache atomically
 	a.lg.Debug("wireless config replaced", "wlans", len(env.Wlans))
 	return nil
+}
+
+// syncDir fsyncs a directory so a just-renamed file entry survives a crash.
+// Best effort by design: some platforms reject directory fsync, and a
+// durability-flushing failure must not fail an otherwise-complete write.
+// (The same helper exists in the store package; the wireless writer is a
+// separate rename site, hence a tiny local copy rather than a dependency.)
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	_ = d.Sync()
+	_ = d.Close()
 }
 
 // ---- metrics poller ------------------------------------------------------
@@ -372,8 +412,14 @@ func (a *App) RunPoller(ctx context.Context, interval time.Duration) {
 }
 
 // lostAfterSeconds is how long an ADOPTED device may go without an inform
-// before the poller marks it StateLost: 180s ≈ 12 missed 15s inform heartbeats.
-const lostAfterSeconds int64 = 180
+// before the poller marks it StateLost. The reference controller sets
+// considered_lost_at = now + 3*(interval+10) seconds
+// (tmpwork/javap/com__ubnt__service__devmgr__voidsuper.txt:11398-11408,
+// `considered_lost_at` put: (lload + 10) * 3 + interval); with our fixed
+// 15s inform interval that is 3*25 = 75s. If the inform interval ever
+// becomes dynamic this constant must be derived from the emitted interval,
+// not hardcoded above it.
+const lostAfterSeconds int64 = 75
 
 // PollOnce iterates every device record and reports it to metrics.
 // Phase 1 sweeps stale heartbeats: an adopted device whose last_seen is
@@ -439,9 +485,13 @@ func (a *App) PollOnce() {
 // sweepLost transitions devices whose adopted heartbeats have gone stale
 // (LastSeen > lostAfterSeconds ago) to StateLost. Pending/Adopting records
 // and devices that have never been seen (LastSeen == 0) are never swept.
-// Each successful transition is counted as an adopt failure and the
-// prevStates entry is pinned to the new state, so PollOnce's phase-2 loop
-// observes an unchanged state and the transition is counted exactly once.
+// The sweep conditions are re-verified INSIDE the store RMW closure so a
+// concurrent inform (fresh heartbeat, state change, or record mutation
+// between the List snapshot above and this cycle) aborts the transition
+// instead of racing it. Each actual transition is counted as an adopt
+// failure exactly once and the prevStates entry is pinned to the new state,
+// so PollOnce's phase-2 loop observes an unchanged state and cannot double
+// count.
 func (a *App) sweepLost() {
 	list, err := a.st.List()
 	if err != nil {
@@ -454,13 +504,26 @@ func (a *App) sweepLost() {
 			continue
 		}
 		if now-d.LastSeen <= lostAfterSeconds {
-			continue // fresh heartbeat
+			continue // fresh heartbeat (as of the snapshot)
 		}
 		err := a.st.Update(d.MAC, func(u *store.Device) error {
+			// TOCTOU re-check: the store List above is a snapshot; a
+			// concurrent inform may have refreshed the heartbeat or moved
+			// the device out of StateAdopted since. Only a record that is
+			// STILL adopted and STILL stale at cycle time transitions.
+			if u.State != store.StateAdopted || u.LastSeen <= 0 ||
+				now-u.LastSeen <= lostAfterSeconds {
+				return errSweepAborted
+			}
 			u.State = store.StateLost
 			return nil
 		})
-		if err != nil {
+		switch {
+		case err == nil:
+			// exactly one persisted transition happened
+		case errors.Is(err, errSweepAborted):
+			continue // concurrent mutation won; no transition, no count
+		default:
 			a.lg.Warn("lost sweep: state transition failed", "mac", store.ColonMAC(d.MAC), "err", err)
 			continue
 		}
@@ -472,6 +535,10 @@ func (a *App) sweepLost() {
 			"last_seen_age_s", now-d.LastSeen)
 	}
 }
+
+// errSweepAborted aborts a sweep RMW cycle (no persist, no metric) when the
+// pre-conditions re-verified inside the closure no longer hold.
+var errSweepAborted = errors.New("lost sweep: device changed under us")
 
 // numFloat extracts a numeric field as float64; missing/non-numeric values
 // are reported as NaN so the metrics helpers skip (never fabricate) them.

@@ -9,12 +9,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/lucabecker/open-unifi/internal/adminapi"
 	"github.com/lucabecker/open-unifi/internal/store"
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
 
 func testApp(t *testing.T) (*App, store.DeviceStore, string) {
@@ -390,6 +392,42 @@ func TestNewWithMissingWirelessFileIsEmptyDefault(t *testing.T) {
 	}
 }
 
+// The load path runs the SAME validation as PUT /api/v1/wireless
+// (adminapi.ValidateWlan): a document that only DECODES but violates the
+// rules must fail startup, and the error must name the offending wlan
+// (FID-39), not wrap silently like the original json.Unmarshal-only path.
+func TestNewRejectsInvalidWirelessDocument(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, wantText string
+	}{
+		{"wpa-eap without RADIUS support", `{"wlans":[{"name":"corp","ssid":"corp","security":"wpa-eap","vlan":1}]}`, "wpa-eap requires RADIUS profiles"},
+		{"vlan out of range", `{"wlans":[{"ssid":"x","security":"wpa-p","passphrase":"longenough","vlan":5000}]}`, "vlan must be 1..4094"},
+		{"bad security enum", `{"wlans":[{"ssid":"x","security":"wpa2","passphrase":"longenough","vlan":1}]}`, "security must be one of open, wpa-p"},
+		{"control char ssid", `{"wlans":[{"ssid":"a\nb","security":"open","vlan":1}]}`, "control characters"},
+		{"name too long", `{"wlans":[{"name":"` + strings.Repeat("n", 65) + `","ssid":"x","security":"open","vlan":1}]}`, "name must be at most 64 characters"},
+	} {
+		dir := t.TempDir()
+		wpath := filepath.Join(dir, "wireless.json")
+		if err := os.WriteFile(wpath, []byte(tc.body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		a := New(store.NewMemStore(), wpath, quietLogger())
+		env, err := a.CurrentWireless()
+		if err == nil {
+			t.Fatalf("%s: invalid document must fail the load error", tc.name)
+		}
+		if !strings.Contains(err.Error(), tc.wantText) {
+			t.Fatalf("%s: error %q must name the rule violation", tc.name, err.Error())
+		}
+		if !strings.Contains(err.Error(), "wlan[0]") {
+			t.Fatalf("%s: error %q must name the offending wlan index", tc.name, err.Error())
+		}
+		if len(env.Wlans) != 0 {
+			t.Fatalf("%s: invalid load must still serve the empty default, got %+v", tc.name, env)
+		}
+	}
+}
+
 // TestWirelessServedFromCacheWithoutFileIO proves GetWireless/CurrentWireless
 // hit the in-memory cache, not the disk: after PutWireless, the backing file
 // is removed and then replaced with garbage — reads keep serving the NEW
@@ -530,6 +568,76 @@ func TestPrevStatesPrunedForDeletedDevices(t *testing.T) {
 	if left != 0 {
 		t.Fatalf("prevStates entry for deleted device must be pruned, %d left", left)
 	}
+}
+
+// Deleting a device must also remove its metric series (FID-38): per-device
+// gauges keyed by MAC would otherwise survive inventory churn forever, with
+// mac labels enumerating devices that are no longer ours to track.
+func TestDeleteDevicePrunesMetricSeries(t *testing.T) {
+	a, st := pollerSetup(t)
+	ctx := context.Background()
+
+	if _, err := a.CreateDevice(ctx, adminapi.DeviceUpsert{MAC: "F0:9F:C2:84:8F:2A", Name: "lobby"}); err != nil {
+		t.Fatal(err)
+	}
+	d, err := st.Get("f09fc2848f2a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.State = store.StateAdopted
+	d.Model = "U7PG2"
+	d.LastSeen = time.Now().Unix()
+	if err := st.Put(d); err != nil {
+		t.Fatal(err)
+	}
+	a.PollOnce() // seeds the per-device gauges
+
+	if got := seriesForMAC(gatherDefault(t), "f0:9f:c2:84:8f:2a"); got < 6 {
+		t.Fatalf("expected seeded series (state+last_seen+uptime+tx+rx), got %d", got)
+	}
+
+	if err := a.DeleteDevice(ctx, "f0:9f:c2:84:8f:2a"); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := seriesForMAC(gatherDefault(t), "f0:9f:c2:84:8f:2a"); got != 0 {
+		t.Fatalf("deleted device still has %d metric series", got)
+	}
+}
+
+// gatherDefault and seriesForMAC count exposition series for a MAC label,
+// since the process-global registry accumulates series from earlier tests.
+
+// gatherDefault collects one exposition snapshot from the default registry,
+// keyed "<family>{label=value,...}".
+func gatherDefault(t *testing.T) map[string]*dto.Metric {
+	t.Helper()
+	fams, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]*dto.Metric{}
+	for _, f := range fams {
+		for _, m := range f.Metric {
+			labels := ""
+			for _, l := range m.GetLabel() {
+				labels += l.GetName() + "=" + l.GetValue() + ","
+			}
+			out[f.GetName()+"{"+labels+"}"] = m
+		}
+	}
+	return out
+}
+
+// seriesForMAC counts gathered series whose mac label matches.
+func seriesForMAC(g map[string]*dto.Metric, mac string) int {
+	n := 0
+	for k := range g {
+		if strings.Contains(k, "mac="+mac+",") {
+			n++
+		}
+	}
+	return n
 }
 
 // ---- MAC consolidation (store.CanonicalMAC is the single normalizer) -----

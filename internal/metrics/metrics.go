@@ -20,16 +20,20 @@ var informsTotal = prometheus.NewCounter(prometheus.CounterOpts{
 	Help: "Total number of inform packets received.",
 })
 
-// adoptTotal counts adoption attempts initiated via the admin API.
+// adoptTotal counts ADOPTED-state transitions observed by the app poller
+// (device first observed entering state 3). It is NOT an admin-API request
+// counter — endpoints never touch this metric.
 var adoptTotal = prometheus.NewCounter(prometheus.CounterOpts{
 	Name: "openunifi_adopt_total",
-	Help: "Total number of adoption attempts initiated.",
+	Help: "Adopted-state transitions observed by the app poller (not API requests).",
 })
 
-// adoptFailTotal counts adoption attempts that ended in failure.
+// adoptFailTotal counts transitions observed by the app poller that
+// indicate a failed adoption effort: leaving the adopted state (device lost
+// or deconfigured). It is NOT an admin-API request counter.
 var adoptFailTotal = prometheus.NewCounter(prometheus.CounterOpts{
 	Name: "openunifi_adopt_fail_total",
-	Help: "Total number of adoption attempts that failed.",
+	Help: "Adoption-failure transitions observed by the app poller (adopted → lost/other), not API requests.",
 })
 
 // apiRequestsTotal counts admin API requests by status code and route pattern.
@@ -49,9 +53,10 @@ var apiRequestsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 // Cardinality is therefore bounded by the set of distinct (mac, model) pairs
 // the trust domain ever reports; on a trusted LAN that is "one model per
 // device", small, and a churned repair only adds one extra series.
-// Documented residual risk: a malicious device on the network could vary its
-// reported model per inform to inflate series count until store removal
-// prunes stale label pairs.
+// Residual risk mitigation: series for a device are pruned when the device
+// record is deleted via the admin API (ForgetDevice, called from
+// app.DeleteDevice) — that is the "until store removal" bound below, which
+// USED to be claimed but not implemented; it is now real.
 var deviceState = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "openunifi_device_state",
 	Help: "Device lifecycle state as an integer (-1 unknown, 1 pending, 2 adopting, 3 adopted, 4 lost).",
@@ -121,10 +126,17 @@ func init() {
 // IncInform increments the inform counter by one.
 func IncInform() { informsTotal.Inc() }
 
-// IncAdopt increments the successful-adoption counter by one.
+// IncAdopt increments the adopted-transition counter by one. DECIDED
+// semantics: this counts state transitions INTO adopted observed by the app
+// poller (app.PollOnce phase 2 / sweep), NOT admin-API adoption requests —
+// endpoints must not call it.
 func IncAdopt() { adoptTotal.Inc() }
 
-// IncAdoptFail increments the failed-adoption counter by one.
+// IncAdoptFail increments the adoption-failure-transition counter by one.
+// DECIDED semantics: this counts state transitions observed by the app
+// poller that represent a failed adoption effort (leaving the adopted
+// state on lost-sweep, or adopted → other in the poll loop), NOT admin-API
+// adoption requests — endpoints must not call it.
 func IncAdoptFail() { adoptFailTotal.Inc() }
 
 // ObserveAPIRequest records one admin API response. code is the HTTP status;
@@ -188,6 +200,20 @@ func UpdateFromDevice(mac, model string, state, lastSeenUnix int64, uptime, sta,
 	SetUptime(mac, uptime)
 	SetStaCount(mac, sta)
 	SetUserBytes(mac, txBytes, rxBytes)
+}
+
+// ForgetDevice removes every per-device metric series for mac (the colon-hex
+// label spelling used by UpdateFromDevice). Call it when the device record
+// is deleted from the store, so per-MAC label cardinality cannot outgrow the
+// tracked inventory — the deviceState (mac, model) pairs included. Idempotent:
+// removing labels that were never set is a no-op.
+func ForgetDevice(mac string) {
+	deviceState.DeletePartialMatch(prometheus.Labels{"mac": mac})
+	lastInformTimestamp.DeleteLabelValues(mac)
+	uptimeSeconds.DeleteLabelValues(mac)
+	staCount.DeleteLabelValues(mac)
+	userTxBytes.DeleteLabelValues(mac)
+	userRxBytes.DeleteLabelValues(mac)
 }
 
 // Handler returns the Prometheus HTTP handler (metrics endpoint).

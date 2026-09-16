@@ -81,7 +81,12 @@ func (f *fakeBackend) AdoptPending(_ context.Context, mac string) (DeviceView, e
 	f.adopted = append(f.adopted, mac)
 	for _, p := range f.pending {
 		if strings.EqualFold(p.MAC, mac) {
-			dv := DeviceView{MAC: mac, State: 2, Actions: []string{"delete"}}
+			// Wire contract (see Backend.AdoptPending): a successful adopt
+			// response carries State 1 (pending) — the unsigned-promotion
+			// state — NOT 2 (adopting); adopting is entered later by the
+			// inform handshake. State: 2 here once contradicted the real
+			// adapter (internal/app returns 1).
+			dv := DeviceView{MAC: mac, State: 1, Actions: []string{"delete"}}
 			f.byMAC[mac] = dv
 			return dv, nil
 		}
@@ -207,21 +212,30 @@ func TestAuthAcceptedAndHealthzOpen(t *testing.T) {
 }
 
 func TestWrongTokenRejected(t *testing.T) {
-	// Constant-time compare must still reject a same-length wrong token.
-	run(t, testCase{
-		name: "wrong token", method: "GET", path: "/api/v1/devices",
-		token: "s3cret", want: http.StatusUnauthorized,
-		checks: func(t *testing.T, _ *fakeBackend, rec *httptest.ResponseRecorder) {
-			req := httptest.NewRequest("GET", "/api/v1/devices", nil)
-			req.Header.Set("Authorization", "Bearer s3cerx")
-			h := New(Config{AdminToken: "s3cret"}, newFakeBackend())
-			rec2 := httptest.NewRecorder()
-			h.ServeHTTP(rec2, req)
-			if rec2.Code != http.StatusUnauthorized {
-				t.Fatalf("same-length wrong token accepted: %d", rec2.Code)
-			}
-		},
-	})
+	// A SAME-LENGTH wrong token must still be rejected: this is the case
+	// that proves the constant-time compare actually compares content, not
+	// just length (length-mismatch cases 401 trivially).
+	req := httptest.NewRequest("GET", "/api/v1/devices", nil)
+	req.Header.Set("Authorization", "Bearer s3cerx") // same length as "s3cret"
+	h := New(Config{AdminToken: "s3cret"}, newFakeBackend())
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("same-length wrong token accepted: %d (%s)", rec.Code, rec.Body.String())
+	}
+	if m := decodeJSON(t, rec); m["error"] != "unauthorized" {
+		t.Fatalf("error shape: %v", m["error"])
+	}
+
+	// The correct token still opens the same endpoint with the same handler.
+	req = httptest.NewRequest("GET", "/api/v1/devices", nil)
+	req.Header.Set("Authorization", "Bearer s3cret")
+	h = New(Config{AdminToken: "s3cret"}, newFakeBackend())
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("correct same-length token rejected: %d", rec.Code)
+	}
 }
 
 // ---- full authenticated flow ----------------------------------------------
@@ -291,8 +305,8 @@ func TestAuthorizedFullFlow(t *testing.T) {
 		t.Fatalf("backend adopt calls: %v", be.adopted)
 	}
 	var dv2 DeviceView
-	if err := json.Unmarshal(rec.Body.Bytes(), &dv2); err != nil || dv2.State != 2 {
-		t.Fatalf("adopt body: %+v err=%v", dv2, err)
+	if err := json.Unmarshal(rec.Body.Bytes(), &dv2); err != nil || dv2.State != 1 {
+		t.Fatalf("adopt body (contract: State 1 = pending): %+v err=%v", dv2, err)
 	}
 }
 
@@ -466,6 +480,64 @@ func TestWirelessValidation(t *testing.T) {
 	}
 }
 
+func TestWPAEAPRejected(t *testing.T) {
+	// Bytecode rationale in validateWlan: the reference controller only
+	// emits functional EAP vaps with a valid radiusprofile; without RADIUS
+	// support we must never accept wpa-eap.
+	h := New(Config{}, newFakeBackend())
+	rec := putWireless(t, h, `{"wlans":[{"ssid":"corp","security":"wpa-eap","vlan":1}]}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("wpa-eap: %d, want 400", rec.Code)
+	}
+	if m := decodeJSON(t, rec); !strings.Contains(m["error"].(string), "wpa-eap requires RADIUS profiles, which open-unifi does not support") {
+		t.Fatalf("wpa-eap error text: %v", m["error"])
+	}
+}
+
+func TestWirelessNameCapAndBodyStrictness(t *testing.T) {
+	h := New(Config{}, newFakeBackend())
+
+	// 65-byte name -> 400 (same cap style as the ID).
+	rec := putWireless(t, h, `{"wlans":[{"name":"`+strings.Repeat("a", 65)+`","ssid":"x","security":"open","vlan":1}]}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("65-byte name: %d, want 400", rec.Code)
+	}
+	// exactly 64 bytes is fine
+	rec = putWireless(t, h, `{"wlans":[{"name":"`+strings.Repeat("a", 64)+`","ssid":"x","security":"open","vlan":1}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("64-byte name: %d %q, want 200", rec.Code, rec.Body.String())
+	}
+
+	// Unknown fields must be rejected (DisallowUnknownFields).
+	rec = putWireless(t, h, `{"wlans":[{"ssid":"x","security":"open","vlan":1,"typo_field":true}]}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("unknown field: %d %q, want 400", rec.Code, rec.Body.String())
+	}
+	rec = putWireless(t, h, `{"wlans":[],"extra_field":1}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("unknown envelope field: %d, want 400", rec.Code)
+	}
+
+	// Trailing data after the JSON value must be rejected.
+	rec = putWireless(t, h, `{"wlans":[]} trail`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("trailing data: %d, want 400", rec.Code)
+	}
+	// ...including trailing JSON values (smuggling attempts).
+	rec = putWireless(t, h, `{"wlans":[]} {"wlans":[]}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("trailing value: %d, want 400", rec.Code)
+	}
+
+	// The same strictness applies to the devices endpoint body.
+	req := httptest.NewRequest("POST", "/api/v1/devices", strings.NewReader(`{"mac":"aabbccddeeff","bogus":1}`))
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("devices unknown field: %d, want 400", rec.Code)
+	}
+}
+
 func TestWirelessGetPutRoundTrip(t *testing.T) {
 	be := newFakeBackend()
 	h := New(Config{}, be)
@@ -554,7 +626,7 @@ func TestMetricsInstrumented(t *testing.T) {
 	}
 	for _, series := range []string{`{code="200",path="GET /api/v1/devices"}`} {
 		if !strings.Contains(rec2.Body.String(), series) {
-			t.Fatalf("metrics missing api request series %q; instrumented suffix:\n%s", series, rec2.Body.String()[:0]+bodyExcerpt(rec2.Body.String()))
+			t.Fatalf("metrics missing api request series %q; instrumented suffix:\n%s", series, bodyExcerpt(rec2.Body.String()))
 		}
 	}
 }
@@ -703,14 +775,12 @@ func Test404PathKeepsErrorTextAndDefaultLoggerWorks(t *testing.T) {
 	}
 }
 
-// ---- adopt 404-skip (item 3) ------------------------------------------------
+// ---- adopt counters are poller-only (item 3) --------------------------------
 
-// adoptFailValue reads openunifi_adopt_fail_total through the handler's own
-// /metrics endpoint (in-process exposition parse; no sockets). The counter
-// delta is then attributable to ONLY the requests issued between two reads,
-// because tests in this package run sequentially (prometheus counters are
-// process-global).
-func adoptFailValue(t *testing.T, h http.Handler) float64 {
+// adoptCounterValues reads openunifi_adopt_total / _adopt_fail_total through
+// the handler's own /metrics endpoint (in-process exposition parse; no
+// sockets).
+func adoptCounterValues(t *testing.T, h http.Handler) (adopt, fail float64) {
 	t.Helper()
 	req := httptest.NewRequest("GET", "/metrics", nil)
 	rec := httptest.NewRecorder()
@@ -718,55 +788,61 @@ func adoptFailValue(t *testing.T, h http.Handler) float64 {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("metrics fetch: %d", rec.Code)
 	}
-	re := regexp.MustCompile(`(?m)^openunifi_adopt_fail_total\s+([0-9.eE+-]+)$`)
-	m := re.FindStringSubmatch(rec.Body.String())
-	if m == nil {
-		t.Fatalf("no openunifi_adopt_fail_total series in exposition:\n%s", rec.Body.String())
+	parse := func(name string) float64 {
+		re := regexp.MustCompile(`(?m)^` + name + `\s+([0-9.eE+-]+)$`)
+		m := re.FindStringSubmatch(rec.Body.String())
+		if m == nil {
+			t.Fatalf("no %s series in exposition:\n%s", name, rec.Body.String())
+		}
+		v, err := strconv.ParseFloat(m[1], 64)
+		if err != nil {
+			t.Fatalf("parse %s value %q: %v", name, m[1], err)
+		}
+		return v
 	}
-	v, err := strconv.ParseFloat(m[1], 64)
-	if err != nil {
-		t.Fatalf("parse adopt_fail value %q: %v", m[1], err)
-	}
-	return v
+	return parse("openunifi_adopt_total"), parse("openunifi_adopt_fail_total")
 }
 
-func TestAdoptFailCounterSkips404ButCountsRealFailures(t *testing.T) {
-	// NOTE on semantics (also in adminapi.go): openunifi_adopt_fail_total and
-	// openunifi_adopt_total count adoption REQUESTS at this endpoint; the
-	// app poller's counters count real state transitions asserted from
-	// informs. Different semantics by design. A 404 "device not found" is
-	// caller error (stale pending list / bad MAC), not an adoption failure.
+// TestAdoptCountersArePollerOnly pins the DECIDED metric semantics: the
+// admin API NEVER bumps openunifi_adopt_total / _adopt_fail_total — those
+// count state transitions observed by the app poller (internal/app
+// PollOnce / sweepLost). Endpoint adopt success, genuine endpoint failure
+// and 404 caller errors must all leave the counters untouched; otherwise
+// real transitions would be double-counted (the poller observes the very
+// transitions an adopt request kicks off) and API noise would look like
+// adoption outcomes.
+func TestAdoptCountersArePollerOnly(t *testing.T) {
 	be := &failingBackend{
 		fakeBackend: newFakeBackend(),
 		adoptErr:    errors.New("fake adopt blowup: radius socket refused"),
 	}
 	h := New(Config{}, be)
+	before, beforeFail := adoptCounterValues(t, h)
 
-	before := adoptFailValue(t, h)
-
-	// Unknown MAC -> 404 -> must NOT move the counter.
+	// Unknown MAC -> 404 (caller error) → NO movement.
 	req := httptest.NewRequest("POST", "/api/v1/pending/aa:bb:cc:dd:ee:66/adopt", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("adopt unknown: %d, want 404", rec.Code)
 	}
-	if after := adoptFailValue(t, h); after != before {
-		t.Fatalf("404 adopt bumped adopt_fail_total: %v -> %v (must be unchanged)", before, after)
+	if a, f := adoptCounterValues(t, h); a != before || f != beforeFail {
+		t.Fatalf("404 adopt moved counters: adopt %v->%v fail %v->%v", before, a, beforeFail, f)
 	}
 
-	// Genuine backend failure -> 500 -> must bump the counter by exactly 1.
+	// Genuine backend failure -> 500 → NO movement.
 	req = httptest.NewRequest("POST", "/api/v1/pending/a0:40:a0:aa:bb:cc/adopt", nil)
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("adopt failure: %d, want 500", rec.Code)
 	}
-	if after := adoptFailValue(t, h); after != before+1 {
-		t.Fatalf("real adopt failure counter: got delta %v, want 1", after-before)
+	if a, f := adoptCounterValues(t, h); a != before || f != beforeFail {
+		t.Fatalf("failed adopt endpoint moved counters: adopt %v->%v fail %v->%v", before, a, beforeFail, f)
 	}
 
-	// Successful adoption requires no failure counter change and reaches the backend.
+	// Successful adoption -> 200 → NO movement (the backend was reached;
+	// its later state transition will be counted by the app poller).
 	be2 := newFakeBackend()
 	h2 := New(Config{}, be2)
 	req = httptest.NewRequest("POST", "/api/v1/pending/a0:40:a0:aa:bb:cc/adopt", nil)
@@ -777,6 +853,9 @@ func TestAdoptFailCounterSkips404ButCountsRealFailures(t *testing.T) {
 	}
 	if len(be2.adopted) != 1 {
 		t.Fatalf("healthy adopt did not reach backend: %v", be2.adopted)
+	}
+	if a, f := adoptCounterValues(t, h2); a != before || f != beforeFail {
+		t.Fatalf("successful adopt endpoint moved counters: adopt %v->%v fail %v->%v", before, a, beforeFail, f)
 	}
 }
 

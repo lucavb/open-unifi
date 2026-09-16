@@ -87,6 +87,11 @@ type Backend interface {
 	// ListPending returns discovery-beacon candidates.
 	ListPending(ctx context.Context) []PendingView
 	// AdoptPending attempts adoption of a pending candidate.
+	//
+	// Wire contract: on success the response DeviceView carries
+	// State 1 (pending) — adoption here only puts the MAC on the inform
+	// adopt whitelist; the native PENDING state is what the device record
+	// holds until the inform handshake completes.
 	AdoptPending(ctx context.Context, mac string) (DeviceView, error)
 	// GetWireless returns the whole wireless config document.
 	GetWireless(ctx context.Context) WlansEnvelope
@@ -192,21 +197,20 @@ func New(cfg Config, be Backend) http.Handler {
 		}
 		dv, err := be.AdoptPending(r.Context(), mac)
 		if err != nil {
-			// Endpoint-counter semantics: openunifi_adopt_fail_total counts
-			// FAILED ADOPTION REQUESTS hitting this endpoint, while the app
-			// poller's inform-driven counters count real state transitions.
-			// Different things by design. A "device not found" 404 is a
-			// caller/user error (bad MAC, stale pending list), not an
-			// adoption-protocol failure — it must not inflate the failure
-			// metric, otherwise a spammer probing unknown MACs looks like a
-			// fleet of dying radios.
-			if !errors.Is(err, ErrNotFound) {
-				metrics.IncAdoptFail()
-			}
+			// Metric semantics (DECIDED): openunifi_adopt_total and
+			// openunifi_adopt_fail_total count state transitions observed
+			// by the app poller ONLY (see internal/metrics and
+			// internal/app PollOnce). This endpoint deliberately bumps
+			// NEITHER: an endpoint-driven count would double-count real
+			// transitions (the poller sees the same adopting→...→adopted
+			// state changes moments later) and would let API error churn
+			// masquerade as adoption outcomes. A "device not found" 404 is
+			// a caller error (bad MAC, stale pending list), never an
+			// adoption failure; a genuine backend 500 is logged and
+			// returned, not counter-bumped.
 			handleBackendErr(w, lg, err)
 			return
 		}
-		metrics.IncAdopt()
 		writeJSON(w, http.StatusOK, dv)
 	}))
 	mux.HandleFunc("GET /api/v1/wireless", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
@@ -219,7 +223,7 @@ func New(cfg Config, be Backend) http.Handler {
 			return
 		}
 		for i := range env.Wlans {
-			if msg := validateWlan(&env.Wlans[i]); msg != "" {
+			if msg := ValidateWlan(&env.Wlans[i]); msg != "" {
 				writeErr(w, http.StatusBadRequest, "wlan["+strconv.Itoa(i)+"]: "+msg)
 				return
 			}

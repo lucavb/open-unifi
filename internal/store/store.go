@@ -78,6 +78,11 @@ type DeviceStore interface {
 	// Unknown MACs receive &Device{MAC: canonical mac} (upsert semantics).
 	// fn's error aborts the cycle without persisting.
 	Update(mac string, fn func(*Device) error) error
+	// UpdateExisting is Update WITHOUT the upsert: an unknown MAC returns
+	// ErrNotFound and fn runs zero times (the inform handler can therefore
+	// never resurrect a deliberately deleted device). fn's error aborts the
+	// cycle without persisting.
+	UpdateExisting(mac string, fn func(*Device) error) error
 }
 
 // ErrNotFound is returned by Get/Delete for unknown MACs.
@@ -154,21 +159,39 @@ func ColonMAC(canonical string) string {
 // references into m.devices' maps/slices.
 //
 // NOTE: jsonStore must override every MUTATING method of this core
-// (Put/Delete/MarkPending/Update) so each mutation also calls save();
-// the read methods are shared as-is.
+// (Put/Delete/MarkPending/Update/UpdateExisting) so each mutation also
+// calls save(); the read methods are shared as-is.
 type db struct {
 	mu      sync.RWMutex
 	devices map[string]Device
-	pending map[string]string
+	pending map[string]pendingEntry
 
 	// upMu serializes read-modify-write cycles per canonical MAC (small
 	// fixed-size map entry per known device; harmless at this scale).
 	upMu    sync.Mutex
 	upLocks map[string]*sync.Mutex
+
+	// now is the time source for pending TTL eviction; a test hook (nil ⇒
+	// time.Now).
+	now func() time.Time
+}
+
+// pendingEntry is one discovery-beacon sighting. seenAt is first-seen (in
+// memory only — see save); it drives TTL eviction.
+type pendingEntry struct {
+	note   string
+	seenAt int64 // unix seconds
 }
 
 func newDB() *db {
-	return &db{devices: map[string]Device{}, pending: map[string]string{}, upLocks: map[string]*sync.Mutex{}}
+	return &db{devices: map[string]Device{}, pending: map[string]pendingEntry{}, upLocks: map[string]*sync.Mutex{}}
+}
+
+func (m *db) clockNow() time.Time {
+	if m.now != nil {
+		return m.now()
+	}
+	return time.Now()
 }
 
 // macLock returns the per-MAC serialization mutex (creating it lazily).
@@ -259,6 +282,17 @@ func (m *db) Put(d Device) error {
 // Update serializes Get→mutate→Put under a per-MAC mutex. Unknown MACs
 // start from the zero Device carrying the canonical MAC (upsert).
 func (m *db) Update(mac string, fn func(*Device) error) error {
+	return m.update(mac, fn, true)
+}
+
+// UpdateExisting is Update without the upsert seed: unknown MACs return
+// ErrNotFound and fn never runs.
+func (m *db) UpdateExisting(mac string, fn func(*Device) error) error {
+	return m.update(mac, fn, false)
+}
+
+// update implements both flavors under one per-MAC cycle.
+func (m *db) update(mac string, fn func(*Device) error, upsert bool) error {
 	mac = canonicalMAC(mac)
 	if mac == "" {
 		return errors.New("store: empty MAC")
@@ -270,6 +304,9 @@ func (m *db) Update(mac string, fn func(*Device) error) error {
 	d, err := m.Get(mac)
 	switch {
 	case errors.Is(err, ErrNotFound):
+		if !upsert {
+			return fmt.Errorf("%w: %s", ErrNotFound, mac)
+		}
 		d = Device{MAC: mac}
 	case err != nil:
 		return err
@@ -284,18 +321,54 @@ func (m *db) Update(mac string, fn func(*Device) error) error {
 // the cap bounds memory on hostile/misconfigured networks).
 const maxPending = 512
 
+// pendingTTL bounds how long an unpurged sighting may linger: beacons for
+// MACs that never appear on the inform channel are evicted (lazily) after
+// 24h. This keeps the map bounded for long-lived sightings even when the
+// cap is never hit and the same beacons keep refreshing.
+const pendingTTL = 24 * time.Hour
+
 // errPendingFull is returned by MarkPending when the cap is hit for a
 // NEW MAC (existing sightings still pass).
 var errPendingFull = errors.New("store: pending map full")
 
+// evictExpired drops TTL-expired sightings. Caller holds m.mu (write).
+func (m *db) evictExpiredLocked() {
+	if len(m.pending) == 0 {
+		return
+	}
+	cutoff := m.clockNow().Add(-pendingTTL).Unix()
+	for mac, e := range m.pending {
+		if e.seenAt < cutoff {
+			delete(m.pending, mac)
+		}
+	}
+}
+
 func (m *db) Delete(mac string) error {
 	mac = canonicalMAC(mac)
+	// Serialize under the same per-MAC lock as Update/UpdateExisting: a
+	// concurrent RMW cycle must not resurrect a device that Delete is
+	// removing (previously Delete only took m.mu, so a mid-cycle Update
+	// could put the record right back after the delete observed emptiness).
+	lk := m.macLock(mac)
+	lk.Lock()
+	defer lk.Unlock()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.devices[mac]; !ok {
 		return ErrNotFound
 	}
 	delete(m.devices, mac)
+
+	// Prune the per-MAC lock entry so churn cannot grow upLocks without
+	// bound. Safe under upMu while we hold the lock ourselves: goroutines
+	// that already resolved the pointer race with the prune only in the
+	// pre-existing "Update upserts onto a just-deleted MAC" way, which this
+	// locking deliberately permits (Delete is not a tombstone).
+	m.upMu.Lock()
+	delete(m.upLocks, mac)
+	m.upMu.Unlock()
 	return nil
 }
 
@@ -311,27 +384,45 @@ func (m *db) List() ([]Device, error) {
 }
 
 func (m *db) Pending() (map[string]string, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.evictExpiredLocked()
 	out := make(map[string]string, len(m.pending))
-	for k, v := range m.pending {
-		out[k] = v
+	for k, e := range m.pending {
+		out[k] = e.note
 	}
 	return out, nil
 }
 
-func (m *db) MarkPending(mac, note string) error {
+// markPending is the core mutation behind MarkPending. It reports whether
+// the persisted state changed, so jsonStore can skip its full save+fsync
+// when repeated sightings carry the same note.
+func (m *db) markPending(mac, note string) (bool, error) {
 	mac = canonicalMAC(mac)
 	if mac == "" {
-		return errors.New("store: empty MAC")
+		return false, errors.New("store: empty MAC")
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.pending[mac]; !ok && len(m.pending) >= maxPending {
-		return errPendingFull
+	m.evictExpiredLocked()
+	if existing, ok := m.pending[mac]; ok {
+		if existing.note == note {
+			return false, nil // repeat sighting: nothing changed, nothing to persist
+		}
+		m.pending[mac] = pendingEntry{note: note, seenAt: existing.seenAt}
+		return true, nil
 	}
-	m.pending[mac] = note
-	return nil
+	if len(m.pending) >= maxPending {
+		return false, errPendingFull
+	}
+	m.pending[mac] = pendingEntry{note: note, seenAt: m.clockNow().Unix()}
+	return true, nil
+}
+
+// MarkPending records a discovery beacon sighting for adoption UI.
+func (m *db) MarkPending(mac, note string) error {
+	_, err := m.markPending(mac, note)
+	return err
 }
 
 // memStore is the plain in-memory implementation (tests, ephemeral use).
@@ -378,8 +469,13 @@ func NewJSONStore(path string) (DeviceStore, error) {
 			}
 		}
 		if pf.Pending != nil {
+			// Reloaded sightings restart their TTL clock at load time: the
+			// persisted format carries no timestamp (backward-compatible
+			// map[string]string), and this keeps restarts from re-exposing
+			// long-dead beacons for another full TTL.
+			seenAt := time.Now().Unix()
 			for k, v := range pf.Pending {
-				core.pending[canonicalMAC(k)] = v
+				core.pending[canonicalMAC(k)] = pendingEntry{note: v, seenAt: seenAt}
 			}
 		}
 	case errors.Is(err, os.ErrNotExist):
@@ -404,9 +500,17 @@ func (s *jsonStore) Delete(mac string) error {
 	return s.save()
 }
 
+// MarkPending persists the mutation ONLY when the core reports a change:
+// discovery beacons re-announce every few seconds with an identical body,
+// and each one previously cost a full snapshot marshal + fsync + rename on
+// disk. Unchanged repeats now stop at the in-memory refresh.
 func (s *jsonStore) MarkPending(mac, note string) error {
-	if err := s.db.MarkPending(mac, note); err != nil {
+	changed, err := s.markPending(mac, note)
+	if err != nil {
 		return err
+	}
+	if !changed {
+		return nil
 	}
 	return s.save()
 }
@@ -414,6 +518,16 @@ func (s *jsonStore) MarkPending(mac, note string) error {
 // Update runs the per-MAC cycle on the core, then persists on success.
 func (s *jsonStore) Update(mac string, fn func(*Device) error) error {
 	if err := s.db.Update(mac, fn); err != nil {
+		return err
+	}
+	return s.save()
+}
+
+// UpdateExisting runs the per-MAC cycle on the core without the upsert
+// seed, then persists on success. An unknown MAC is an error — nothing to
+// persist, no save.
+func (s *jsonStore) UpdateExisting(mac string, fn func(*Device) error) error {
+	if err := s.db.UpdateExisting(mac, fn); err != nil {
 		return err
 	}
 	return s.save()
@@ -427,18 +541,21 @@ func (s *jsonStore) save() error {
 	defer s.saveMu.Unlock()
 
 	s.mu.RLock()
-	now := time.Now().Unix()
+	savedAt := s.db.clockNow().Unix()
 	pf := PersistedFile{
 		Version: 1,
-		SavedAt: now,
+		SavedAt: savedAt,
 		Devices: make(map[string]Device, len(s.devices)),
 		Pending: make(map[string]string, len(s.pending)),
 	}
 	for k, d := range s.devices {
 		pf.Devices[k] = d
 	}
-	for k, v := range s.pending {
-		pf.Pending[k] = v
+	for k, e := range s.pending {
+		// Persisted pending format stays map[string]string (v1): TTL
+		// first-seen stamps are intentionally in-memory only; a reload
+		// restarts the eviction clock, which is bounded by pendingTTL.
+		pf.Pending[k] = e.note
 	}
 	blob, err := json.MarshalIndent(pf, "", "  ")
 	s.mu.RUnlock()
@@ -477,5 +594,19 @@ func (s *jsonStore) save() error {
 		return fmt.Errorf("store: rename: %w", err)
 	}
 	tmpName = "" // renamed successfully; nothing to clean up
+	syncDir(dir) // best effort: make the rename itself durable
 	return nil
+}
+
+// syncDir fsyncs a directory so a just-renamed file entry survives a crash.
+// Best effort by design: some platforms reject directory fsync (macOS can
+// return errors on dir fds), and a durability-flushing failure must not
+// fail an otherwise-complete save.
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	_ = d.Sync()
+	_ = d.Close()
 }
