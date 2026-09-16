@@ -343,21 +343,25 @@ section):
   (encrypted + zlib + AES-GCM) post-adoption; `ErrSnappyUnsupported` never
   fired.
 
-`noop.interval` classic value algorithm (documented for reference; open-unifi
-simplified): `interval` is emitted as a JSON number — `Integer.valueOf(10)` on
-the exception-path noop (tmpwork/javap/com__ubnt__service__devmgr__voidsuper.txt:9945-9955)
-and `Long.valueOf(computed)` in the main noop builder (voidsuper.txt:11412-11422).
-The value is load-tiered from the device's last `system-stats` (cpu/mem double
-fields, voidsuper.txt:11182-11226): cpu<50 ∧ mem<90 → 1 s; cpu<50 ∧ mem≥90 → 5 s;
-cpu<75 ∧ mem<95 → 5 s; else the static default 10 s. Steady-state target:
-`max(lastInform + 5, now + 10) + random[0,5)` (voidsuper.txt:11235-11292).
+`noop.interval` is emitted as a JSON number. The exception/non-record fallback
+is `Integer.valueOf(10)` (tmpwork/javap/com__ubnt__service__devmgr__voidsuper.txt:9945-9955).
+For an ordinary non-ubios UAP, the standard path is steady scheduling, not the
+cpu/mem `Stringclass` load tier: its target is
+`max(previous target + 5, current inform timestamp + 10) + floor(random[0,1)*5)`
+(voidsuper.txt:11235-11292), and the returned interval is target minus the
+current inform timestamp. If that interval is below the configured
+`inform.interval` cap, the target is persisted and returned; otherwise the
+fallback is `floor(cap * (1 - 0.7 * random[0,1)))`. The jar default cap is 90
+(voidsuper.txt:20618-20625). A device marked `Extra["watching"]` truthy gets 5
+seconds. cpu/mem `Stringclass` is called only for `isUbios` devices (UDM/UXG);
+this implementation intentionally does not model that tier or wifiman-active.
+The implementation boundary is the server's record-aware normal noop path;
+internal-error, non-record, and plain fallback noops remain interval 10.
 The servlet response writer itself adds only `server_time_in_utc` — a **string**
 (`Long.toString(epochMillis)`, tmpwork/javap/com__ubnt__net__InformServlet.txt:1569-1580)
 and no interval of its own (InformServlet.txt:1568-1624).
-open-unifi note: simplified to a fixed number (15); **live 2026-09-16**: the
-U7PG2 accepted the fixed 15 s interval across the whole session (inform gaps
-15 s ×113, 16 s ×70, outliers only at controller restarts) — no firmware-side
-demand for load tiering observed. Load tiering remains future work.
+open-unifi implements the standard non-ubios UAP path above; load tiering is
+not used for UAPs.
 
 ### Live acceptance log (2026-09-16)
 

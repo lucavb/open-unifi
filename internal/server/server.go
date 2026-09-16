@@ -8,12 +8,14 @@ package server
 import (
 	"crypto/md5"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -106,6 +108,9 @@ type Server struct {
 
 	seenMu sync.Mutex
 	seenAt map[string]time.Time // discovery dedupe per MAC
+
+	noopMu     sync.Mutex
+	noopTarget map[string]int64 // controller-owned steady-state target, by MAC
 }
 
 // New builds a Server. A nil logger falls back to slog.Default().
@@ -114,10 +119,11 @@ func New(cfg Config, st store.DeviceStore, lg *slog.Logger) *Server {
 		lg = slog.Default()
 	}
 	return &Server{
-		cfg:    cfg,
-		st:     st,
-		lg:     lg,
-		seenAt: map[string]time.Time{},
+		cfg:        cfg,
+		st:         st,
+		lg:         lg,
+		seenAt:     map[string]time.Time{},
+		noopTarget: map[string]int64{},
 	}
 }
 
@@ -491,17 +497,18 @@ type advanceResult struct {
 //     noop + StateAdopted; mismatch → full provisioning, incl. the wireless
 //     drift hash bump).
 func (s *Server) plainAdvance(mac string, rec *store.Device, body map[string]any, claim string) (map[string]any, string, error) {
-	s.absorbInform(mac, rec, body, time.Now(), false)
+	now := time.Now()
+	s.absorbInform(mac, rec, body, now, false)
 	rtype, _ := body["_type"].(string)
 	if informTypeGentleNoop(rtype) {
 		s.lg.Debug("inform-plain: gentle noop for _type", "mac", mac, "type", rtype)
-		return s.noopResp(), "noop", nil
+		return s.noopRespFor(mac, rec, now.Unix()), "noop", nil
 	}
 
 	switch {
 	case rec.XAuthkey == "":
 		s.lg.Debug("inform-plain: noop without assignment", "mac", mac)
-		return s.noopResp(), "noop", nil
+		return s.noopRespFor(mac, rec, now.Unix()), "noop", nil
 
 	case !strings.EqualFold(rec.XAuthkey, claim):
 		s.lg.Debug("inform-plain: re-send current assignment", "mac", mac)
@@ -699,7 +706,7 @@ func (s *Server) advance(mac string, rec *store.Device, body map[string]any, use
 	rtype, _ := body["_type"].(string)
 	if informTypeGentleNoop(rtype) {
 		s.lg.Debug("inform: gentle noop for _type", "mac", mac, "type", rtype)
-		return s.noopResp(), "noop", nil
+		return s.noopRespFor(mac, rec, now.Unix()), "noop", nil
 	}
 
 	// Wireless envelope drift (FSM hash bump): BEFORE the cfgversion drift
@@ -783,11 +790,11 @@ func (s *Server) advance(mac string, rec *store.Device, body map[string]any, use
 			}
 			rec.CfgVersion = nv
 			s.lg.Debug("inform: no envelope baseline, forcing provisioning", "mac", mac)
-			return s.noopResp(), "noop", nil
+			return s.noopRespFor(mac, rec, now.Unix()), "noop", nil
 		}
 		rec.State = store.StateAdopted
 		s.lg.Debug("inform: connected noop", "mac", mac, "cfg", rec.CfgVersion)
-		return s.noopResp(), "noop", nil
+		return s.noopRespFor(mac, rec, now.Unix()), "noop", nil
 
 	default:
 		resp, kind, err := s.assignedKeyFlow(mac, rec, body)
@@ -1363,6 +1370,16 @@ func md5CryptMatches(key, stored string) bool {
 // aside: letters only). Var so tests can inject failure (FID-23 path).
 var randAlphaSalt = randAlphaSaltLive
 
+// noopRandom is a narrow seam for the jar's per-response random interval.
+// It deliberately does not use the process-global math/rand source.
+var noopRandom = func() float64 {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return 0
+	}
+	return float64(binary.LittleEndian.Uint64(b[:])) / float64(^uint64(0))
+}
+
 func randAlphaSaltLive(n int) (string, error) {
 	const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 	buf := make([]byte, n)
@@ -1392,14 +1409,72 @@ func (s *Server) adoptionPushResp(d store.Device, usedKey string) map[string]any
 // assembled inside assignedKeyFlow so a buildSystemCfg error (FID-23) can
 // fail the whole push.
 
-// noopResp builds the connected/nothing-to-do response. Interval is a JSON
-// NUMBER of seconds (jar: `object.put("interval", nextInterval)` — FID-11),
-// 15 here; tiered/load-based intervals are a documented follow-up.
+// noopResp is the exception/internal fallback. Record-aware normal noops use
+// noopRespFor, which implements the standard non-ubios UAP scheduler.
 func (s *Server) noopResp() map[string]any {
 	return map[string]any{
 		"_type":              "noop",
 		"server_time_in_utc": nowMS(),
-		"interval":           15,
+		"interval":           10,
+	}
+}
+
+func isUbios(model string) bool {
+	m := strings.ToUpper(model)
+	return strings.Contains(m, "UDM") || strings.Contains(m, "UXG")
+}
+
+// noopRespFor implements devmgr's ordinary UAP noop scheduling. now is the
+// timestamp of the inform currently being handled, not a poller snapshot.
+func (s *Server) noopRespFor(mac string, rec *store.Device, now int64) map[string]any {
+	interval := int64(10)
+	if !isUbios(rec.Model) {
+		if truthy(rec.Extra["watching"]) {
+			interval = 5
+		} else {
+			const capSeconds int64 = 90
+			r := noopRandom()
+			if r < 0 {
+				r = 0
+			} else if r >= 1 {
+				r = math.Nextafter(1, 0)
+			}
+			s.noopMu.Lock()
+			previous := s.noopTarget[mac]
+			if previous == 0 {
+				previous = now
+			}
+			target := maxInt64(previous+5, now+10) + int64(math.Floor(r*5))
+			candidate := target - now
+			if candidate < capSeconds {
+				interval = candidate
+				s.noopTarget[mac] = target
+			} else {
+				interval = int64(math.Floor(float64(capSeconds) * (1 - 0.7*r)))
+			}
+			s.noopMu.Unlock()
+		}
+	}
+	return map[string]any{"_type": "noop", "server_time_in_utc": nowMS(), "interval": interval}
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func truthy(v any) bool {
+	switch x := v.(type) {
+	case bool:
+		return x
+	case string:
+		return x != "" && x != "false" && x != "0"
+	case float64:
+		return x != 0
+	default:
+		return v != nil
 	}
 }
 

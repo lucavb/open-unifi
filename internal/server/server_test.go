@@ -34,6 +34,54 @@ const (
 	testMAC        = "aabbccddeeff"
 )
 
+func TestNoopIntervalScheduling(t *testing.T) {
+	oldRandom := noopRandom
+	t.Cleanup(func() { noopRandom = oldRandom })
+	tests := []struct {
+		name string
+		r    float64
+		rec  store.Device
+		now  int64
+		want int64
+	}{
+		{"first low", 0, store.Device{Model: "U7PG2", Extra: store.JSONMap{}}, 1000, 10},
+		{"first high", .9, store.Device{Model: "U7PG2", Extra: store.JSONMap{}}, 1000, 14},
+		{"watching", .5, store.Device{Model: "U7PG2", Extra: store.JSONMap{"watching": true}}, 1000, 5},
+		{"ubios fallback", .5, store.Device{Model: "UDM-Pro", Extra: store.JSONMap{}}, 1000, 10},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			noopRandom = func() float64 { return tt.r }
+			s := New(Config{}, nil, slog.Default())
+			got := s.noopRespFor(testMAC, &tt.rec, tt.now)["interval"]
+			if got != tt.want {
+				t.Fatalf("interval = %v, want %d", got, tt.want)
+			}
+		})
+	}
+	t.Run("target advances and cap fallback does not persist", func(t *testing.T) {
+		noopRandom = func() float64 { return 0 }
+		s := New(Config{}, nil, slog.Default())
+		r := store.Device{Model: "U7PG2", Extra: store.JSONMap{}}
+		if got := s.noopRespFor(testMAC, &r, 1000)["interval"]; got != int64(10) {
+			t.Fatal(got)
+		}
+		if got := s.noopRespFor(testMAC, &r, 1005)["interval"]; got != int64(10) {
+			t.Fatal(got)
+		}
+		s.noopMu.Lock()
+		s.noopTarget[testMAC] = 1100
+		s.noopMu.Unlock()
+		noopRandom = func() float64 { return .5 }
+		if got := s.noopRespFor(testMAC, &r, 1000)["interval"]; got != int64(58) {
+			t.Fatal(got)
+		}
+	})
+	if got := (&Server{}).noopResp()["interval"]; got != 10 {
+		t.Fatalf("fallback = %v", got)
+	}
+}
+
 var testIV = bytes16(0x07)
 
 func bytes16(fill byte) []byte { return bytes.Repeat([]byte{fill}, 16) }
@@ -542,8 +590,8 @@ func TestHappyAdoption(t *testing.T) {
 		t.Fatalf("inform#2 type = %v, want noop", jm["_type"])
 	}
 	// FID-11: interval is a JSON number of seconds.
-	if iv, ok := jm["interval"].(float64); !ok || iv != 15 {
-		t.Fatalf("interval = %v (%T), want number 15", jm["interval"], jm["interval"])
+	if iv, ok := jm["interval"].(float64); !ok || iv < 1 || iv > 90 {
+		t.Fatalf("interval = %v (%T), want number in [1,90]", jm["interval"], jm["interval"])
 	}
 	flags2 := binary.BigEndian.Uint16(resp.Body.Bytes()[14:16])
 	if flags2&testFlagGCM != 0 {
