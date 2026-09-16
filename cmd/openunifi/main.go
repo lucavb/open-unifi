@@ -41,7 +41,8 @@ func run() error {
 	discovery := flag.Bool("discovery", true, "enable the UDP discovery listener")
 	dataDir := flag.String("data-dir", "data", "directory for devices.json / wireless.json")
 	controllerURL := flag.String("controller-url", "", "base URL devices are pointed at during adoption (e.g. http://10.0.0.5:8080)")
-	apSSHPassword := flag.String("ap-ssh-password", "", "SSH password for adopted APs (empty uses the built-in site default \"ubnt\")")
+	apSSHPassword := flag.String("ap-ssh-password", os.Getenv("OPEN_UNIFI_AP_SSH_PASSWORD"),
+		"SSH password for adopted APs (empty uses the built-in site default \"ubnt\"; falls back to $OPEN_UNIFI_AP_SSH_PASSWORD)")
 	// Default from the provider's token env var; --admin-token overrides it.
 	adminToken := flag.String("admin-token", os.Getenv("OPEN_UNIFI_ADMIN_TOKEN"),
 		"admin API bearer token (empty disables auth; defaults to $OPEN_UNIFI_ADMIN_TOKEN)")
@@ -56,7 +57,7 @@ func run() error {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
 	slog.SetDefault(logger)
 
-	dport, err := discoveryPort(*listenDiscovery)
+	dhost, dport, err := discoveryPort(*listenDiscovery)
 	if err != nil {
 		return fmt.Errorf("invalid --listen-discovery %q: %w", *listenDiscovery, err)
 	}
@@ -144,7 +145,16 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("bind inform %s: %w", *listenInform, err)
 	}
-	adminSrv := &http.Server{Addr: *listenAdmin, Handler: adminH}
+	// The jar terminates its bounded reading/writing listener sockets on a
+	// per-connection deadline (com/ubnt/ace/J.ø00000)); mirror that with
+	// explicit http.Server timeouts here (FID-10).
+	adminSrv := &http.Server{
+		Addr:              *listenAdmin,
+		Handler:           adminH,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+	}
 	// TODO(TLS): the classic controller terminates HTTPS on 8443; we serve
 	// plain HTTP on --listen-admin for the current milestone (same-host/
 	// trusted-lab setups). Front-load TLS via a reverse proxy, or wire
@@ -157,7 +167,27 @@ func run() error {
 
 	var udp *net.UDPConn
 	if *discovery {
-		udp, err = net.ListenUDP("udp", &net.UDPAddr{Port: dport})
+		// FID-7: the jar's discovery socket is a MulticastSocket that JOINS
+		// the 233.89.188.1 group (G.O0oO's bindMulticast(O0oO) — the
+		// setReuseAddress(true) + joinGroup(233.89.188.1:10001) call; join
+		// failures are only logged: the broadcast listener still starts,
+		// mirrored by the fallback below).
+		gaddr := &net.UDPAddr{IP: net.IPv4(233, 89, 188, 1), Port: dport}
+		var ifi *net.Interface
+		if dhost != "" {
+			ifi, err = net.InterfaceByName(dhost)
+			if err != nil {
+				_ = informLn.Close()
+				_ = adminLn.Close()
+				return fmt.Errorf("discovery interface %q: %w", dhost, err)
+			}
+		}
+		udp, err = net.ListenMulticastUDP("udp", ifi, gaddr)
+		if err != nil {
+			logger.Warn("discovery multicast join failed; falling back to plain UDP listener",
+				"group", gaddr.IP.String(), "host", dhost, "err", err)
+			udp, err = net.ListenUDP("udp", &net.UDPAddr{Port: dport})
+		}
 		if err != nil {
 			_ = informLn.Close()
 			_ = adminLn.Close()
@@ -191,7 +221,14 @@ func run() error {
 	// informSrv owns the inform TCP listener: the metrics middleware happens
 	// HERE (main owns the HTTP plumbing), directly onto srv.InformHandler().
 	// Inform state machine still lives in internal/server.
-	informSrv := &http.Server{Addr: *listenInform, Handler: informH}
+	// FID-10: same bounded-socket timeouts as adminSrv above.
+	informSrv := &http.Server{
+		Addr:              *listenInform,
+		Handler:           informH,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+	}
 	go func() {
 		if err := informSrv.Serve(informLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("inform server: %w", err)
@@ -268,20 +305,28 @@ func parseLevel(s string) (slog.Level, error) {
 	case "error":
 		return slog.LevelError, nil
 	default:
-		return slog.LevelInfo, fmt.Errorf("want debug|info|warn|error")
+		return slog.LevelInfo, errors.New("want debug|info|warn|error")
 	}
 }
 
-// discoveryPort extracts the UDP port from an address like ":10001".
-// Portless addresses default to 10001.
-func discoveryPort(addr string) (int, error) {
-	_, port, err := net.SplitHostPort(addr)
-	if err != nil || port == "" {
-		return 10001, nil
+// discoveryPort resolves a --listen-discovery spec. Accepted forms are
+// "host:port", ":port" and a bare "port"; anything unparseable is an
+// error (FID-41: the spec must hard-fail at startup instead of silently
+// defaulting).
+func discoveryPort(addr string) (host string, port int, err error) {
+	if p, perr := strconv.Atoi(addr); perr == nil {
+		if p <= 0 || p > 65535 {
+			return "", 0, errors.New("want numeric UDP port in 1..65535")
+		}
+		return "", p, nil
 	}
-	n, err := strconv.Atoi(port)
-	if err != nil || n <= 0 || n > 65535 {
-		return 0, fmt.Errorf("want numeric UDP port, got %q", port)
+	host, p, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", 0, errors.New("want host:port, :port or bare port (e.g. :10001)")
 	}
-	return n, nil
+	n, aerr := strconv.Atoi(p)
+	if aerr != nil || n <= 0 || n > 65535 {
+		return "", 0, errors.New("want numeric UDP port, got " + p)
+	}
+	return host, n, nil
 }

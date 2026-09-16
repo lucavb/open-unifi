@@ -1644,21 +1644,31 @@ func TestCBCLegacyZeroPadFallback(t *testing.T) {
 
 // ---- discovery table tests (§8a) -------------------------------------------
 
+// mkTLV frames a TLV [type:1][len:2 BE][value] (unused by the discovery
+// tests after the real-layout rewrite, kept for §4 reply work).
 func mkTLV(typ byte, val []byte) []byte {
 	out := []byte{typ, byte(len(val) >> 8), byte(len(val) & 0xff)}
 	return append(out, val...)
 }
 
-// mkDiscovery frames a discovery packet with the BE dlen header value.
-func mkDiscovery(ver, cmd byte, data []byte) []byte {
-	return append([]byte{ver, cmd, byte(len(data) >> 8), byte(len(data) & 0xff)}, data...)
+// mkDiscoveryAnnounce frames an announce in the real on-wire layout
+// (FID-12, D.<init>(java.lang.String, byte[], InetAddress, String)):
+// [ver:1][mac:6][ip:4][len:2 BE][version:1][extra...]. The len half is
+// the extra-byte count and the version byte is ver==0's "epoch" float.
+func mkDiscoveryAnnounce(ver byte, mac [6]byte, ip [4]byte, version byte, extra []byte) []byte {
+	ln := uint16(len(extra))
+	out := make([]byte, 0, 14+len(extra))
+	out = append(out, ver)
+	out = append(out, mac[:]...)
+	out = append(out, ip[:]...)
+	out = append(out, byte(ln>>8), byte(ln&0xff))
+	out = append(out, version)
+	return append(out, extra...)
 }
 
 func TestParseDiscovery(t *testing.T) {
-	macRaw := []byte{0x24, 0xa4, 0x3c, 0x11, 0x22, 0x33}
-	sender := []byte{0x24, 0xa4, 0x3c, 0xaa, 0xbb, 0xcc}
-	oneMAC := append(mkTLV(1, macRaw), mkTLV(12, []byte("e50"))...)
-	twoMAC := append(append(mkTLV(1, macRaw), mkTLV(19, sender)...), mkTLV(12, []byte("e50"))...)
+	mac := [6]byte{0x24, 0xa4, 0x3c, 0x11, 0x22, 0x33}
+	ip := [4]byte{192, 168, 1, 50}
 
 	cases := []struct {
 		name   string
@@ -1667,20 +1677,13 @@ func TestParseDiscovery(t *testing.T) {
 		note   string
 		reject bool
 	}{
-		{"v0 legacy valid", mkDiscovery(0, 6, append(macRaw, make([]byte, 5)...)), "24a43c112233", "discovery:platform=unknown", false},
-		{"v0 too short", []byte{0, 6, 0, 6, 1, 2, 3, 4, 5}, "", "", true},
-		{"v1 TLV stream", mkDiscovery(1, 6, oneMAC), "24a43c112233", "discovery:platform=e50", false},
-		{"sender-MAC wins (type19 over type1)", mkDiscovery(2, 6, twoMAC), "24a43caabbcc", "discovery:platform=e50", false},
-		{"truncated TLV stream (dlen > data tolerated)", func() []byte {
-			b := mkDiscovery(1, 6, mkTLV(1, macRaw))
-			b[2], b[3] = 0xff, 0xff // dlen beyond data
-			return b
-		}(), "24a43c112233", "discovery:platform=", false},
-		{"ver 3 rejected", []byte{3, 6, 0, 0}, "", "", true},
-		{"cmd 2 ignored", mkDiscovery(1, 2, oneMAC), "", "", true},
-		{"cmd 8 ignored", mkDiscovery(1, 8, oneMAC), "", "", true},
-		{"header too short", []byte{1, 6, 0}, "", "", true},
-		{"no MAC TLV", append([]byte{1, 6, 0, 3}, mkTLV(12, []byte("e50"))...), "", "", true},
+		{"v0 legacy valid", mkDiscoveryAnnounce(0, mac, ip, 0x01, []byte("abcd")), "24a43c112233", "discovery:platform=unknown", false},
+		{"v0 too short", mkDiscoveryAnnounce(0, mac, ip, 0x01, nil), "", "", true},
+		{"v0 non-1 version byte", mkDiscoveryAnnounce(0, mac, ip, 0x02, []byte("abcd")), "", "", true},
+		{"v1 fold with extra bytes", mkDiscoveryAnnounce(1, mac, ip, 0x01, []byte{9, 9}), "24a43c112233", "discovery:platform=unknown", false},
+		{"v1 zero length half", mkDiscoveryAnnounce(1, mac, ip, 0x01, nil), "", "", true},
+		{"0x80 flag shares the 0x00 path (FID-28)", mkDiscoveryAnnounce(0x80, mac, ip, 0x01, []byte("abcd")), "24a43c112233", "discovery:platform=unknown", false},
+		{"header too short", bytes.Repeat([]byte{1}, 12), "", "", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1731,17 +1734,19 @@ func TestSeeDiscoveryDedupe(t *testing.T) {
 	}
 }
 
-// full discovery-record path: MarkPending note shape.
+// full discovery-record path: MarkPending note shape (real layout).
 func TestDiscoveryMarkPendingNote(t *testing.T) {
 	st := store.NewMemStore()
 	s := New(Config{}, st, testLogger())
-	pkt := mkDiscovery(1, 6, append(mkTLV(1, []byte{0x24, 0xa4, 0x3c, 0x11, 0x22, 0x33}), mkTLV(12, []byte("BZ2"))...))
+	pkt := mkDiscoveryAnnounce(0,
+		[6]byte{0x24, 0xa4, 0x3c, 0x11, 0x22, 0x33}, [4]byte{192, 168, 1, 50},
+		0x01, []byte("abcd"))
 	s.handleDiscoveryPacket(pkt)
 	pending, err := st.Pending()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pending["24a43c112233"] != "discovery:platform=BZ2" {
+	if pending["24a43c112233"] != "discovery:platform=unknown" {
 		t.Fatalf("pending note = %q", pending["24a43c112233"])
 	}
 }
