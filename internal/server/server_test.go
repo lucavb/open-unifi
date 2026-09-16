@@ -1962,7 +1962,7 @@ func TestParseDiscovery(t *testing.T) {
 		{"v2 missing TLV1", mkDiscoveryPacket(2, 6,
 			mkTLV(18, []byte{0, 0, 0, 1}), mkTLV(19, outer[:])), "", true},
 		{"v2 seq 0", mkDiscoveryV2(0, outer, ip), "", true},
-		{"v2 cmd8 parses for reply handling", mkDiscoveryPacket(2, 8,
+		{"v2 cmd8 parses as reply-only", mkDiscoveryPacket(2, 8,
 			mkTLV(1, devMAC[:]), mkTLV(18, []byte{0, 0, 0, 1}), mkTLV(19, outer[:])), "00156d010001", false},
 		{"v1 challenge parses (dropped at dispatch)", mkDiscoveryPacket(1, 2,
 			mkTLV(1, devMAC[:])), "00156d010001", false},
@@ -2010,6 +2010,7 @@ func TestDiscoveryV2Gates(t *testing.T) {
 		st := store.NewMemStore()
 		s := New(Config{}, st, testLogger())
 		s.setDiscoveryTestIdentity("24:a4:3c:aa:bb:cc")
+		defer func() { s.setDiscoveryTestIdentity("") }()
 		s.handleDiscoveryPacket(nil, mkDiscoveryV2(1, [6]byte{0x24, 0xa4, 0x3c, 0xaa, 0xbb, 0xcc}, ip))
 		if got := beaconPending(t, st); len(got) != 0 {
 			t.Fatalf("self-MAC echo must not record: %v", got)
@@ -2018,6 +2019,8 @@ func TestDiscoveryV2Gates(t *testing.T) {
 	t.Run("blocklisted mFi model dropped", func(t *testing.T) {
 		st := store.NewMemStore()
 		s := New(Config{}, st, testLogger())
+		s.setDiscoveryTestIdentity("5a:5a:5a:5a:5a:5a")
+		defer func() { s.setDiscoveryTestIdentity("") }()
 		s.handleDiscoveryPacket(nil, mkDiscoveryV2(1, [6]byte{0x24, 0xa4, 0x3c, 0xaa, 0xbb, 0xcc}, ip, beaconTLV21("M2M")))
 		if got := beaconPending(t, st); len(got) != 0 {
 			t.Fatalf("mFi blocklist must not record: %v", got)
@@ -2026,6 +2029,8 @@ func TestDiscoveryV2Gates(t *testing.T) {
 	t.Run("cmd8 dropped", func(t *testing.T) {
 		st := store.NewMemStore()
 		s := New(Config{}, st, testLogger())
+		s.setDiscoveryTestIdentity("5a:5a:5a:5a:5a:5a")
+		defer func() { s.setDiscoveryTestIdentity("") }()
 		s.handleDiscoveryPacket(nil, mkDiscoveryPacket(2, 8,
 			mkTLV(1, deviceMAC[:]), mkTLV(18, []byte{0, 0, 0, 1}),
 			mkTLV(19, []byte{0x24, 0xa4, 0x3c, 0xaa, 0xbb, 0xcc})))
@@ -2036,6 +2041,8 @@ func TestDiscoveryV2Gates(t *testing.T) {
 	t.Run("v1 cmd2 challenge records nothing", func(t *testing.T) {
 		st := store.NewMemStore()
 		s := New(Config{}, st, testLogger())
+		s.setDiscoveryTestIdentity("5a:5a:5a:5a:5a:5a")
+		defer func() { s.setDiscoveryTestIdentity("") }()
 		s.handleDiscoveryPacket(nil, mkDiscoveryPacket(1, 2, mkTLV(1, deviceMAC[:])))
 		if got := beaconPending(t, st); len(got) != 0 {
 			t.Fatalf("cmd2 challenge must not record: %v", got)
@@ -2044,6 +2051,8 @@ func TestDiscoveryV2Gates(t *testing.T) {
 	t.Run("v2 valid beacon pending with keyed note (cmd6 on X feed)", func(t *testing.T) {
 		st := store.NewMemStore()
 		s := New(Config{}, st, testLogger())
+		s.setDiscoveryTestIdentity("5a:5a:5a:5a:5a:5a")
+		defer func() { s.setDiscoveryTestIdentity("") }()
 		s.handleDiscoveryPacket(nil, mkDiscoveryV2(1, [6]byte{0x24, 0xa4, 0x3c, 0xaa, 0xbb, 0xcc}, ip,
 			beaconTLV3("BZ.ar7240.v3.1.0.15.150311.1401"),
 			beaconTLV21("BZ2"),
@@ -2077,6 +2086,7 @@ func TestDiscoveryAntiReplay(t *testing.T) {
 	t.Run("same seq inside window dropped, higher seq accepted", func(t *testing.T) {
 		st := store.NewMemStore()
 		s := New(Config{}, st, testLogger())
+		s.setDiscoveryTestIdentity("5a:5a:5a:5a:5a:5a")
 		first := mkDiscoveryV2(5, outer, ip)
 		s.handleDiscoveryPacket(nil, first)
 		if len(beaconPending(t, st)) != 1 {
@@ -2134,6 +2144,8 @@ func mkInfo(base discoveryInfo, seq int) discoveryInfo {
 func TestDiscoveryMarkPendingNote(t *testing.T) {
 	st := store.NewMemStore()
 	s := New(Config{}, st, testLogger())
+	s.setDiscoveryTestIdentity("5a:5a:5a:5a:5a:5a")
+	defer func() { s.setDiscoveryTestIdentity("") }()
 	s.handleDiscoveryPacket(nil, mkDiscoveryV2(1, [6]byte{0x24, 0xa4, 0x3c, 0xaa, 0xbb, 0xcc},
 		[]byte{10, 2, 2, 1},
 		beaconTLV21("BZ2"), beaconTLV11("uap-lab"), mkTLV(10, []byte{0, 0, 0x0e, 0x10})))

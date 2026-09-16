@@ -150,10 +150,11 @@ type discoverySighting struct {
 	lastSeen time.Time
 }
 
-// discoverySightings carries per-Server anti-replay state plus the lazily
-// computed own-interface MACs used by the v2 self-guard. It lives here (a
-// registry keyed by *Server) so the lane's ownership stays inside
-// discovery.go instead of widening server.go's struct.
+// discoverySightings carries per-Server anti-replay state and the cmd-9
+// reply bookkeeping (monotonic sequence, selected identity and
+// destination, plus the test seams). It lives here (a registry keyed by
+// *Server) so the lane's ownership stays inside discovery.go instead of
+// widening server.go's struct.
 type discoverySightings struct {
 	mu                 sync.Mutex
 	byMAC              map[string]discoverySighting
