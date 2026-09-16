@@ -84,25 +84,27 @@ var (
 
 // ParsePacket decodes and validates an inform packet body.
 //
-// Validation closely follows InformServlet semantics: total-size bounds,
-// minimum header length, magic, supported data version and payload-length
-// sanity. Error strings match the controller wording.
+// Validation closely follows InformServlet semantics, in the jar's exact
+// order (InformServlet.super(HttpServletRequest) +
+// InformServlet$_O0.super(byte[])): content-length bounds (< 8, > 10 MB),
+// magic, minimum header length, payload-length sanity and supported data
+// version. Error strings match the controller wording.
 func ParsePacket(body []byte) (*Packet, error) {
+	if len(body) < 8 {
+		return nil, errors.New("Content too short")
+	}
 	if len(body) > MaxBodySize {
 		return nil, errors.New("Content too long")
-	}
-	if len(body) < HeaderLen {
-		return nil, errTooShort
 	}
 	if magic := binary.BigEndian.Uint32(body[0:4]); magic != Magic {
 		return nil, errBadMagic
 	}
+	if len(body) < HeaderLen {
+		return nil, errTooShort
+	}
 	dataLen := binary.BigEndian.Uint32(body[36:40])
 	if dataLen > uint32(len(body)-HeaderLen) {
 		return nil, errBadLength
-	}
-	if dataLen == 0 {
-		return nil, errors.New("Content too short")
 	}
 	dv := binary.BigEndian.Uint32(body[32:36])
 	if dv != DataVersion {
@@ -285,6 +287,9 @@ func (p *Packet) EncryptPayload(key []byte, plaintext []byte) error {
 //
 // Panics only when MAC is not 6 bytes (a caller programming error in a
 // hand-assembled Packet; packets from ParsePacket always satisfy it).
+//
+// Exported for tests only; deliberately kept — tests pin real crypto
+// behavior through it.
 func (p *Packet) HeaderBytes() []byte {
 	b, err := headerBytes(p, uint32(len(p.Payload)))
 	if err != nil {
@@ -307,6 +312,9 @@ func (p *Packet) HeaderBytes() []byte {
 // deliberately NOT touched: the response path sets those explicitly
 // (flags 0x0009 GCM / 0x0001 CBC per docs/PROTOCOL-mgmt.md §5), so this
 // helper stays usable for both request and response packets.
+//
+// Exported for tests only; deliberately kept — tests pin real crypto
+// behavior through it.
 func (p *Packet) EncryptPayloadGCM(key, plaintext, aad []byte) error {
 	if err := checkKey(key); err != nil {
 		return err

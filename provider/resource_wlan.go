@@ -360,8 +360,11 @@ func readWlanInto(ctx context.Context, c *apiClient, m *wlanModel) error {
 // validateWlan mirrors the server's rules (internal/adminapi/helpers.go
 // validateWlan: security enum, ssid length 1..32, vlan 1..4094, passphrase
 // empty for open / >=8 chars otherwise) so clients get an attribute-level
-// error at plan/validate time instead of a mid-apply HTTP 400. Keep this in
-// lockstep with the server; both sides currently reject the same payloads.
+// error at plan/validate time instead of a mid-apply HTTP 400. Deliberately
+// NOT full lockstep: the server additionally rejects control characters in
+// ssid/name/passphrase and unsafe wlan IDs (defense-in-depth against
+// system_cfg row injection, helpers.go hasControlChar/validateWlanID) —
+// those checks stay server-side-only.
 func (r *wlanResource) validateWlan(m *wlanModel, d *diag.Diagnostics) bool {
 	sec := m.Security.ValueString()
 	switch sec {

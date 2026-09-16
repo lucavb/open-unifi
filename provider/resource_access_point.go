@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"net/http"
+	"net/url"
 	"strconv"
 
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -202,7 +203,9 @@ func (r *accessPointResource) Delete(ctx context.Context, req resource.DeleteReq
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	if err := r.client.do(ctx, http.MethodDelete, "/api/v1/devices/"+state.Mac.ValueString(), nil, nil); err != nil {
+	// The MAC is path-escaped (getDevice does the same for GET reads) so an
+	// unvalidated state value cannot add path segments to the DELETE URL.
+	if err := r.client.do(ctx, http.MethodDelete, "/api/v1/devices/"+url.PathEscape(state.Mac.ValueString()), nil, nil); err != nil {
 		// 404 => already gone: treat as success (deletion is idempotent).
 		if !errNotFound(err) {
 			resp.Diagnostics.AddError("Delete access point", err.Error())

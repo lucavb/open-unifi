@@ -220,8 +220,12 @@
 
   function badgeFor(state) {
     var info = stateNames[state];
-    if (!info) { return '<span class="badge state-unknown">unknown (' + state + ")</span>"; }
+    if (!info) { return '<span class="badge state-unknown">unknown (' + esc(state) + ")</span>"; }
     return '<span class="badge ' + info[1] + '">' + info[0] + "</span>";
+  }
+
+  function is401(e) {
+    return e && e.message && e.message.indexOf("401") >= 0;
   }
 
   function esc(s) {
@@ -307,7 +311,7 @@
       }).join("") +
       "</select></td>" +
       '<td><input name="passphrase" type="password" value="' + esc(w.passphrase || "") + '"></td>' +
-      '<td><input name="vlan" class="num" type="number" min="1" max="4094" value="' + (w.vlan || 1) + '"></td>' +
+      '<td><input name="vlan" class="num" type="number" min="1" max="4094" value="' + esc(w.vlan || 1) + '"></td>' +
       '<td><input name="enabled" type="checkbox"' + (w.enabled ? " checked" : "") + "></td>" +
       '<td class="actions-cell"><button type="button" class="btn-ghost btn-small" data-rm>&times;</button></td>';
   }
@@ -369,16 +373,19 @@
           (me.authConfigured ? " \u00b7 auth enabled" : " \u00b7 no auth");
         if (me.authConfigured && !window.sessionStorage.getItem("ou_token")) { showToken(""); }
       })
-      .catch(function (e) { if (e.message.indexOf("401") < 0) { setError("globalError", e.message); } })
+      // 401s are surfaced by the auth flow (showToken) only — they are not
+      // data errors, so no section shows a red pill for them. This keeps
+      // a token-protected controller's first load down to the token prompt.
+      .catch(function (e) { if (!is401(e)) { setError("globalError", e.message); } })
       .then(function () { return api("/api/v1/devices").then(getJSON); })
       .then(function (env) { renderDevices(env.devices || []); setError("devError", ""); })
-      .catch(function (e) { setError("devError", "devices: " + e.message); })
+      .catch(function (e) { if (!is401(e)) { setError("devError", "devices: " + e.message); } })
       .then(function () { return api("/api/v1/pending").then(getJSON); })
       .then(function (env) { renderPending(env.pending || []); setError("pendingError", ""); })
-      .catch(function (e) { setError("pendingError", "pending: " + e.message); })
+      .catch(function (e) { if (!is401(e)) { setError("pendingError", "pending: " + e.message); } })
       .then(function () { return api("/api/v1/wireless").then(getJSON); })
       .then(renderWireless)
-      .catch(function (e) { setError("wlError", "wireless: " + e.message); });
+      .catch(function (e) { if (!is401(e)) { setError("wlError", "wireless: " + e.message); } });
   }
 
   document.getElementById("addForm").addEventListener("submit", function (ev) {

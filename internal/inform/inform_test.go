@@ -225,23 +225,28 @@ func TestParsePacketErrorPaths(t *testing.T) {
 		body []byte
 		want string
 	}{
+		// Case bodies are built so each check fires at its jar-verified
+		// position (content length < 8 / > 10 MB, magic, header length,
+		// data length, data version).
+		{"content too short", make([]byte, 7), "Content too short"},
 		{"too long", make([]byte, MaxBodySize+1), "Content too long"},
-		{"header too short", make([]byte, HeaderLen-1), "Header is too short"},
 		{"bad magic", func() []byte {
-			b := mk()
+			// 8 bytes so the content-length bound passes but the magic
+			// check (which precedes the header-length check in the jar)
+			// fires.
+			b := make([]byte, 8)
 			b[0] = 0xFF
 			return b
 		}(), "Bad packet magic"},
+		{"header too short", func() []byte {
+			// Valid magic, truncated header (< 40 bytes).
+			return mk()[:HeaderLen-1]
+		}(), "Header is too short"},
 		{"bad data length", func() []byte {
 			b := mk()
 			binary.BigEndian.PutUint32(b[36:40], uint32(len(payload)+1))
 			return b
 		}(), "Bad data length"},
-		{"content too short", func() []byte {
-			b := mk()
-			binary.BigEndian.PutUint32(b[36:40], 0)
-			return b
-		}(), "Content too short"},
 		{"bad data version", func() []byte {
 			b := mk()
 			binary.BigEndian.PutUint32(b[32:36], 2)
@@ -258,6 +263,18 @@ func TestParsePacketErrorPaths(t *testing.T) {
 				t.Fatalf("error %q, want %q", err.Error(), tc.want)
 			}
 		})
+	}
+
+	// The jar has no dataLen==0 special case: an empty payload parses
+	// fine ("Content too short" there only means HTTP content-length < 8).
+	empty := mk()
+	binary.BigEndian.PutUint32(empty[36:40], 0)
+	p, err := ParsePacket(empty)
+	if err != nil {
+		t.Fatalf("dataLen=0 rejected: %v (jar has no such special case)", err)
+	}
+	if len(p.Payload) != 0 {
+		t.Fatalf("Payload = %q, want empty", p.Payload)
 	}
 }
 

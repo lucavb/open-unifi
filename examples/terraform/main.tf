@@ -10,8 +10,8 @@
 
 variable "controller_url" {
   type        = string
-  description = "Base URL of the open-unifi admin API, e.g. https://192.168.1.2"
-  default     = "https://192.168.1.2"
+  description = "Base URL of the open-unifi admin API, e.g. http://192.168.1.2:8443 (plain HTTP: the controller has no TLS yet)"
+  default     = "http://192.168.1.2:8443"
 }
 
 variable "admin_token" {
@@ -30,9 +30,11 @@ terraform {
 }
 
 provider "open-unifi" {
-  url                  = var.controller_url
-  token                = var.admin_token
-  insecure_skip_verify = true # self-signed controller cert in the lab
+  url   = var.controller_url
+  token = var.admin_token
+  # insecure_skip_verify only matters for https:// URLs; the controller
+  # serves plain HTTP today (no TLS yet), so it stays false.
+  insecure_skip_verify = false
 }
 
 # --- Adopt an access point by MAC ------------------------------------------

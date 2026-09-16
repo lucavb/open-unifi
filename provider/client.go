@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -34,6 +35,10 @@ type apiClient struct {
 	token   string
 	http    *http.Client
 }
+
+// maxRespBodySize caps how many response-body bytes the client will read
+// into memory (4 MB; responses are small JSON documents).
+const maxRespBodySize = 4 << 20
 
 // newAPIClient builds a client. url has trailing slashes trimmed. If
 // insecureSkipVerify is true, TLS certificate verification is disabled
@@ -90,7 +95,10 @@ func (c *apiClient) do(ctx context.Context, method, path string, body any, out a
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	// Read at most 4 MB: a server is never expected to return more, and a
+	// hostile/broken peer handing us an unbounded stream must not balloon
+	// memory. A truncated oversized body fails later at JSON decode time.
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxRespBodySize))
 	if err != nil {
 		return err
 	}
@@ -222,10 +230,12 @@ func (c *apiClient) listDevices(ctx context.Context) ([]device, error) {
 	return env.Devices, nil
 }
 
-// getDevice GETs /api/v1/devices/{mac}.
+// getDevice GETs /api/v1/devices/{mac}. The MAC is path-escaped here (the
+// single place all GET-read MACs flow into a URL path) so an unvalidated
+// state value cannot add path segments.
 func (c *apiClient) getDevice(ctx context.Context, mac string) (*apDevice, error) {
 	var dev apDevice
-	if err := c.do(ctx, http.MethodGet, "/api/v1/devices/"+mac, nil, &dev); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/api/v1/devices/"+url.PathEscape(mac), nil, &dev); err != nil {
 		return nil, err
 	}
 	return &dev, nil

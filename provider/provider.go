@@ -37,7 +37,7 @@ func (p *openUnifiProvider) Schema(_ context.Context, _ provider.SchemaRequest, 
 		MarkdownDescription: "Terraform provider for the open-unifi minimal UniFi control plane (UAP-AC-Pro-Gen2).",
 		Attributes: map[string]provschema.Attribute{
 			"url": schema.StringAttribute{
-				MarkdownDescription: "Base URL of the open-unifi admin API, e.g. `https://192.168.1.2`.",
+				MarkdownDescription: "Base URL of the open-unifi admin API, e.g. `http://192.168.1.2:8443` (plain HTTP: no TLS yet — front-load TLS via a reverse proxy if needed).",
 				Required:            true,
 			},
 			"token": schema.StringAttribute{
@@ -46,7 +46,7 @@ func (p *openUnifiProvider) Schema(_ context.Context, _ provider.SchemaRequest, 
 				Sensitive:           true,
 			},
 			"insecure_skip_verify": schema.BoolAttribute{
-				MarkdownDescription: "Skip TLS certificate verification against the controller (dev/self-signed setups).",
+				MarkdownDescription: "Skip TLS certificate verification against the controller (only relevant for `https://` URLs; the controller serves plain HTTP today). Dev/self-signed setups.",
 				Optional:            true,
 			},
 		},
@@ -68,7 +68,7 @@ func (p *openUnifiProvider) Configure(ctx context.Context, req provider.Configur
 		resp.Diagnostics.AddAttributeError(
 			path.Root("url"),
 			"Missing controller URL",
-			"The provider attribute `url` must be set, e.g. `url = \"https://192.168.1.2\"`.",
+			"The provider attribute `url` must be set, e.g. `url = \"http://192.168.1.2:8443\"`.",
 		)
 		return
 	}

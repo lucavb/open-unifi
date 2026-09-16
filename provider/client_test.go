@@ -7,10 +7,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/lucabecker/open-unifi/internal/adminapi"
 )
 
 // The tests in this file run without opening any TCP socket: the sandbox
@@ -481,6 +484,104 @@ func TestAPIErrorTyped404(t *testing.T) {
 	e401 := doErr(http.StatusUnauthorized, []byte(`{"error":"unauthorized"}`))
 	if got := e401.Error(); got != "unauthorized: check token" {
 		t.Fatalf("401 message = %q", got)
+	}
+}
+
+// TestDeviceStructParityWithServer guards the duplicated device wire
+// structs: provider.device (client.go) and provider.apDevice
+// (resource_access_point.go) are independent copies of the
+// adminapi.DeviceView wire shape, with no compile-time link between them
+// and the server lane. Mirroring TestWlanStructParityWithServer
+// (internal/adminapi), this reflect test catches drift: every provider
+// field must exist in DeviceView with the same JSON key and Go type, the
+// provider struct must not carry tag options the server tag lacks, and
+// DeviceView may only carry extra fields listed in serverOnly (never
+// decoded by the provider). The two provider copies must also stay
+// identical to each other. Add new fields to ALL THREE structs.
+//
+// Known deliberate delta: DeviceView.Name carries ",omitempty" (server
+// emit behavior); the provider tags plain "name" because it only decodes.
+func TestDeviceStructParityWithServer(t *testing.T) {
+	serverOnly := map[string]bool{
+		"actions": true, // DeviceView.Actions: server-side affordance, never decoded
+	}
+
+	serverFields := map[string]reflect.StructField{}
+	st := reflect.TypeOf(adminapi.DeviceView{})
+	for i := 0; i < st.NumField(); i++ {
+		f := st.Field(i)
+		key := strings.Split(f.Tag.Get("json"), ",")[0]
+		serverFields[key] = f
+	}
+
+	provFields := map[string]map[string]string{} // struct name -> key -> tag
+	for _, pair := range []struct {
+		name string
+		typ  reflect.Type
+	}{
+		{"device", reflect.TypeOf(device{})},
+		{"apDevice", reflect.TypeOf(apDevice{})},
+	} {
+		m := map[string]string{}
+		for i := 0; i < pair.typ.NumField(); i++ {
+			f := pair.typ.Field(i)
+			tag := f.Tag.Get("json")
+			key := strings.Split(tag, ",")[0]
+			if prev, dup := m[key]; dup {
+				t.Fatalf("%s: duplicate JSON key %q (%q and %q)", pair.name, key, prev, tag)
+			}
+			m[key] = tag
+
+			sf, ok := serverFields[key]
+			if !ok {
+				t.Fatalf("%s: JSON key %q missing in adminapi.DeviceView — rename or add the field to BOTH lanes", pair.name, key)
+			}
+			if f.Type != sf.Type {
+				t.Fatalf("%s: field %q type drift: provider %v vs adminapi.DeviceView %v", pair.name, key, f.Type, sf.Type)
+			}
+			// Provider tag options must be a subset of the server's.
+			pOpts := map[string]bool{}
+			for _, o := range strings.Split(tag, ",")[1:] {
+				if o != "" {
+					pOpts[o] = true
+				}
+			}
+			sOpts := map[string]bool{}
+			for _, o := range strings.Split(sf.Tag.Get("json"), ",")[1:] {
+				if o != "" {
+					sOpts[o] = true
+				}
+			}
+			for o := range pOpts {
+				if !sOpts[o] {
+					t.Fatalf("%s: field %q tag option %q not in adminapi.DeviceView tag %q", pair.name, key, o, sf.Tag.Get("json"))
+				}
+			}
+		}
+		provFields[pair.name] = m
+	}
+
+	for key := range serverFields {
+		if !serverOnly[key] {
+			if _, ok := provFields["device"][key]; !ok {
+				t.Fatalf("adminapi.DeviceView field %q missing in provider.device — decode would silently drop it; add to ALL THREE structs", key)
+			}
+			if _, ok := provFields["apDevice"][key]; !ok {
+				t.Fatalf("adminapi.DeviceView field %q missing in provider.apDevice — decode would silently drop it; add to ALL THREE structs", key)
+			}
+		}
+	}
+
+	// The two provider copies must stay identical to each other (they are
+	// hand-maintained mirrors; a one-sided edit is exactly the drift this
+	// test exists to catch).
+	if len(provFields["device"]) != len(provFields["apDevice"]) {
+		t.Fatalf("device (%d fields) and apDevice (%d fields) diverged", len(provFields["device"]), len(provFields["apDevice"]))
+	}
+	for key, tag := range provFields["device"] {
+		if t2, ok := provFields["apDevice"][key]; !ok || t2 != tag {
+			t.Fatalf("device field %q (%s) missing/changed in apDevice (%q)", key, tag, t2)
+		}
 	}
 }
 
