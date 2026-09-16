@@ -1211,6 +1211,78 @@ func TestPartialEthInventoryWarns(t *testing.T) {
 	}
 }
 
+// FID-2 if_table fallback: 6.8.2 U7PG2 sends no ethernet_table (live
+// acceptance 2026-09-16) but reports its interfaces in if_table (observed:
+// [{name: "eth0", up: true}]). The ethN names there must feed the vlan rows
+// and silence the partial-inventory warn; non-eth interfaces in the same table
+// must not leak into the config.
+func TestEthInventoryFromIfTable(t *testing.T) {
+	var logs strings.Builder
+	rec := u7pg2Record()
+	rec.Extra["if_table"] = []any{
+		map[string]any{"name": "eth0", "up": true},
+		map[string]any{"name": "ath0", "up": true},
+		map[string]any{"name": "ath1", "up": true},
+	}
+	s := New(Config{WirelessSource: func() []Wlan { return workedEnvelope() }},
+		store.NewMemStore(), testWarnLogger(&logs))
+	sys := mustBuildSys(t, s, rec)
+	if !strings.Contains(sys, "vlan.1.devname=eth0\nvlan.1.id=42\n") {
+		t.Fatalf("if_table-derived eth0 vlan row missing:\n%s", sys)
+	}
+	if strings.Contains(sys, "vlan.2.") {
+		t.Fatalf("non-eth iface leaked into vlan rows:\n%s", sys)
+	}
+	if strings.Contains(logs.String(), "partial eth inventory") {
+		t.Fatalf("partial-inventory warn should be silenced by if_table, log:\n%s", logs.String())
+	}
+}
+
+// FID-2 if_table multi-port: every distinct ethN name in if_table is emitted
+// sorted, matching the ethernet_table-derived shape.
+func TestEthInventoryFromIfTableMultiPort(t *testing.T) {
+	rec := u7pg2Record()
+	rec.Extra["if_table"] = []any{
+		map[string]any{"name": "eth1", "up": true},
+		map[string]any{"name": "eth0", "up": true},
+	}
+	s := New(Config{WirelessSource: func() []Wlan { return workedEnvelope() }}, store.NewMemStore(), testLogger())
+	sys := mustBuildSys(t, s, rec)
+	for _, want := range []string{
+		"vlan.1.devname=eth0\nvlan.1.id=42\n",
+		"vlan.2.devname=eth1\nvlan.2.id=42\n",
+		"bridge.1.port.1.devname=eth0\nbridge.1.port.2.devname=eth1\n",
+		"bridge.2.port.1.devname=eth0.42\nbridge.2.port.2.devname=eth1.42\n",
+	} {
+		if !strings.Contains(sys, want) {
+			t.Fatalf("if_table eth inventory wiring missing %q in:\n%s", want, sys)
+		}
+	}
+}
+
+// FID-2 uplink-only fallback: with no ethernet_table and no if_table the
+// learned uplink names the port (no hardcoded eth0) and the partial-inventory
+// warn still fires. port_table is present here on purpose — its labels must
+// not be mistaken for interfaces.
+func TestEthInventoryUplinkOnlyStillWarns(t *testing.T) {
+	var logs strings.Builder
+	rec := u7pg2Record()
+	rec.Extra["uplink"] = "eth1"
+	rec.Extra["port_table"] = []any{
+		map[string]any{"name": "Main", "is_uplink": true, "port_idx": 1.0},
+		map[string]any{"name": "Secondary", "is_uplink": false, "port_idx": 2.0},
+	}
+	s := New(Config{WirelessSource: func() []Wlan { return workedEnvelope() }},
+		store.NewMemStore(), testWarnLogger(&logs))
+	sys := mustBuildSys(t, s, rec)
+	if !strings.Contains(sys, "vlan.1.devname=eth1\n") {
+		t.Fatalf("learned-uplink vlan row missing:\n%s", sys)
+	}
+	if !strings.Contains(logs.String(), "partial eth inventory") {
+		t.Fatalf("expected partial-inventory warn, log:\n%s", logs.String())
+	}
+}
+
 // FID-13: the mgmt dhcp client row follows Extra["mgmt_dev"].
 func TestDhcpcMgmtRowUsesMgmtDev(t *testing.T) {
 	rec := u7pg2Record()

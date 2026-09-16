@@ -53,9 +53,11 @@ const (
 	// unreachable for wpa-p because the admin API enforces >= 8 chars.
 	fallbackPsk = "letmeinnow"
 
-	// defaultEthIface is the fallback uplink iface for `# vlan` rows when
-	// the record carries NO eth inventory at all (ethPortNames); with an
-	// inventory the emitted names come from ethernet_table.
+	// defaultEthIface is the last-resort fallback uplink iface for `# vlan`
+	// rows when the record carries NO eth inventory at all (ethPortNames);
+	// with an inventory the emitted names come from ethernet_table, else from
+	// the ethN names in if_table, else from the learned uplink (6.8.2 U7PG2
+	// sends no ethernet_table — live acceptance 2026-09-16).
 	defaultEthIface = "eth0"
 )
 
@@ -524,13 +526,17 @@ func (s *Server) emitVlanBlocks(b *strings.Builder, d store.Device, vaps []vapPl
 
 	// eth inventory from the device record's inform passthrough
 	// (ethernet_table num_port sum; Device.getPortNum fallback,
-	// Device.java §6941-6957). An absent/partial inventory is flagged:
-	// we then fall back to the single eth0 uplink instead of inventing
-	// ports (partial-eth-inventory flag, FID-2).
+	// Device.java §6941-6957), else from the ethN interfaces in if_table,
+	// else from the learned uplink (6.8.2 U7PG2 sends no ethernet_table —
+	// live acceptance 2026-09-16). port_table is deliberately NOT used: its
+	// names are labels ("Main", "Secondary"), not ifaces, and the same record
+	// reports has_eth1=false with a lone eth0 in if_table. An absent/partial
+	// inventory is flagged: we then fall back to a single inferred uplink
+	// instead of inventing ports (partial-eth-inventory flag, FID-2).
 	ethIfaces, ethKnown := ethPortNames(d)
 	if !ethKnown {
-		s.lg.Warn("wireless provision: no ethernet_table inventory in the device record; " +
-			"falling back to a single eth0 uplink (partial eth inventory)")
+		s.lg.Warn("wireless provision: no ethernet_table/if_table inventory in the device record; " +
+			"falling back to a single inferred uplink (partial eth inventory)")
 	}
 
 	// collect tagged vids (sorted) and bridge memberships
@@ -621,15 +627,32 @@ func (s *Server) emitVlanBlocks(b *strings.Builder, d store.Device, vaps []vapPl
 	line("dhcpc.1.devname", mgmtDevOf(d))
 }
 
-// ethPortNames derives the physical eth port names from the record's
-// inform passthrough: sum of ethernet_table num_port values (per the vlan
-// writer's port count), entries without num_port count as one each. Returns
-// known=false when the record carries no usable inventory (caller falls
-// back to the single learned uplink and flags partial inventory, FID-2).
+// ethPortNames derives the physical eth port names from the record's inform
+// passthrough: sum of ethernet_table num_port values (per the vlan writer's
+// port count), entries without num_port count as one each. When ethernet_table
+// is absent (6.8.2 U7PG2 never sends one — live acceptance 2026-09-16) the
+// ethN names in if_table are used, else the learned uplink. Returns known=false
+// when the record carries no usable inventory (caller flags partial inventory,
+// FID-2).
 func ethPortNames(d store.Device) (ports []string, known bool) {
+	if names, ok := ethPortNamesFromEthernetTable(d); ok {
+		return names, true
+	}
+	if names, ok := ethPortNamesFromIfTable(d); ok {
+		return names, true
+	}
+	if up, ok := d.Extra["uplink"].(string); ok && isEthIfaceName(up) {
+		return []string{up}, false
+	}
+	return []string{defaultEthIface}, false
+}
+
+// ethPortNamesFromEthernetTable expands ethernet_table entries into ethN names
+// (an entry without num_port counts as one port).
+func ethPortNamesFromEthernetTable(d store.Device) ([]string, bool) {
 	rawList, ok := d.Extra["ethernet_table"].([]any)
 	if !ok {
-		return []string{defaultEthIface}, false
+		return nil, false
 	}
 	total := 0
 	sawEntries := false
@@ -646,13 +669,61 @@ func ethPortNames(d store.Device) (ports []string, known bool) {
 		}
 	}
 	if !sawEntries || total <= 0 {
-		return []string{defaultEthIface}, false
+		return nil, false
 	}
 	out := make([]string, 0, total)
 	for i := 0; i < total; i++ {
 		out = append(out, "eth"+strconv.Itoa(i))
 	}
 	return out, true
+}
+
+// ethPortNamesFromIfTable collects the distinct ethN interface names the
+// device reports in if_table (its interface inventory). This is the fallback
+// the 6.8.2 U7PG2 needs: it sends no ethernet_table (live acceptance
+// 2026-09-16, where if_table was [{name: "eth0", up: true}]). port_table is
+// deliberately not consulted — its entries are labels ("Main", "Secondary"),
+// not ifaces — and the same record reports has_eth1=false, so deriving a port
+// count from it would invent an eth1 the device does not have.
+func ethPortNamesFromIfTable(d store.Device) ([]string, bool) {
+	rawList, ok := d.Extra["if_table"].([]any)
+	if !ok {
+		return nil, false
+	}
+	seen := map[string]bool{}
+	for _, item := range rawList {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _ := m["name"].(string)
+		if !isEthIfaceName(name) {
+			continue
+		}
+		seen[name] = true
+	}
+	if len(seen) == 0 {
+		return nil, false
+	}
+	out := make([]string, 0, len(seen))
+	for name := range seen {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out, true
+}
+
+// isEthIfaceName reports whether name is of the form "ethN" (N ≥ 0 digits).
+func isEthIfaceName(name string) bool {
+	if !strings.HasPrefix(name, "eth") || len(name) == len("eth") {
+		return false
+	}
+	for _, r := range name[len("eth"):] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // ---- envelope hash (FSM drift input) ---------------------------------------
