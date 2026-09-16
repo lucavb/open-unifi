@@ -53,8 +53,9 @@ const (
 	// unreachable for wpa-p because the admin API enforces >= 8 chars.
 	fallbackPsk = "letmeinnow"
 
-	// defaultEthIface is the one uplink iface in `# vlan` rows. The device's
-	// eth inventory lives in informs we do not persist separately yet.
+	// defaultEthIface is the fallback uplink iface for `# vlan` rows when
+	// the record carries NO eth inventory at all (ethPortNames); with an
+	// inventory the emitted names come from ethernet_table.
 	defaultEthIface = "eth0"
 )
 
@@ -149,6 +150,30 @@ func jsonBool(m map[string]any, key string) bool {
 	return v
 }
 
+// jsonInt fetches an integer field (numeric JSON scalars decode as
+// float64); absent/non-numeric → 0.
+func jsonInt(m map[string]any, key string) int {
+	switch t := m[key].(type) {
+	case float64:
+		return int(t)
+	case string:
+		n, _ := strconv.Atoi(t)
+		return n
+	default:
+		return 0
+	}
+}
+
+// mgmtDevOf resolves the device's mgmt interface name for system_cfg rows
+// (admin escape hatch Extra["mgmt_dev"], else the classic br0 — same shape
+// as the sshd.1.ifname resolver in server.go).
+func mgmtDevOf(d store.Device) string {
+	if v, ok := d.Extra["mgmt_dev"].(string); ok && v != "" {
+		return v
+	}
+	return "br0"
+}
+
 // ---- vap plan -------------------------------------------------------------
 
 // vapPlan is one provisioned vap: an (enabled) WLAN instantiated on
@@ -190,6 +215,10 @@ func planVaps(d store.Device, wls []Wlan) ([]vapPlan, []radioRow) {
 
 // wrapVID applies the doc §6 VLAN guard: vids ≤ 1 (0/absent, or the classic
 // 1) join the mgmt bridge untagged, never br-trunk (documented deviation).
+// SAFE-BY-CONSTRUCTION note (Lane A): the admin API and envelope loader
+// validate VLAN ∈ 1..4094 upstream, so callers only reach here with
+// pre-validated values; the ≤1/4094+ clamp is a belt-and-suspenders sink to
+// the untagged mgmt bridge, never a silent re-tag of an invalid value.
 func wrapVID(vid int) int {
 	if vid < 2 || vid > 4094 {
 		return 0
@@ -239,11 +268,13 @@ func (s *Server) emitWirelessCfg(b *strings.Builder, d store.Device, wls []Wlan)
 		line(prefix+"forbiasauto", "0")
 		line(prefix+"channel", jsonStr(r.raw, "channel", "0"))
 		line(prefix+"backup_channel", jsonStr(r.raw, "backup_channel", "0"))
-		// TODO(wireless): ht-width for ieee_mode is UNRESOLVED (doc §9,
-		// devmgr chanWidth resolver class never decompiled) — emitting the
-		// commonly-seen "20" default pending a live cfg dump.
+		// chanWidth resolver (devmgr c javap 1242-1298): width =
+		// min(countryLimit, ht cap (ng→20 / na→40), device caps). All three
+		// floors resolve to 20 on ng and 40 on na for U7PG2 defaults, so
+		// the emitted ieee_mode is the static "11nght20"/"11naht40" pair
+		// (FID-3; supersedes the doc §9 UNRESOLVED note).
 		if r.band == "na" {
-			line(prefix+"ieee_mode", "11naht20")
+			line(prefix+"ieee_mode", "11naht40")
 		} else {
 			line(prefix+"ieee_mode", "11nght20")
 		}
@@ -258,35 +289,41 @@ func (s *Server) emitWirelessCfg(b *strings.Builder, d store.Device, wls []Wlan)
 		line(prefix+"txpower_mode", jsonStr(r.raw, "tx_power_mode", "auto"))
 		line(prefix+"txpower", jsonStr(r.raw, "tx_power", "auto"))
 		line(prefix+"hard_noisefloor.status", "disabled")
-		// virtual companion rows: vap index on this radio (>0 only when the
-		// radio hosts a second+ vap).
+		// per-vap devname/status rows (int offsets 1141-1432): emitted for
+		// EVERY vap walking this radio — plain `radio.<n>` prefix for
+		// vapIdxOnRadio 0, `radio.<n>.virtual.<vapIdxOnRadio>` for the
+		// radio's second+ member (FID-5).
 		vIdx := 0
 		for _, v := range vaps {
 			if v.radioN != n {
 				continue
 			}
-			if vIdx > 0 { // vapIdxOnRadio > 0 → companion row pair
-				line(fmt.Sprintf("%svirtual.%d.devname", prefix, vIdx), "ath"+strconv.Itoa(v.athN))
-				line(fmt.Sprintf("%svirtual.%d.status", prefix, vIdx), "enabled")
+			p := prefix
+			if vIdx > 0 { // vapIdxOnRadio > 0 → virtual companion prefix
+				p += "virtual." + strconv.Itoa(vIdx) + "."
 			}
+			line(p+"devname", "ath"+strconv.Itoa(v.athN))
+			line(p+"status", "enabled")
 			vIdx++
 		}
 	}
 
 	// Per-vap aaa.<n> + wireless.<n> rows, radio-sorted order (doc §4/§5).
-	// open-hostapd capability (wifi_caps bit 0x2000) gates
-	// aaa.<n>.status for open WLANs; records without fw_caps default to
-	// supported (modern U7PG2 firmware).
-	fwCapsKnown, fwCaps := numFromExtra(d.Extra, "fw_caps")
-	openHostapd := !fwCapsKnown || fwCaps&0x2000 != 0
-	for n, v := range vaps { // 0-based over emissions → row index n+1
+	// Device capability bits come from the RECORD's `wifi_caps` field
+	// (Device.hasWifiCapability(int) javap: (wifi_caps & mask) == mask —
+	// NOT fw_caps; X.getInt default 0 when the field is absent, so an
+	// unreported wifi_caps means every capability is_UNSUPPORTED). FID-15.
+	wifiCapsKnown, wifiCaps := numFromExtra(d.Extra, "wifi_caps")
+	openHostapd := wifiCapsKnown && wifiCaps&0x2000 != 0 // supportOpenHostapd() = bit 0x2000 (Device §7696-7704)
+	bgaFilterCap := wifiCapsKnown && wifiCaps&0x40 != 0  // hasWifiCapability(64) (FID-51)
+	for n, v := range vaps {                             // 0-based over emissions → row index n+1
 		s.emitAaaRows(b, n+1, v, openHostapd)
-		s.emitWirelessRows(b, n+1, v)
+		s.emitWirelessRows(b, n+1, v, bgaFilterCap)
 	}
 
 	// VLAN wiring (doc §6): tag table, bridges, netconf, dhcpc — each with
 	// its own counter.
-	s.emitVlanBlocks(b, vaps)
+	s.emitVlanBlocks(b, d, vaps)
 }
 
 func boolStr(v bool) string {
@@ -338,7 +375,9 @@ func (s *Server) emitAaaRows(b *strings.Builder, n int, v vapPlan, openHostapd b
 
 	switch v.wlan.Security {
 	case "open":
-		// §4.2: status = enabled iff supportOpenHostapd (wifi_caps 0x2000).
+		// §4.2: status = enabled iff supportOpenHostapd (wifi_caps 0x2000,
+		// Device.hasWifiCapability — absence of the reported field means
+		// DISABLED, not enabled: X.getInt default 0, FID-15).
 		if openHostapd {
 			line("status", "enabled")
 		} else {
@@ -350,7 +389,8 @@ func (s *Server) emitAaaRows(b *strings.Builder, n int, v vapPlan, openHostapd b
 		if v.wlan.Security == "wpa-eap" {
 			// Our admin API carries no RADIUS servers/profile yet; the real
 			// controller would append radius.auth.<i>.* rows from the
-			// RADIUS profile (int §791-840) after the psk writer.
+			// RADIUS profile (int §791-840) right after the auth_cache row,
+			// before dynamic_vlan.
 			// TODO(wireless): radius rows once the API has RADIUS fields.
 			s.lg.Warn("provisioning WPA-EAP wlan without RADIUS servers; " +
 				"emitting mgmt=WPA-EAP with auth_cache enabled, no radius.* rows")
@@ -360,7 +400,9 @@ func (s *Server) emitAaaRows(b *strings.Builder, n int, v vapPlan, openHostapd b
 		// NOTE for wpa-eap: still the fixed §4.3 block; psk uses the same
 		// getWpaPreSharedKey() fallback shape.
 		line("verbose", "2")
-		line("wpa", "2") // wpa_mode auto → WPA2 (WpaMode.getMode javap)
+		// wpa_mode default = WpaMode.AUTO → getMode() = 3 (enum javap
+		// static{}: AUTO=3, WPA1=1, WPA2=2; FID-4 — NOT wpa2's 2).
+		line("wpa", "3")
 		line("eapol_version", "2")
 		line("wpa.group_rekey", "3600")
 		line("p2p", "disabled")
@@ -375,20 +417,25 @@ func (s *Server) emitAaaRows(b *strings.Builder, n int, v vapPlan, openHostapd b
 		if psk == "" {
 			psk = fallbackPsk // getWpaPreSharedKey() fallback shape (§8)
 		}
+		// Row order below the fixed block per the AAA writer (int offsets
+		// 2357-3031 + EAP sub-writer at 8616-8920): mgmt → psk → auth_cache
+		// → [radius.*] → dynamic_vlan → wpa.1.pairwise → pmf.cipher
+		// (FID-25).
 		mgmt := "WPA-PSK"
 		if v.wlan.Security == "wpa-eap" {
 			mgmt = "WPA-EAP"
-			line("auth_cache", "enabled") // default per WlanConf (§8)
 		}
 		line("wpa.key.1.mgmt", mgmt)
-		line("wpa.psk", psk)           // psk writer: NEVER hashed/obfuscated (§8)
-		line("wpa.1.pairwise", "CCMP") // wpa_enc auto → CCMP (§8)
-		line("pmf.cipher", "AES-128-CMAC")
+		line("wpa.psk", psk) // psk writer: NEVER hashed/obfuscated (§8)
 		if v.wlan.Security == "wpa-eap" {
+			// always "enabled" at WlanConf's auth_cache is(..., true) default
+			line("auth_cache", "enabled")
 			// vlan_wlan_mode disabled → dynamic_vlan=0 (default §8); the
 			// RADIUS-driven 1|2 variants need the missing RADIUS fields.
 			line("dynamic_vlan", "0")
 		}
+		line("wpa.1.pairwise", "CCMP") // wpa_enc auto → CCMP (§8)
+		line("pmf.cipher", "AES-128-CMAC")
 	}
 
 	// §4.3/§613-624 common tail (macacl off, not hidden).
@@ -406,7 +453,7 @@ func aaaBridge(v vapPlan) string {
 
 // emitWirelessRows writes the wireless.<n> block per doc §5 (worked-example
 // key order; security is LITERAL none, authmode 0 only for open).
-func (s *Server) emitWirelessRows(b *strings.Builder, n int, v vapPlan) {
+func (s *Server) emitWirelessRows(b *strings.Builder, n int, v vapPlan, bgaFilterCap bool) {
 	p := fmt.Sprintf("wireless.%d.", n)
 	prefix := s.lineWriter(b, "wireless-rows")
 	line := func(k, vv string) { prefix(p+k, vv) }
@@ -420,6 +467,10 @@ func (s *Server) emitWirelessRows(b *strings.Builder, n int, v vapPlan) {
 	} else {
 		line("authmode", "1")
 	}
+	// l2_isolation = enabled iff (this wlan's l2_isolation flag || is_guest)
+	// (int offsets 3468-3502); both false in our admin API, and FID-51 notes
+	// the polarity stays ambiguous until those fields exist — the defaultValue
+	// is "disabled" either way (is_guest=false ⇒ same).
 	line("l2_isolation", "disabled")
 	line("is_guest", "false")
 	line("security", "none") // ⚠ literal, even for WPA (doc §5 line 250)
@@ -444,13 +495,43 @@ func (s *Server) emitWirelessRows(b *strings.Builder, n int, v vapPlan) {
 	// condition-gated follow-ups that always fire at defaults (§7 example):
 	line("element_adopt", "disabled")
 	line("mcastrate", "auto")
+	// bga_filter: emitted only when the device reports wifi_caps bit 64
+	// (hasWifiCapability(64), int offsets 4433-4546); absent capability →
+	// the ROW IS SKIPPED entirely, not "disabled" (FID-51). At our defaults
+	// (no wds vaps; forward_bpdu absent ⇒ bga bridge-flooded ON) the value
+	// is enabled. forward_bpdu tie-in unrepresentable in the admin API — flagged.
+	if bgaFilterCap {
+		line("bga_filter", "enabled")
+	}
 	line("dtim_period", "3")
 }
 
 // emitVlanBlocks writes `# vlan`, `# bridge`, `# netconf` and `# dhcpc`
 // from the vap wiring (doc §6 + §7 excerpt).
-func (s *Server) emitVlanBlocks(b *strings.Builder, vaps []vapPlan) {
+//
+// Merge model (FID-2, int/String bytecode): a vlan-table row keyed
+// ("vlan", <vid>) accumulates a PORT SET from both wlan sides — the
+// per-vap ath members (`br0.<vid>` ath ports, int offsets 2733-2830) AND
+// the eth-port×vid sub-interfaces `<eth>.<vid>` (int offsets 3662-3730,
+// ports×vids) — and the bridge writer (String offsets 3886-4052) drains
+// each row as `bridge.<j>.port.<k>.devname`. The `# vlan` block itself
+// prints eth-ports×vids pairs (String offsets ~3862-3970: vids outer,
+// ports inner). Status rows: vlan.status/bridge.status exist even when
+// their table is empty (disabled), netconf.status/dhcpc.status are
+// written unconditionally (FID-14).
+func (s *Server) emitVlanBlocks(b *strings.Builder, d store.Device, vaps []vapPlan) {
 	line := s.lineWriter(b, "vlan-blocks")
+
+	// eth inventory from the device record's inform passthrough
+	// (ethernet_table num_port sum; Device.getPortNum fallback,
+	// Device.java §6941-6957). An absent/partial inventory is flagged:
+	// we then fall back to the single eth0 uplink instead of inventing
+	// ports (partial-eth-inventory flag, FID-2).
+	ethIfaces, ethKnown := ethPortNames(d)
+	if !ethKnown {
+		s.lg.Warn("wireless provision: no ethernet_table inventory in the device record; " +
+			"falling back to a single eth0 uplink (partial eth inventory)")
+	}
 
 	// collect tagged vids (sorted) and bridge memberships
 	vidAths := map[int][]string{}
@@ -465,19 +546,27 @@ func (s *Server) emitVlanBlocks(b *strings.Builder, vaps []vapPlan) {
 	}
 	sort.Ints(vids)
 
+	// `# vlan`: status row exists always; rows are eth-port×vid pairs.
+	b.WriteString("# vlan\n")
 	if len(vids) > 0 {
-		b.WriteString("# vlan\n")
-		for i, vid := range vids {
-			// TODO(wireless): eth0 is the literal uplink; read the device's
-			// actual eth port inventory from persistd inform data instead.
-			line(fmt.Sprintf("vlan.%d.devname", i+1), defaultEthIface)
-			line(fmt.Sprintf("vlan.%d.id", i+1), strconv.Itoa(vid))
+		line("vlan.status", "enabled")
+		i := 0
+		for _, vid := range vids {
+			for _, p := range ethIfaces {
+				i++
+				line(fmt.Sprintf("vlan.%d.devname", i), p)
+				line(fmt.Sprintf("vlan.%d.id", i), strconv.Itoa(vid))
+			}
 		}
+	} else {
+		line("vlan.status", "disabled")
 	}
 
-	// bridge section: mgmt br0 (untagged ports: eth0 + untagged aths), then
-	// one br0.<vid> per sorted vid with its ath ports.
+	// bridge section: status row first, then mgmt br0 (infra eth ports +
+	// untagged aths), then one br0.<vid> per sorted vid carrying BOTH the
+	// `<eth>.<vid>` sub-interface ports and the vap ath ports (FID-2).
 	b.WriteString("# bridge\n")
+	line("bridge.status", "enabled")
 	j := 0
 	writeBridge := func(name string, ports ...string) {
 		j++
@@ -488,7 +577,7 @@ func (s *Server) emitVlanBlocks(b *strings.Builder, vaps []vapPlan) {
 			line(fmt.Sprintf("bridge.%d.port.%d.devname", j, k+1), port)
 		}
 	}
-	untagged := []string{defaultEthIface}
+	untagged := append([]string{}, ethIfaces...)
 	for _, v := range vaps {
 		if v.vid == 0 {
 			untagged = append(untagged, "ath"+strconv.Itoa(v.athN))
@@ -496,28 +585,74 @@ func (s *Server) emitVlanBlocks(b *strings.Builder, vaps []vapPlan) {
 	}
 	writeBridge("br0", untagged...)
 	for _, vid := range vids {
-		writeBridge("br0."+strconv.Itoa(vid), vidAths[vid]...)
-	}
-
-	// netconf: ONLY for the tagged bridges. No rows for br0/eth0: emitting
-	// them would re-assert the device's mgmt interface addressing we must
-	// not override during provisioning (doc §6 table; deliberate omission).
-	if len(vids) > 0 {
-		b.WriteString("# netconf\n")
-		for k, vid := range vids {
-			m := fmt.Sprintf("netconf.%d.", k+1)
-			line(m+"devname", "br0."+strconv.Itoa(vid))
-			line(m+"ip", "0.0.0.0")
-			line(m+"autoip.status", "disabled")
-			line(m+"promisc", "enabled")
-			line(m+"up", "enabled")
+		tagged := make([]string, 0, len(ethIfaces)+len(vidAths[vid]))
+		for _, p := range ethIfaces {
+			tagged = append(tagged, p+"."+strconv.Itoa(vid))
 		}
+		tagged = append(tagged, vidAths[vid]...)
+		writeBridge("br0."+strconv.Itoa(vid), tagged...)
 	}
 
-	// dhcpc: status row only in our build — guest-WLAN tagged-bridge rows
-	// need an is_guest flag the admin API does not have yet.
+	// netconf: status row ALWAYS (writer emits it before draining rows,
+	// String offsets 4655-4671); rows only for the tagged bridges. No rows
+	// for br0/eth0: emitting them would re-assert the device's mgmt
+	// interface addressing we must not override during provisioning
+	// (doc §6 table; deliberate omission).
+	b.WriteString("# netconf\n")
+	line("netconf.status", "enabled")
+	for k, vid := range vids {
+		m := fmt.Sprintf("netconf.%d.", k+1)
+		line(m+"devname", "br0."+strconv.Itoa(vid))
+		line(m+"ip", "0.0.0.0")
+		line(m+"autoip.status", "disabled")
+		line(m+"promisc", "enabled")
+		line(m+"up", "enabled")
+	}
+
+	// dhcpc: status row always; then the mgmt dhcp-client row for the
+	// mgmt dev — the classic writer emits dhcpc.<n>.status + .devname
+	// whenever config_network.type != "static" (B__P javap offsets
+	// 38-115; the site default type is "dhcp", so this is the default
+	// shape), FID-13. The guest-vlan branch (.ip_only=true) needs an
+	// is_guest flag the admin API does not have yet. (FID-14)
 	b.WriteString("# dhcpc\n")
 	line("dhcpc.status", "enabled")
+	line("dhcpc.1.status", "enabled")
+	line("dhcpc.1.devname", mgmtDevOf(d))
+}
+
+// ethPortNames derives the physical eth port names from the record's
+// inform passthrough: sum of ethernet_table num_port values (per the vlan
+// writer's port count), entries without num_port count as one each. Returns
+// known=false when the record carries no usable inventory (caller falls
+// back to the single learned uplink and flags partial inventory, FID-2).
+func ethPortNames(d store.Device) (ports []string, known bool) {
+	rawList, ok := d.Extra["ethernet_table"].([]any)
+	if !ok {
+		return []string{defaultEthIface}, false
+	}
+	total := 0
+	sawEntries := false
+	for _, item := range rawList {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		sawEntries = true
+		if n := jsonInt(m, "num_port"); n > 0 {
+			total += n
+		} else {
+			total++
+		}
+	}
+	if !sawEntries || total <= 0 {
+		return []string{defaultEthIface}, false
+	}
+	out := make([]string, 0, total)
+	for i := 0; i < total; i++ {
+		out = append(out, "eth"+strconv.Itoa(i))
+	}
+	return out, true
 }
 
 // ---- envelope hash (FSM drift input) ---------------------------------------

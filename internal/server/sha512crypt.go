@@ -79,26 +79,44 @@ func sha512CryptRaw(key, salt []byte) string {
 	}
 	sumA := ctx.Sum(nil)
 
-	// seqP: for every character in the key, add the whole key; the recycled
-	// sequence contributes its first keylen bytes in the round loop.
+	// seqP/seqS — the round-chain byte sequences. P = sha512 digest over
+	// (the key added keylen times), S = sha512 digest over (salt hashed
+	// 16 + sumA[0] times). The SEQUENCES are not bare digest slices: each
+	// is the digest tiled chunk-wise into a len(key)/len(salt) buffer
+	// (commons-codec Sha2Crypt offsets 184-238 fingerprint: full blocks
+	// while remaining > blockSize, then the remainder). Tiling equals a
+	// digest[:n] slice only while n ≤ one 64-byte block; slicing beyond a
+	// block would panic, so keys over the block size tile instead.
+	// Result: a >64B key feeds a >64B P sequence to every round. (FID-21)
+	seqFill := func(digest []byte, want int) []byte {
+		out := make([]byte, want)
+		for i := range out {
+			out[i] = digest[i%len(digest)]
+		}
+		return out
+	}
 	pSeq := func() []byte {
 		ctx := sha512.New()
-		for i := 0; i < len(key); i++ {
+		for i := 0; i < len(key); i++ { // digest P input: key added keylen times (commons 279-306)
 			ctx.Write(key)
 		}
-		return ctx.Sum(nil)[:len(key)]
+		return seqFill(ctx.Sum(nil), len(key))
 	}()
-	// seqS: salt hashed (16 + sumA[0]) times over; first saltlen bytes used.
+	// seqS: salt hashed (16 + sumA[0]) times over → saltlen-byte sequence.
+	// Salt is clamped ≤16 so this always stays within one block, but the
+	// tiling constructor is shared for symmetry.
 	sSeq := func() []byte {
 		ctx := sha512.New()
 		for i := 0; i < 16+int(sumA[0]); i++ {
 			ctx.Write(salt)
 		}
-		return ctx.Sum(nil)[:len(salt)]
+		return seqFill(ctx.Sum(nil), len(salt))
 	}()
 
-	// Round loop (5000): the recycled P/S byte sequences contribute only
-	// their first keylen/saltlen bytes (short-key/salt case, = ours).
+	// Round loop (5000): the recycled P/S byte sequences contribute
+	// keylen/saltlen bytes per round (commons offsets 479-572: update(seq,
+	// 0, keyLen/saltLen)) — pSeq is already exactly keylen bytes long, so
+	// long keys feed the full tiled sequence here.
 	for cnt := 0; cnt < defaultRounds; cnt++ {
 		ctx = sha512.New()
 		if cnt&1 != 0 {

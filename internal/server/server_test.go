@@ -800,8 +800,7 @@ func TestWorkedExampleWirelessSystemCfg(t *testing.T) {
 		"radio.1.backup_channel=0",
 		"radio.1.ieee_mode=11nght20",
 		"radio.1.mode=master",
-		"radio.1.rate.auto=enabled",
-		"radio.1.rate.mcs=auto",
+		"radio.1.rate.auto=enabled", "radio.1.rate.mcs=auto",
 		"radio.1.rfscan=disabled",
 		"radio.1.bcmc_l2_filter.status=enabled",
 		"radio.1.bgscan.status=disabled",
@@ -810,6 +809,8 @@ func TestWorkedExampleWirelessSystemCfg(t *testing.T) {
 		"radio.1.txpower_mode=auto",
 		"radio.1.txpower=auto",
 		"radio.1.hard_noisefloor.status=disabled",
+		"radio.1.devname=ath0",
+		"radio.1.status=enabled",
 		"radio.2.phyname=rai0",
 		"radio.2.ack.auto=disabled",
 		"radio.2.acktimeout=64",
@@ -821,7 +822,7 @@ func TestWorkedExampleWirelessSystemCfg(t *testing.T) {
 		"radio.2.forbiasauto=0",
 		"radio.2.channel=0",
 		"radio.2.backup_channel=0",
-		"radio.2.ieee_mode=11naht20",
+		"radio.2.ieee_mode=11naht40",
 		"radio.2.mode=master",
 		"radio.2.rate.auto=enabled",
 		"radio.2.rate.mcs=auto",
@@ -833,6 +834,8 @@ func TestWorkedExampleWirelessSystemCfg(t *testing.T) {
 		"radio.2.txpower_mode=auto",
 		"radio.2.txpower=auto",
 		"radio.2.hard_noisefloor.status=disabled",
+		"radio.2.devname=ath1",
+		"radio.2.status=enabled",
 		"aaa.1.pmf.status=disabled",
 		"aaa.1.pmf.mode=0",
 		"aaa.1.ft.status=disabled",
@@ -844,7 +847,7 @@ func TestWorkedExampleWirelessSystemCfg(t *testing.T) {
 		"aaa.1.ssid=corp",
 		"aaa.1.status=enabled",
 		"aaa.1.verbose=2",
-		"aaa.1.wpa=2",
+		"aaa.1.wpa=3",
 		"aaa.1.eapol_version=2",
 		"aaa.1.wpa.group_rekey=3600",
 		"aaa.1.p2p=disabled",
@@ -900,7 +903,7 @@ func TestWorkedExampleWirelessSystemCfg(t *testing.T) {
 		"aaa.2.ssid=corp",
 		"aaa.2.status=enabled",
 		"aaa.2.verbose=2",
-		"aaa.2.wpa=2",
+		"aaa.2.wpa=3",
 		"aaa.2.eapol_version=2",
 		"aaa.2.wpa.group_rekey=3600",
 		"aaa.2.p2p=disabled",
@@ -946,9 +949,11 @@ func TestWorkedExampleWirelessSystemCfg(t *testing.T) {
 		"wireless.2.mcastrate=auto",
 		"wireless.2.dtim_period=3",
 		"# vlan",
+		"vlan.status=enabled",
 		"vlan.1.devname=eth0",
 		"vlan.1.id=42",
 		"# bridge",
+		"bridge.status=enabled",
 		"bridge.1.devname=br0",
 		"bridge.1.fd=1",
 		"bridge.1.stp.status=disabled",
@@ -956,9 +961,11 @@ func TestWorkedExampleWirelessSystemCfg(t *testing.T) {
 		"bridge.2.devname=br0.42",
 		"bridge.2.fd=1",
 		"bridge.2.stp.status=disabled",
-		"bridge.2.port.1.devname=ath0",
-		"bridge.2.port.2.devname=ath1",
+		"bridge.2.port.1.devname=eth0.42",
+		"bridge.2.port.2.devname=ath0",
+		"bridge.2.port.3.devname=ath1",
 		"# netconf",
+		"netconf.status=enabled",
 		"netconf.1.devname=br0.42",
 		"netconf.1.ip=0.0.0.0",
 		"netconf.1.autoip.status=disabled",
@@ -966,6 +973,8 @@ func TestWorkedExampleWirelessSystemCfg(t *testing.T) {
 		"netconf.1.up=enabled",
 		"# dhcpc",
 		"dhcpc.status=enabled",
+		"dhcpc.1.status=enabled",
+		"dhcpc.1.devname=br0",
 		"",
 	}, "\n")
 	if got != want {
@@ -1005,18 +1014,161 @@ func TestWpaEapWirelessMinimal(t *testing.T) {
 		}
 	}}, store.NewMemStore(), testWarnLogger(&logs))
 	sys := s.buildSystemCfg(u7pg2Record())
-	for _, want := range []string{
+	// FID-25 row order (int AAA writer): mgmt → psk → auth_cache →
+	// [radius.*] → dynamic_vlan → wpa.1.pairwise → pmf.cipher.
+	ordered := []string{
 		"aaa.1.wpa.key.1.mgmt=WPA-EAP\n",
 		"aaa.1.wpa.psk=letmeinnow\n",
 		"aaa.1.auth_cache=enabled\n",
 		"aaa.1.dynamic_vlan=0\n",
-	} {
-		if !strings.Contains(sys, want) {
-			t.Fatalf("wpa-eap block missing %q in:\n%s", want, sys)
+		"aaa.1.wpa.1.pairwise=CCMP\n",
+		"aaa.1.pmf.cipher=AES-128-CMAC\n",
+	}
+	last := 0
+	for _, w := range ordered {
+		i := strings.Index(sys, w)
+		if i < 0 || i < last {
+			t.Fatalf("wpa-eap row order broken (want %q after offset %d):\n%s", w, last, sys)
 		}
+		last = i + len(w)
 	}
 	if !strings.Contains(logs.String(), "RADIUS") {
 		t.Fatal("expected RADIUS warn for wpa-eap provisioning")
+	}
+}
+
+// FID-14: the `# vlan` / `# bridge` / `# netconf` status rows are ALWAYS
+// on; with no tagged WLAN the vlan table is empty → vlan.status=disabled
+// (classic writer: ports×vids empty ⇒ disabled) while the mgmt bridge row
+// keeps bridge.status=enabled, and netconf/dhcpc carry their unconditional
+// status rows with zero tagged rows.
+func TestVlanWiringStatusRowsAlwaysOn(t *testing.T) {
+	env := []Wlan{{Name: "net", SSID: "net", Security: "wpa-p",
+		Passphrase: "correcthorse", Enabled: true}} // untagged only
+	s := New(Config{WirelessSource: func() []Wlan { return env }}, store.NewMemStore(), testLogger())
+	sys := s.buildSystemCfg(u7pg2Record())
+	for _, want := range []string{
+		"# vlan\nvlan.status=disabled\n",
+		"bridge.status=enabled\nbridge.1.devname=br0\n",
+		"# netconf\nnetconf.status=enabled\n",
+		"dhcpc.status=enabled\ndhcpc.1.status=enabled\ndhcpc.1.devname=br0\n",
+	} {
+		if !strings.Contains(sys, want) {
+			t.Fatalf("status wiring missing %q in:\n%s", want, sys)
+		}
+	}
+	for _, wrong := range []string{"vlan.1.", "netconf.1.", "bridge.2."} {
+		if strings.Contains(sys, wrong) {
+			t.Fatalf("no-tagged-wlans build must not emit %q rows:\n%s", wrong, sys)
+		}
+	}
+}
+
+// FID-15: aaa.<n>.status for open WLANs is gated on the RECORD's wifi_caps
+// bit 0x2000 (Device.hasWifiCapability reading `wifi_caps`, NOT fw_caps);
+// an absent field means disabled (X.getInt default 0).
+func TestOpenHostapdNeedsWifiCapsBit0x2000(t *testing.T) {
+	env := []Wlan{{Name: "open", SSID: "opennet", Security: "open", Enabled: true, ID: "idOA"}}
+	cases := []struct {
+		name     string
+		extraVal float64
+		fwCaps   float64 // legacy misread target: must be ignored
+		wantEn   bool
+	}{
+		{"absent → disabled (not optimistic)", 0, 0, false},
+		{"wifi_caps 0x2000 → enabled", 0x2000, 0, true},
+		{"wifi_caps other bits → disabled", 64, 0, false},
+		{"fw_caps alone must be ignored", 0, 0x2000, false},
+	}
+	for _, tc := range cases {
+		rec := u7pg2Record()
+		if tc.extraVal != 0 {
+			rec.Extra["wifi_caps"] = tc.extraVal
+		}
+		if tc.fwCaps != 0 {
+			rec.Extra["fw_caps"] = tc.fwCaps
+		}
+		s := New(Config{WirelessSource: func() []Wlan { return env }}, store.NewMemStore(), testLogger())
+		sys := s.buildSystemCfg(rec)
+		have := "aaa.1.status=disabled\n"
+		if tc.wantEn {
+			have = "aaa.1.status=enabled\n"
+		}
+		if !strings.Contains(sys, have) {
+			t.Fatalf("%s: missing %q in:\n%s", tc.name, have, sys)
+		}
+	}
+}
+
+// FID-51: wireless.<n>.bga_filter is emitted ONLY when the record reports
+// wifi_caps bit 64 — absent capability means no row at all (not
+// "disabled") — and the value is enabled at our defaults.
+func TestBgaFilterGatedOnWifiCapsBit64(t *testing.T) {
+	env := workedEnvelope()
+	s := New(Config{WirelessSource: func() []Wlan { return env }}, store.NewMemStore(), testLogger())
+	sys := s.buildSystemCfg(u7pg2Record())
+	if strings.Contains(sys, "bga_filter") {
+		t.Fatalf("absent wifi_caps must skip the bga_filter row:\n%s", sys)
+	}
+
+	rec := u7pg2Record()
+	rec.Extra["wifi_caps"] = float64(0x40)
+	sys = s.buildSystemCfg(rec)
+	for _, want := range []string{"wireless.1.bga_filter=enabled\n", "wireless.2.bga_filter=enabled\n"} {
+		if !strings.Contains(sys, want) {
+			t.Fatalf("wifi_caps 0x40 must emit %q in:\n%s", want, sys)
+		}
+	}
+}
+
+// FID-2: the eth inventory rides in the record passthrough
+// (ethernet_table entries with num_port) and feeds the `# vlan` rows
+// (vid×port pairs) AND the bridge port sets (`<eth>.<vid>` sub-interfaces
+// alongside the vap aths).
+func TestEthInventoryInformsVlanRows(t *testing.T) {
+	rec := u7pg2Record()
+	rec.Extra["ethernet_table"] = []any{
+		map[string]any{"num_port": 2.0},
+	}
+	s := New(Config{WirelessSource: func() []Wlan { return workedEnvelope() }}, store.NewMemStore(), testLogger())
+	sys := s.buildSystemCfg(rec)
+	for _, want := range []string{
+		"vlan.status=enabled\n",
+		"vlan.1.devname=eth0\nvlan.1.id=42\n",
+		"vlan.2.devname=eth1\nvlan.2.id=42\n",
+		"bridge.1.port.1.devname=eth0\nbridge.1.port.2.devname=eth1\n",
+		"bridge.2.port.1.devname=eth0.42\nbridge.2.port.2.devname=eth1.42\n" +
+			"bridge.2.port.3.devname=ath0\nbridge.2.port.4.devname=ath1\n",
+	} {
+		if !strings.Contains(sys, want) {
+			t.Fatalf("eth-inventory wiring missing %q in:\n%s", want, sys)
+		}
+	}
+}
+
+// FID-2 partial-inventory flag: a record with NO ethernet_table falls back
+// to the single eth0 uplink and the server warns (wlans with radios).
+func TestPartialEthInventoryWarns(t *testing.T) {
+	var logs strings.Builder
+	s := New(Config{WirelessSource: func() []Wlan { return workedEnvelope() }},
+		store.NewMemStore(), testWarnLogger(&logs))
+	sys := s.buildSystemCfg(u7pg2Record())
+	if !strings.Contains(sys, "vlan.1.devname=eth0\n") {
+		t.Fatalf("fallback eth0 uplink missing:\n%s", sys)
+	}
+	if !strings.Contains(logs.String(), "partial eth inventory") {
+		t.Fatalf("expected partial-inventory warn, log:\n%s", logs.String())
+	}
+}
+
+// FID-13: the mgmt dhcp client row follows Extra["mgmt_dev"].
+func TestDhcpcMgmtRowUsesMgmtDev(t *testing.T) {
+	rec := u7pg2Record()
+	rec.Extra["mgmt_dev"] = "br0.9"
+	s := New(Config{WirelessSource: func() []Wlan { return workedEnvelope() }}, store.NewMemStore(), testLogger())
+	sys := s.buildSystemCfg(rec)
+	if !strings.Contains(sys, "dhcpc.1.devname=br0.9\n") {
+		t.Fatalf("dhcpc mgmt row must follow mgmt_dev:\n%s", sys)
 	}
 }
 
@@ -1622,31 +1774,36 @@ func TestMultiWlanSystemCfg(t *testing.T) {
 		}
 	}
 
-	// virtual companion rows ONLY where a radio hosts its second vap:
+	// virtual companion rows ONLY where a radio hosts its second vap; the
+	// FIRST vap of each radio gets the plain radio.<n>.devname/status rows
+	// (FID-5: devname/status for EVERY vap, virtual prefix only >0).
 	for _, want := range []string{
+		"radio.1.devname=ath0\n", "radio.1.status=enabled\n",
+		"radio.2.devname=ath2\n", "radio.2.status=enabled\n",
 		"radio.1.virtual.1.devname=ath1\n", "radio.1.virtual.1.status=enabled\n",
 		"radio.2.virtual.1.devname=ath3\n", "radio.2.virtual.1.status=enabled\n",
 	} {
 		if !strings.Contains(sys, want) {
-			t.Fatalf("missing virtual companion row %q", want)
+			t.Fatalf("missing devname/status row %q", want)
 		}
 	}
 	if strings.Contains(sys, "radio.1.virtual.0") || strings.Contains(sys, "radio.1.virtual.2") {
 		t.Fatal("unexpected virtual row indices")
 	}
 
-	// bridges: br0 gets eth0 + the two untagged aths; br0.42 the tagged ones.
+	// bridges: br0 gets eth0 + the two untagged aths; br0.42 carries the
+	// eth0.42 sub-interface AND the tagged aths (FID-2 merge model).
 	for _, want := range []string{
 		"bridge.1.devname=br0\nbridge.1.fd=1\nbridge.1.stp.status=disabled\n" +
 			"bridge.1.port.1.devname=eth0\nbridge.1.port.2.devname=ath0\nbridge.1.port.3.devname=ath2\n",
 		"bridge.2.devname=br0.42\nbridge.2.fd=1\nbridge.2.stp.status=disabled\n" +
-			"bridge.2.port.1.devname=ath1\nbridge.2.port.2.devname=ath3\n",
+			"bridge.2.port.1.devname=eth0.42\nbridge.2.port.2.devname=ath1\nbridge.2.port.3.devname=ath3\n",
 	} {
 		if !strings.Contains(sys, want) {
 			t.Fatalf("bridge wiring mismatch, missing:\n%s\n---system_cfg---\n%s", want, sys)
 		}
 	}
-	if !strings.Contains(sys, "bridge.2.port.2.devname=ath3\n") {
+	if !strings.Contains(sys, "bridge.2.port.3.devname=ath3\n") {
 		t.Fatalf("br0.42 port order wrong:\n%s", sys)
 	}
 	// aaa bridges: untagged vap on br0, tagged on br0.42
