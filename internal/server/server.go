@@ -15,8 +15,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
-	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -25,20 +23,17 @@ import (
 	"time"
 
 	"github.com/lucabecker/open-unifi/internal/inform"
+	"github.com/lucabecker/open-unifi/internal/server/adoption"
 	"github.com/lucabecker/open-unifi/internal/store"
+	"github.com/lucabecker/open-unifi/internal/wireless"
 )
 
 // maxInformBody matches the classic controller's 10 MB inform body cap.
 const maxInformBody = 10 * 1024 * 1024
 
-// defaultKeyHex is the factory pre-adoption AES key (docs/PROTOCOL.md §2).
-const defaultKeyHex = "ba86f2bbe107c7c57eb5f2690775c712"
-
-const (
-	wlanRetryBase   = 2 * time.Second
-	wlanRetryMax    = 60 * time.Second
-	wlanMaxAttempts = 6
-)
+// defaultKeyHex is the factory pre-adoption AES key (docs/PROTOCOL.md §2);
+// the canonical constant lives in the adoption engine.
+const defaultKeyHex = adoption.DefaultKeyHex
 
 // ErrLiveWLANProvisioningUnsupported is returned for the exact U7PG2
 // firmware lane whose system_cfg WLAN template has not been differentially
@@ -55,37 +50,9 @@ func (e *ErrLiveWLANProvisioningUnsupported) Error() string {
 
 func (e *ErrLiveWLANProvisioningUnsupported) Status() int { return http.StatusNotImplemented }
 
-// Wire-shape constants of the classic controller (FID-54 dedupe: every
-// literal here recurs in more than one emission site).
-const (
-	defaultInformPort   = "8080" // unifi.http.port default
-	defaultMgmtPort     = "8443" // manage-port fallback  (mgmt_url)
-	defaultStunPort     = "3478" // unifi.stun.port default
-	defaultSiteName     = "default"
-	informFactoryNotype = "inform:factory"
-)
-
-// informKnownTypes labels the NON-EMPTY request _type values the inform
-// state machine processes specially. Real firmware sends its periodic
-// status informs with an EMPTY _type (live evidence: U7PG2 on BZ.6.8.2,
-// captured during the 2026-09-16 acceptance session), and the jar runs its
-// main dispatcher (voidsuper — docs/PROTOCOL-mgmt.md §6.2) on exactly those
-// informs: adoption, re-key, and provisioning all ride the empty-_type
-// status inform. informTypeGentleNoop therefore lets "" through and only
-// noops unknown NON-EMPTY types.
-var informKnownTypes = map[string]bool{
-	"info": true, "heartbeat": true, "cmd": true,
-	"setparam": true, "setparam-ack": true, "cmd-ack": true,
-	"alarms": true, "disconnect": true,
-}
-
-// informTypeGentleNoop reports whether the request _type falls outside the
-// inform state machine: the empty _type IS the main-dispatcher status
-// inform (see informKnownTypes), so only unknown NON-EMPTY types get the
-// gentle noop.
-func informTypeGentleNoop(rtype string) bool {
-	return rtype != "" && !informKnownTypes[rtype]
-}
+// Wire-shape constant of the classic controller (FID-54 dedupe): the
+// factory-notype pending annotation.
+const informFactoryNotype = "inform:factory"
 
 // Config describes the runtime configuration of the inform server.
 type Config struct {
@@ -166,6 +133,10 @@ type Server struct {
 	st  store.DeviceStore
 	lg  *slog.Logger
 
+	// engine is the adoption decider: every decoded inform's decision logic
+	// lives there; this type is the transport adapter around it.
+	engine *adoption.Engine
+
 	seenMu sync.Mutex
 	seenAt map[string]time.Time // discovery dedupe per MAC
 
@@ -178,13 +149,31 @@ func New(cfg Config, st store.DeviceStore, lg *slog.Logger) *Server {
 	if lg == nil {
 		lg = slog.Default()
 	}
-	return &Server{
+	s := &Server{
 		cfg:        cfg,
 		st:         st,
 		lg:         lg,
 		seenAt:     map[string]time.Time{},
 		noopTarget: map[string]int64{},
 	}
+	// The adoption engine is a pure decider: randomness, key generation and
+	// the wireless source are injected, and the system_cfg producer stays
+	// right here in package server this checkpoint (UNCHANGED
+	// buildGeneratedSystemCfg code).
+	s.engine = adoption.New(adoption.Deps{
+		Logger: lg,
+		Random: func() float64 { return noopRandom() },
+		KeyChars: func(n int) (string, error) {
+			return s.keyChars(n)
+		},
+		Wireless: s.currentWireless,
+		SystemCfg: func(d store.Device, wls []wireless.Wlan) (string, error) {
+			return s.buildSystemCfg(d, wls)
+		},
+		ControllerURL:    cfg.ControllerURL,
+		InformListenAddr: cfg.InformListenAddr,
+	})
+	return s
 }
 
 // InformHandler returns the HTTP handler implementing POST /inform semantics.
@@ -215,8 +204,6 @@ func randKeyChars(n int) (string, error) {
 	return string(out), nil
 }
 
-// mustKeyChars is gone: rand failures must surface as errors (advance →
-// HTTP 500) instead of silently emitting empty authkey=/cfgversion= lines.
 // keyChars returns n random lowercase hex chars, logging the (effectively
 // impossible) crypto/rand failure as an error.
 func (s *Server) keyChars(n int) (string, error) {
@@ -261,17 +248,6 @@ func keyCandidates(rec store.Device) []string {
 		out = append(out, def)
 	}
 	return out
-}
-
-// addKey appends a lowercase key to the deduped authkey list.
-func addKey(keys []string, key string) []string {
-	key = strings.ToLower(key)
-	for _, k := range keys {
-		if strings.ToLower(k) == key {
-			return keys
-		}
-	}
-	return append(keys, key)
 }
 
 // writeJSONErr writes a plain-JSON error body.
@@ -505,11 +481,20 @@ func (s *Server) handlePacket(w http.ResponseWriter, pkt *inform.Packet, body []
 	// device records; a MAC deleted mid-flight lands on the noop path.
 	var outcome advanceResult
 	uerr := s.st.UpdateExisting(mac, func(rec *store.Device) error {
-		resp, kind, aerr := s.advance(mac, rec, jm, usedKey, gcmReq)
+		now := time.Now()
+		s.absorbInform(mac, rec, jm, now, gcmReq)
+		out, aerr := s.engine.Decide(adoption.Request{
+			Transport:      adoption.TransportEncrypted,
+			Device:         *rec,
+			Body:           jm,
+			UsedKey:        usedKey,
+			Now:            now,
+			PrevNoopTarget: s.noopTargetSnapshot(mac),
+		})
 		if aerr != nil {
-			return aerr
+			return s.mapEngineError(rec, aerr)
 		}
-		outcome = advanceResult{resp: resp, kind: kind}
+		outcome = advanceResult{resp: s.applyOutcome(mac, rec, out), kind: string(out.Kind)}
 		return nil
 	})
 	if uerr != nil {
@@ -547,42 +532,6 @@ func (s *Server) handlePacket(w http.ResponseWriter, pkt *inform.Packet, body []
 type advanceResult struct {
 	resp map[string]any
 	kind string
-}
-
-// plainAdvance is the PLAINTEXT inform state machine. It NEVER rotates
-// keys (deviation from the classic debug-build rotation path — we treat
-// plaintext claims as assertions, not authenticators):
-//
-//   - XAuthkey unset  → noop; the record stays StatePending (plaintext can
-//     never initiate adoption — rotating/adopting from an unauthenticated
-//     channel would let any network observer seed a device's mgmt_cfg with
-//     an empty cfgversion/authkey);
-//   - claim ≠ XAuthkey → mgmt_cfg-only push carrying the CURRENT XAuthkey
-//     via the authkey= line (re-key me), no rotation, no cfgversion regen;
-//   - claim == XAuthkey → the normal assigned-key flow (cfgversion match →
-//     noop + StateAdopted; mismatch → full provisioning, incl. the wireless
-//     drift hash bump).
-func (s *Server) plainAdvance(mac string, rec *store.Device, body map[string]any, claim string) (map[string]any, string, error) {
-	now := time.Now()
-	s.absorbInform(mac, rec, body, now, false)
-	rtype, _ := body["_type"].(string)
-	if informTypeGentleNoop(rtype) {
-		s.lg.Debug("inform-plain: gentle noop for _type", "mac", mac, "type", rtype)
-		return s.noopRespFor(mac, rec, now.Unix()), "noop", nil
-	}
-
-	switch {
-	case rec.XAuthkey == "":
-		s.lg.Debug("inform-plain: noop without assignment", "mac", mac)
-		return s.noopRespFor(mac, rec, now.Unix()), "noop", nil
-
-	case !strings.EqualFold(rec.XAuthkey, claim):
-		s.lg.Debug("inform-plain: re-send current assignment", "mac", mac)
-		return s.adoptionPushResp(*rec, claim), "setparam", nil
-
-	default:
-		return s.assignedKeyFlow(mac, rec, body)
-	}
 }
 
 // writeInformResponse renders outcome over the wire: plaintext informs get
@@ -712,11 +661,20 @@ func (s *Server) handlePlain(w http.ResponseWriter, mac string, jm map[string]an
 	}
 	var outcome advanceResult
 	uerr := s.st.UpdateExisting(mac, func(rec *store.Device) error {
-		resp, kind, aerr := s.plainAdvance(mac, rec, jm, claim)
+		now := time.Now()
+		s.absorbInform(mac, rec, jm, now, false)
+		out, aerr := s.engine.Decide(adoption.Request{
+			Transport:      adoption.TransportPlaintext,
+			Device:         *rec,
+			Body:           jm,
+			UsedKey:        claim,
+			Now:            now,
+			PrevNoopTarget: s.noopTargetSnapshot(mac),
+		})
 		if aerr != nil {
-			return aerr
+			return s.mapEngineError(rec, aerr)
 		}
-		outcome = advanceResult{resp: resp, kind: kind}
+		outcome = advanceResult{resp: s.applyOutcome(mac, rec, out), kind: string(out.Kind)}
 		return nil
 	})
 	if uerr != nil {
@@ -759,298 +717,75 @@ func (s *Server) handlePlain(w http.ResponseWriter, mac string, jm map[string]an
 	_, _ = w.Write(out)
 }
 
-// advance applies the adoption state machine (docs/PROTOCOL-mgmt.md §6.2) for
-// ENCRYPTED informs and returns the response body map plus a response kind
-// label (and an error for unrecoverable internal conditions mapped to 500).
-// It mutates rec; the caller-side store.Update persists.
-//
-//		setparam variants (exactly three shapes):
-//		  - adoption push:  {"_type":"setparam","mgmt_cfg":...} + server_time
-//		    (mgmt_cfg ONLY; fresh 16-hex cfgversion stored on the record first,
-//		    carried in the mgmt_cfg "cfgversion=" line).
-//		  - full provisioning: {"_type":"setparam","cfgversion":...,\
-//		    "system_cfg":...,"blocked_sta":...,"mgmt_cfg":...} + server_time.
-//	  - noop: {"_type":"noop","interval":15} + server_time.
-//
-// usedKey is the lowercase hex key that authenticated the inform.
-func (s *Server) advance(mac string, rec *store.Device, body map[string]any, usedKey string, gcmReq bool) (map[string]any, string, error) {
-	now := time.Now()
-	s.absorbInform(mac, rec, body, now, gcmReq)
-
-	rtype, _ := body["_type"].(string)
-	if informTypeGentleNoop(rtype) {
-		s.lg.Debug("inform: gentle noop for _type", "mac", mac, "type", rtype)
-		return s.noopRespFor(mac, rec, now.Unix()), "noop", nil
+// mapEngineError converts engine error sentinels onto the transport-layer
+// protocol rejections they map to (FID-1 default-key rejection → the 404
+// marker; the unsupported-live-WLAN lane → the typed 501).
+func (s *Server) mapEngineError(rec *store.Device, err error) error {
+	if errors.Is(err, adoption.ErrDefaultKeyRejected) {
+		return errDefaultKeyRejected
 	}
+	if errors.Is(err, adoption.ErrLiveWLANProvisioningUnsupported) {
+		return &ErrLiveWLANProvisioningUnsupported{Model: rec.Model, Firmware: rec.Firmware}
+	}
+	return err
+}
 
-	// Wireless envelope drift (FSM hash bump): BEFORE the cfgversion drift
-	// check, compare sha256(canonical wireless envelope) with the stored
-	// Extra["wlan_cfg_sha"]. A mismatch regenerates CfgVersion, which the
-	// drift check then sees as unknown → full provisioning. The hash is
-	// minted together with the cfgversion it belongs to: the adoption push
-	// seeds it (rotateKeys case below) and full provisioning refreshes it
-	// (assignedKeyFlow). Live finding (2026-09-16 acceptance session, U7PG2
-	// on BZ.6.8.2): real firmware echoes the adoption mgmt_cfg's cfgversion
-	// back on its first re-keyed inform — matching the jar's equal path
-	// (voidsuper bytes 3287-3306 jump to 3549) — so full provisioning never
-	// follows adoption on its own, and the drift baseline must NOT depend on
-	// assignedKeyFlow having run first. The jar bumps device.cfgversion on
-	// operator config saves ("CONFIG changed" log); this hash comparison is
-	// open-unifi's equivalent trigger.
-	// A system_cfg transmission is only an offer.  Its hash remains pending
-	// until a later inform proves the VAPs are actually running.
-	settlePendingWLAN(rec)
-	wlanDrift := false
-	if prev, _ := rec.Extra["wlan_cfg_sha"].(string); prev != "" {
-		if cur := wlanListHash(s.currentWireless()); cur != prev {
-			wlanDrift = true
-			nv, kerr := s.keyChars(16)
-			if kerr != nil {
-				return nil, "", kerr
+// noopTargetSnapshot reads the controller-owned steady-state noop target for
+// a MAC. The Server.noopMu/noopTarget map stays adapter-owned; the engine
+// receives the value in the Request and the outcome carries the new one back.
+func (s *Server) noopTargetSnapshot(mac string) int64 {
+	s.noopMu.Lock()
+	defer s.noopMu.Unlock()
+	return s.noopTarget[mac]
+}
+
+// applyOutcome applies the engine's record deltas to the adapter's record
+// and serializes the outcome into the EXACT response JSON shapes of the
+// pre-extraction behavior (adoption push: mgmt_cfg only; full provisioning:
+// all four config keys; noop: interval).
+func (s *Server) applyOutcome(mac string, rec *store.Device, out adoption.Outcome) map[string]any {
+	if out.SetState {
+		rec.State = out.State
+	}
+	if out.SetXAuthkey {
+		rec.XAuthkey = out.XAuthkey
+	}
+	if out.SetCfgVersion {
+		rec.CfgVersion = out.CfgVersion
+	}
+	if out.SetAuthkeys {
+		rec.Authkeys = out.Authkeys
+	}
+	rec.Extra = out.Extra
+	if out.PersistNoopTarget {
+		s.noopMu.Lock()
+		s.noopTarget[mac] = out.NewNoopTarget
+		s.noopMu.Unlock()
+	}
+	switch out.Kind {
+	case adoption.KindSetparam:
+		if out.FullProvision {
+			return map[string]any{
+				"_type":              "setparam",
+				"server_time_in_utc": nowMS(),
+				"cfgversion":         out.CfgVersion,
+				"system_cfg":         out.SystemCfg,
+				"blocked_sta":        out.BlockedSta,
+				"mgmt_cfg":           out.MgmtCfg,
 			}
-			rec.CfgVersion = nv
-			s.lg.Debug("inform: wireless envelope drift", "mac", mac)
 		}
-	}
-	if pending, ok := rec.Extra["wlan_cfg_pending_sha"].(string); ok && pending != "" {
-		// A changed envelope is a new delivery operation. For the unchanged
-		// operation, rate-limit retries before the switch below; importantly,
-		// this does not clear pending or treat cfgversion equality as success.
-		if pending == wlanListHash(s.currentWireless()) && !wlanRetryDue(rec, now) {
-			return s.noopRespFor(mac, rec, now.Unix()), "noop-pending-wlan", nil
+		return map[string]any{
+			"_type":              "setparam",
+			"server_time_in_utc": nowMS(),
+			"mgmt_cfg":           out.MgmtCfg,
 		}
-		wlanDrift = true
-	}
-
-	onAssigned := rec.XAuthkey != "" && strings.EqualFold(rec.XAuthkey, usedKey)
-	switch {
-	// The factory/default key is still (or again) in use: adopt. Rotate the
-	// per-device key AND the config version, respond with a fresh adoption
-	// push in the same key the device just sent (classic: send non-default
-	// authkey while the device still holds the default — §8 of the doc).
-	// FID-1: the shared default key is only ACCEPTED for a device that has
-	// not yet authenticated its per-device key — our StatePending stands in
-	// for the jar's UNKNOWN(0) pre-adoption record and StateAdopting for the
-	// jar's ADOPTING(7) two-phase default-key window (gate ôØ0000, devmgr
-	// §11006-11020). An adopted (or lost) device claiming the default key is
-	// REJECTED (devmgr "used default key in X state, reject it!" returns the
-	// ÖoÓ000 marker → servlet 404). No INFORM_ERROR(9) re-adopt state exists
-	// in the store yet — flagged for the store lane.
-	case usedKey == defaultKeyHex:
-		prev := rec.State
-		if prev != store.StatePending && prev != store.StateAdopting {
-			return nil, "", errDefaultKeyRejected
-		}
-		if err := s.rotateKeys(mac, rec); err != nil {
-			return nil, "", err
-		}
-		// Seed the wireless-envelope baseline for the cfgversion just
-		// minted (see the drift block above): the device would reach
-		// connected-noop on its very next inform (mgmt_cfg echo) without
-		// ever seeing system_cfg, and without a baseline a later WLAN
-		// change could never be detected as drift. Envelope changes made
-		// AFTER this push then mismatch the seed → full provisioning.
-		if cur := wlanListHash(s.currentWireless()); cur != "" {
-			rec.Extra["wlan_cfg_sha"] = cur
-		}
-		s.lg.Debug("inform: adoption push (default key)", "mac", mac, "prevState", prev)
-		return s.adoptionPushResp(*rec, usedKey), "setparam", nil
-
-	// A non-default key that is neither the default nor our current
-	// assignment: a stale or rogue x_authkey. FID-36 (jar §1348 rotation
-	// pending path): do NOT rotate — RE-PUSH the existing per-device key in
-	// the authkey= line; the device re-keys to the assignment it was given.
-	case !onAssigned:
-		s.lg.Debug("inform: adoption push (stale/rogue key, re-push existing assignment)", "mac", mac)
-		return s.adoptionPushResp(*rec, usedKey), "setparam", nil
-
-	// A WLAN change is a content change, not merely a version change.  In
-	// particular, U7 firmware commonly echoes the cfgversion from the previous
-	// mgmt_cfg on the first inform after an admin WLAN save.  Do not let that
-	// echoed value enter the equality/noop branch: the response must contain the
-	// newly rendered system_cfg in this inform.
-	case wlanDrift:
-		resp, kind, err := s.assignedKeyFlow(mac, rec, body)
-		if err != nil {
-			return nil, "", err
-		}
-		s.lg.Debug("inform: wireless envelope drift, forcing full provisioning", "mac", mac)
-		return resp, kind, nil
-
-	// Authenticated with our per-device key and the config applied → noop.
-	case rec.CfgVersion != "" && rec.AppliedCfg == rec.CfgVersion:
-		// Self-heal for records without a drift baseline (e.g. adopted
-		// before the hash was seeded at adoption time): mint a fresh
-		// cfgversion so the NEXT inform mismatches and flows through
-		// full provisioning, which captures the hash. Terminates: the
-		// provisioning path always stores it.
-		if prev, _ := rec.Extra["wlan_cfg_sha"].(string); prev == "" {
-			nv, kerr := s.keyChars(16)
-			if kerr != nil {
-				return nil, "", kerr
-			}
-			rec.CfgVersion = nv
-			s.lg.Debug("inform: no envelope baseline, forcing provisioning", "mac", mac)
-			return s.noopRespFor(mac, rec, now.Unix()), "noop", nil
-		}
-		if _, pending := rec.Extra["wlan_cfg_pending_sha"]; pending {
-			return s.noopRespFor(mac, rec, now.Unix()), "noop-pending-wlan", nil
-		}
-		rec.State = store.StateAdopted
-		s.lg.Debug("inform: connected noop", "mac", mac, "cfg", rec.CfgVersion)
-		return s.noopRespFor(mac, rec, now.Unix()), "noop", nil
-
 	default:
-		resp, kind, err := s.assignedKeyFlow(mac, rec, body)
-		if err != nil {
-			return nil, "", err
-		}
-		s.lg.Debug("inform: full provisioning", "mac", mac, "ours", rec.CfgVersion, "device", rec.AppliedCfg)
-		return resp, kind, nil
-	}
-}
-
-// fwMatches68215592 reports whether s identifies the U7PG2 6.8.2 build
-// 15592. The device-reported version may arrive as the short form
-// ("6.8.2.15592") or the long form the docs capture shows
-// ("BZ.qca956x_6.8.2+15592.260126.1358", docs/PROTOCOL.md:374-375) — both
-// name the same build; nothing else legitimately contains either fragment.
-// TODO(firmware): the exact wire form of the inform `version` field is still
-// unpinned (the only capture sample in docs shows "6.6.55"); once the
-// morning capture is fetched, pin the real string in the fixture
-// (docs/PROTOCOL.md:396-398).
-func fwMatches68215592(s string) bool {
-	return strings.Contains(s, "6.8.2.15592") || strings.Contains(s, "6.8.2+15592")
-}
-
-func (s *Server) rejectUnsupportedLiveWLAN(d store.Device) error {
-	if d.Model != "U7PG2" || !fwMatches68215592(d.Firmware) {
-		return nil
-	}
-	for _, w := range s.currentWireless() {
-		if w.Name != "" || w.SSID != "" {
-			return &ErrLiveWLANProvisioningUnsupported{Model: d.Model, Firmware: d.Firmware}
+		return map[string]any{
+			"_type":              "noop",
+			"server_time_in_utc": nowMS(),
+			"interval":           out.Interval,
 		}
 	}
-	return nil
-}
-
-// assignedKeyFlow is the shared tail of the assigned-key (x_authkey-held)
-// path: at CFGVERSION MATCH it is unreachable (handled by the noop branch),
-// here it emits FULL PROVISIONING — fresh cfgversion when unset, adopting
-// state, ssh password-hash cache, and capture of the emitted wireless
-// envelope hash (the next identical-envelope inform after apply must noop).
-func (s *Server) assignedKeyFlow(mac string, rec *store.Device, body map[string]any) (map[string]any, string, error) {
-	// The unsupported-live-WLAN gate runs FIRST — before any record
-	// mutation (State/CfgVersion must not change on a rejected push) and
-	// before any emission. assignedKeyFlow is the single emission point
-	// shared by BOTH transports (encrypted advance() and plaintext
-	// plainAdvance()), so one call here gates both. mgmt_cfg-only paths
-	// (re-key pushes, adoption pushes, noop) never reach this function and
-	// are deliberately NOT gated — mgmt pushes keep working for gated
-	// devices.
-	if err := s.rejectUnsupportedLiveWLAN(*rec); err != nil {
-		return nil, "", err
-	}
-	if rec.CfgVersion == "" {
-		nv, err := s.keyChars(16)
-		if err != nil {
-			return nil, "", err
-		}
-		rec.CfgVersion = nv
-	}
-	rec.State = store.StateAdopting
-	sys, serr := s.buildSystemCfg(*rec)
-	if serr != nil {
-		// FID-23: provisioning content that cannot be rendered (e.g. an
-		// unusable/empty SSH password hash) fails the whole push, like the
-		// classic L.ÔO0000 crypt call — it must never silently emit a
-		// degraded config. Nothing was persisted (the store cycle aborts).
-		return nil, "", serr
-	}
-	// This is intentionally the only observability of the full config: the
-	// diagnostic contains a digest and ordered names, never config values.
-	if diagnostic, err := systemCfgDiagnostic(sys); err == nil {
-		s.lg.Debug(diagnostic)
-	} else {
-		// Keep the debug path bounded even for malformed passthrough input; do
-		// not log err because it includes a key name copied from the config.
-		s.lg.Debug("system_cfg diagnostic unavailable", "reason", "duplicate-key")
-	}
-	cur := wlanListHash(s.currentWireless())
-	// Do not mark the configuration applied merely because system_cfg was
-	// sent.  Keep the desired snapshot as delivery evidence for the next AP
-	// inform (including deletions, where absence must be observed).
-	rec.Extra["wlan_cfg_pending_sha"] = cur
-	// Each emitted system_cfg is one bounded delivery attempt. Replacing the
-	// pending hash starts a fresh budget; retrying the same hash increments it.
-	if prev, _ := rec.Extra["wlan_cfg_attempt_sha"].(string); prev != cur {
-		rec.Extra["wlan_cfg_attempt_sha"] = cur
-		rec.Extra["wlan_cfg_attempts"] = 1
-	} else {
-		rec.Extra["wlan_cfg_attempts"] = wlanAttemptCount(rec) + 1
-	}
-	rec.Extra["wlan_cfg_last_attempt"] = time.Now().Unix()
-	rec.Extra["wlan_cfg_delivery_status"] = "pending"
-	if applied, ok := rec.Extra["wlan_cfg_applied_wlans"]; ok {
-		rec.Extra["wlan_cfg_pending_old_wlans"] = applied
-	}
-	if snapshot, err := json.Marshal(s.currentWireless()); err == nil {
-		rec.Extra["wlan_cfg_pending_wlans"] = string(snapshot)
-	}
-	// Record the intended SSID-to-radio placements so confirmation cannot be
-	// satisfied by a VAP on the wrong band/radio.
-	if placements, err := json.Marshal(wlanPlacements(*rec, s.currentWireless())); err == nil {
-		rec.Extra["wlan_cfg_pending_placements"] = string(placements)
-	}
-	resp := map[string]any{
-		"_type":              "setparam",
-		"server_time_in_utc": nowMS(),
-		"cfgversion":         rec.CfgVersion,
-		"system_cfg":         sys,
-		"blocked_sta":        "",
-		"mgmt_cfg":           s.buildMgmtCfg(*rec, rec.XAuthkey),
-	}
-	return resp, "setparam", nil
-}
-
-// siteRef is the site value the classic builder puts into mgmt_url and
-// unifi.siteid (FID-17/FID-52): the site NAME the device belongs to. The
-// store's Device.SiteID carries exactly that admin-supplied site name for
-// this MVP (no site table yet, so an empty id degrades to "default").
-func siteRef(d store.Device) string {
-	if d.SiteID == "" {
-		return defaultSiteName
-	}
-	return d.SiteID
-}
-
-// rotateKeys assigns a fresh per-device key and config version to rec and
-// moves it back into the adopting state. An error here (crypto/rand
-// failure, practically impossible) maps the inform to HTTP 500 — the
-// caller must never persist half-rotated records.
-func (s *Server) rotateKeys(mac string, rec *store.Device) error {
-	xk, err := s.keyChars(32)
-	if err != nil {
-		return err
-	}
-	cv, err := s.keyChars(16)
-	if err != nil {
-		return err
-	}
-	rec.XAuthkey = xk
-	rec.CfgVersion = cv
-	rec.Authkeys = addKey(rec.Authkeys, xk)
-	// Keep only the NEWEST TWO assigned keys: the device might still be
-	// finishing one rotation cycle when the next starts, so its previous
-	// key must keep decrypting, but everything older is useless ballast.
-	// The factory default key is never stored in this list — keyCandidates
-	// appends it at decrypt time — so factory-reset recovery is unaffected.
-	if len(rec.Authkeys) > 2 {
-		rec.Authkeys = rec.Authkeys[len(rec.Authkeys)-2:]
-	}
-	rec.State = store.StateAdopting
-	return nil
 }
 
 // Extra preservation classes when an inform body replaces rec.Extra:
@@ -1065,8 +800,13 @@ func (s *Server) rotateKeys(mac string, rec *store.Device) error {
 //	adminOwned   — never sourced from a device body: value comes from the
 //	               previous record if present, otherwise the key is DELETED
 //	               (the device can never introduce them).
+//
+// extraPrevWins is built from the engine's single-source controller-owned
+// key list (adoption.ControllerOwnedKeys) plus the server-side ssh hash
+// cache key. absorbInform's iteration is order-independent and JSON map
+// marshaling sorts keys, so the copy order carries no byte semantics.
 var (
-	extraPrevWins     = []string{"wlan_cfg_sha", "wlan_cfg_pending_sha", "wlan_cfg_pending_wlans", "wlan_cfg_pending_old_wlans", "wlan_cfg_applied_wlans", "wlan_cfg_pending_placements", "wlan_cfg_attempt_sha", "wlan_cfg_attempts", "wlan_cfg_last_attempt", "wlan_cfg_delivery_status", "ssh_sha512passwd"}
+	extraPrevWins     = append(append([]string{}, adoption.ControllerOwnedKeys...), "ssh_sha512passwd")
 	extraFillIfAbsent = []string{"radio_table", "wifi_caps", "fw_caps", "if_table", "ethernet_table", "uplink", "has_eth1"}
 	extraAdminOwned   = []string{"system_cfg_extra_lines", "mgmt_dev",
 		"anonymous_controller_id", "anonymous_site_id"}
@@ -1121,169 +861,14 @@ func (s *Server) absorbInform(mac string, rec *store.Device, body map[string]any
 	}
 }
 
-// settlePendingWLAN promotes a sent WLAN hash only after the latest inform
-// proves both sides of the change: every desired SSID has RUN VAPs and every
-// previously enabled SSID being removed has disappeared. cfgversion equality
-// is deliberately not evidence of WLAN application.
-func settlePendingWLAN(rec *store.Device) {
-	pending, ok := rec.Extra["wlan_cfg_pending_sha"].(string)
-	if !ok {
-		return
-	}
-	vaps, ok := rec.Extra["vap_table"].([]any)
-	if !ok {
-		return
-	}
-	desired := pendingWLANs(rec)
-	old := storedWLANs(rec, "wlan_cfg_pending_old_wlans")
-	need := map[string]int{}
-	placements := map[string]int{}
-	if raw, ok := rec.Extra["wlan_cfg_pending_placements"].(string); ok {
-		_ = json.Unmarshal([]byte(raw), &placements)
-	}
-	removed := map[string]bool{}
-	for _, w := range old {
-		if w.Enabled && !containsEnabled(desired, ssidOf(w)) {
-			removed[ssidOf(w)] = true
-		}
-	}
-	for _, w := range desired {
-		if w.Enabled {
-			need[ssidOf(w)]++
-		}
-	}
-	// The old snapshot is not available as a separate desired/current pair in
-	// the record, so use the current source for positive proof and only require
-	// old names to be absent when they are no longer desired.
-	//
-	// Wire keys: the AP's real vap_table uses essid/state/radio_name/name
-	// (firmware-verified, mcad FUN_0041cecc; corroborated by the live log
-	// "vap_table reports state RUN", docs/PROTOCOL.md:388;
-	// docs/AP-FIRMWARE-APPLY-PATH.md). The ssid/status/parent spellings only
-	// ever existed in our synthetic test fixtures — status/parent are kept
-	// as fallbacks here pending the capture cross-check so in-flight
-	// fixtures keep working. The placement construction side
-	// (wlanPlacements) keys on radio_table `name` values; the device-side
-	// radio_name carries the same strings.
-	for _, raw := range vaps {
-		m, ok := raw.(map[string]any)
-		if !ok || !strings.EqualFold(jsonStr(m, "state", jsonStr(m, "status", "")), "RUN") {
-			continue
-		}
-		ssid := jsonStr(m, "essid", jsonStr(m, "ssid", ""))
-		if ssid == "" {
-			continue
-		}
-		if removed[ssid] {
-			return
-		}
-		parent := jsonStr(m, "radio_name", jsonStr(m, "parent", ""))
-		key := ssid + "\x00" + parent
-		if placements[key] > 0 {
-			placements[key]--
-			need[ssid]--
-		} else if need[ssid] > 0 && len(placements) == 0 {
-			need[ssid]--
-		}
-	}
-	for _, w := range desired {
-		if w.Enabled && need[ssidOf(w)] > 0 {
-			return
-		}
-	}
-	// A deleted WLAN is settled only when the old VAP is absent. Positive
-	// desired WLANs were checked above; no VAP table means unknown, not success.
-	rec.Extra["wlan_cfg_sha"] = pending
-	rec.Extra["wlan_cfg_applied_wlans"] = rec.Extra["wlan_cfg_pending_wlans"]
-	rec.Extra["wlan_cfg_delivery_status"] = "confirmed"
-	delete(rec.Extra, "wlan_cfg_pending_sha")
-	delete(rec.Extra, "wlan_cfg_pending_wlans")
-	delete(rec.Extra, "wlan_cfg_pending_placements")
-}
-
-func wlanPlacements(d store.Device, wls []Wlan) map[string]int {
-	out := map[string]int{}
-	vaps, _ := planVaps(d, wls)
-	for _, v := range vaps {
-		out[ssidOf(v.wlan)+"\x00"+v.phyname]++
-	}
-	return out
-}
-
-func wlanAttemptCount(rec *store.Device) int {
-	switch v := rec.Extra["wlan_cfg_attempts"].(type) {
-	case int:
-		return v
-	case float64:
-		return int(v)
-	}
-	return 0
-}
-
-func wlanRetryDue(rec *store.Device, now time.Time) bool {
-	count := wlanAttemptCount(rec)
-	if count >= wlanMaxAttempts {
-		rec.Extra["wlan_cfg_delivery_status"] = "exhausted"
-		return false
-	}
-	last := int64(0)
-	switch v := rec.Extra["wlan_cfg_last_attempt"].(type) {
-	case int64:
-		last = v
-	case float64:
-		last = int64(v)
-	}
-	delay := wlanRetryBase * time.Duration(1<<max(0, count-1))
-	if delay > wlanRetryMax {
-		delay = wlanRetryMax
-	}
-	return last == 0 || now.Unix() >= last+int64(delay/time.Second)
-}
-
-func pendingWLANs(rec *store.Device) []Wlan {
-	return storedWLANs(rec, "wlan_cfg_pending_wlans")
-}
-
-func storedWLANs(rec *store.Device, key string) []Wlan {
-	if raw, ok := rec.Extra[key].(string); ok {
-		var w []Wlan
-		if json.Unmarshal([]byte(raw), &w) == nil {
-			return w
-		}
-	}
-	return nil
-}
-
-func containsEnabled(wls []Wlan, ssid string) bool {
-	for _, w := range wls {
-		if w.Enabled && ssidOf(w) == ssid {
-			return true
-		}
-	}
-	return false
-}
-
 // ---- config blob builders (docs/PROTOCOL-mgmt.md §2, §3) ------------------
 
 // lineWriter returns the shared INJECTION-GUARDED key=value line writer used
-// by every system_cfg/mgmt_cfg emission site. Any VALUE containing \n or \r
-// makes the whole row skipped (with a warn) instead of emitted — a newline
-// smuggled in from an inform body (forged radio fields, timezone strings,
-// cookie comments) would terminate the row early and inject attacker-chosen
-// key=value rows into the device's config. "Fail loud, never emit."
-// (raw() admin passthrough lines in buildSystemCfg are the ONLY unguarded
-// writer: admin-owned by definition.)
+// by every system_cfg/mgmt_cfg emission site (the implementation lives in the
+// adoption engine package so both the system_cfg renderer here and the
+// engine's mgmt_cfg builder share it).
 func (s *Server) lineWriter(b *strings.Builder, where string) func(k, v string) {
-	return func(k, v string) {
-		if strings.ContainsAny(v, "\n\r") {
-			s.lg.Warn("config blob: row skipped, newline in value", "where", where, "key", k)
-			return
-		}
-		b.WriteString(k)
-		b.WriteString("=")
-		b.WriteString(v)
-		b.WriteString("\n")
-	}
+	return adoption.LineWriter(s.lg, b, where)
 }
 
 // sshPassword is the effective SSH password ("ubnt" default, cfg override).
@@ -1301,100 +886,6 @@ func (s *Server) regulatoryCountryCode() int {
 	return s.cfg.RegulatoryCountryCode
 }
 
-// addrHost extracts the hostname/IP of u, tolerating unparseable input.
-func addrHost(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil || u == nil {
-		return ""
-	}
-	return u.Hostname()
-}
-
-// advertHost derives the controller host a device should be pointed back at:
-// server.Config.ControllerURL host → the device's reported inform_url host →
-// device IP (docs/PROTOCOL-mgmt.md §2, L.o00000 priority).
-func (s *Server) advertHost(d store.Device) string {
-	if h := addrHost(s.cfg.ControllerURL); h != "" {
-		return h
-	}
-	if h := addrHost(d.InformURL); h != "" {
-		return h
-	}
-	return d.IP
-}
-
-// informURLPort is the port embedded into the inform_url line: the
-// ControllerURL's explicit port, else the configured listen port, else the
-// classic 8080.
-func (s *Server) informURLPort() string {
-	if u, err := url.Parse(s.cfg.ControllerURL); err == nil && u != nil && u.Port() != "" {
-		return u.Port()
-	}
-	if _, port, err := net.SplitHostPort(strings.TrimSpace(s.cfg.InformListenAddr)); err == nil && port != "" {
-		return port
-	}
-	return defaultInformPort
-}
-
-// mgmtPort is the HTTPS manage-port embedded into mgmt_url. The classic
-// controller appends the port unless it is 443 (docs/PROTOCOL-mgmt.md §2:
-// "https://<host>[:443]/…" vs the 8443-default branch). We cannot know the
-// admin HTTPS port from a plain-HTTP ControllerURL, so anything that is not
-// an explicit https URL falls back to the classic default 8443.
-func (s *Server) mgmtPort() string {
-	u, err := url.Parse(s.cfg.ControllerURL)
-	if err != nil || u == nil || u.Scheme != "https" {
-		return defaultMgmtPort
-	}
-	if u.Port() == "" {
-		return "443"
-	}
-	return u.Port()
-}
-
-// buildMgmtCfg renders the mgmt_cfg blob exactly in the config/B (decompile
-// cfr_renamed_0) line order. Every line is terminated with \n (verified in
-// com/ubnt/ace/C.o00000(StringBuilder,…): append(key=value).append("\n")).
-//
-// usedKey is the key the current inform was encrypted with; the authkey=
-// rotation line is emitted only when that key differs from the record's
-// XAuthkey (x_inform_authkey != x_authkey in the decompile).
-func (s *Server) buildMgmtCfg(d store.Device, usedKey string) string {
-	host := s.advertHost(d)
-	site := siteRef(d)
-	var b strings.Builder
-	line := s.lineWriter(&b, "mgmt_cfg")
-
-	// AP capabilities: notif + notif-assoc-stat. fastapply-bg is USW-only
-	// and is never emitted for an AP (B decompile: "usw".equals(type)).
-	line("capability", "notif,notif-assoc-stat")
-	// selfrun_guest_mode comes from the site's config.selfrun_guest_mode
-	// setting, default "pass"; we have no site table yet — emit the default.
-	line("selfrun_guest_mode", "pass")
-	line("cfgversion", d.CfgVersion)
-	line("led_enabled", "true")
-	line("stun_url", "stun://"+host+":"+defaultStunPort+"/")
-	if p := s.mgmtPort(); p == "443" {
-		line("mgmt_url", "https://"+host+"/manage/site/"+site)
-	} else {
-		line("mgmt_url", "https://"+host+":"+p+"/manage/site/"+site)
-	}
-	if d.XAuthkey != "" && !strings.EqualFold(usedKey, d.XAuthkey) {
-		line("authkey", d.XAuthkey)
-	}
-	// FID-16: the inform_url row exists only when the controller URL is
-	// explicitly overridden (jar: mgmt.override_inform_host/migrate_inform_url —
-	// config L.new() returns null without an override, and the B writer
-	// skips the row on null). Devices keep pointing wherever they already
-	// point until an admin overrides.
-	if s.cfg.ControllerURL != "" && host != "" {
-		line("inform_url", "http://"+host+":"+s.informURLPort()+"/inform")
-	}
-	line("use_aes_gcm", "true")
-	line("report_crash", "true")
-	return b.String()
-}
-
 // buildSystemCfg renders the MINIMAL system_cfg text blob
 // (docs/PROTOCOL-mgmt.md §3; builder = com/ubnt/service/config/int).
 // Sections are plain "# name" headers followed by key=value lines, each
@@ -1406,11 +897,14 @@ func (s *Server) buildMgmtCfg(d store.Device, usedKey string) string {
 // the wireless/aaa.<n>, vlan/bridge/netconf, qos/bandsteering, syslog, snmp
 // and cron/ntp sections from the real int builder are pending
 // reverse-engineering and must NOT be invented here.
-func (s *Server) buildSystemCfg(d store.Device) (string, error) {
-	return s.buildGeneratedSystemCfg(d)
+func (s *Server) buildSystemCfg(d store.Device, wls []Wlan) (string, error) {
+	return s.buildGeneratedSystemCfg(d, wls)
 }
 
-func (s *Server) buildGeneratedSystemCfg(d store.Device) (string, error) {
+// buildGeneratedSystemCfg renders the generated system_cfg from the record
+// and the PASSED wireless envelope (the engine threads one snapshot per
+// decision so the drift hash and the rendered config always agree).
+func (s *Server) buildGeneratedSystemCfg(d store.Device, wls []Wlan) (string, error) {
 	if err := ValidateConfig(s.cfg); err != nil {
 		return "", err
 	}
@@ -1449,7 +943,7 @@ func (s *Server) buildGeneratedSystemCfg(d store.Device) (string, error) {
 		// reporterid = the very same controller anonymous id.
 		line("unifi.reporterid", v)
 	}
-	line("unifi.siteid", siteRef(d))
+	line("unifi.siteid", adoption.SiteRef(d))
 	// unifi.idp — tail of String's unifi writer (String.txt:1898+,
 	// com__ubnt__service__config__String.txt:1899-1902): the bytecode pushes
 	// iconst_1, i.e. Setting.is("unifi_idp_enabled", true) — the JAR DEFAULT
@@ -1502,7 +996,7 @@ func (s *Server) buildGeneratedSystemCfg(d store.Device) (string, error) {
 	// `# wlans (radio)` + radio.<n>/virtual + aaa.<n>/wireless.<n> vaps +
 	// `# vlan`/`# bridge`/`# netconf`/`# dhcpc` wiring. Real section order
 	// per PROTOCOL-mgmt.md §3 puts this before the sshd/syslog ones.
-	s.emitWirelessCfg(&b, d, s.currentWireless())
+	s.emitWirelessCfg(&b, d, wls)
 
 	// 4b. Factory-baseline echo sections. The system_cfg apply is a
 	// FULL-CONFIG REPLACEMENT (mcad renames the staged file over
@@ -1532,7 +1026,7 @@ func (s *Server) buildGeneratedSystemCfg(d store.Device) (string, error) {
 	line("connectivity.uplink_bridge", mgmtDevOf(d))
 	ethIfaces, _ := ethPortNames(d)
 	line("connectivity.uplink_eth", ethIfaces[0])
-	line("connectivity.uplink_wds", fmt.Sprintf("ath%d", len(storedRadios(d))-1))
+	line("connectivity.uplink_wds", fmt.Sprintf("ath%d", len(wireless.StoredRadios(d))-1))
 
 	// # syslog (§3 step 8) — factory echo.
 	b.WriteString("# syslog\n")
@@ -1667,7 +1161,7 @@ func (s *Server) usersPasswordHash(d store.Device) (string, error) {
 // fw_caps SHA-512 bit (0x0400); a record that does not report the field
 // evaluates to capability 0 (jar X.getInt default) → the $1$ branch.
 func supportsSha512Password(d store.Device) bool {
-	ok, caps := numFromExtra(d.Extra, "fw_caps")
+	ok, caps := wireless.NumFromExtra(d.Extra, "fw_caps")
 	return ok && caps&0x400 == 0x400
 }
 
@@ -1816,88 +1310,14 @@ func randAlphaSaltLive(n int) (string, error) {
 	return string(out), nil
 }
 
-// adoptionPushResp is the §6.2 a/b/c/f setparam variant: mgmt_cfg ONLY,
-// with a freshly stored cfgversion carried inside the mgmt_cfg blob. The
-// response is encrypted with the key the device just used, so a pending
-// authkey= line forwards the rotated key.
-func (s *Server) adoptionPushResp(d store.Device, usedKey string) map[string]any {
-	return map[string]any{
-		"_type":              "setparam",
-		"server_time_in_utc": nowMS(),
-		"mgmt_cfg":           s.buildMgmtCfg(d, usedKey),
-	}
-}
-
-// fullProvisionResp was removed: assigned-key full provisioning is now
-// assembled inside assignedKeyFlow so a buildSystemCfg error (FID-23) can
-// fail the whole push.
-
 // noopResp is the exception/internal fallback. Record-aware normal noops use
-// noopRespFor, which implements the standard non-ubios UAP scheduler.
+// the adoption engine's noop scheduling (Engine.noopFor, the standard
+// non-ubios UAP scheduler).
 func (s *Server) noopResp() map[string]any {
 	return map[string]any{
 		"_type":              "noop",
 		"server_time_in_utc": nowMS(),
 		"interval":           10,
-	}
-}
-
-func isUbios(model string) bool {
-	m := strings.ToUpper(model)
-	return strings.Contains(m, "UDM") || strings.Contains(m, "UXG")
-}
-
-// noopRespFor implements devmgr's ordinary UAP noop scheduling. now is the
-// timestamp of the inform currently being handled, not a poller snapshot.
-func (s *Server) noopRespFor(mac string, rec *store.Device, now int64) map[string]any {
-	interval := int64(10)
-	if !isUbios(rec.Model) {
-		if truthy(rec.Extra["watching"]) {
-			interval = 5
-		} else {
-			const capSeconds int64 = 90
-			r := noopRandom()
-			if r < 0 {
-				r = 0
-			} else if r >= 1 {
-				r = math.Nextafter(1, 0)
-			}
-			s.noopMu.Lock()
-			previous := s.noopTarget[mac]
-			if previous == 0 {
-				previous = now
-			}
-			target := maxInt64(previous+5, now+10) + int64(math.Floor(r*5))
-			candidate := target - now
-			if candidate < capSeconds {
-				interval = candidate
-				s.noopTarget[mac] = target
-			} else {
-				interval = int64(math.Floor(float64(capSeconds) * (1 - 0.7*r)))
-			}
-			s.noopMu.Unlock()
-		}
-	}
-	return map[string]any{"_type": "noop", "server_time_in_utc": nowMS(), "interval": interval}
-}
-
-func maxInt64(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func truthy(v any) bool {
-	switch x := v.(type) {
-	case bool:
-		return x
-	case string:
-		return x != "" && x != "false" && x != "0"
-	case float64:
-		return x != 0
-	default:
-		return v != nil
 	}
 }
 

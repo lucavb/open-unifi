@@ -23,7 +23,9 @@ import (
 	"time"
 
 	"github.com/lucabecker/open-unifi/internal/inform"
+	"github.com/lucabecker/open-unifi/internal/server/adoption"
 	"github.com/lucabecker/open-unifi/internal/store"
+	"github.com/lucabecker/open-unifi/internal/wireless"
 )
 
 const (
@@ -33,54 +35,6 @@ const (
 	testDefaultKey = "ba86f2bbe107c7c57eb5f2690775c712" // MD5("ubnt")
 	testMAC        = "aabbccddeeff"
 )
-
-func TestNoopIntervalScheduling(t *testing.T) {
-	oldRandom := noopRandom
-	t.Cleanup(func() { noopRandom = oldRandom })
-	tests := []struct {
-		name string
-		r    float64
-		rec  store.Device
-		now  int64
-		want int64
-	}{
-		{"first low", 0, store.Device{Model: "U7PG2", Extra: store.JSONMap{}}, 1000, 10},
-		{"first high", .9, store.Device{Model: "U7PG2", Extra: store.JSONMap{}}, 1000, 14},
-		{"watching", .5, store.Device{Model: "U7PG2", Extra: store.JSONMap{"watching": true}}, 1000, 5},
-		{"ubios fallback", .5, store.Device{Model: "UDM-Pro", Extra: store.JSONMap{}}, 1000, 10},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			noopRandom = func() float64 { return tt.r }
-			s := New(Config{}, nil, slog.Default())
-			got := s.noopRespFor(testMAC, &tt.rec, tt.now)["interval"]
-			if got != tt.want {
-				t.Fatalf("interval = %v, want %d", got, tt.want)
-			}
-		})
-	}
-	t.Run("target advances and cap fallback does not persist", func(t *testing.T) {
-		noopRandom = func() float64 { return 0 }
-		s := New(Config{}, nil, slog.Default())
-		r := store.Device{Model: "U7PG2", Extra: store.JSONMap{}}
-		if got := s.noopRespFor(testMAC, &r, 1000)["interval"]; got != int64(10) {
-			t.Fatal(got)
-		}
-		if got := s.noopRespFor(testMAC, &r, 1005)["interval"]; got != int64(10) {
-			t.Fatal(got)
-		}
-		s.noopMu.Lock()
-		s.noopTarget[testMAC] = 1100
-		s.noopMu.Unlock()
-		noopRandom = func() float64 { return .5 }
-		if got := s.noopRespFor(testMAC, &r, 1000)["interval"]; got != int64(58) {
-			t.Fatal(got)
-		}
-	})
-	if got := (&Server{}).noopResp()["interval"]; got != 10 {
-		t.Fatalf("fallback = %v", got)
-	}
-}
 
 var testIV = bytes16(0x07)
 
@@ -344,7 +298,7 @@ func hexKey(t *testing.T, s string) []byte {
 // fails the test unless the test specifically asserts the failure.
 func mustBuildSys(t *testing.T, s *Server, rec store.Device) string {
 	t.Helper()
-	sys, err := s.buildSystemCfg(rec)
+	sys, err := s.buildSystemCfg(rec, s.currentWireless())
 	if err != nil {
 		t.Fatalf("system_cfg build: %v", err)
 	}
@@ -464,174 +418,6 @@ func TestFramedPlainZlib(t *testing.T) {
 	}
 }
 
-// (a4) plaintext claim = stale/missing key → mgmt_cfg-only push carrying
-// the CURRENT XAuthkey, NO rotation, state unchanged.
-func TestPlainRekeyPushNoRotation(t *testing.T) {
-	const xk = "11112222333344445555666677778888"
-	plain, err := json.Marshal(infoBody("aaaa"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	h, st := newServerWith(Config{AllowPlainText: true})
-	registerAdopted(t, st, "aaaa", xk)
-
-	resp := post(t, h, plain) // no _authkey claim in body
-	if resp.Code != http.StatusOK {
-		t.Fatalf("status %d %q", resp.Code, resp.Body.String())
-	}
-	var jm map[string]any
-	if err := json.Unmarshal(resp.Body.Bytes(), &jm); err != nil {
-		t.Fatal(err)
-	}
-	exactKeys(t, jm, "_type", "server_time_in_utc", "mgmt_cfg")
-	mgmt := jm["mgmt_cfg"].(string)
-	if !strings.Contains(mgmt, "authkey="+xk+"\n") {
-		t.Fatalf("plain push mgmt_cfg missing current assignment: %q", mgmt)
-	}
-	rec, err := st.Get(testMAC)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rec.XAuthkey != xk || rec.CfgVersion != "aaaa" || rec.State != store.StateAdopted {
-		t.Fatalf("plain push rotated/mutated assignment: %+v", rec)
-	}
-}
-
-// (a5) plaintext claim == XAuthkey with cfgversion drift → full provisioning.
-func TestPlainClaimDriftFullProvision(t *testing.T) {
-	const xk = "11112222333344445555666677778888"
-	h, st := newServerWith(Config{AllowPlainText: true})
-	registerAdopted(t, st, "aaaa", xk)
-
-	// with the claim equal to the assigned key
-	withClaim := infoBody("stale-1")
-	withClaim["_authkey"] = xk
-	plain, err := json.Marshal(withClaim)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp := post(t, h, plain)
-	if resp.Code != http.StatusOK {
-		t.Fatalf("status %d", resp.Code)
-	}
-	var jm map[string]any
-	if err := json.Unmarshal(resp.Body.Bytes(), &jm); err != nil {
-		t.Fatal(err)
-	}
-	if jm["_type"] != "setparam" || jm["system_cfg"] == nil || jm["cfgversion"] != "aaaa" {
-		t.Fatalf("plain claim drift type = %v, want full provisioning", jm["_type"])
-	}
-}
-
-// (c) happy adoption path: pending + default-key (CBC) inform → setparam with
-// fresh x_authkey; re-keyed inform with matching cfgversion → noop (+adopted).
-func TestHappyAdoption(t *testing.T) {
-	h, st := newServerWith(Config{})
-	registerPending(t, st)
-
-	// Inform #1: factory default key, no cfgversion applied yet.
-	resp := post(t, h, encryptCBC(t, mustJSON(t, infoBody("")), hexKey(t, testDefaultKey), testIV))
-	if resp.Code != http.StatusOK {
-		t.Fatalf("inform#1: status %d", resp.Code)
-	}
-	if ct := resp.Header().Get("Content-Type"); ct != "application/x-binary" {
-		t.Fatalf("inform#1 content-type: %s", ct)
-	}
-	flags, jm := decryptResponse(t, resp.Body.Bytes(), hexKey(t, testDefaultKey))
-	if flags&testFlagGCM != 0 {
-		t.Fatalf("inform#1 response should echo CBC, flags %04x", flags)
-	}
-	if jm["_type"] != "setparam" {
-		t.Fatalf("inform#1 type = %v, want setparam", jm["_type"])
-	}
-	// Adoption push (§6.2 a/c/f): mgmt_cfg ONLY, no top-level cfgversion.
-	exactKeys(t, jm, "_type", "server_time_in_utc", "mgmt_cfg")
-	mgmt, _ := jm["mgmt_cfg"].(string)
-	if mgmt == "" || !strings.HasSuffix(mgmt, "\n") {
-		t.Fatalf("inform#1 mgmt_cfg not \\n-terminated: %q", mgmt)
-	}
-	if !strings.Contains(mgmt, "cfgversion=") ||
-		!strings.Contains(mgmt, "capability=notif,notif-assoc-stat") {
-		t.Fatalf("inform#1 mgmt_cfg = %q", mgmt)
-	}
-	if strings.Contains(mgmt, "unifi.") {
-		t.Fatalf("inform#1 mgmt_cfg has superseded unifi.* keys: %q", mgmt)
-	}
-	if !strings.Contains(mgmt, "authkey=") {
-		t.Fatalf("inform#1 adoption mgmt_cfg missing authkey rotation line: %q", mgmt)
-	}
-
-	rec, err := st.Get(testMAC)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rec.State != store.StateAdopting {
-		t.Fatalf("state after inform#1 = %d, want adopting", rec.State)
-	}
-	if len(rec.XAuthkey) != 32 || !isHex(rec.XAuthkey) {
-		t.Fatalf("x_authkey not stored as 32 hex: %q", rec.XAuthkey)
-	}
-	if !containsKey(rec.Authkeys, rec.XAuthkey) {
-		t.Fatalf("x_authkey not in authkeys: %v", rec.Authkeys)
-	}
-	xkey := rec.XAuthkey
-	cfg := rec.CfgVersion
-	if len(cfg) != 16 || !isHex(cfg) {
-		t.Fatalf("cfgversion not 16 hex: %q", cfg)
-	}
-
-	// Inform #2: device re-keyed to x_authkey and applied the config.
-	resp = post(t, h, encryptCBC(t, mustJSON(t, infoBody(cfg)), hexKey(t, xkey), testIV))
-	if resp.Code != http.StatusOK {
-		t.Fatalf("inform#2: status %d", resp.Code)
-	}
-	flags, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
-	if jm["_type"] != "noop" {
-		t.Fatalf("inform#2 type = %v, want noop", jm["_type"])
-	}
-	// FID-11: interval is a JSON number of seconds.
-	if iv, ok := jm["interval"].(float64); !ok || iv < 1 || iv > 90 {
-		t.Fatalf("interval = %v (%T), want number in [1,90]", jm["interval"], jm["interval"])
-	}
-	flags2 := binary.BigEndian.Uint16(resp.Body.Bytes()[14:16])
-	if flags2&testFlagGCM != 0 {
-		t.Fatalf("inform#2 response should echo CBC, flags %04x", flags2)
-	}
-	rec, err = st.Get(testMAC)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rec.State != store.StateAdopted {
-		t.Fatalf("state after inform#2 = %d, want adopted", rec.State)
-	}
-	if rec.Model != "U7PG2" || rec.AppliedCfg != cfg || rec.LastSeen == 0 {
-		t.Fatalf("record not updated: %+v", rec)
-	}
-
-	// GCM capability round-trip: inform #3 uses GCM; response must echo GCM
-	// (flags = GCM|EncCBC = 0x0009) encrypted with the same per-device key.
-	resp = post(t, h, encryptGCM(t, mustJSON(t, infoBody(cfg)), hexKey(t, xkey), testIV))
-	if resp.Code != http.StatusOK {
-		t.Fatalf("inform#3: status %d", resp.Code)
-	}
-	flags, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
-	if jm["_type"] != "noop" {
-		t.Fatalf("inform#3 type = %v, want noop", jm["_type"])
-	}
-	if flags != testFlagGCM|testFlagEncCBC {
-		t.Fatalf("inform#3 response flags = %04x, want 0x0009", flags)
-	}
-	// The response IV must be FRESH, never the request's IV (servlet:
-	// _O02.IV = C.random(16) before the GCM/CBC branch, both directions).
-	if bytes.Equal(resp.Body.Bytes()[16:32], testIV) {
-		t.Fatal("inform#3 response reused the request IV")
-	}
-	// MAC/flags echo discipline on the response header.
-	if !bytes.Equal(resp.Body.Bytes()[8:14], testMACRaw()) {
-		t.Fatal("inform#3 response MAC not echoed from the request")
-	}
-}
-
 // (c-live) regression from the 2026-09-16 acceptance session: real firmware
 // (U7PG2 on BZ.6.8.2) sends its periodic status informs with NO _type key at
 // all, factory key, ~15 s cadence. The empty-_type inform IS the jar's
@@ -658,179 +444,6 @@ func TestEmptyTypeStatusInformAdopts(t *testing.T) {
 	}
 	if rec.State != store.StateAdopting {
 		t.Fatalf("state = %d, want adopting", rec.State)
-	}
-}
-
-// (d) cfgversion drift after adoption → FULL provisioning setparam (all four
-// config keys), state back to adopting. Device is on its x_authkey, so the
-// mgmt_cfg must NOT carry the authkey rotation line.
-func TestCfgVersionDriftFullProvisioning(t *testing.T) {
-	h, st := newServerWith(Config{})
-	const k = "11112222333344445555666677778888"
-	registerAdopted(t, st, "aaaa", k)
-
-	body := encryptCBC(t, mustJSON(t, infoBody("bogus-drift")), hexKey(t, k), testIV)
-	resp := post(t, h, body)
-	if resp.Code != http.StatusOK {
-		t.Fatalf("status %d", resp.Code)
-	}
-	_, jm := decryptResponse(t, resp.Body.Bytes(), hexKey(t, k))
-	if jm["_type"] != "setparam" {
-		t.Fatalf("drift reply type = %v, want setparam", jm["_type"])
-	}
-	exactKeys(t, jm, "_type", "server_time_in_utc",
-		"cfgversion", "system_cfg", "blocked_sta", "mgmt_cfg")
-
-	if jm["cfgversion"] != "aaaa" {
-		t.Fatalf("top-level cfgversion = %v, want record value %q", jm["cfgversion"], "aaaa")
-	}
-	if sta, _ := jm["blocked_sta"].(string); sta != "" {
-		t.Fatalf("blocked_sta = %q, want empty (no block list yet)", sta)
-	}
-	sys, _ := jm["system_cfg"].(string)
-	// Real section head order (int.txt:17208-17216): `# unifi` first
-	// (with the idp + cfgcap_info tail rows), then `# users`. The
-	// `# system` section is deliberately omitted (no site locale; the
-	// factory baseline carries no system rows — see
-	// buildGeneratedSystemCfg).
-	for _, want := range []string{
-		"# unifi\n", "unifi.version=0.1.0-dev\n", "unifi.siteid=default\n",
-		"unifi.idp=disabled\n", "unifi.cfgcap_info=0x7\n",
-		"# users\n", "users.status=enabled\n", "users.1.name=ubnt\n",
-		"users.2.name=nobody\n",
-		"sshd.status=enabled\n", "sshd.1.status=enabled\n",
-	} {
-		if !strings.Contains(sys, want) {
-			t.Fatalf("system_cfg missing %q:\n%s", want, sys)
-		}
-	}
-	// FID-20/FID-62: no invented "# sshd"/"# misc" section headers.
-	for _, wrong := range []string{"# sshd\n", "# misc\n"} {
-		if strings.Contains(sys, wrong) {
-			t.Fatalf("system_cfg must not carry the invented header %q:\n%s", wrong, sys)
-		}
-	}
-	if strings.Contains(sys, "wireless.") || strings.Contains(sys, "aaa.") {
-		t.Fatalf("system_cfg invented unpublished wireless lines:\n%s", sys)
-	}
-
-	mgmt, _ := jm["mgmt_cfg"].(string)
-	if strings.Contains(mgmt, "authkey=") {
-		t.Fatalf("full-provisioning mgmt_cfg must omit authkey when device is on x_authkey: %q", mgmt)
-	}
-	if !strings.Contains(mgmt, "cfgversion=aaaa\n") {
-		t.Fatalf("full-provisioning mgmt_cfg missing record cfgversion: %q", mgmt)
-	}
-	for _, want := range []string{
-		"capability=notif,notif-assoc-stat\n",
-		"selfrun_guest_mode=pass\n",
-		"led_enabled=true\n",
-		"stun_url=stun://10.0.0.5:3478/\n",
-		"mgmt_url=https://10.0.0.5:8443/manage/site/default\n",
-		// FID-16: no inform_url row — the row is emitted only when the
-		// controller URL is explicitly overridden (this Config{} is not).
-		"use_aes_gcm=true\n",
-		"report_crash=true\n",
-	} {
-		if !strings.Contains(mgmt, want) {
-			t.Fatalf("mgmt_cfg missing %q:\n%s", want, mgmt)
-		}
-	}
-	if strings.Contains(mgmt, "inform_url=") {
-		t.Fatalf("unoverridden mgmt_cfg must omit the inform_url row:\n%s", mgmt)
-	}
-	if strings.Contains(mgmt, "is_setup_completed") {
-		t.Fatalf("mgmt_cfg is UDM-only line: %q", mgmt)
-	}
-	rec, err := st.Get(testMAC)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rec.State != store.StateAdopting {
-		t.Fatalf("drift state = %d, want adopting", rec.State)
-	}
-	if rec.CfgVersion != "aaaa" {
-		t.Fatalf("full provisioning must keep the record cfgversion, got %q", rec.CfgVersion)
-	}
-}
-
-// (e) inform with the forbidden default key AFTER adoption → REJECTED: the
-// state-gated factory key (FID-1) maps to the classic 404 marker (devmgr
-// "used default key in ADOPTED state, reject it!" → ÖoÓ000 → servlet 404)
-// and the record must stay completely untouched.
-func TestDefaultKeyAfterAdoptionRejected(t *testing.T) {
-	h, st := newServerWith(Config{})
-	const k = "99998888777766665555444433332222"
-	registerAdopted(t, st, "aaaa", k)
-
-	body := encryptCBC(t, mustJSON(t, infoBody("aaaa")), hexKey(t, testDefaultKey), testIV)
-	resp := post(t, h, body)
-	if resp.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404 (default key rejected post-adoption)", resp.Code)
-	}
-	rec, err := st.Get(testMAC)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rec.XAuthkey != k || rec.CfgVersion != "aaaa" || rec.State != store.StateAdopted {
-		t.Fatalf("rejected default-key inform mutated the record: %+v", rec)
-	}
-	if !containsKey(rec.Authkeys, k) {
-		t.Fatalf("authkeys touched by rejection: %v", rec.Authkeys)
-	}
-
-	// Pending and adopting records still accept the default key (the
-	// UNKNOWN/two-phase acceptance window), covered by TestHappyAdoption,
-	// TestGCMAdoptionMatrix and TestAuthkeysPrunedToTwo.
-}
-
-// A known-but-stale authkey (≠ x_authkey) used during adoption → hostile/
-// unexpected, but FID-36 (jar rotation-pending push): the broker RE-PUSHES
-// the existing per-device key via the authkey= line WITHOUT rotating it.
-func TestUnexpectedKeyDuringAdoption(t *testing.T) {
-	h, st := newServerWith(Config{})
-	// Seeded mid-adoption record: our assigned x_authkey is "deadbeef...", but
-	// the device still holds the older admin key "1111..." from a previous cycle.
-	const stale = "11112222333344445555666677778888"
-	const xauth = "deadbeefdeadbeefdeadbeefdeadbeef"
-	if err := st.Put(store.Device{
-		MAC:        testMAC,
-		State:      store.StateAdopting,
-		CfgVersion: "aaaa",
-		AppliedCfg: "",
-		XAuthkey:   xauth,
-		Authkeys:   []string{stale, testDefaultKey},
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	resp := post(t, h, encryptCBC(t, mustJSON(t, infoBody("")), hexKey(t, stale), testIV))
-	if resp.Code != http.StatusOK {
-		t.Fatalf("inform: status %d", resp.Code)
-	}
-	_, jm := decryptResponse(t, resp.Body.Bytes(), hexKey(t, stale))
-	if jm["_type"] != "setparam" {
-		t.Fatalf("type = %v, want setparam", jm["_type"])
-	}
-	// Stale-x_authkey inform → adoption-push shape (mgmt_cfg only) carrying
-	// the CURRENT assignment, no rotation (FID-36).
-	exactKeys(t, jm, "_type", "server_time_in_utc", "mgmt_cfg")
-	mgmt, _ := jm["mgmt_cfg"].(string)
-	rec, err := st.Get(testMAC)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rec.XAuthkey != xauth {
-		t.Fatalf("x_authkey must be re-pushed unchanged, got %q (want %q)", rec.XAuthkey, xauth)
-	}
-	if rec.State != store.StateAdopting {
-		t.Fatalf("state = %d, want adopting", rec.State)
-	}
-	if len(rec.Authkeys) != 2 || !containsKey(rec.Authkeys, stale) || !containsKey(rec.Authkeys, testDefaultKey) {
-		t.Fatalf("authkeys touched by re-push: %v", rec.Authkeys)
-	}
-	if !strings.Contains(mgmt, "authkey="+xauth+"\n") {
-		t.Fatalf("adoption push mgmt_cfg %q missing current assignment authkey line", mgmt)
 	}
 }
 
@@ -1618,7 +1231,7 @@ func TestWirelessDriftFSM(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantHash := wlanListHash(env)
+	wantHash := wireless.WlanListHash(env)
 	if rec.Extra["wlan_cfg_pending_sha"] != wantHash {
 		t.Fatalf("wlan_cfg_pending_sha = %v, want %q", rec.Extra["wlan_cfg_pending_sha"], wantHash)
 	}
@@ -1649,7 +1262,7 @@ func TestWirelessDriftFSM(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	newHash := wlanListHash(env)
+	newHash := wireless.WlanListHash(env)
 	if rec.Extra["wlan_cfg_pending_sha"] != newHash {
 		t.Fatalf("pending hash not refreshed: %v want %q", rec.Extra["wlan_cfg_pending_sha"], newHash)
 	}
@@ -1698,8 +1311,8 @@ func TestAdoptionPushSeedsHash(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec.Extra["wlan_cfg_sha"] != wlanListHash(env) {
-		t.Fatalf("adoption push wlan_cfg_sha = %v, want %q", rec.Extra["wlan_cfg_sha"], wlanListHash(env))
+	if rec.Extra["wlan_cfg_sha"] != wireless.WlanListHash(env) {
+		t.Fatalf("adoption push wlan_cfg_sha = %v, want %q", rec.Extra["wlan_cfg_sha"], wireless.WlanListHash(env))
 	}
 	if !containsKey(rec.Authkeys, rec.XAuthkey) {
 		t.Fatal("x_authkey not appended")
@@ -1733,7 +1346,7 @@ func TestAdoptionEchoThenEnvelopeDrift(t *testing.T) {
 		t.Fatal(err)
 	}
 	xkey, cfg := rec.XAuthkey, rec.CfgVersion
-	if rec.Extra["wlan_cfg_sha"] != wlanListHash(env) {
+	if rec.Extra["wlan_cfg_sha"] != wireless.WlanListHash(env) {
 		t.Fatalf("adoption push did not seed the empty-envelope baseline: %v", rec.Extra["wlan_cfg_sha"])
 	}
 
@@ -1767,7 +1380,7 @@ func TestAdoptionEchoThenEnvelopeDrift(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec.Extra["wlan_cfg_pending_sha"] != wlanListHash(env) {
+	if rec.Extra["wlan_cfg_pending_sha"] != wireless.WlanListHash(env) {
 		t.Fatalf("pending hash not refreshed after provisioning: %v", rec.Extra["wlan_cfg_pending_sha"])
 	}
 
@@ -1778,43 +1391,6 @@ func TestAdoptionEchoThenEnvelopeDrift(t *testing.T) {
 	_, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
 	if jm["_type"] != "noop" {
 		t.Fatalf("inform#4 type = %v, want noop", jm["_type"])
-	}
-}
-
-// The ENCRYPTED transport (the only one a real U7PG2 uses) is also gated:
-// the unsupported-live-WLAN rejection lives in assignedKeyFlow (the single
-// emission point both transports share), so a drifted/adopted U7PG2 on
-// 6.8.2.15592 with a managed WLAN answers the inform with the typed 501 and
-// NEVER emits a system_cfg — and the record is not mutated by the gate.
-func TestEncryptedGateBlocksSystemCfg(t *testing.T) {
-	env := workedEnvelope()
-	st := store.NewMemStore()
-	xkey := "11112222333344445555666677778888"
-	if err := st.Put(store.Device{
-		MAC: testMAC, State: store.StateAdopted,
-		CfgVersion: "aaaa", AppliedCfg: "",
-		XAuthkey: xkey, Authkeys: []string{xkey}, Model: "U7PG2",
-		Extra: u7pg2Record().Extra,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	h := wiredServer(t, func() []Wlan { return env }, st)
-
-	body := infoBody("")
-	body["version"] = "6.8.2.15592"
-	resp := post(t, h, encryptCBC(t, mustJSON(t, body), hexKey(t, xkey), testIV))
-	if resp.Code != http.StatusNotImplemented {
-		t.Fatalf("gated inform status = %d, want 501", resp.Code)
-	}
-	if strings.Contains(resp.Body.String(), "system_cfg") {
-		t.Fatalf("gated inform leaked system_cfg: %q", resp.Body.String())
-	}
-	rec, err := st.Get(testMAC)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rec.State != store.StateAdopted || rec.CfgVersion != "aaaa" {
-		t.Fatalf("gate must not mutate the record: state=%d cfg=%q", rec.State, rec.CfgVersion)
 	}
 }
 
@@ -1836,49 +1412,10 @@ func TestGateFirmwareForms(t *testing.T) {
 		{"U6LR", "6.8.2.15592", false},
 	}
 	for _, c := range cases {
-		got := s.rejectUnsupportedLiveWLAN(store.Device{Model: c.model, Firmware: c.fw}) != nil
+		got := s.engine.RejectUnsupportedLiveWLAN(store.Device{Model: c.model, Firmware: c.fw}, env) != nil
 		if got != c.want {
 			t.Fatalf("gate(model=%q, fw=%q) = %v, want %v", c.model, c.fw, got, c.want)
 		}
-	}
-}
-
-// With the gate moved into assignedKeyFlow, a plaintext mgmt_cfg-only
-// re-send (XAuthkey mismatch → adoption push) from a gated device SUCCEEDS:
-// mgmt pushes keep working, only system_cfg emission is blocked.
-func TestPlainMgmtResendNotGated(t *testing.T) {
-	env := workedEnvelope()
-	st := store.NewMemStore()
-	rec := store.Device{
-		MAC: testMAC, State: store.StateAdopted,
-		CfgVersion: "aaaa", AppliedCfg: "aaaa",
-		XAuthkey: "22223333444455556666777788889999",
-		Authkeys: []string{"22223333444455556666777788889999"}, Model: "U7PG2",
-	}
-	if err := st.Put(rec); err != nil {
-		t.Fatal(err)
-	}
-	h := New(Config{WirelessSource: func() []Wlan { return env }, AllowPlainText: true}, st, testLogger()).InformHandler()
-
-	body := infoBody("aaaa")
-	body["version"] = "6.8.2.15592"
-	body["_authkey"] = "stale-claim" // ≠ rec.XAuthkey → re-send current assignment
-	resp := post(t, h, mustJSON(t, body))
-	if resp.Code != http.StatusOK {
-		t.Fatalf("mgmt-only push from gated device: %d %q", resp.Code, resp.Body.String())
-	}
-	var jm map[string]any
-	if err := json.Unmarshal(resp.Body.Bytes(), &jm); err != nil {
-		t.Fatal(err)
-	}
-	if jm["_type"] != "setparam" {
-		t.Fatalf("mgmt re-send type = %v, want setparam (adoption push)", jm["_type"])
-	}
-	if _, has := jm["system_cfg"]; has {
-		t.Fatalf("mgmt-only push must not carry system_cfg: %v", jm)
-	}
-	if _, has := jm["mgmt_cfg"]; !has {
-		t.Fatalf("mgmt re-send missing mgmt_cfg: %v", jm)
 	}
 }
 
@@ -1986,11 +1523,11 @@ func TestSettleFSMPlacementsAndExhaustion(t *testing.T) {
 		// the attempt counter at the cap flips the delivery status to
 		// "exhausted" and stops rate-limiting (next inform re-provisions).
 		rec := store.Device{Extra: store.JSONMap{
-			"wlan_cfg_pending_sha": wlanListHash(env),
-			"wlan_cfg_attempt_sha": wlanListHash(env),
-			"wlan_cfg_attempts":    wlanMaxAttempts,
+			"wlan_cfg_pending_sha": wireless.WlanListHash(env),
+			"wlan_cfg_attempt_sha": wireless.WlanListHash(env),
+			"wlan_cfg_attempts":    adoption.WlanMaxAttempts,
 		}}
-		if due := wlanRetryDue(&rec, time.Now()); due {
+		if due := adoption.WlanRetryDue(rec.Extra, time.Now()); due {
 			t.Fatal("attempts at cap must not still be retry-due")
 		}
 		if rec.Extra["wlan_cfg_delivery_status"] != "exhausted" {
@@ -2091,7 +1628,7 @@ func TestMissingBaselineForcesProvisioning(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec.Extra["wlan_cfg_pending_sha"] != wlanListHash(env) {
+	if rec.Extra["wlan_cfg_pending_sha"] != wireless.WlanListHash(env) {
 		t.Fatalf("baseline not left pending before runtime proof: %v", rec.Extra["wlan_cfg_pending_sha"])
 	}
 
@@ -2181,6 +1718,74 @@ func TestStoreGetErrorNoop(t *testing.T) {
 	}
 	if jm["_type"] != "noop" {
 		t.Fatalf("internal-error payload = %v, want noop", jm["_type"])
+	}
+}
+
+// The fixed fallback noop (non-record/exception path) stays a handler
+// constant: interval 10 (formerly asserted by the converted
+// TestNoopIntervalScheduling's tail).
+func TestNoopRespFallbackInterval(t *testing.T) {
+	if got := (&Server{}).noopResp()["interval"]; got != 10 {
+		t.Fatalf("fallback = %v", got)
+	}
+}
+
+// Adapter plumbing for the engine-owned noop formula: the handler reads the
+// per-MAC target, feeds it into the engine, and persists the outcome's new
+// target — but ONLY in the sub-cap branch (the cap fallback never persists).
+// The gentle-noop lane (unknown non-empty _type) reaches the pure formula;
+// deterministic intervals: with the target in the past the candidate is
+// always now+10 (interval 10); with the target far in the future the cap
+// fallback interval depends only on r (0.9 → floor(90*0.37) = 33).
+func TestHandlerNoopTargetPersistence(t *testing.T) {
+	oldRandom := noopRandom
+	noopRandom = func() float64 { return 0.0 }
+	t.Cleanup(func() { noopRandom = oldRandom })
+
+	st := store.NewMemStore()
+	if err := st.Put(store.Device{MAC: testMAC, State: store.StateAdopted,
+		CfgVersion: "aaaa", AppliedCfg: "aaaa",
+		XAuthkey: testDefaultKey, Authkeys: []string{testDefaultKey},
+		Model: "U7PG2", Extra: store.JSONMap{"wlan_cfg_sha": wireless.WlanListHash(nil)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s := New(Config{AllowPlainText: true}, st, testLogger())
+	h := s.InformHandler()
+
+	// gentle-noop lane: the record already matches (sha baseline seeded),
+	// so the formula inputs are exactly Model/Extra["watching"]/now/target.
+	body := map[string]any{"mac": "aa:bb:cc:dd:ee:ff", "model": "U7PG2", "_type": "status"}
+
+	// Sub-cap branch: interval = candidate = 10, and the target PERSISTS.
+	resp := post(t, h, mustJSON(t, body))
+	var jm map[string]any
+	if err := json.Unmarshal(resp.Body.Bytes(), &jm); err != nil {
+		t.Fatal(err)
+	}
+	if jm["_type"] != "noop" || jm["interval"].(float64) != 10 {
+		t.Fatalf("sub-cap noop = %v", jm)
+	}
+	before := s.noopTargetSnapshot(testMAC)
+	if before == 0 {
+		t.Fatal("handler did not persist the advanced noop target")
+	}
+
+	// Cap fallback branch: target far in the future → interval from r only,
+	// and the target must NOT persist.
+	noopRandom = func() float64 { return 0.9 }
+	s.noopMu.Lock()
+	s.noopTarget[testMAC] = before + 2000
+	s.noopMu.Unlock()
+	resp = post(t, h, mustJSON(t, body))
+	if err := json.Unmarshal(resp.Body.Bytes(), &jm); err != nil {
+		t.Fatal(err)
+	}
+	if jm["_type"] != "noop" || jm["interval"].(float64) != 33 {
+		t.Fatalf("cap-fallback noop = %v, want interval 33", jm)
+	}
+	if got := s.noopTargetSnapshot(testMAC); got != before+2000 {
+		t.Fatalf("cap fallback persisted a target: %d", got)
 	}
 }
 
@@ -2311,7 +1916,7 @@ func TestNewlineInjectionGuarded(t *testing.T) {
 	// mgmt_cfg: device IP with newline → the doubtful rows are skipped.
 	mrec := store.Device{MAC: testMAC, CfgVersion: "aaaa", XAuthkey: testDefaultKey,
 		InformURL: "http://10.0.0.5:8080/inform", IP: "10.0.0.1\nbad=1"}
-	mgmt := s.buildMgmtCfg(mrec, testDefaultKey)
+	mgmt := s.engine.BuildMgmtCfg(mrec, testDefaultKey)
 	if strings.Contains(mgmt, "bad=1") {
 		t.Fatalf("newline value leaked into mgmt_cfg: %q", mgmt)
 	}
@@ -2682,6 +2287,11 @@ func TestGCMAdoptionMatrix(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			// LastSeen must be stamped by the absorbed inform (base asserted
+			// this on the adoption inform#2).
+			if rec.LastSeen == 0 {
+				t.Fatal("LastSeen not stamped by the inform")
+			}
 
 			// inform#3: cfgversion drift on the assigned key → full provisioning.
 			body = family.req(t, mustJSON(t, radioBody("bogus-drift")), hexKey(t, xkey))
@@ -2690,10 +2300,130 @@ func TestGCMAdoptionMatrix(t *testing.T) {
 			if jm["_type"] != "setparam" || jm["system_cfg"] == nil {
 				t.Fatalf("inform#3 type = %v, want full provisioning", jm["_type"])
 			}
+			// Exact full-provisioning key set (the deleted base drift test
+			// asserted exactly this set).
+			exactKeys(t, jm, "_type", "server_time_in_utc",
+				"cfgversion", "system_cfg", "blocked_sta", "mgmt_cfg")
 			if rec, _ := st.Get(testMAC); rec.State != store.StateAdopting {
 				t.Fatalf("inform#3 state %d, want adopting", rec.State)
 			}
 		})
+	}
+}
+
+// ---- engine↔adapter error mapping (H1) -------------------------------------
+
+// (a) Adapter: an adopted device's ENCRYPTED default-key inform is REJECTED
+// at the transport layer (FID-1): the engine sentinel maps onto the classic
+// ÖoÓ000 404 marker and the record stays completely untouched. (Engine-side
+// twin: adoption.TestDefaultKeyAfterAdoptionRejected.)
+func TestAdapterDefaultKeyPostAdoption404(t *testing.T) {
+	h, st := newServerWith(Config{})
+	const k = "99998888777766665555444433332222"
+	registerAdopted(t, st, "aaaa", k)
+
+	body := encryptCBC(t, mustJSON(t, infoBody("aaaa")), hexKey(t, testDefaultKey), testIV)
+	resp := post(t, h, body)
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (default key rejected post-adoption)", resp.Code)
+	}
+	rec, err := st.Get(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.XAuthkey != k || rec.CfgVersion != "aaaa" || rec.State != store.StateAdopted {
+		t.Fatalf("rejected default-key inform mutated the record: %+v", rec)
+	}
+	if !containsKey(rec.Authkeys, k) {
+		t.Fatalf("authkeys touched by rejection: %v", rec.Authkeys)
+	}
+
+	// Pending and adopting records still accept the default key (the
+	// UNKNOWN/two-phase acceptance window), covered by TestHappyAdoption,
+	// TestGCMAdoptionMatrix and TestAuthkeysPrunedToTwo.
+}
+
+// (b) Adapter: a device whose reported version trips the live-WLAN gate
+// reaches the full-provisioning path → HTTP 501 via the typed
+// *ErrLiveWLANProvisioningUnsupported (the engine sentinel maps onto it in
+// mapEngineError); the gated inform NEVER emits a system_cfg and the record
+// is not mutated by the gate. (Engine-side twin:
+// adoption.TestEncryptedGateBlocksSystemCfg.)
+func TestAdapterLiveWLANGate501(t *testing.T) {
+	env := workedEnvelope()
+	st := store.NewMemStore()
+	xkey := "11112222333344445555666677778888"
+	if err := st.Put(store.Device{
+		MAC: testMAC, State: store.StateAdopted,
+		CfgVersion: "aaaa", AppliedCfg: "",
+		XAuthkey: xkey, Authkeys: []string{xkey}, Model: "U7PG2",
+		Extra: u7pg2Record().Extra,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h := wiredServer(t, func() []Wlan { return env }, st)
+
+	body := infoBody("")
+	body["version"] = "6.8.2.15592"
+	resp := post(t, h, encryptCBC(t, mustJSON(t, body), hexKey(t, xkey), testIV))
+	if resp.Code != http.StatusNotImplemented {
+		t.Fatalf("gated inform status = %d, want 501", resp.Code)
+	}
+	if strings.Contains(resp.Body.String(), "system_cfg") {
+		t.Fatalf("gated inform leaked system_cfg: %q", resp.Body.String())
+	}
+	rec, err := st.Get(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.State != store.StateAdopted || rec.CfgVersion != "aaaa" {
+		t.Fatalf("gate must not mutate the record: state=%d cfg=%q", rec.State, rec.CfgVersion)
+	}
+	// The typed error the adapter maps the engine sentinel onto carries the
+	// classic 501 status.
+	s := New(Config{WirelessSource: func() []Wlan { return env }}, st, testLogger())
+	mapped := s.mapEngineError(&store.Device{Model: "U7PG2", Firmware: "6.8.2.15592"},
+		adoption.ErrLiveWLANProvisioningUnsupported)
+	var unsupported *ErrLiveWLANProvisioningUnsupported
+	if !errors.As(mapped, &unsupported) || unsupported.Status() != http.StatusNotImplemented {
+		t.Fatalf("gate error mapping = %v, want typed 501 error", mapped)
+	}
+}
+
+// ---- full-provisioning system_cfg content rows (H3) -------------------------
+
+// Content rows of the full-provisioning system_cfg path, re-homed from the
+// converted drift test (the builder lives in package server this
+// checkpoint). Rows already covered elsewhere are deliberately NOT
+// duplicated here: unifi.siteid (TestSystemCfgIdentityRows), users.2.*
+// (TestUsers1CacheStability), section head order (TestSystemCfgSectionHead-
+// Order), and the mcad gate rows users.1.status/sshd.status/netconf.1.status
+// (TestSystemCfgMcadValidatorGateKeysPresent).
+func TestSystemCfgProvisioningContentRows(t *testing.T) {
+	s := New(Config{}, store.NewMemStore(), testLogger())
+	rec := u7pg2Record()
+	delete(rec.Extra, "radio_table") // the drift path's inform carries no radio_table
+	sys := mustBuildSys(t, s, rec)
+	for _, want := range []string{
+		"unifi.version=0.1.0-dev\n",
+		"unifi.idp=disabled\n",
+		"unifi.cfgcap_info=0x7\n",
+		"users.status=enabled\n",
+		"users.1.name=ubnt\n",
+		"sshd.1.status=enabled\n",
+	} {
+		if !strings.Contains(sys, want) {
+			t.Fatalf("system_cfg missing %q:\n%s", want, sys)
+		}
+	}
+	// FID-20/FID-62: no invented "# sshd"/"# misc" section headers.
+	for _, wrong := range []string{"# sshd\n", "# misc\n"} {
+		if strings.Contains(sys, wrong) {
+			t.Fatalf("system_cfg must not carry the invented header %q:\n%s", wrong, sys)
+		}
+	}
+	if strings.Contains(sys, "wireless.") || strings.Contains(sys, "aaa.") {
+		t.Fatalf("system_cfg invented unpublished wireless lines:\n%s", sys)
 	}
 }
 
@@ -2780,37 +2510,6 @@ func TestMultiWlanSystemCfg(t *testing.T) {
 	}
 	if !strings.Contains(sys, "vlan.1.devname=eth0\nvlan.1.id=42\n") {
 		t.Fatal("missing vlan wiring")
-	}
-}
-
-// ---- mgmt_cfg golden (§8f) --------------------------------------------------
-
-func TestMgmtCfgGolden(t *testing.T) {
-	s := New(Config{ControllerURL: "http://10.0.0.5:8080"}, store.NewMemStore(), testLogger())
-	d := store.Device{
-		MAC: testMAC, CfgVersion: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-	}
-	d.CfgVersion = "aaaaaaaaaaaaaaaa"
-	d.XAuthkey = "11112222333344445555666677778888"
-	d.InformURL = "http://10.0.0.9:8080/inform"
-	got := s.buildMgmtCfg(d, "ba86f2bbe107c7c57eb5f2690775c712")
-	want := "capability=notif,notif-assoc-stat\n" +
-		"selfrun_guest_mode=pass\n" +
-		"cfgversion=aaaaaaaaaaaaaaaa\n" +
-		"led_enabled=true\n" +
-		"stun_url=stun://10.0.0.5:3478/\n" +
-		"mgmt_url=https://10.0.0.5:8443/manage/site/default\n" +
-		"authkey=11112222333344445555666677778888\n" +
-		"inform_url=http://10.0.0.5:8080/inform\n" +
-		"use_aes_gcm=true\n" +
-		"report_crash=true\n"
-	if got != want {
-		t.Fatalf("mgmt_cfg golden mismatch:\n got %q\nwant %q", got, want)
-	}
-	// same-key inform → no authkey line
-	got2 := s.buildMgmtCfg(d, d.XAuthkey)
-	if strings.Contains(got2, "authkey=") {
-		t.Fatalf("authkey line must be omitted when keys match: %q", got2)
 	}
 }
 
@@ -3008,7 +2707,7 @@ func TestUsers1PasswordGenerationFailureFailsBuild(t *testing.T) {
 	randAlphaSalt = func(int) (string, error) { return "", errors.New("rand unavailable") }
 	defer func() { randAlphaSalt = prev }()
 
-	if _, err := s.buildSystemCfg(rec); err == nil {
+	if _, err := s.buildSystemCfg(rec, s.currentWireless()); err == nil {
 		t.Fatal("failed salt generation must fail the system_cfg build, not emit an empty users.1.password")
 	}
 }
@@ -3134,7 +2833,7 @@ func TestMgmtCfgAndSiteidFollowSiteName(t *testing.T) {
 	s := New(Config{ControllerURL: "http://10.0.0.5:8080"}, store.NewMemStore(), testLogger())
 	d := u7pg2Record()
 	d.SiteID = "building-a"
-	got := s.buildMgmtCfg(d, d.XAuthkey)
+	got := s.engine.BuildMgmtCfg(d, d.XAuthkey)
 	if !strings.Contains(got, "mgmt_url=https://10.0.0.5:8443/manage/site/building-a\n") {
 		t.Fatalf("mgmt_url must use the site name:\n%s", got)
 	}

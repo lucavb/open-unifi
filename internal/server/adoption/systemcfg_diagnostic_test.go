@@ -1,4 +1,4 @@
-package server
+package adoption
 
 import (
 	"strings"

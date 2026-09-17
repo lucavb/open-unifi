@@ -16,40 +16,29 @@ package server
 //     security lives in `aaa.<n>.wpa.*` rows only;
 //   - the `# vlan`/`# bridge`/`# netconf`/`# dhcpc` blocks have their own
 //     counters, independent of the vap counters.
+//
+// The shared WLAN type and the vap/radio PLANNING helpers (PlanVaps,
+// StoredRadios, WlanListHash, …) live in internal/wireless so the adoption
+// engine (internal/server/adoption) can share them without a package cycle.
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/lucabecker/open-unifi/internal/store"
+	"github.com/lucabecker/open-unifi/internal/wireless"
 )
 
-// Wlan is the server-local WLAN envelope item fed by Config.WirelessSource
-// (mirrors adminapi.Wlan — deliberately re-declared here so the inform lane
-// stays decoupled from the admin API lane).
-type Wlan struct {
-	Name       string // human label; also the on-wire ssid source (see ssidOf)
-	SSID       string // broadcast SSID (preferred over Name when set)
-	Security   string // "open" | "wpa-p" | "wpa-eap"
-	Passphrase string // plaintext (psk writer never hashes)
-	VLAN       int    // 0 = untagged (mgmt br0); 2..4094 tagged br0.<vid>
-	Enabled    bool   // false ⇒ ENTIRE WLAN omitted (doc §2)
-	ID         string // stable WlanConf._id; empty ⇒ sha256(nameSSID)[:24]
-	Band       string // 2g, 5g, both; empty is legacy both
-}
+// Wlan aliases the shared WLAN type (internal/wireless): every existing
+// server-side reference (and cmd/openunifi's converter) keeps compiling
+// unchanged while the type itself lives in its own package.
+type Wlan = wireless.Wlan
 
 // wlanEnvelopeShape is a work-in-progress marker for the band model.
 const (
-	// wlanBandDefault is the band value our admin API cannot express today.
-	// It maps to WlanConf "both": ONE vap per device radio (doc §8).
-	wlanBandDefault = "both"
-
-	// wepFallbackPsk is the classic getWpaPreSharedKey() fallback
+	// fallbackPsk is the classic getWpaPreSharedKey() fallback
 	// (WlanConf.java §308-311), mirrored "in shape" per the contract; it is
 	// unreachable for wpa-p because the admin API enforces >= 8 chars.
 	fallbackPsk = "letmeinnow"
@@ -62,110 +51,6 @@ const (
 	defaultEthIface = "eth0"
 )
 
-func ssidOf(w Wlan) string {
-	if w.SSID != "" {
-		return w.SSID
-	}
-	return w.Name
-}
-
-func wlanId(d store.Device, w Wlan) string {
-	if w.ID != "" {
-		return w.ID
-	}
-	src := w.Name
-	if src == "" {
-		src = w.SSID
-	}
-	if src == "" {
-		src = "vlan" + strconv.Itoa(w.VLAN)
-	}
-	sum := sha256.Sum256([]byte(src))
-	return hex.EncodeToString(sum[:])[:24]
-}
-
-// ---- stored radio data ----------------------------------------------------
-
-// radioRow is one device radio from the stored inform passthrough
-// (the per-radio map under rec.Extra["radio_table"]).
-type radioRow struct {
-	name      string // radio_table "name" → phyname + parent + sort key
-	band      string // "radio" field: "ng" | "na" (default ng)
-	bandKnown bool
-	raw       map[string]any
-}
-
-// storedRadios extracts and sorts radios by name (sort key = `name`,
-// config_int §141) from the device record's stored inform data. No radios →
-// empty slice → the "no radio found" variant of the block (doc §1).
-func storedRadios(d store.Device) []radioRow {
-	rawList, ok := d.Extra["radio_table"].([]any)
-	if !ok {
-		return nil
-	}
-	var out []radioRow
-	for _, item := range rawList {
-		m, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		name := jsonStr(m, "name", "")
-		if name == "" {
-			continue
-		}
-		band := jsonStr(m, "radio", "")
-		known := band == "na" || band == "ng"
-		out = append(out, radioRow{name: name, band: band, bandKnown: known, raw: m})
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
-	return out
-}
-
-// jsonStr fetches a string field, formatting JSON scalars (float64 from
-// decode) as their number form — "0", "42", "auto", …
-func jsonStr(m map[string]any, key, def string) string {
-	v, ok := m[key]
-	if !ok {
-		return def
-	}
-	switch t := v.(type) {
-	case string:
-		if t != "" {
-			return t
-		}
-		return def
-	case float64:
-		if t == float64(int64(t)) {
-			return strconv.FormatInt(int64(t), 10)
-		}
-		return strconv.FormatFloat(t, 'g', -1, 64)
-	case bool:
-		return strconv.FormatBool(t)
-	default:
-		return def
-	}
-}
-
-// jsonBool fetches a boolean field (defaults false when absent).
-func jsonBool(m map[string]any, key string) bool {
-	v, _ := m[key].(bool)
-	return v
-}
-
-// jsonInt fetches an integer field (numeric JSON scalars decode as
-// float64); absent/non-numeric → 0.
-func jsonInt(m map[string]any, key string) int {
-	switch t := m[key].(type) {
-	case float64:
-		return int(t)
-	case string:
-		n, _ := strconv.Atoi(t)
-		return n
-	default:
-		return 0
-	}
-}
-
 // mgmtDevOf resolves the device's mgmt interface name for system_cfg rows
 // (admin escape hatch Extra["mgmt_dev"], else the classic br0 — same shape
 // as the sshd.1.ifname resolver in server.go).
@@ -176,89 +61,6 @@ func mgmtDevOf(d store.Device) string {
 	return "br0"
 }
 
-// ---- vap plan -------------------------------------------------------------
-
-// vapPlan is one provisioned vap: an (enabled) WLAN instantiated on
-// radio i, holding its bridge binding and devname.
-type vapPlan struct {
-	wlan    Wlan
-	id      string
-	radioN  int // 1-based index into the sorted radio list
-	phyname string
-	athN    int // global 0-based counter → devname "ath<N>"
-	vid     int // 0 = untagged mgmt br0; 2..4094 tagged br0.<vid>
-}
-
-// planVaps builds the vap list in radio-sorted order (global wireless/aaa
-// counter = list order; doc §2). Band default "both": one vap per radio.
-func planVaps(d store.Device, wls []Wlan) ([]vapPlan, []radioRow) {
-	radios := storedRadios(d)
-	var vaps []vapPlan
-	// NOTE: device vap_table devname reuse was considered (seeding the ath
-	// counter from the device's reported vaps) and REJECTED as dead code —
-	// the wire key is `name`/`radio_name`, not `devname`, so the block never
-	// matched anything on a real AP. Revisit only with a capture-derived
-	// fixture; do not re-key it without live evidence.
-	ath := 0
-	for i, r := range radios {
-		if !r.bandKnown {
-			continue
-		}
-		if jsonStr(r.raw, "usage", "") == "uplink" && jsonStr(r.raw, "mode", "") == "managed" {
-			continue
-		}
-		for _, w := range wls {
-			if !w.Enabled {
-				continue // dropped with no trace (F.super line 44)
-			}
-			band := w.Band
-			if band == "" {
-				band = wlanBandDefault
-			}
-			if band == "2g" && r.band != "ng" || band == "5g" && r.band != "na" {
-				continue
-			}
-			vaps = append(vaps, vapPlan{
-				wlan:    w,
-				id:      wlanId(d, w),
-				radioN:  i + 1,
-				phyname: r.name,
-				athN:    ath,
-				vid:     wrapVID(w.VLAN),
-			})
-			ath++
-		}
-	}
-	return vaps, radios
-}
-
-// unknownBandRadios counts radio_table entries whose `radio` token is
-// unrecognized (known provisioning bands are na/ng; the real token set is
-// na/ng/6e/scan — skipping scan/6e is correct, but a WHOLE table of unknown
-// tokens silently drops every WLAN, so callers log the count).
-func unknownBandRadios(d store.Device) int {
-	n := 0
-	for _, r := range storedRadios(d) {
-		if !r.bandKnown {
-			n++
-		}
-	}
-	return n
-}
-
-// wrapVID applies the doc §6 VLAN guard: vids ≤ 1 (0/absent, or the classic
-// 1) join the mgmt bridge untagged, never br-trunk (documented deviation).
-// SAFE-BY-CONSTRUCTION note (Lane A): the admin API and envelope loader
-// validate VLAN ∈ 1..4094 upstream, so callers only reach here with
-// pre-validated values; the ≤1/4094+ clamp is a belt-and-suspenders sink to
-// the untagged mgmt bridge, never a silent re-tag of an invalid value.
-func wrapVID(vid int) int {
-	if vid < 2 || vid > 4094 {
-		return 0
-	}
-	return vid
-}
-
 // ---- emission -------------------------------------------------------------
 
 // emitWirelessCfg appends the whole wireless/VLAN compound to b: the
@@ -266,14 +68,14 @@ func wrapVID(vid int) int {
 // per-vap `aaa.<n>`/`wireless.<n>` rows, then `# vlan`, `# bridge`,
 // `# netconf` (mgmt netconf.1 + br0.<vid> instances) and `# dhcpc`.
 func (s *Server) emitWirelessCfg(b *strings.Builder, d store.Device, wls []Wlan) {
-	if skipped := unknownBandRadios(d); skipped > 0 {
+	if skipped := wireless.UnknownBandRadios(d); skipped > 0 {
 		// Diagnosability (fix 4): skipping unknown band tokens (real token
 		// set na/ng/6e/scan) is correct behavior, but a table of all-unknown
 		// tokens silently drops every WLAN — say so once per planning pass.
 		s.lg.Debug(fmt.Sprintf("wireless provision: skipped %d radio(s) with unrecognized band token "+
 			"(known provisioning bands: na, ng; real tokens also include 6e/scan)", skipped))
 	}
-	vaps, radios := planVaps(d, wls)
+	vaps, radios := wireless.PlanVaps(d, wls)
 	if len(radios) == 0 {
 		// doc §1 int §489-493 variant.
 		b.WriteString("# no wlan provisioned as no radio found\n")
@@ -302,7 +104,7 @@ func (s *Server) emitWirelessCfg(b *strings.Builder, d store.Device, wls []Wlan)
 	for i, r := range radios {
 		n := i + 1
 		prefix := fmt.Sprintf("radio.%d.", n)
-		line(prefix+"phyname", r.name)
+		line(prefix+"phyname", r.Name)
 		line(prefix+"ack.auto", "disabled")
 		line(prefix+"acktimeout", "64")
 		line(prefix+"ampdu.status", "enabled")
@@ -311,14 +113,14 @@ func (s *Server) emitWirelessCfg(b *strings.Builder, d store.Device, wls []Wlan)
 		line(prefix+"cwm.enable", "0")
 		line(prefix+"cwm.mode", "0")
 		line(prefix+"forbiasauto", "0")
-		line(prefix+"channel", jsonStr(r.raw, "channel", "0"))
-		line(prefix+"backup_channel", jsonStr(r.raw, "backup_channel", "0"))
+		line(prefix+"channel", wireless.JSONStr(r.Raw, "channel", "0"))
+		line(prefix+"backup_channel", wireless.JSONStr(r.Raw, "backup_channel", "0"))
 		// chanWidth resolver (devmgr c javap 1242-1298): width =
 		// min(countryLimit, ht cap (ng→20 / na→40), device caps). All three
 		// floors resolve to 20 on ng and 40 on na for U7PG2 defaults, so
 		// the emitted ieee_mode is the static "11nght20"/"11naht40" pair
 		// (FID-3; supersedes the doc §9 UNRESOLVED note).
-		if r.band == "na" {
+		if r.Band == "na" {
 			line(prefix+"ieee_mode", "11naht40")
 		} else {
 			line(prefix+"ieee_mode", "11nght20")
@@ -326,13 +128,13 @@ func (s *Server) emitWirelessCfg(b *strings.Builder, d store.Device, wls []Wlan)
 		line(prefix+"mode", "master")
 		line(prefix+"rate.auto", "enabled")
 		line(prefix+"rate.mcs", "auto")
-		line(prefix+"rfscan", boolStr(jsonBool(r.raw, "spectrum_enabled")))
+		line(prefix+"rfscan", boolStr(wireless.JSONBool(r.Raw, "spectrum_enabled")))
 		line(prefix+"bcmc_l2_filter.status", "enabled")
 		line(prefix+"bgscan.status", "disabled")
-		line(prefix+"antenna.gain", antennaGain(r.raw))
-		line(prefix+"antenna", jsonStr(r.raw, "antenna_id", "-1"))
-		line(prefix+"txpower_mode", jsonStr(r.raw, "tx_power_mode", "auto"))
-		line(prefix+"txpower", jsonStr(r.raw, "tx_power", "auto"))
+		line(prefix+"antenna.gain", antennaGain(r.Raw))
+		line(prefix+"antenna", wireless.JSONStr(r.Raw, "antenna_id", "-1"))
+		line(prefix+"txpower_mode", wireless.JSONStr(r.Raw, "tx_power_mode", "auto"))
+		line(prefix+"txpower", wireless.JSONStr(r.Raw, "tx_power", "auto"))
 		line(prefix+"hard_noisefloor.status", "disabled")
 		// per-vap devname/status rows (int offsets 1141-1432): emitted for
 		// EVERY vap walking this radio — plain `radio.<n>` prefix for
@@ -340,14 +142,14 @@ func (s *Server) emitWirelessCfg(b *strings.Builder, d store.Device, wls []Wlan)
 		// radio's second+ member (FID-5).
 		vIdx := 0
 		for _, v := range vaps {
-			if v.radioN != n {
+			if v.RadioN != n {
 				continue
 			}
 			p := prefix
 			if vIdx > 0 { // vapIdxOnRadio > 0 → virtual companion prefix
 				p += "virtual." + strconv.Itoa(vIdx) + "."
 			}
-			line(p+"devname", "ath"+strconv.Itoa(v.athN))
+			line(p+"devname", "ath"+strconv.Itoa(v.AthN))
 			line(p+"status", "enabled")
 			vIdx++
 		}
@@ -358,7 +160,7 @@ func (s *Server) emitWirelessCfg(b *strings.Builder, d store.Device, wls []Wlan)
 	// (Device.hasWifiCapability(int) javap: (wifi_caps & mask) == mask —
 	// NOT fw_caps; X.getInt default 0 when the field is absent, so an
 	// unreported wifi_caps means every capability is_UNSUPPORTED). FID-15.
-	wifiCapsKnown, wifiCaps := numFromExtra(d.Extra, "wifi_caps")
+	wifiCapsKnown, wifiCaps := wireless.NumFromExtra(d.Extra, "wifi_caps")
 	openHostapd := wifiCapsKnown && wifiCaps&0x2000 != 0 // supportOpenHostapd() = bit 0x2000 (Device §7696-7704)
 	bgaFilterCap := wifiCapsKnown && wifiCaps&0x40 != 0  // hasWifiCapability(64) (FID-51)
 	for n, v := range vaps {                             // 0-based over emissions → row index n+1
@@ -381,28 +183,20 @@ func boolStr(v bool) string {
 // antennaGain: builtin_antenna → builtin_ant_gain (default 0), else
 // antenna_gain (default 6 when absent, doc §3).
 func antennaGain(raw map[string]any) string {
-	if jsonBool(raw, "builtin_antenna") {
-		return jsonStr(raw, "builtin_ant_gain", "0")
+	if wireless.JSONBool(raw, "builtin_antenna") {
+		return wireless.JSONStr(raw, "builtin_ant_gain", "0")
 	}
-	return jsonStr(raw, "antenna_gain", "6")
-}
-
-func numFromExtra(extra store.JSONMap, key string) (bool, int64) {
-	v, ok := extra[key].(float64)
-	if !ok {
-		return false, 0
-	}
-	return true, int64(v)
+	return wireless.JSONStr(raw, "antenna_gain", "6")
 }
 
 // emitAaaRows writes the aaa.<n> block for one vap per doc §4:
 // always-first block, then the security branch (§4.2 open, §4.3 WPA),
 // then the common tail.
-func (s *Server) emitAaaRows(b *strings.Builder, n int, v vapPlan, openHostapd bool) {
+func (s *Server) emitAaaRows(b *strings.Builder, n int, v wireless.VapPlan, openHostapd bool) {
 	p := fmt.Sprintf("aaa.%d.", n)
 	prefix := s.lineWriter(b, "aaa-rows")
 	line := func(k, vv string) { prefix(p+k, vv) }
-	name := ssidOf(v.wlan)
+	name := wireless.SSIDOf(v.Wlan)
 
 	// §4.1 always-first block (int §566-578; no log_level row: record field
 	// absent ⇒ default never >= 0).
@@ -414,11 +208,11 @@ func (s *Server) emitAaaRows(b *strings.Builder, n int, v vapPlan, openHostapd b
 
 	br := aaaBridge(v)
 	line("br.devname", br)
-	line("devname", "ath"+strconv.Itoa(v.athN))
+	line("devname", "ath"+strconv.Itoa(v.AthN))
 	line("driver", "madwifi") // atheros bean naming branch (doc §0)
 	line("ssid", name)
 
-	switch v.wlan.Security {
+	switch v.Wlan.Security {
 	case "open":
 		// §4.2: status = enabled iff supportOpenHostapd (wifi_caps 0x2000,
 		// Device.hasWifiCapability — absence of the reported field means
@@ -428,10 +222,10 @@ func (s *Server) emitAaaRows(b *strings.Builder, n int, v vapPlan, openHostapd b
 		} else {
 			line("status", "disabled")
 		}
-		line("id", v.id)
+		line("id", v.ID)
 		// no wpa.* rows in the open branch (§4.2).
 	default:
-		if v.wlan.Security == "wpa-eap" {
+		if v.Wlan.Security == "wpa-eap" {
 			// Our admin API carries no RADIUS servers/profile yet; the real
 			// controller would append radius.auth.<i>.* rows from the
 			// RADIUS profile (int §791-840) right after the auth_cache row,
@@ -456,9 +250,9 @@ func (s *Server) emitAaaRows(b *strings.Builder, n int, v vapPlan, openHostapd b
 		line("is_guest", "false")
 		line("tdls_prohibit", "disabled")
 		line("bss_transition", "enabled")
-		line("id", v.id)
+		line("id", v.ID)
 
-		psk := v.wlan.Passphrase
+		psk := v.Wlan.Passphrase
 		if psk == "" {
 			psk = fallbackPsk // getWpaPreSharedKey() fallback shape (§8)
 		}
@@ -467,12 +261,12 @@ func (s *Server) emitAaaRows(b *strings.Builder, n int, v vapPlan, openHostapd b
 		// → [radius.*] → dynamic_vlan → wpa.1.pairwise → pmf.cipher
 		// (FID-25).
 		mgmt := "WPA-PSK"
-		if v.wlan.Security == "wpa-eap" {
+		if v.Wlan.Security == "wpa-eap" {
 			mgmt = "WPA-EAP"
 		}
 		line("wpa.key.1.mgmt", mgmt)
 		line("wpa.psk", psk) // psk writer: NEVER hashed/obfuscated (§8)
-		if v.wlan.Security == "wpa-eap" {
+		if v.Wlan.Security == "wpa-eap" {
 			// always "enabled" at WlanConf's auth_cache is(..., true) default
 			line("auth_cache", "enabled")
 			// vlan_wlan_mode disabled → dynamic_vlan=0 (default §8); the
@@ -489,25 +283,25 @@ func (s *Server) emitAaaRows(b *strings.Builder, n int, v vapPlan, openHostapd b
 }
 
 // aaaBridge resolves the bridge hosting this vap's athdev (doc §6/§555-561).
-func aaaBridge(v vapPlan) string {
-	if v.vid == 0 {
+func aaaBridge(v wireless.VapPlan) string {
+	if v.Vid == 0 {
 		return "br0"
 	}
-	return "br0." + strconv.Itoa(v.vid)
+	return "br0." + strconv.Itoa(v.Vid)
 }
 
 // emitWirelessRows writes the wireless.<n> block per doc §5 (worked-example
 // key order; security is LITERAL none, authmode 0 only for open).
-func (s *Server) emitWirelessRows(b *strings.Builder, n int, v vapPlan, bgaFilterCap bool) {
+func (s *Server) emitWirelessRows(b *strings.Builder, n int, v wireless.VapPlan, bgaFilterCap bool) {
 	p := fmt.Sprintf("wireless.%d.", n)
 	prefix := s.lineWriter(b, "wireless-rows")
 	line := func(k, vv string) { prefix(p+k, vv) }
 
 	line("mode", "master")
-	line("devname", "ath"+strconv.Itoa(v.athN))
-	line("id", v.id)
+	line("devname", "ath"+strconv.Itoa(v.AthN))
+	line("id", v.ID)
 	line("status", "enabled") // literal — disabled wlans never reach here
-	if v.wlan.Security == "open" {
+	if v.Wlan.Security == "open" {
 		line("authmode", "0")
 	} else {
 		line("authmode", "1")
@@ -520,13 +314,13 @@ func (s *Server) emitWirelessRows(b *strings.Builder, n int, v vapPlan, bgaFilte
 	line("is_guest", "false")
 	line("security", "none") // ⚠ literal, even for WPA (doc §5 line 250)
 	line("addmtikie", "disabled")
-	line("ssid", ssidOf(v.wlan))
+	line("ssid", wireless.SSIDOf(v.Wlan))
 	line("hide_ssid", "false")
 	line("mac_acl.status", "enabled") // literal
 	line("mac_acl.policy", "deny")    // literal
 	line("wmm", "enabled")
 	line("uapsd", "disabled")
-	line("parent", v.phyname) // radio TABLE device name (§1399)
+	line("parent", v.Phyname) // radio TABLE device name (§1399)
 	line("puren", "0")
 	line("pureg", "1") // b_supported default false ⇒ jour pure-g (§8)
 	line("usage", "user")
@@ -566,7 +360,7 @@ func (s *Server) emitWirelessRows(b *strings.Builder, n int, v vapPlan, bgaFilte
 // written unconditionally (FID-14).
 // The netconf section itself is emitted by emitNetconfSection (see its
 // doc for the mgmt-instance + validator rationale).
-func (s *Server) emitVlanBlocks(b *strings.Builder, d store.Device, vaps []vapPlan) {
+func (s *Server) emitVlanBlocks(b *strings.Builder, d store.Device, vaps []wireless.VapPlan) {
 	line := s.lineWriter(b, "vlan-blocks")
 
 	// eth inventory from the device record's inform passthrough
@@ -588,11 +382,11 @@ func (s *Server) emitVlanBlocks(b *strings.Builder, d store.Device, vaps []vapPl
 	vidAths := map[int][]string{}
 	var vids []int
 	for _, v := range vaps {
-		if v.vid != 0 {
-			if _, seen := vidAths[v.vid]; !seen {
-				vids = append(vids, v.vid)
+		if v.Vid != 0 {
+			if _, seen := vidAths[v.Vid]; !seen {
+				vids = append(vids, v.Vid)
 			}
-			vidAths[v.vid] = append(vidAths[v.vid], "ath"+strconv.Itoa(v.athN))
+			vidAths[v.Vid] = append(vidAths[v.Vid], "ath"+strconv.Itoa(v.AthN))
 		}
 	}
 	sort.Ints(vids)
@@ -630,8 +424,8 @@ func (s *Server) emitVlanBlocks(b *strings.Builder, d store.Device, vaps []vapPl
 	}
 	untagged := append([]string{}, ethIfaces...)
 	for _, v := range vaps {
-		if v.vid == 0 {
-			untagged = append(untagged, "ath"+strconv.Itoa(v.athN))
+		if v.Vid == 0 {
+			untagged = append(untagged, "ath"+strconv.Itoa(v.AthN))
 		}
 	}
 	writeBridge("br0", untagged...)
@@ -765,7 +559,7 @@ func (s *Server) emitNetconfSection(b *strings.Builder, d store.Device, vids []i
 	}
 
 	// radio slot instances ath0..ath<n> (factory echo).
-	for i := range storedRadios(d) {
+	for i := range wireless.StoredRadios(d) {
 		m := next()
 		line(m+"autoip.status", "disabled")
 		line(m+"devname", "ath"+strconv.Itoa(i))
@@ -822,7 +616,7 @@ func ethPortNamesFromEthernetTable(d store.Device) ([]string, bool) {
 			continue
 		}
 		sawEntries = true
-		if n := jsonInt(m, "num_port"); n > 0 {
+		if n := wireless.JSONInt(m, "num_port"); n > 0 {
 			total += n
 		} else {
 			total++
@@ -884,33 +678,6 @@ func isEthIfaceName(name string) bool {
 		}
 	}
 	return true
-}
-
-// ---- envelope hash (FSM drift input) ---------------------------------------
-
-// wlanListHash serializes the wireless envelope stably (sorted-key JSON per
-// item) and hashes it with sha256; the value is only compared against
-// itself, so any stable canonicalization works.
-func wlanListHash(wls []Wlan) string {
-	m := make([]map[string]any, 0, len(wls))
-	for _, w := range wls {
-		m = append(m, map[string]any{
-			"name":       w.Name,
-			"ssid":       w.SSID,
-			"security":   w.Security,
-			"passphrase": w.Passphrase,
-			"vlan":       w.VLAN,
-			"enabled":    w.Enabled,
-			"id":         w.ID,
-			"band":       w.Band,
-		})
-	}
-	blob, err := json.Marshal(m) // map keys marshal in sorted order
-	if err != nil {
-		return ""
-	}
-	sum := sha256.Sum256(blob)
-	return hex.EncodeToString(sum[:])
 }
 
 // currentWireless resolves the configured source; nil source ⇒ empty list.

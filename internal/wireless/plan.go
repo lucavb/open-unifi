@@ -1,0 +1,239 @@
+package wireless
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"sort"
+	"strconv"
+
+	"github.com/lucabecker/open-unifi/internal/store"
+)
+
+// wlanBandDefault is the band value our admin API cannot express today.
+// It maps to WlanConf "both": ONE vap per device radio (doc §8).
+const wlanBandDefault = "both"
+
+// SSIDOf resolves the on-wire SSID of a WLAN (SSID preferred over Name).
+func SSIDOf(w Wlan) string {
+	if w.SSID != "" {
+		return w.SSID
+	}
+	return w.Name
+}
+
+func WlanID(d store.Device, w Wlan) string {
+	if w.ID != "" {
+		return w.ID
+	}
+	src := w.Name
+	if src == "" {
+		src = w.SSID
+	}
+	if src == "" {
+		src = "vlan" + strconv.Itoa(w.VLAN)
+	}
+	sum := sha256.Sum256([]byte(src))
+	return hex.EncodeToString(sum[:])[:24]
+}
+
+// ---- stored radio data ----------------------------------------------------
+
+// RadioRow is one device radio from the stored inform passthrough
+// (the per-radio map under rec.Extra["radio_table"]).
+type RadioRow struct {
+	Name      string // radio_table "name" → phyname + parent + sort key
+	Band      string // "radio" field: "ng" | "na" (default ng)
+	BandKnown bool
+	Raw       map[string]any
+}
+
+// StoredRadios extracts and sorts radios by name (sort key = `name`,
+// config_int §141) from the device record's stored inform data. No radios →
+// empty slice → the "no radio found" variant of the block (doc §1).
+func StoredRadios(d store.Device) []RadioRow {
+	rawList, ok := d.Extra["radio_table"].([]any)
+	if !ok {
+		return nil
+	}
+	var out []RadioRow
+	for _, item := range rawList {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := JSONStr(m, "name", "")
+		if name == "" {
+			continue
+		}
+		band := JSONStr(m, "radio", "")
+		known := band == "na" || band == "ng"
+		out = append(out, RadioRow{Name: name, Band: band, BandKnown: known, Raw: m})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// JSONStr fetches a string field, formatting JSON scalars (float64 from
+// decode) as their number form — "0", "42", "auto", …
+func JSONStr(m map[string]any, key, def string) string {
+	v, ok := m[key]
+	if !ok {
+		return def
+	}
+	switch t := v.(type) {
+	case string:
+		if t != "" {
+			return t
+		}
+		return def
+	case float64:
+		if t == float64(int64(t)) {
+			return strconv.FormatInt(int64(t), 10)
+		}
+		return strconv.FormatFloat(t, 'g', -1, 64)
+	case bool:
+		return strconv.FormatBool(t)
+	default:
+		return def
+	}
+}
+
+// JSONBool fetches a boolean field (defaults false when absent).
+func JSONBool(m map[string]any, key string) bool {
+	v, _ := m[key].(bool)
+	return v
+}
+
+// JSONInt fetches an integer field (numeric JSON scalars decode as
+// float64); absent/non-numeric → 0.
+func JSONInt(m map[string]any, key string) int {
+	switch t := m[key].(type) {
+	case float64:
+		return int(t)
+	case string:
+		n, _ := strconv.Atoi(t)
+		return n
+	default:
+		return 0
+	}
+}
+
+// NumFromExtra reads a numeric Extra field (absent/non-numeric → known=false).
+func NumFromExtra(extra store.JSONMap, key string) (bool, int64) {
+	v, ok := extra[key].(float64)
+	if !ok {
+		return false, 0
+	}
+	return true, int64(v)
+}
+
+// WrapVID applies the doc §6 VLAN guard: vids ≤ 1 (0/absent, or the classic
+// 1) join the mgmt bridge untagged, never br-trunk (documented deviation).
+// SAFE-BY-CONSTRUCTION note (Lane A): the admin API and envelope loader
+// validate VLAN ∈ 1..4094 upstream, so callers only reach here with
+// pre-validated values; the ≤1/4094+ clamp is a belt-and-suspenders sink to
+// the untagged mgmt bridge, never a silent re-tag of an invalid value.
+func WrapVID(vid int) int {
+	if vid < 2 || vid > 4094 {
+		return 0
+	}
+	return vid
+}
+
+// ---- vap plan -------------------------------------------------------------
+
+// VapPlan is one provisioned vap: an (enabled) WLAN instantiated on
+// radio i, holding its bridge binding and devname.
+type VapPlan struct {
+	Wlan    Wlan
+	ID      string
+	RadioN  int // 1-based index into the sorted radio list
+	Phyname string
+	AthN    int // global 0-based counter → devname "ath<N>"
+	Vid     int // 0 = untagged mgmt br0; 2..4094 tagged br0.<vid>
+}
+
+// PlanVaps builds the vap list in radio-sorted order (global wireless/aaa
+// counter = list order; doc §2). Band default "both": one vap per radio.
+func PlanVaps(d store.Device, wls []Wlan) ([]VapPlan, []RadioRow) {
+	radios := StoredRadios(d)
+	var vaps []VapPlan
+	// NOTE: device vap_table devname reuse was considered (seeding the ath
+	// counter from the device's reported vaps) and REJECTED as dead code —
+	// the wire key is `name`/`radio_name`, not `devname`, so the block never
+	// matched anything on a real AP. Revisit only with a capture-derived
+	// fixture; do not re-key it without live evidence.
+	ath := 0
+	for i, r := range radios {
+		if !r.BandKnown {
+			continue
+		}
+		if JSONStr(r.Raw, "usage", "") == "uplink" && JSONStr(r.Raw, "mode", "") == "managed" {
+			continue
+		}
+		for _, w := range wls {
+			if !w.Enabled {
+				continue // dropped with no trace (F.super line 44)
+			}
+			band := w.Band
+			if band == "" {
+				band = wlanBandDefault
+			}
+			if band == "2g" && r.Band != "ng" || band == "5g" && r.Band != "na" {
+				continue
+			}
+			vaps = append(vaps, VapPlan{
+				Wlan:    w,
+				ID:      WlanID(d, w),
+				RadioN:  i + 1,
+				Phyname: r.Name,
+				AthN:    ath,
+				Vid:     WrapVID(w.VLAN),
+			})
+			ath++
+		}
+	}
+	return vaps, radios
+}
+
+// UnknownBandRadios counts radio_table entries whose `radio` token is
+// unrecognized (known provisioning bands are na/ng; the real token set is
+// na/ng/6e/scan — skipping scan/6e is correct, but a WHOLE table of unknown
+// tokens silently drops every WLAN, so callers log the count).
+func UnknownBandRadios(d store.Device) int {
+	n := 0
+	for _, r := range StoredRadios(d) {
+		if !r.BandKnown {
+			n++
+		}
+	}
+	return n
+}
+
+// ---- envelope hash (FSM drift input) ---------------------------------------
+
+// WlanListHash serializes the wireless envelope stably (sorted-key JSON per
+// item) and hashes it with sha256; the value is only compared against
+// itself, so any stable canonicalization works.
+func WlanListHash(wls []Wlan) string {
+	m := make([]map[string]any, 0, len(wls))
+	for _, w := range wls {
+		m = append(m, map[string]any{
+			"name":       w.Name,
+			"ssid":       w.SSID,
+			"security":   w.Security,
+			"passphrase": w.Passphrase,
+			"vlan":       w.VLAN,
+			"enabled":    w.Enabled,
+			"id":         w.ID,
+			"band":       w.Band,
+		})
+	}
+	blob, err := json.Marshal(m) // map keys marshal in sorted order
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(blob)
+	return hex.EncodeToString(sum[:])
+}
