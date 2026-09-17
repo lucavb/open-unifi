@@ -1,15 +1,13 @@
 package server
 
-// Tests build inform packets by hand per docs/PROTOCOL.md §1 so they do not
-// depend on internal/inform's helper constructors — only the contract
-// functions (ParsePacket / DecryptPayload / EncryptPayload) exercised through
-// the handler itself.
+// Tests forge inform packets through the inform codec (inform.NewPacket /
+// EncryptPayload / Serialize — same crypto as production) and decrypt
+// responses through inform.ParsePacket / DecryptPayload; everything else is
+// exercised through the real handler per docs/PROTOCOL.md §1.
 
 import (
 	"bytes"
 	"compress/zlib"
-	"crypto/aes"
-	"crypto/cipher"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -28,86 +26,71 @@ import (
 	"github.com/lucabecker/open-unifi/internal/wireless"
 )
 
-const (
-	testMagic      = 0x544E4255 // "TNBU"
-	testFlagEncCBC = 0x0001
-	testFlagGCM    = 0x0008
-	testDefaultKey = "ba86f2bbe107c7c57eb5f2690775c712" // MD5("ubnt")
-	testMAC        = "aabbccddeeff"
-)
+// Wire-shape constants for the forged informs come from the codec itself
+// (single source): inform.FlagEncCBC / inform.FlagGCM / inform.DefaultKeyHex.
+const testMAC = "aabbccddeeff"
 
 var testIV = bytes16(0x07)
 
 func bytes16(fill byte) []byte { return bytes.Repeat([]byte{fill}, 16) }
 func testMACRaw() []byte       { return []byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff} }
 
-// ---- packet construction helpers ----------------------------------------
+// ---- packet construction helpers (codec verbs) ---------------------------
 
-func pkcs7Pad(b []byte) []byte {
-	p := aes.BlockSize - len(b)%aes.BlockSize
-	return append(append([]byte{}, b...), bytes.Repeat([]byte{byte(p)}, p)...)
-}
-
-func unpadCBC(b []byte) ([]byte, error) {
-	if len(b) == 0 || len(b)%aes.BlockSize != 0 {
-		return nil, errors.New("bad cbc length")
-	}
-	p := int(b[len(b)-1])
-	if p == 0 || p > aes.BlockSize {
-		return nil, errors.New("bad pad byte")
-	}
-	if !bytes.Equal(b[len(b)-p:], bytes.Repeat([]byte{byte(p)}, p)) {
-		return nil, errors.New("bad pad content")
-	}
-	return b[:len(b)-p], nil
-}
-
-func buildInform(t *testing.T, mac []byte, flags uint16, iv []byte, payload []byte) []byte {
+// forgeInform builds a request inform through the codec: NewPacket framing
+// (magic/version/dataVersion + the given MAC), the requested flags, the
+// given IV, then EncryptPayload+Serialize. CAUTION: flags=0 is a footgun —
+// EncryptPayload ORs FlagEncCBC onto a flagless packet (inform.go's CBC
+// branch), so flags=0 silently becomes CBC; payloads that must ride
+// UNENCRYPTED (plain or zlib-only informs) go through forgePlainInform.
+// The encrypted variants seal through pkt.EncryptPayload, so the wire bytes
+// are exactly what the codec produces (same crypto as production).
+func forgeInform(t *testing.T, mac []byte, flags uint16, keyHex, iv, plaintext []byte) []byte {
 	t.Helper()
-	hdr := make([]byte, 40)
-	binary.BigEndian.PutUint32(hdr[0:4], testMagic)
-	binary.BigEndian.PutUint32(hdr[4:8], 0) // packet version 0
-	copy(hdr[8:14], mac)
-	binary.BigEndian.PutUint16(hdr[14:16], flags)
-	copy(hdr[16:32], iv)
-	binary.BigEndian.PutUint32(hdr[32:36], 1) // data version must be 1
-	binary.BigEndian.PutUint32(hdr[36:40], uint32(len(payload)))
-	return append(hdr, payload...)
+	if flags == 0 {
+		t.Fatal("forgeInform: flags=0 is silently upgraded to CBC by EncryptPayload — use forgePlainInform")
+	}
+	pkt := inform.NewPacket(mac)
+	pkt.Flags = flags
+	copy(pkt.IV[:], iv)
+	if err := pkt.EncryptPayload(keyHex, plaintext); err != nil {
+		t.Fatalf("codec encrypt: %v", err)
+	}
+	wire, err := pkt.Serialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return wire
 }
 
+// forgePlainInform builds a framed packet with NO encryption flags (payload
+// rides as-is) through the codec's framing.
+func forgePlainInform(t *testing.T, mac []byte, flags uint16, iv, payload []byte) []byte {
+	t.Helper()
+	pkt := inform.NewPacket(mac)
+	pkt.Flags = flags
+	copy(pkt.IV[:], iv)
+	pkt.Payload = append([]byte(nil), payload...)
+	wire, err := pkt.Serialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return wire
+}
+
+// encryptCBC forges a CBC (flag 0x0001) inform for the test device with the
+// JSON body as plaintext, via the codec.
 func encryptCBC(t *testing.T, jsonBody []byte, keyHex, iv []byte) []byte {
 	t.Helper()
-	block, err := aes.NewCipher(keyHex)
-	if err != nil {
-		t.Fatal(err)
-	}
-	padded := pkcs7Pad(jsonBody)
-	ctext := make([]byte, len(padded))
-	cipher.NewCBCEncrypter(block, iv).CryptBlocks(ctext, padded)
-	return buildInform(t, testMACRaw(), testFlagEncCBC, iv, ctext)
+	return forgeInform(t, testMACRaw(), inform.FlagEncCBC, keyHex, iv, jsonBody)
 }
 
-// encryptGCM seals with a 16-byte nonce and AAD = 40-byte header (payloadLen
-// ct+tag), tag appended — Java AES/GCM/NoPadding semantics, §1.
+// encryptGCM seals with a 16-byte nonce and AAD = the 40-byte request header
+// (payloadLen plaintext+tag), tag appended — Java AES/GCM/NoPadding
+// semantics, §1 — via the codec.
 func encryptGCM(t *testing.T, jsonBody []byte, keyHex, iv []byte) []byte {
 	t.Helper()
-	block, err := aes.NewCipher(keyHex)
-	if err != nil {
-		t.Fatal(err)
-	}
-	aead, err := cipher.NewGCMWithNonceSize(block, 16)
-	if err != nil {
-		t.Fatal(err)
-	}
-	hdr := make([]byte, 40)
-	binary.BigEndian.PutUint32(hdr[0:4], testMagic)
-	binary.BigEndian.PutUint32(hdr[4:8], 0)
-	copy(hdr[8:14], testMACRaw())
-	binary.BigEndian.PutUint16(hdr[14:16], testFlagGCM)
-	copy(hdr[16:32], iv)
-	binary.BigEndian.PutUint32(hdr[32:36], 1)
-	binary.BigEndian.PutUint32(hdr[36:40], uint32(len(jsonBody)+16))
-	return buildInform(t, testMACRaw(), testFlagGCM, iv, aead.Seal(nil, iv, jsonBody, hdr))
+	return forgeInform(t, testMACRaw(), inform.FlagGCM, keyHex, iv, jsonBody)
 }
 
 // post posts a raw body to the handler and returns the recorder.
@@ -121,58 +104,33 @@ func post(t *testing.T, h http.Handler, body []byte) *httptest.ResponseRecorder 
 }
 
 // decryptResponse parses/decrypts an encrypted 200 response with keyHex and
-// returns (flags, decoded JSON map). The GCM tag verifies against the
-// response's OWN 40-byte header (fresh IV, flags 0x0009, dataVersion
-// unchanged — decompiled servlet mutates IV/flags/length in place and builds
-// the AAD after), so body[:40] is the correct AAD.
+// returns (flags, decoded JSON map) — through the codec (ParsePacket framing
+// + DecryptPayload crypto). The GCM tag verifies against the response's OWN
+// 40-byte header (fresh IV, flags 0x0009, dataVersion unchanged — decompiled
+// servlet mutates IV/flags/length in place and builds the AAD after), which
+// is exactly the AAD DecryptPayload reconstructs.
 func decryptResponse(t *testing.T, respBody []byte, keyHex []byte) (uint16, map[string]any) {
 	t.Helper()
-	if len(respBody) < 40 {
-		t.Fatalf("response too short: %d", len(respBody))
+	pkt, perr := inform.ParsePacket(respBody)
+	if perr != nil {
+		t.Fatalf("response framing: %v", perr)
 	}
-	if m := binary.BigEndian.Uint32(respBody[0:4]); m != testMagic {
-		t.Fatalf("bad magic in response: %08x", m)
+	// The response's dataVersion is never mutated from the request's parsed
+	// value (=1); ParsePacket already rejects any other value (inform.go's
+	// dv check), so the property is enforced by the framing above. The
+	// header payload-length field must equal the exact payload length on
+	// the wire.
+	if len(respBody) != inform.HeaderLen+len(pkt.Payload) {
+		t.Fatalf("response payloadLen %d, body %d", len(pkt.Payload), len(respBody)-inform.HeaderLen)
 	}
-	if dv := binary.BigEndian.Uint32(respBody[32:36]); dv != 1 {
-		t.Fatalf("response dataVersion %d, want 1 (bytecode: dataVersion is never mutated on responses)", dv)
-	}
-	flags := binary.BigEndian.Uint16(respBody[14:16])
-	iv := respBody[16:32]
-	dlen := binary.BigEndian.Uint32(respBody[36:40])
-	if uint32(len(respBody)-40) != dlen {
-		t.Fatalf("response payloadLen %d, body %d", dlen, len(respBody)-40)
-	}
-	payload := respBody[40:]
-
-	block, err := aes.NewCipher(keyHex)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var plain []byte
-	switch {
-	case flags&testFlagGCM != 0:
-		aead, err := cipher.NewGCMWithNonceSize(block, 16)
-		if err != nil {
-			t.Fatal(err)
-		}
-		plain, err = aead.Open(nil, iv, payload, respBody[:40])
-		if err != nil {
-			t.Fatalf("response GCM open failed: %v", err)
-		}
-	case flags&testFlagEncCBC != 0:
-		if len(payload)%aes.BlockSize != 0 || len(payload) == 0 {
-			t.Fatalf("bad response CBC payload len %d", len(payload))
-		}
-		plain = make([]byte, len(payload))
-		cipher.NewCBCDecrypter(block, iv).CryptBlocks(plain, payload)
-		plain, err = unpadCBC(plain)
-		if err != nil {
-			t.Fatalf("response unpad failed: %v", err)
-		}
-	default:
+	flags := pkt.Flags
+	if flags&(inform.FlagGCM|inform.FlagEncCBC) == 0 {
 		t.Fatalf("response not encrypted: flags %04x", flags)
 	}
-
+	plain, derr := pkt.DecryptPayload(keyHex)
+	if derr != nil {
+		t.Fatalf("response decrypt failed: %v", derr)
+	}
 	var jm map[string]any
 	if err := json.Unmarshal(plain, &jm); err != nil {
 		t.Fatalf("response JSON: %v (%q)", err, plain)
@@ -310,7 +268,7 @@ func mustBuildSys(t *testing.T, s *Server, rec store.Device) string {
 // (b) unknown MAC: classic 404, MAC recorded as pending with inform:factory.
 func TestInformUnknownMAC404(t *testing.T) {
 	h, st := newServerWith(Config{})
-	body := encryptCBC(t, mustJSON(t, infoBody("")), hexKey(t, testDefaultKey), testIV)
+	body := encryptCBC(t, mustJSON(t, infoBody("")), hexKey(t, inform.DefaultKeyHex), testIV)
 	resp := post(t, h, body)
 	if resp.Code != http.StatusNotFound {
 		t.Fatalf("want 404, got %d", resp.Code)
@@ -373,7 +331,7 @@ func TestInformPlainText(t *testing.T) {
 // (a2) framed packet with NO encryption flags: gated like plain JSON
 // (classic InformServlet gates unencrypted informs, docs §5 L262-265).
 func TestFramedPlainTextGate(t *testing.T) {
-	pkt := buildInform(t, testMACRaw(), 0, bytes16(0x01), mustJSON(t, infoBody("")))
+	pkt := forgePlainInform(t, testMACRaw(), 0, bytes16(0x01), mustJSON(t, infoBody("")))
 	// note: dataVersion 1, payload plaintext (unparseable JSON not even needed)
 
 	h0, st := newServerWith(Config{})
@@ -401,7 +359,7 @@ func TestFramedPlainZlib(t *testing.T) {
 	if err := zw.Close(); err != nil {
 		t.Fatal(err)
 	}
-	pkt := buildInform(t, testMACRaw(), inform.FlagZlib, bytes16(0x02), zbuf.Bytes())
+	pkt := forgePlainInform(t, testMACRaw(), inform.FlagZlib, bytes16(0x02), zbuf.Bytes())
 
 	h, st := newServerWith(Config{AllowPlainText: true})
 	registerPending(t, st)
@@ -430,11 +388,11 @@ func TestEmptyTypeStatusInformAdopts(t *testing.T) {
 
 	body := infoBody("")
 	delete(body, "_type") // exactly what the real device sends
-	resp := post(t, h, encryptCBC(t, mustJSON(t, body), hexKey(t, testDefaultKey), testIV))
+	resp := post(t, h, encryptCBC(t, mustJSON(t, body), hexKey(t, inform.DefaultKeyHex), testIV))
 	if resp.Code != http.StatusOK {
 		t.Fatalf("inform: status %d", resp.Code)
 	}
-	_, jm := decryptResponse(t, resp.Body.Bytes(), hexKey(t, testDefaultKey))
+	_, jm := decryptResponse(t, resp.Body.Bytes(), hexKey(t, inform.DefaultKeyHex))
 	if jm["_type"] != "setparam" {
 		t.Fatalf("type = %v, want setparam adoption push for the real-device empty-_type inform", jm["_type"])
 	}
@@ -467,7 +425,7 @@ func u7pg2Record() store.Device {
 	return store.Device{
 		MAC: testMAC, Model: "U7PG2", State: store.StateAdopted,
 		CfgVersion: "aaaa", AppliedCfg: "aaaa",
-		XAuthkey: testDefaultKey, Authkeys: []string{testDefaultKey},
+		XAuthkey: inform.DefaultKeyHex, Authkeys: []string{inform.DefaultKeyHex},
 		// fw_caps = 0x0400: the SHA-512 password capability bit real U7PG2
 		// reports (drives the users.1 $6$ branch, FID-22).
 		Extra: store.JSONMap{"fw_caps": 1024.0, "radio_table": []any{
@@ -1301,9 +1259,9 @@ func TestAdoptionPushSeedsHash(t *testing.T) {
 	}
 	h := wiredServer(t, func() []Wlan { return env }, st)
 
-	body := encryptCBC(t, mustJSON(t, infoBody("")), hexKey(t, testDefaultKey), testIV)
+	body := encryptCBC(t, mustJSON(t, infoBody("")), hexKey(t, inform.DefaultKeyHex), testIV)
 	resp := post(t, h, body)
-	_, jm := decryptResponse(t, resp.Body.Bytes(), hexKey(t, testDefaultKey))
+	_, jm := decryptResponse(t, resp.Body.Bytes(), hexKey(t, inform.DefaultKeyHex))
 	if jm["_type"] != "setparam" || !strings.HasPrefix(jm["mgmt_cfg"].(string), "capability=") {
 		t.Fatalf("adoption push shape wrong: %v", jm)
 	}
@@ -1336,8 +1294,8 @@ func TestAdoptionEchoThenEnvelopeDrift(t *testing.T) {
 	h := wiredServer(t, func() []Wlan { return env }, st)
 
 	// inform#1 (factory key): adoption push.
-	resp := post(t, h, encryptCBC(t, mustJSON(t, infoBody("")), hexKey(t, testDefaultKey), testIV))
-	_, jm := decryptResponse(t, resp.Body.Bytes(), hexKey(t, testDefaultKey))
+	resp := post(t, h, encryptCBC(t, mustJSON(t, infoBody("")), hexKey(t, inform.DefaultKeyHex), testIV))
+	_, jm := decryptResponse(t, resp.Body.Bytes(), hexKey(t, inform.DefaultKeyHex))
 	if jm["_type"] != "setparam" {
 		t.Fatalf("inform#1 type = %v, want setparam adoption push", jm["_type"])
 	}
@@ -1688,7 +1646,7 @@ func TestInformVanishedMACRecord404(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := New(Config{}, st, testLogger()).InformHandler()
-	resp := post(t, h, encryptCBC(t, mustJSON(t, infoBody("")), hexKey(t, testDefaultKey), testIV))
+	resp := post(t, h, encryptCBC(t, mustJSON(t, infoBody("")), hexKey(t, inform.DefaultKeyHex), testIV))
 	if resp.Code != http.StatusNotFound {
 		t.Fatalf("vanished record: want 404 (unknown-MAC marker), got %d %q", resp.Code, resp.Body.String())
 	}
@@ -1707,7 +1665,7 @@ func TestInformVanishedMACRecord404(t *testing.T) {
 func TestStoreGetErrorNoop(t *testing.T) {
 	st := &failingStore{DeviceStore: store.NewMemStore(), failGet: true}
 	s := New(Config{}, st, testLogger())
-	body := encryptCBC(t, mustJSON(t, infoBody("")), hexKey(t, testDefaultKey), testIV)
+	body := encryptCBC(t, mustJSON(t, infoBody("")), hexKey(t, inform.DefaultKeyHex), testIV)
 	resp := post(t, s.InformHandler(), body)
 	if resp.Code != http.StatusOK || resp.Header().Get("Content-Type") != "application/json" {
 		t.Fatalf("want 200 plain-JSON noop on store Get error, got %d %s", resp.Code, resp.Header().Get("Content-Type"))
@@ -1718,6 +1676,27 @@ func TestStoreGetErrorNoop(t *testing.T) {
 	}
 	if jm["_type"] != "noop" {
 		t.Fatalf("internal-error payload = %v, want noop", jm["_type"])
+	}
+}
+
+// F3: a framed-plain inform whose payload decrypts (no crypto flags) but is
+// NOT a JSON object (a bare number) must answer 400 "unable to parse inform
+// payload" with the codec's ErrNotJSONObject wording in the debug log.
+func TestFramedPlainPayloadNotJSONObject(t *testing.T) {
+	var logs strings.Builder
+	st := store.NewMemStore()
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	s := New(Config{AllowPlainText: true}, st, logger)
+	registerPending(t, st)
+
+	pkt := forgePlainInform(t, testMACRaw(), 0, bytes16(0x01), []byte("6"))
+	resp := post(t, s.InformHandler(), pkt)
+	if resp.Code != http.StatusBadRequest ||
+		!strings.Contains(resp.Body.String(), "unable to parse inform payload") {
+		t.Fatalf("want 400 unable to parse inform payload, got %d %q", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(logs.String(), "inform-plain: payload not a JSON object") {
+		t.Fatalf("expected the not-a-JSON-object debug wording, log:\n%s", logs.String())
 	}
 }
 
@@ -1745,7 +1724,7 @@ func TestHandlerNoopTargetPersistence(t *testing.T) {
 	st := store.NewMemStore()
 	if err := st.Put(store.Device{MAC: testMAC, State: store.StateAdopted,
 		CfgVersion: "aaaa", AppliedCfg: "aaaa",
-		XAuthkey: testDefaultKey, Authkeys: []string{testDefaultKey},
+		XAuthkey: inform.DefaultKeyHex, Authkeys: []string{inform.DefaultKeyHex},
 		Model: "U7PG2", Extra: store.JSONMap{"wlan_cfg_sha": wireless.WlanListHash(nil)},
 	}); err != nil {
 		t.Fatal(err)
@@ -1798,12 +1777,12 @@ func TestStorePutErrorNoop(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := New(Config{}, st, testLogger())
-	body := encryptCBC(t, mustJSON(t, infoBody("")), hexKey(t, testDefaultKey), testIV)
+	body := encryptCBC(t, mustJSON(t, infoBody("")), hexKey(t, inform.DefaultKeyHex), testIV)
 	resp := post(t, s.InformHandler(), body)
 	if resp.Code != http.StatusOK || resp.Header().Get("Content-Type") != "application/x-binary" {
 		t.Fatalf("want 200 sealed noop on store update error, got %d %s", resp.Code, resp.Header().Get("Content-Type"))
 	}
-	flags, jm := decryptResponse(t, resp.Body.Bytes(), hexKey(t, testDefaultKey))
+	flags, jm := decryptResponse(t, resp.Body.Bytes(), hexKey(t, inform.DefaultKeyHex))
 	_ = flags
 	if jm["_type"] != "noop" {
 		t.Fatalf("sealed internal-error payload = %v, want noop", jm["_type"])
@@ -1831,7 +1810,7 @@ func TestHandlerFalseBranches(t *testing.T) {
 	}
 
 	// > 10 MB body
-	resp := post(t, h, bytes.Repeat([]byte{0}, maxInformBody+1))
+	resp := post(t, h, bytes.Repeat([]byte{0}, inform.MaxBodySize+1))
 	if resp.Code != http.StatusBadRequest || !strings.Contains(resp.Body.String(), "payload too large") {
 		t.Fatalf("oversize: want 400 payload too large, got %d %q", resp.Code, resp.Body.String())
 	}
@@ -1854,7 +1833,7 @@ func TestAuthkeysPrunedToTwo(t *testing.T) {
 
 	keys := []string{}
 	for i := 0; i < 3; i++ {
-		body := encryptGCM(t, mustJSON(t, infoBody("")), hexKey(t, testDefaultKey), testIV)
+		body := encryptGCM(t, mustJSON(t, infoBody("")), hexKey(t, inform.DefaultKeyHex), testIV)
 		resp := post(t, h, body)
 		if resp.Code != http.StatusOK {
 			t.Fatalf("rotation#%d: status %d", i+1, resp.Code)
@@ -1914,39 +1893,11 @@ func TestNewlineInjectionGuarded(t *testing.T) {
 	}
 
 	// mgmt_cfg: device IP with newline → the doubtful rows are skipped.
-	mrec := store.Device{MAC: testMAC, CfgVersion: "aaaa", XAuthkey: testDefaultKey,
+	mrec := store.Device{MAC: testMAC, CfgVersion: "aaaa", XAuthkey: inform.DefaultKeyHex,
 		InformURL: "http://10.0.0.5:8080/inform", IP: "10.0.0.1\nbad=1"}
-	mgmt := s.engine.BuildMgmtCfg(mrec, testDefaultKey)
+	mgmt := s.engine.BuildMgmtCfg(mrec, inform.DefaultKeyHex)
 	if strings.Contains(mgmt, "bad=1") {
 		t.Fatalf("newline value leaked into mgmt_cfg: %q", mgmt)
-	}
-}
-
-// ---- CBC legacy zero-pad fallback (§8d) ------------------------------------
-
-func TestCBCLegacyZeroPadFallback(t *testing.T) {
-	// NOT PKCS7-valid: "hello world" + NUL padding to a block boundary.
-	msg := []byte("hello world")
-	buf := make([]byte, (aes.BlockSize + len(msg)/aes.BlockSize*aes.BlockSize))
-	copy(buf, msg)
-	buf[11] = 0
-	block, err := aes.NewCipher(hexKey(t, testDefaultKey))
-	if err != nil {
-		t.Fatal(err)
-	}
-	ct := make([]byte, len(buf))
-	cipher.NewCBCEncrypter(block, testIV).CryptBlocks(ct, buf)
-	wire := buildInform(t, testMACRaw(), testFlagEncCBC, testIV, ct)
-	pkt, err := inform.ParsePacket(wire)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := pkt.DecryptPayload(hexKey(t, testDefaultKey))
-	if err != nil {
-		t.Fatalf("lenient decrypt failed: %v", err)
-	}
-	if !bytes.Equal(bytes.TrimRight(got, "\x00"), msg) {
-		t.Fatalf("legacy fallback round trip mismatch: %q", got)
 	}
 }
 
@@ -2244,22 +2195,22 @@ func TestGCMAdoptionMatrix(t *testing.T) {
 	}{
 		{"cbc", func(t *testing.T, plain []byte, key []byte) []byte {
 			return encryptCBC(t, plain, key, testIV)
-		}, testFlagEncCBC},
+		}, inform.FlagEncCBC},
 		{"gcm", func(t *testing.T, plain []byte, key []byte) []byte {
 			return encryptGCM(t, plain, key, testIV)
-		}, testFlagGCM | testFlagEncCBC},
+		}, inform.FlagGCM | inform.FlagEncCBC},
 	} {
 		t.Run(family.name, func(t *testing.T) {
 			h, st := newServerWith(Config{})
 			registerPending(t, st)
 
 			// inform#1: factory-fresh device, DEFAULT key.
-			body := family.req(t, mustJSON(t, radioBody("")), hexKey(t, testDefaultKey))
+			body := family.req(t, mustJSON(t, radioBody("")), hexKey(t, inform.DefaultKeyHex))
 			resp := post(t, h, body)
 			if resp.Code != http.StatusOK {
 				t.Fatalf("inform#1: %d %q", resp.Code, resp.Body.String())
 			}
-			flags, jm := decryptResponse(t, resp.Body.Bytes(), hexKey(t, testDefaultKey))
+			flags, jm := decryptResponse(t, resp.Body.Bytes(), hexKey(t, inform.DefaultKeyHex))
 			if flags != family.wantFlags {
 				t.Fatalf("inform#1 response flags %04x, want %04x", flags, family.wantFlags)
 			}
@@ -2322,7 +2273,7 @@ func TestAdapterDefaultKeyPostAdoption404(t *testing.T) {
 	const k = "99998888777766665555444433332222"
 	registerAdopted(t, st, "aaaa", k)
 
-	body := encryptCBC(t, mustJSON(t, infoBody("aaaa")), hexKey(t, testDefaultKey), testIV)
+	body := encryptCBC(t, mustJSON(t, infoBody("aaaa")), hexKey(t, inform.DefaultKeyHex), testIV)
 	resp := post(t, h, body)
 	if resp.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404 (default key rejected post-adoption)", resp.Code)
@@ -2741,7 +2692,7 @@ func TestPayloadMACMismatchRejected(t *testing.T) {
 
 	body := infoBody("")
 	body["mac"] = "aa:bb:cc:dd:ee:00" // does NOT match the test header MAC aa…ff
-	resp := post(t, h, encryptCBC(t, mustJSON(t, body), hexKey(t, testDefaultKey), testIV))
+	resp := post(t, h, encryptCBC(t, mustJSON(t, body), hexKey(t, inform.DefaultKeyHex), testIV))
 	if resp.Code != http.StatusBadRequest {
 		t.Fatalf("mac mismatch: want 400, got %d %q", resp.Code, resp.Body.String())
 	}
@@ -2757,7 +2708,7 @@ func TestPayloadMACMismatchRejected(t *testing.T) {
 	// Missing/invalid mac in the payload body rejects the same way.
 	body2 := infoBody("")
 	delete(body2, "mac")
-	resp = post(t, h, encryptCBC(t, mustJSON(t, body2), hexKey(t, testDefaultKey), testIV))
+	resp = post(t, h, encryptCBC(t, mustJSON(t, body2), hexKey(t, inform.DefaultKeyHex), testIV))
 	if resp.Code != http.StatusBadRequest {
 		t.Fatalf("missing payload mac: want 400, got %d", resp.Code)
 	}
@@ -2767,7 +2718,7 @@ func TestPayloadMACMismatchRejected(t *testing.T) {
 	h2, st3 := newServerWith(Config{})
 	body3 := infoBody("")
 	body3["mac"] = "aa:bb:cc:dd:ee:00"
-	resp = post(t, h2, encryptCBC(t, mustJSON(t, body3), hexKey(t, testDefaultKey), testIV))
+	resp = post(t, h2, encryptCBC(t, mustJSON(t, body3), hexKey(t, inform.DefaultKeyHex), testIV))
 	pending, _ := st3.Pending()
 	if resp.Code != http.StatusBadRequest {
 		t.Fatalf("unknown-MAC mismatch: want 400, got %d", resp.Code)

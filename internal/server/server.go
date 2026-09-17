@@ -28,13 +28,6 @@ import (
 	"github.com/lucabecker/open-unifi/internal/wireless"
 )
 
-// maxInformBody matches the classic controller's 10 MB inform body cap.
-const maxInformBody = 10 * 1024 * 1024
-
-// defaultKeyHex is the factory pre-adoption AES key (docs/PROTOCOL.md §2);
-// the canonical constant lives in the adoption engine.
-const defaultKeyHex = adoption.DefaultKeyHex
-
 // ErrLiveWLANProvisioningUnsupported is returned for the exact U7PG2
 // firmware lane whose system_cfg WLAN template has not been differentially
 // verified against the official controller. The caller must not retry this as
@@ -243,7 +236,7 @@ func keyCandidates(rec store.Device) []string {
 			out = append(out, k)
 		}
 	}
-	def := defaultKeyHex
+	def := inform.DefaultKeyHex
 	if !seen[def] {
 		out = append(out, def)
 	}
@@ -264,13 +257,13 @@ func (s *Server) handleInform(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxInformBody+1))
+	body, err := io.ReadAll(io.LimitReader(r.Body, inform.MaxBodySize+1))
 	if err != nil {
 		s.lg.Debug("inform: body read error", "err", err)
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	if len(body) > maxInformBody {
+	if len(body) > inform.MaxBodySize {
 		writeJSONErr(w, http.StatusBadRequest, "payload too large")
 		return
 	}
@@ -312,18 +305,13 @@ func (s *Server) handleInform(w http.ResponseWriter, r *http.Request) {
 	s.handlePlain(w, mac, jm)
 }
 
-// plainGateKeyBytes returns a usable-length AES key for the PLAIN framed
-// path: DecryptPayload's no-encryption-flags branch ignores the key entirely
-// and only inflates zlib/parses snappy — any valid key works.
-func plainGateKeyBytes() ([]byte, error) {
-	return inform.DecodeKeyHex(inform.DefaultKeyHex)
-}
-
 // handlePacketPlain processes a FRAMED packet that carries no encryption
 // flags (plain inform, possibly zlib-compressed). MAC comes from the packet
-// header; payload goes through pkt.DecryptPayload so zlib-only (0x02)
+// header; the payload goes through the codec's Decode so zlib-only (0x02)
 // packets are inflated and snappy-flagged ones are rejected with the
-// classic error.
+// classic error. Decode's no-encryption-flags branch ignores the key
+// entirely and only inflates zlib/parses snappy — any valid key works, the
+// factory default is simply the cheapest candidate.
 func (s *Server) handlePacketPlain(w http.ResponseWriter, pkt *inform.Packet) {
 	mac := canonMACFromHeader(pkt.MAC)
 	if mac == "" {
@@ -331,25 +319,17 @@ func (s *Server) handlePacketPlain(w http.ResponseWriter, pkt *inform.Packet) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	kb, kerr := plainGateKeyBytes()
-	if kerr != nil {
-		s.lg.Error("inform-plain: gate key decode failed", "err", kerr)
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-	p, derr := pkt.DecryptPayload(kb)
+	d, derr := inform.Decode(pkt, []string{inform.DefaultKeyHex})
 	if derr != nil {
-		s.lg.Debug("inform-plain: payload parse failed", "err", derr)
+		if errors.Is(derr, inform.ErrNotJSONObject) {
+			s.lg.Debug("inform-plain: payload not a JSON object")
+		} else {
+			s.lg.Debug("inform-plain: payload parse failed", "err", derr)
+		}
 		writeJSONErr(w, http.StatusBadRequest, "unable to parse inform payload")
 		return
 	}
-	var jm map[string]any
-	if uerr := json.Unmarshal(p, &jm); uerr != nil || jm == nil {
-		s.lg.Debug("inform-plain: payload not a JSON object")
-		writeJSONErr(w, http.StatusBadRequest, "unable to parse inform payload")
-		return
-	}
-	s.handlePlain(w, mac, jm)
+	s.handlePlain(w, mac, d.Body)
 }
 
 // handlePacket processes one binary (CBC or GCM) inform.
@@ -377,30 +357,6 @@ func errMACMismatch(hdr, payload string) error {
 // Object.ÖoÓ000 → 404).
 var errDefaultKeyRejected = &informRejectError{status: http.StatusNotFound,
 	reason: "default key used by an adopted device"}
-
-// decryptPayloadWithKeys runs the candidate-key loop: the first candidate
-// whose plaintext parses as a JSON object wins (JSON validation is required
-// because the legacy lenient CBC unpad makes wrong-key decrypts "succeed"
-// with garbage bytes rather than erroring).
-func decryptPayloadWithKeys(pkt *inform.Packet, keys []string) (map[string]any, string, []byte, error) {
-	var jm map[string]any
-	for _, k := range keys {
-		kb, derr := inform.DecodeKeyHex(k)
-		if derr != nil {
-			continue
-		}
-		p, derr := pkt.DecryptPayload(kb)
-		if derr != nil {
-			continue
-		}
-		if jerr := json.Unmarshal(p, &jm); jerr != nil || jm == nil {
-			jm = nil // wrong key (lenient garbage) or malformed payload
-			continue
-		}
-		return jm, strings.ToLower(k), kb, nil
-	}
-	return nil, "", nil, errors.New("no key produced a valid JSON payload")
-}
 
 // payloadMACMatches enforces FID-35: the decrypted body's mac field (when
 // present) must canonicalize to the header MAC. The classic controller
@@ -430,7 +386,7 @@ func (s *Server) handlePacket(w http.ResponseWriter, pkt *inform.Packet, body []
 		// only AFTER the payload proved decryptable (FID-8) and its MAC
 		// matched (FID-35). A garbage/mis-keyed payload touches no state.
 		s.lg.Debug("inform: unregistered device", "mac", mac)
-		jm, _, _, derr := decryptPayloadWithKeys(pkt, []string{defaultKeyHex})
+		jd, derr := inform.Decode(pkt, []string{inform.DefaultKeyHex})
 		if derr != nil {
 			s.lg.Debug("inform: no key produced a valid JSON payload", "mac", mac, "tried", 1)
 			writeJSONErr(w, http.StatusBadRequest, "unable to decrypt inform payload")
@@ -438,8 +394,8 @@ func (s *Server) handlePacket(w http.ResponseWriter, pkt *inform.Packet, body []
 		}
 		// FID-35: the jar's MAC-consistency check (privatesuper offsets
 		// 13-50) precedes every recording step, unknown devices included.
-		if !payloadMACMatches(mac, jm) {
-			mm, _ := jm["mac"].(string)
+		if !payloadMACMatches(mac, jd.Body) {
+			mm, _ := jd.Body["mac"].(string)
 			s.lg.Error("invalid inform (mac inconsistent in header and payload)", "mac", mac, "payloadMac", mm)
 			writeJSONErr(w, http.StatusBadRequest, errMACMismatch(mac, mm).Error())
 			return
@@ -455,17 +411,19 @@ func (s *Server) handlePacket(w http.ResponseWriter, pkt *inform.Packet, body []
 		// (classic: devmgr sentinels ØoÓ000/øOÓ000 flow back through the
 		// servlet as a real response for everything but the explicit
 		// unknown-device marker).
-		s.internalNoopResponse(w, pkt, nil, "", false, mac, "store error", err)
+		s.internalNoopResponse(w, pkt, nil, "", mac, "store error", err)
 		return
 	}
 	s.lg.Debug("inform: packet", "mac", mac, "flags", fmt.Sprintf("0x%04x", pkt.Flags), "bodyLen", len(body))
 
-	jm, usedKey, keyBytes, derr := decryptPayloadWithKeys(pkt, keyCandidates(rec))
+	candidates := keyCandidates(rec)
+	jd, derr := inform.Decode(pkt, candidates)
 	if derr != nil {
-		s.lg.Debug("inform: no key produced a valid JSON payload", "mac", mac, "tried", len(keyCandidates(rec)))
+		s.lg.Debug("inform: no key produced a valid JSON payload", "mac", mac, "tried", len(candidates))
 		writeJSONErr(w, http.StatusBadRequest, "unable to decrypt inform payload")
 		return
 	}
+	jm, usedKey, keyBytes := jd.Body, jd.UsedKey, jd.KeyBytes
 	gcmReq := pkt.Flags&inform.FlagGCM != 0
 	if !payloadMACMatches(mac, jm) {
 		mm, _ := jm["mac"].(string)
@@ -520,11 +478,11 @@ func (s *Server) handlePacket(w http.ResponseWriter, pkt *inform.Packet, body []
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		s.internalNoopResponse(w, pkt, keyBytes, usedKey, gcmReq, mac, "update error", uerr)
+		s.internalNoopResponse(w, pkt, keyBytes, usedKey, mac, "update error", uerr)
 		return
 	}
 
-	s.writeInformResponse(w, pkt, keyBytes, outcome, mac, usedKey, gcmReq)
+	s.writeInformResponse(w, pkt, keyBytes, outcome, mac, usedKey)
 }
 
 // advanceResult carries the inform response built inside the store's
@@ -539,45 +497,20 @@ type advanceResult struct {
 // fails (rand/cipher errors), a plain-JSON noop rides out under an HTTP 200
 // (FID-69: internal failures never surface as 500) rather than leaving the
 // socket empty.
-func (s *Server) writeInformResponse(w http.ResponseWriter, pkt *inform.Packet, keyBytes []byte, outcome advanceResult, mac, usedKey string, gcmReq bool) {
+func (s *Server) writeInformResponse(w http.ResponseWriter, pkt *inform.Packet, keyBytes []byte, outcome advanceResult, mac, usedKey string) {
 	out, err := json.Marshal(outcome.resp)
 	if err != nil {
 		s.internalPlainNoopResponse(w, "response marshal failed", err)
 		return
 	}
-
-	// Response header (InformServlet._O0 reuse semantics, c_e9bb4be74abe
-	// §206-216): the request header object is reused in place. Mutated:
-	// flags (0x0009 for GCM responses = GCM|EncCBC, 0x0001 for CBC) and a
-	// FRESH RANDOM 16-byte IV for BOTH branches (C.random(16) before the
-	// if). Not mutated: magic, packet version, MAC (echoed from the
-	// request) and the dataVersion field, which stays at the request's
-	// parsed value (= 1).
-	rpkt := *pkt
-	if gcmReq {
-		rpkt.Flags = inform.FlagGCM | inform.FlagEncCBC
-	} else {
-		rpkt.Flags = inform.FlagEncCBC
-	}
-	if _, err := rand.Read(rpkt.IV[:]); err != nil {
-		s.internalPlainNoopResponse(w, "response IV generation failed", err)
-		return
-	}
-	// Flags are finalized BEFORE encryption: on the GCM path the sealed
-	// ciphertext is AAD-bound to the response header's 40 bytes in this
-	// exact state (IV/flags/length already mutated), which the device
-	// reproduces from the plaintext header it receives.
-	if eerr := rpkt.EncryptPayload(keyBytes, out); eerr != nil {
-		s.internalPlainNoopResponse(w, "response encryption failed", eerr)
-		return
-	}
-	serialized, serr := rpkt.Serialize()
+	serialized, serr := inform.Respond(pkt, keyBytes, out)
 	if serr != nil {
-		s.internalPlainNoopResponse(w, "response serialize failed", serr)
+		s.internalPlainNoopResponse(w, "response sealing failed", serr)
 		return
 	}
 	// Never log usedKey: it is a live decryption/adoption credential.
-	s.lg.Debug("inform: reply", "mac", mac, "kind", outcome.kind, "gcm", gcmReq)
+	s.lg.Debug("inform: reply", "mac", mac, "kind", outcome.kind,
+		"gcm", pkt.Flags&inform.FlagGCM != 0)
 	w.Header().Set("Content-Type", "application/x-binary")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(serialized)
@@ -588,14 +521,14 @@ func (s *Server) writeInformResponse(w http.ResponseWriter, pkt *inform.Packet, 
 // request was encrypted and the per-device key is known, the noop is sealed
 // exactly like a real reply; when no key was established (e.g. the store
 // failed before decryption), it falls back to plain JSON.
-func (s *Server) internalNoopResponse(w http.ResponseWriter, pkt *inform.Packet, keyBytes []byte, usedKey string, gcmReq bool, mac, cause string, cerr error) {
+func (s *Server) internalNoopResponse(w http.ResponseWriter, pkt *inform.Packet, keyBytes []byte, usedKey string, mac, cause string, cerr error) {
 	s.lg.Error("inform: internal error, answering noop", "mac", mac, "cause", cause, "err", cerr)
 	outcome := advanceResult{resp: s.noopResp(), kind: "internal-error"}
 	if keyBytes == nil {
 		s.internalPlainNoopResponse(w, cause, cerr)
 		return
 	}
-	s.writeInformResponse(w, pkt, keyBytes, outcome, mac, usedKey, gcmReq)
+	s.writeInformResponse(w, pkt, keyBytes, outcome, mac, usedKey)
 }
 
 // internalPlainNoopResponse is the unsealed fallback of the noop path.
@@ -657,7 +590,7 @@ func (s *Server) handlePlain(w http.ResponseWriter, mac string, jm map[string]an
 	// Plaintext devices authenticate via the reported _authkey claim.
 	claim := strings.ToLower(str(jm, "_authkey"))
 	if claim == "" {
-		claim = defaultKeyHex
+		claim = inform.DefaultKeyHex
 	}
 	var outcome advanceResult
 	uerr := s.st.UpdateExisting(mac, func(rec *store.Device) error {

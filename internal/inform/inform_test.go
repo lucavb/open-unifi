@@ -353,12 +353,13 @@ func TestIndependentGCMDecrypt(t *testing.T) {
 	}
 }
 
-// TestPacketHeaderBytes mirrors the classic response/envelope path: the
-// canonical header of a parsed packet must be byte-identical to the first
-// 40 bytes the device actually sent (same MAC/version/flags/IV/dataVersion
-// and same payload-length field), since the decompiled servlet builds the
-// GCM AAD from exactly such a header clone (c_cf8384dbe7ae.java §64-78).
-func TestPacketHeaderBytes(t *testing.T) {
+// TestPacketHeaderRoundTrip mirrors the classic response/envelope path: the
+// codec's framing must reproduce the first 40 bytes the device actually
+// sent byte-for-byte (same MAC/version/flags/IV/dataVersion and the same
+// payload-length field), since the decompiled servlet builds the GCM AAD
+// from exactly such a header clone (c_cf8384dbe7ae.java §64-78). Exercise it
+// through the public verbs: parse the wire, Serialize it again, compare.
+func TestPacketHeaderRoundTrip(t *testing.T) {
 	wire := mustSerialize(t, func() *Packet {
 		p := NewPacket(testMAC)
 		p.Flags = FlagGCM | FlagEncCBC
@@ -367,94 +368,39 @@ func TestPacketHeaderBytes(t *testing.T) {
 		}
 		return p
 	}())
-	if got := parseOrDie(t, wire).HeaderBytes(); !bytes.Equal(got, wire[:HeaderLen]) {
-		t.Fatalf("HeaderBytes mismatch:\n got %x\nwant %x", got, wire[:HeaderLen])
-	}
-
-	// Header state reflects later mutation of the packet.
-	pp := NewPacket(testMAC)
-	pp.Payload = []byte("x")
-	h1 := pp.HeaderBytes()
-	if binary.BigEndian.Uint32(h1[36:40]) != 1 {
-		t.Fatalf("header payload length %d, want 1", h1[36:40])
-	}
-	pp.DataVersion = 9
-	if hv := pp.HeaderBytes(); binary.BigEndian.Uint32(hv[32:36]) != 9 {
-		t.Fatal("HeaderBytes does not reflect current DataVersion")
+	re := mustSerialize(t, parseOrDie(t, wire))
+	if !bytes.Equal(re, wire) {
+		t.Fatalf("header round trip mismatch:\n got %x\nwant %x", re, wire)
 	}
 }
 
-// TestEncryptPayloadGCMExternalAAD: response-shaped round trip where the
-// GCM tag binds an EXTERNAL AAD (here: the 40-byte header of a request
-// packet). Decryption only succeeds with that exact AAD; using the sealed
-// packet's own header instead must fail tag verification. Also verifies
-// EncryptPayloadGCM leaves Flags/DataVersion untouched and appends a
-// 16-byte tag.
-func TestEncryptPayloadGCMExternalAAD(t *testing.T) {
-	block, err := aes.NewCipher(testKey)
+// TestEncryptPayloadShape pins the verb-level contract of EncryptPayload on
+// the GCM path: Flags/DataVersion left untouched, payload = plaintext+16-byte
+// tag, nil-error round trip through the standard decrypt path, and bad key
+// sizes rejected.
+func TestEncryptPayloadShape(t *testing.T) {
+	p := NewPacket(testMAC)
+	p.Flags = FlagGCM | FlagEncCBC // caller-driven; the verb must not change it
+	wantFlags := p.Flags
+	p.DataVersion = DataVersion
+	if err := p.EncryptPayload(testKey, testPlain); err != nil {
+		t.Fatal(err)
+	}
+	if p.Flags != wantFlags {
+		t.Fatal("EncryptPayload mutated Flags")
+	}
+	if len(p.Payload) != len(testPlain)+gcmTagSize {
+		t.Fatalf("payload len %d, want plaintext+16 (tag)", len(p.Payload))
+	}
+	got, err := parseOrDie(t, mustSerialize(t, p)).DecryptPayload(testKey)
 	if err != nil {
-		t.Fatal(err)
-	}
-	aead, err := cipher.NewGCMWithNonceSize(block, 16)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Request-shaped packet: flags 0x08, dataVersion 1 (device inform).
-	req := NewPacket(testMAC)
-	req.Flags = FlagGCM
-	if err := req.EncryptPayload(testKey, testPlain); err != nil {
-		t.Fatal(err)
-	}
-	reqAAD := req.HeaderBytes()
-
-	// Response-shaped packet: fresh IV, flags set by the caller (classic
-	// response flags 0x0009), dataVersion set/not set by the caller.
-	externalAAD := append([]byte(nil), reqAAD...)
-	resp := NewPacket(testMAC)
-	resp.Flags = FlagGCM | FlagEncCBC // caller-driven; helper must not change it
-	wantFlags := resp.Flags
-	resp.DataVersion = 1
-	if err := resp.EncryptPayloadGCM(testKey, testPlain, externalAAD); err != nil {
-		t.Fatal(err)
-	}
-	if resp.Flags != wantFlags {
-		t.Fatal("EncryptPayloadGCM mutated Flags")
-	}
-	if len(resp.Payload) != len(testPlain)+gcmTagSize {
-		t.Fatalf("payload len %d, want plaintext+16 (tag)", len(resp.Payload))
-	}
-
-	// Open with the exact external AAD: success.
-	if got, err := aead.Open(nil, resp.IV[:], resp.Payload, externalAAD); err != nil || !bytes.Equal(got, testPlain) {
-		t.Fatalf("external-AAD open: %v (plain=%q)", err, got)
-	}
-	// Wrong AAD (the packet's own header): tag failure.
-	if _, err := aead.Open(nil, resp.IV[:], resp.Payload, resp.HeaderBytes()); err == nil {
-		t.Fatal("open accepted own-header AAD despite external-AAD seal")
-	}
-
-	// nil AAD = own-header binding: round trips via the standard decrypt
-	// path and via a raw wire reparse.
-	p2 := NewPacket(testMAC)
-	p2.Flags = FlagGCM
-	if err := p2.EncryptPayloadGCM(testKey, testPlain, nil); err != nil {
-		t.Fatal(err)
-	}
-	wire := mustSerialize(t, p2)
-	got, err := parseOrDie(t, wire).DecryptPayload(testKey)
-	if err != nil {
-		t.Fatalf("nil-AAD round trip: %v", err)
+		t.Fatalf("round trip: %v", err)
 	}
 	if !bytes.Equal(got, testPlain) {
-		t.Fatalf("nil-AAD round trip mismatch: %q", got)
+		t.Fatalf("round trip mismatch: %q", got)
 	}
-	if dl := binary.BigEndian.Uint32(wire[36:40]); dl != uint32(len(testPlain)+gcmTagSize) {
-		t.Fatalf("nil-AAD header payload length %d, want plaintext+16", dl)
-	}
-
 	// Bad key size rejected.
-	if err := (&Packet{}).EncryptPayloadGCM(make([]byte, 5), testPlain, nil); err == nil {
+	if err := (&Packet{}).EncryptPayload(make([]byte, 5), testPlain); err == nil {
 		t.Fatal("bad key accepted")
 	}
 }

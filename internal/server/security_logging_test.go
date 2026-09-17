@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/lucabecker/open-unifi/internal/inform"
 	"github.com/lucabecker/open-unifi/internal/store"
 )
 
@@ -15,7 +16,7 @@ func TestDebugReplyLogsDoNotContainAdoptionOrDecryptionKeys(t *testing.T) {
 	s := New(Config{}, st, logger)
 	registerPending(t, st)
 
-	resp := post(t, s.InformHandler(), encryptCBC(t, mustJSON(t, infoBody("")), hexKey(t, testDefaultKey), testIV))
+	resp := post(t, s.InformHandler(), encryptCBC(t, mustJSON(t, infoBody("")), hexKey(t, inform.DefaultKeyHex), testIV))
 	if resp.Code != 200 {
 		t.Fatalf("adoption inform status = %d", resp.Code)
 	}
@@ -26,7 +27,7 @@ func TestDebugReplyLogsDoNotContainAdoptionOrDecryptionKeys(t *testing.T) {
 	if rec.XAuthkey == "" {
 		t.Fatal("adoption did not create an x_authkey")
 	}
-	if strings.Contains(logs.String(), testDefaultKey) {
+	if strings.Contains(logs.String(), inform.DefaultKeyHex) {
 		t.Fatalf("debug logs contain factory decryption key: %q", logs.String())
 	}
 	if strings.Contains(logs.String(), rec.XAuthkey) {

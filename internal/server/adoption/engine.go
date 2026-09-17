@@ -21,14 +21,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lucabecker/open-unifi/internal/inform"
 	"github.com/lucabecker/open-unifi/internal/store"
 	"github.com/lucabecker/open-unifi/internal/wireless"
 )
 
-// DefaultKeyHex is the factory pre-adoption AES key (docs/PROTOCOL.md §2).
-// Mirrors internal/inform's DefaultKeyHex (the engine must not import the
-// inform codec).
-const DefaultKeyHex = "ba86f2bbe107c7c57eb5f2690775c712"
+// defaultKeyHex is the factory pre-adoption AES key (docs/PROTOCOL.md §2);
+// internal/inform owns the single canonical literal (inform is a leaf
+// package, so aliasing it introduces no cycle).
+const defaultKeyHex = inform.DefaultKeyHex
 
 // WLAN delivery retry budget (bounded attempt bookkeeping per pushed hash).
 const (
@@ -242,7 +243,7 @@ func (e *Engine) currentWireless() []wireless.Wlan {
 //	    5 while watching, else the devmgr scheduling formula — see noopFor).
 //
 // usedKey is the lowercase hex key that authenticated the inform (encrypted)
-// or the _authkey claim (plaintext). usedKey == DefaultKeyHex selects the
+// or the _authkey claim (plaintext). usedKey == defaultKeyHex selects the
 // adoption branch on the encrypted lane.
 func (e *Engine) Decide(req Request) (Outcome, error) {
 	work := cloneDevice(req.Device)
@@ -333,7 +334,7 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, d *store.Devi
 	// REJECTED (devmgr "used default key in X state, reject it!" returns the
 	// ÖoÓ000 marker → servlet 404). No INFORM_ERROR(9) re-adopt state exists
 	// in the store yet — flagged for the store lane.
-	case req.UsedKey == DefaultKeyHex:
+	case req.UsedKey == defaultKeyHex:
 		prev := d.State
 		if prev != store.StatePending && prev != store.StateAdopting {
 			return Outcome{}, ErrDefaultKeyRejected

@@ -1,5 +1,15 @@
-// Package inform implements the UniFi "inform" wire protocol packet
-// framing and crypto, per docs/PROTOCOL.md §1 (wire format) and §2 (keys).
+// Package inform is the inform CODEC (CONTEXT.md: decision modules): it
+// turns an inform body into a decoded inform and an outcome into response
+// bytes. Framing (ParsePacket/Serialize), crypto (crypto_cbc/crypto_gcm)
+// and compression (inflateZlib) live only behind the two verbs:
+//
+//   - Decode: a framed packet → decoded inform (key selection across both
+//     key classes, payload decrypt, zlib inflation, JSON-body validation);
+//   - Respond: a plaintext response payload → fully framed+encrypted
+//     response bytes.
+//
+// The UniFi "inform" wire protocol itself is per docs/PROTOCOL.md §1 (wire
+// format) and §2 (keys).
 //
 // The header is 40 bytes, all integers big-endian:
 //
@@ -39,7 +49,8 @@ const (
 )
 
 // DefaultKeyHex is the pre-adoption factory AES key (= MD5("ubnt")),
-// docs/PROTOCOL.md §2.
+// docs/PROTOCOL.md §2. This is the single canonical literal: the adoption
+// engine and the inform adapter alias it.
 const DefaultKeyHex = "ba86f2bbe107c7c57eb5f2690775c712"
 
 // Header flag bits.
@@ -57,7 +68,8 @@ var (
 	ErrSnappyUnsupported = errors.New("inform: snappy-compressed payloads are not supported")
 )
 
-// Packet is a decoded inform packet.
+// Packet is a framed inform wire packet (the §1 header + payload; Decoded
+// in codec.go is the decoded inform built from one).
 type Packet struct {
 	// Version is the packet version field.
 	Version uint32
@@ -275,66 +287,6 @@ func (p *Packet) EncryptPayload(key []byte, plaintext []byte) error {
 	p.Flags |= FlagEncCBC
 	pad := pkcs7Pad(plaintext)
 	p.Payload = encryptCBC(key, pad, p.IV[:])
-	return nil
-}
-
-// HeaderBytes returns the canonical 40-byte header of the packet's CURRENT
-// state, without mutating anything. It is the Go equivalent of the classic
-// header's ad-hoc serialization (decomp c_cf8384dbe7ae.java
-// `InformServlet._O0.\u00fb200000()`): a header clone carrying MAC, flags, IV,
-// data version and the payload-length field built from len(Payload), with an
-// empty payload.
-//
-// Panics only when MAC is not 6 bytes (a caller programming error in a
-// hand-assembled Packet; packets from ParsePacket always satisfy it).
-//
-// Exported for tests only; deliberately kept — tests pin real crypto
-// behavior through it.
-func (p *Packet) HeaderBytes() []byte {
-	b, err := headerBytes(p, uint32(len(p.Payload)))
-	if err != nil {
-		panic(err)
-	}
-	return b
-}
-
-// EncryptPayloadGCM seals plaintext into p.Payload as AES-GCM
-// ciphertext||tag (128-bit tag appended), with nonce = p.IV.
-//
-//   - aad == nil: the AAD is the packet's OWN serialized 40-byte header with
-//     the payload-length field = len(plaintext)+16 — the shape the
-//     classic consumer reconstructs from the received plaintext header
-//     (docs/PROTOCOL-mgmt.md §5).
-//   - aad != nil: the ciphertext binds to explicitly supplied bytes via
-//     SP 800-38D AAD processing, independent of p's header shape.
-//
-// The IV is randomized only when left all-zero. Flags and DataVersion are
-// deliberately NOT touched: the response path sets those explicitly
-// (flags 0x0009 GCM / 0x0001 CBC per docs/PROTOCOL-mgmt.md §5), so this
-// helper stays usable for both request and response packets.
-//
-// Exported for tests only; deliberately kept — tests pin real crypto
-// behavior through it.
-func (p *Packet) EncryptPayloadGCM(key, plaintext, aad []byte) error {
-	if err := checkKey(key); err != nil {
-		return err
-	}
-	if isAllZero(p.IV[:]) {
-		if _, err := rand.Read(p.IV[:]); err != nil {
-			return fmt.Errorf("inform: generating IV: %w", err)
-		}
-		if isAllZero(p.IV[:]) { // cannot happen in practice; keep nonce sane
-			p.IV[0] = 1
-		}
-	}
-	if aad == nil {
-		a2, err := headerBytes(p, uint32(len(plaintext)+gcmTagSize))
-		if err != nil {
-			return err
-		}
-		aad = a2
-	}
-	p.Payload = encryptGCM(key, plaintext, p.IV[:], aad)
 	return nil
 }
 

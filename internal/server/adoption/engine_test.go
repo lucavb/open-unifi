@@ -167,7 +167,7 @@ func TestHappyAdoption(t *testing.T) {
 		Transport: TransportEncrypted,
 		Device:    dev,
 		Body:      engineBody(""),
-		UsedKey:   DefaultKeyHex,
+		UsedKey:   defaultKeyHex,
 		Now:       time.Unix(1000, 0),
 	})
 	if err != nil {
@@ -340,7 +340,7 @@ func TestDefaultKeyAfterAdoptionRejected(t *testing.T) {
 		Transport: TransportEncrypted,
 		Device:    dev,
 		Body:      engineBody("aaaa"),
-		UsedKey:   DefaultKeyHex,
+		UsedKey:   defaultKeyHex,
 		Now:       time.Unix(1000, 0),
 	})
 	if err != ErrDefaultKeyRejected {
@@ -367,7 +367,7 @@ func TestUnexpectedKeyDuringAdoption(t *testing.T) {
 		CfgVersion: "aaaa",
 		AppliedCfg: "",
 		XAuthkey:   xauth,
-		Authkeys:   []string{stale, DefaultKeyHex},
+		Authkeys:   []string{stale, defaultKeyHex},
 	}
 	out, err := e.Decide(Request{
 		Transport: TransportEncrypted,
@@ -394,7 +394,7 @@ func TestUnexpectedKeyDuringAdoption(t *testing.T) {
 	if dev.State != store.StateAdopting {
 		t.Fatalf("state = %d, want adopting", dev.State)
 	}
-	if len(dev.Authkeys) != 2 || !containsKeyStr(dev.Authkeys, stale) || !containsKeyStr(dev.Authkeys, DefaultKeyHex) {
+	if len(dev.Authkeys) != 2 || !containsKeyStr(dev.Authkeys, stale) || !containsKeyStr(dev.Authkeys, defaultKeyHex) {
 		t.Fatalf("authkeys touched by re-push: %v", dev.Authkeys)
 	}
 	if !strings.Contains(out.MgmtCfg, "authkey="+xauth+"\n") {
@@ -415,7 +415,7 @@ func TestAuthkeysPrunedToTwo(t *testing.T) {
 			Transport: TransportEncrypted,
 			Device:    dev,
 			Body:      engineBody(""),
-			UsedKey:   DefaultKeyHex,
+			UsedKey:   defaultKeyHex,
 			Now:       time.Unix(1000, 0),
 		})
 		if err != nil {
@@ -461,7 +461,7 @@ func TestPlainRekeyPushNoRotation(t *testing.T) {
 		Transport: TransportPlaintext,
 		Device:    dev,
 		Body:      engineBody("aaaa"), // no _authkey claim in body
-		UsedKey:   DefaultKeyHex,
+		UsedKey:   defaultKeyHex,
 		Now:       time.Unix(1000, 0),
 	})
 	if err != nil {
@@ -641,7 +641,7 @@ func TestDefaultKeyLostStateRejected(t *testing.T) {
 		Transport: TransportEncrypted,
 		Device:    dev,
 		Body:      engineBody("aaaa"),
-		UsedKey:   DefaultKeyHex,
+		UsedKey:   defaultKeyHex,
 		Now:       time.Unix(1000, 0),
 	})
 	if err != ErrDefaultKeyRejected {
@@ -709,7 +709,7 @@ func TestMgmtCfgGolden(t *testing.T) {
 	d.CfgVersion = "aaaaaaaaaaaaaaaa"
 	d.XAuthkey = "11112222333344445555666677778888"
 	d.InformURL = "http://10.0.0.9:8080/inform"
-	got := e.BuildMgmtCfg(d, "ba86f2bbe107c7c57eb5f2690775c712")
+	got := e.BuildMgmtCfg(d, defaultKeyHex) // the factory key, single-sourced in internal/inform
 	want := "capability=notif,notif-assoc-stat\n" +
 		"selfrun_guest_mode=pass\n" +
 		"cfgversion=aaaaaaaaaaaaaaaa\n" +
