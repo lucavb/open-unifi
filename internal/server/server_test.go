@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -252,13 +253,20 @@ func hexKey(t *testing.T, s string) []byte {
 	return b
 }
 
-// mustBuildSys renders system_cfg for tests; a build error (FID-23 path)
-// fails the test unless the test specifically asserts the failure.
+// mustBuildSys renders system_cfg for tests through the adapter's
+// renderSystemCfg closure (the engine's producer); a build error (FID-23
+// path) fails the test unless the test specifically asserts the failure.
+// The pure renderer mutates nothing, so the helper applies the returned
+// credential deltas to rec.Extra — the direct-call stand-in for the
+// adapter's delta application.
 func mustBuildSys(t *testing.T, s *Server, rec store.Device) string {
 	t.Helper()
-	sys, err := s.buildSystemCfg(rec, s.currentWireless())
+	sys, deltas, err := s.renderSystemCfg(rec, s.currentWireless())
 	if err != nil {
 		t.Fatalf("system_cfg build: %v", err)
+	}
+	for k, v := range deltas {
+		rec.Extra[k] = v
 	}
 	return sys
 }
@@ -799,7 +807,7 @@ func TestVlanWiringStatusRowsAlwaysOn(t *testing.T) {
 // (full wireless compound) and (b) the no-radio early-return variant
 // (u7pg2Record minus radio_table) — the path that now calls
 // emitNetconfSection with empty vids. Both generate through
-// buildSystemCfg/buildGeneratedSystemCfg (via mustBuildSys); the
+// renderSystemCfg (via mustBuildSys, the adapter's renderer closure); the
 // fail-closed U7PG2 gate error path never reaches emission, so there is
 // nothing to cover there.
 func TestSystemCfgMcadValidatorGateKeysPresent(t *testing.T) {
@@ -1024,70 +1032,6 @@ func TestDhcpcMgmtRowUsesMgmtDev(t *testing.T) {
 	}
 }
 
-// ---- sha512crypt (users.1) -----------------------------------------------
-
-// Golden vectors from OpenSSL 3.x (`openssl passwd -6 -salt S P`) — the
-// OpenSSL SHA-512 crypt implements the same SHA-crypt (Drepper) spec as
-// glibc and the bundled commons-codec on the classic controller; plus the
-// controller cache self-check.
-func TestSha512CryptVectorTests(t *testing.T) {
-	vv := []struct{ pw, salt, want string }{
-		{"ubnt", "abcd1234", "$6$abcd1234$zkx0G4Hd6kNhG.Pis3ng0rgjOuz3ZXjZ6EPChBV2anHZ3lRNKTUSYYj1g2jbmG0/vop6b9TKgKszoDdMeJE39."},
-		{"ubnt", "testsalt", "$6$testsalt$BOcp0ABcwNH6T6E6hVlHRAPmXVmWPjTdTBdbUOuQx4pRbu5jM1bflFSIVQpa/getBK25jGzZgMYbsIFhSSap3/"},
-		{"ubnt", "01234567", "$6$01234567$oPY8xJmDi4MvySVS8bYMY2fLLPzERYmsfHYofoivH4rpDgQeLmIIHX07W3Od32Q4cVg1FX75RdOJ3e4T5cTos."},
-		{"ubnt", "/0ab", "$6$/0ab$f3xVoSoW9z1rE.UG1lqLpck0HAVRs.iywxojvHm0HmhpoijLmUIfnhCmJe70l2DLqGDZjTY9xaJ.pw8qqETuY0"},
-		{"letmeinnow", "abcd1234", "$6$abcd1234$cy1En37fRI8Y7LYYDOvRRQNc.Ml.FNa7g7Fe.xAQ0MBd0fhX0jTu7BVvJ4.cPjhkj2FefvYf.9ODGzrSQSK2S/"},
-		{"letmeinnow", "testsalt", "$6$testsalt$wqpaSda43LzhSf60diJ0nWTRy1a52w5SsE4cquPVah5gJhPAtBffV/plRfW8hLU4N.fz6GShf9wZGChtHpz1y/"},
-		{"letmeinnow", "01234567", "$6$01234567$pNVV8eDqwPmRWmNUMkbXAU78mouUHAPQUMhfj8j0ylS/O9p4CxlWuT/9dtqJxbhx7.A8YbxGoNVQXJ4PlC0.H/"},
-		{"letmeinnow", "/0ab", "$6$/0ab$eP33xgO55Li7PT0DLMd/q/8QOcyYKchtx2YZRpssIqazJfWbBwCFwLCLzul5E3adon421ECqz6ANkhprwxDvg1"},
-		{"correcthorse", "abcd1234", "$6$abcd1234$Y/PARXisSI98RlkbOdASp5yUqeBK8LkQfXwyrr.gvPDUYTUIHXm2uSNBRV6Bzkp3xvll8aVxJM0OCvzr1h6R5/"},
-		{"correcthorse", "testsalt", "$6$testsalt$Tw0mpSk/FHPv7FUgG5EYIxY4BskslsTI2C9V78g4HvOrDMoLYageEbNMpuwIX1Vv26fQQgVXDmPp57z9SvdQt0"},
-		{"correcthorse", "01234567", "$6$01234567$wSEs7eXXvPURUjaP16otdkbL07jpN0zkg29rzkGPC8xITzmUHecAzkd6pcEa5eFj6Vd5E3T4iDp1vLAzK7/0K/"},
-		{"correcthorse", "/0ab", "$6$/0ab$IUuHnCRa136i8vXldE3gvWQxRa/f0L179MEoXUmpAQkkz9dxAk8QBeRrnEgEm91XLUPlffo3fvmwCfhEzQ7WE."},
-	}
-	for _, v := range vv {
-		got := sha512CryptRaw([]byte(v.pw), []byte(v.salt))
-		if got != v.want {
-			t.Errorf("sha512crypt(%q, %q)\n got %s\nwant %s", v.pw, v.salt, got, v.want)
-		}
-		// cache self-check must accept the reference hash (re-crypt with the
-		// embedded salt only).
-		if !sha512CryptMatches(v.pw, v.want) {
-			t.Errorf("cache self-check rejected reference hash for %q", v.pw)
-		}
-	}
-}
-
-// users.1/users.2 row shape + per-device cache stability across pushes.
-func TestUsers1CacheStability(t *testing.T) {
-	rec := u7pg2Record()
-	s := New(Config{}, store.NewMemStore(), testLogger())
-	sys1 := mustBuildSys(t, s, rec)
-	pw1 := systemCfgUsersPassword(t, sys1)
-	if !sha512BodyRx.MatchString(pw1) {
-		t.Fatalf("users.1.password shape not $6$salt$hash: %q", pw1)
-	}
-	rec.Extra["ssh_sha512passwd"] = pw1
-	sys2 := mustBuildSys(t, s, rec)
-	pw2 := systemCfgUsersPassword(t, sys2)
-	if pw1 != pw2 {
-		t.Fatalf("users.1.password not stable across pushes: %q vs %q", pw1, pw2)
-	}
-	if !sha512CryptMatches(defaultSSHPassword, pw1) {
-		t.Fatal("cached hash does not self-check against default password ubnt")
-	}
-	// shape: no users.1.shell row; users.2 has its rows.
-	if strings.Contains(sys1, "users.1.shell") {
-		t.Fatal("users.1 must not carry a shell row (doc §10.1)")
-	}
-	for _, want := range []string{"users.2.name=nobody\n", "users.2.password=x\n",
-		"users.2.shell=/bin/false\n", "users.2.status=enabled\n"} {
-		if !strings.Contains(sys1, want) {
-			t.Fatalf("users.2 missing %q", want)
-		}
-	}
-}
-
 // radioBody returns the inform body map for the worked-example device
 // (radio_table rides in the body exactly as the server persists it).
 func radioBody(appliedCfg string) map[string]any {
@@ -1131,7 +1075,15 @@ func vapTable(wlans []Wlan, radios ...string) []any {
 	return out
 }
 
-// systemCfgUsersPassword extracts the users.1.password value.
+// R5(f): sha512BodyRx and systemCfgUsersPassword are duplicated here because
+// the crypt primitives moved to internal/server/systemcfg in checkpoint 3
+// and their canonical definitions (systemcfg.sha512BodyRx, the renderer's
+// row extractor in systemcfg/render_test.go) are package-unexported —
+// sharing across packages is not possible. Keep both copies in sync.
+var sha512BodyRx = regexp.MustCompile(`^\$6\$([./0-9A-Za-z]{1,16})\$([./0-9A-Za-z]{86})$`)
+
+// systemCfgUsersPassword extracts the users.1.password value (same
+// cross-package-dedup note as sha512BodyRx above).
 func systemCfgUsersPassword(t *testing.T, sys string) string {
 	t.Helper()
 	for _, l := range strings.Split(sys, "\n") {
@@ -2341,43 +2293,6 @@ func TestAdapterLiveWLANGate501(t *testing.T) {
 	}
 }
 
-// ---- full-provisioning system_cfg content rows (H3) -------------------------
-
-// Content rows of the full-provisioning system_cfg path, re-homed from the
-// converted drift test (the builder lives in package server this
-// checkpoint). Rows already covered elsewhere are deliberately NOT
-// duplicated here: unifi.siteid (TestSystemCfgIdentityRows), users.2.*
-// (TestUsers1CacheStability), section head order (TestSystemCfgSectionHead-
-// Order), and the mcad gate rows users.1.status/sshd.status/netconf.1.status
-// (TestSystemCfgMcadValidatorGateKeysPresent).
-func TestSystemCfgProvisioningContentRows(t *testing.T) {
-	s := New(Config{}, store.NewMemStore(), testLogger())
-	rec := u7pg2Record()
-	delete(rec.Extra, "radio_table") // the drift path's inform carries no radio_table
-	sys := mustBuildSys(t, s, rec)
-	for _, want := range []string{
-		"unifi.version=0.1.0-dev\n",
-		"unifi.idp=disabled\n",
-		"unifi.cfgcap_info=0x7\n",
-		"users.status=enabled\n",
-		"users.1.name=ubnt\n",
-		"sshd.1.status=enabled\n",
-	} {
-		if !strings.Contains(sys, want) {
-			t.Fatalf("system_cfg missing %q:\n%s", want, sys)
-		}
-	}
-	// FID-20/FID-62: no invented "# sshd"/"# misc" section headers.
-	for _, wrong := range []string{"# sshd\n", "# misc\n"} {
-		if strings.Contains(sys, wrong) {
-			t.Fatalf("system_cfg must not carry the invented header %q:\n%s", wrong, sys)
-		}
-	}
-	if strings.Contains(sys, "wireless.") || strings.Contains(sys, "aaa.") {
-		t.Fatalf("system_cfg invented unpublished wireless lines:\n%s", sys)
-	}
-}
-
 // ---- multi-WLAN system_cfg pin (§8c) ---------------------------------------
 
 // Two enabled WLANs (untagged open + tagged 42 wpa-p — the
@@ -2592,29 +2507,6 @@ func TestRadioTablePreserveAndRefresh(t *testing.T) {
 
 // ---- FID-22: users.1 hash variant branches on the SHA-512 capability ----
 
-// Golden vectors from OpenSSL 3.x (`openssl passwd -1 -salt S P`) — the
-// glibc/Apache md5crypt the classic controller's commons-codec Md5Crypt
-// mirrors byte-for-byte.
-func TestMD5CryptVectorTests(t *testing.T) {
-	vv := []struct{ pw, salt, want string }{
-		{"ubnt", "abcd1234", "$1$abcd1234$UPyGHXXYPYzFOkGgbE7uo0"},
-		{"ubnt", "testsalt", "$1$testsalt$phdRQ10fojI.hrEiZfZVU/"},
-		{"ubnt", "01234567", "$1$01234567$vigV.l7xN3EZbzxgDJoUg."},
-		{"ubnt", "/0ab", "$1$/0ab$2Pwalw/7N95C047k71opS0"},
-		{"letmeinnow", "abcd1234", "$1$abcd1234$7IaawFGkVaJc9HfqkbLCx."},
-		{"letmeinnow", "testsalt", "$1$testsalt$YP2koC9HPVZjUpyIa288z."},
-	}
-	for _, v := range vv {
-		got := "$1$" + v.salt + "$" + md5CryptRaw([]byte(v.pw), []byte(v.salt))
-		if got != v.want {
-			t.Errorf("md5crypt(%q, %q)\n got %s\nwant %s", v.pw, v.salt, got, v.want)
-		}
-		if !md5CryptMatches(v.pw, v.want) {
-			t.Errorf("stored-hash self-check rejected %q", v.want)
-		}
-	}
-}
-
 // FID-22: the users.1 password variant follows Device.supportsSha512Password
 // ((fw_caps & 0x400) == 0x400, Default-0 semantics) — records reporting the
 // bit get $6$, the rest get $1$.
@@ -2643,23 +2535,6 @@ func TestUsers1HashBranchesOnFwCaps(t *testing.T) {
 	delete(rec.Extra, "fw_caps") // absent field ⇒ capability 0 (X.getInt default)
 	if pw := systemCfgUsersPassword(t, mustBuildSys(t, s, rec)); !strings.HasPrefix(pw, "$1$") {
 		t.Fatalf("absent fw_caps must fall to the $1$ branch: %q", pw)
-	}
-}
-
-// ---- FID-23: an unrenderable SSH password fails the provisioning build ----
-
-func TestUsers1PasswordGenerationFailureFailsBuild(t *testing.T) {
-	var logs strings.Builder
-	s := New(Config{}, store.NewMemStore(), testWarnLogger(&logs))
-	rec := u7pg2Record()
-	rec.Extra["fw_caps"] = 0.0 // md5 branch so the injectable salt seam applies
-	rec.Extra["ssh_md5passwd"] = ""
-	prev := randAlphaSalt
-	randAlphaSalt = func(int) (string, error) { return "", errors.New("rand unavailable") }
-	defer func() { randAlphaSalt = prev }()
-
-	if _, err := s.buildSystemCfg(rec, s.currentWireless()); err == nil {
-		t.Fatal("failed salt generation must fail the system_cfg build, not emit an empty users.1.password")
 	}
 }
 

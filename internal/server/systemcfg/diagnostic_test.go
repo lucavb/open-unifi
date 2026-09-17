@@ -1,4 +1,4 @@
-package adoption
+package systemcfg
 
 import (
 	"strings"
@@ -9,7 +9,7 @@ func TestSystemCfgDiagnosticContainsNoValues(t *testing.T) {
 	const secret = "U7PG2-PSK-secret-marker"
 	cfg := "# system\nsystem.timezone=UTC\n# users\nusers.1.password=" + secret + "\n"
 
-	diagnostic, err := systemCfgDiagnostic(cfg)
+	diagnostic, err := Diagnostic(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -28,7 +28,7 @@ func TestSystemCfgDiagnosticContainsNoValues(t *testing.T) {
 }
 
 func TestSystemCfgDiagnosticRejectsDuplicateKeys(t *testing.T) {
-	_, err := systemCfgDiagnostic("# system\nsystem.timezone=UTC\nsystem.timezone=secret\n")
+	_, err := Diagnostic("# system\nsystem.timezone=UTC\nsystem.timezone=secret\n")
 	if err == nil {
 		t.Fatal("expected duplicate key error")
 	}

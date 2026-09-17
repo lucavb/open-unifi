@@ -1,11 +1,11 @@
 package adoption
 
 import (
-	"log/slog"
 	"net"
 	"net/url"
 	"strings"
 
+	"github.com/lucabecker/open-unifi/internal/configtext"
 	"github.com/lucabecker/open-unifi/internal/store"
 )
 
@@ -15,29 +15,7 @@ const (
 	defaultInformPort = "8080" // unifi.http.port default
 	defaultMgmtPort   = "8443" // manage-port fallback  (mgmt_url)
 	defaultStunPort   = "3478" // unifi.stun.port default
-	defaultSiteName   = "default"
 )
-
-// LineWriter returns the shared INJECTION-GUARDED key=value line writer used
-// by every system_cfg/mgmt_cfg emission site. Any VALUE containing \n or \r
-// makes the whole row skipped (with a warn) instead of emitted — a newline
-// smuggled in from an inform body (forged radio fields, timezone strings,
-// cookie comments) would terminate the row early and inject attacker-chosen
-// key=value rows into the device's config. "Fail loud, never emit."
-// (raw() admin passthrough lines in the system_cfg builder are the ONLY
-// unguarded writer: admin-owned by definition.)
-func LineWriter(lg *slog.Logger, b *strings.Builder, where string) func(k, v string) {
-	return func(k, v string) {
-		if strings.ContainsAny(v, "\n\r") {
-			lg.Warn("config blob: row skipped, newline in value", "where", where, "key", k)
-			return
-		}
-		b.WriteString(k)
-		b.WriteString("=")
-		b.WriteString(v)
-		b.WriteString("\n")
-	}
-}
 
 // buildMgmtCfg renders the mgmt_cfg blob exactly in the config/B (decompile
 // cfr_renamed_0) line order. Every line is terminated with \n (verified in
@@ -48,9 +26,11 @@ func LineWriter(lg *slog.Logger, b *strings.Builder, where string) func(k, v str
 // XAuthkey (x_inform_authkey != x_authkey in the decompile).
 func (e *Engine) BuildMgmtCfg(d store.Device, usedKey string) string {
 	host := e.advertHost(d)
-	site := SiteRef(d)
+	site := configtext.SiteRef(d)
 	var b strings.Builder
-	line := LineWriter(e.lg, &b, "mgmt_cfg")
+	line := configtext.LineWriter(func(where, key string) {
+		e.lg.Warn("config blob: row skipped, newline in value", "where", where, "key", key)
+	}, &b, "mgmt_cfg")
 
 	// AP capabilities: notif + notif-assoc-stat. fastapply-bg is USW-only
 	// and is never emitted for an AP (B decompile: "usw".equals(type)).
@@ -131,15 +111,4 @@ func (e *Engine) mgmtPort() string {
 		return "443"
 	}
 	return u.Port()
-}
-
-// SiteRef is the site value the classic builder puts into mgmt_url and
-// unifi.siteid (FID-17/FID-52): the site NAME the device belongs to. The
-// store's Device.SiteID carries exactly that admin-supplied site name for
-// this MVP (no site table yet, so an empty id degrades to "default").
-func SiteRef(d store.Device) string {
-	if d.SiteID == "" {
-		return defaultSiteName
-	}
-	return d.SiteID
 }

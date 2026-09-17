@@ -34,8 +34,8 @@ func newTestEngine(t *testing.T) *Engine {
 		Random:   func() float64 { return 0.5 },
 		KeyChars: func(n int) (string, error) { return "", nil }, // replaced below
 		Wireless: func() []wireless.Wlan { return nil },
-		SystemCfg: func(store.Device, []wireless.Wlan) (string, error) {
-			return "# unifi\nunifi.version=0.1.0-dev\n", nil
+		SystemCfg: func(store.Device, []wireless.Wlan) (string, map[string]string, error) {
+			return "# unifi\nunifi.version=0.1.0-dev\n", nil, nil
 		},
 	})
 	e.keyChars = func(n int) (string, error) {
@@ -76,6 +76,9 @@ func applyDeltas(dev *store.Device, out Outcome) {
 		dev.Authkeys = out.Authkeys
 	}
 	dev.Extra = out.Extra
+	for k, v := range out.CredentialDeltas {
+		dev.Extra[k] = v
+	}
 }
 
 func isHexStr(s string) bool { return len(s) > 0 && strings.Trim(s, "0123456789abcdef") == "" }
@@ -658,8 +661,8 @@ func TestDefaultKeyLostStateRejected(t *testing.T) {
 func TestSystemCfgProducerErrorAbortsDecide(t *testing.T) {
 	const k = "11112222333344445555666677778888"
 	e := newTestEngine(t)
-	e.systemCfg = func(store.Device, []wireless.Wlan) (string, error) {
-		return "", errors.New("render failed")
+	e.systemCfg = func(store.Device, []wireless.Wlan) (string, map[string]string, error) {
+		return "", nil, errors.New("render failed")
 	}
 	dev := store.Device{
 		MAC:        engineMAC,

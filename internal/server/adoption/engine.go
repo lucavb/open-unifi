@@ -140,6 +140,11 @@ type Outcome struct {
 	BlockedSta    string
 	MgmtCfg       string
 
+	// CredentialDeltas carries the renderer's ssh password-cache writes
+	// (ssh_md5passwd/ssh_sha512passwd); the adapter applies them inside
+	// its RMW cycle — the pure renderer mutates nothing.
+	CredentialDeltas map[string]string
+
 	// Record deltas: applied by the adapter to its record. Extra is the
 	// FULL final map (the engine works on a clone), so the adapter assigns
 	// it wholesale — byte-identical persistence guaranteed by the typed
@@ -172,14 +177,15 @@ type Deps struct {
 	// Wireless supplies the current WLAN envelope (nil ⇒ empty list).
 	Wireless func() []wireless.Wlan
 
-	// SystemCfg renders the system_cfg blob for the record. Package server
-	// fills it with today's buildGeneratedSystemCfg code (UNCHANGED, still
-	// living in package server this checkpoint). NOTE: the production
-	// producer MUTATES the passed device clone's Extra — the credential
-	// cache writes ssh_md5passwd/ssh_sha512passwd so repeated pushes are
-	// byte-identical — and those writes ride back to the record inside
-	// Outcome.Extra.
-	SystemCfg func(store.Device, []wireless.Wlan) (string, error)
+	// SystemCfg renders the system_cfg blob for the record with the NEUTRAL
+	// producer shape: (text, credential deltas, error). The adapter wires
+	// it as a thin closure over the pure systemcfg.Render (assembling
+	// SiteFacts from the server config); the closure also performs the
+	// render's observability (diagnostic) and diagnostics logging, so this
+	// decision module NEVER depends on the renderer package — the only
+	// things crossing back are the text and the credential deltas, which
+	// the ADAPTER applies inside its RMW cycle.
+	SystemCfg func(store.Device, []wireless.Wlan) (text string, credentialDeltas map[string]string, err error)
 
 	// ControllerURL is the configured controller base URL (mgmt_cfg host
 	// facts). Empty means "not overridden".
@@ -196,7 +202,7 @@ type Engine struct {
 	random           func() float64
 	keyChars         func(n int) (string, error)
 	wireless         func() []wireless.Wlan
-	systemCfg        func(store.Device, []wireless.Wlan) (string, error)
+	systemCfg        func(store.Device, []wireless.Wlan) (string, map[string]string, error)
 	controllerURL    string
 	informListenAddr string
 }
@@ -506,22 +512,13 @@ func (e *Engine) assignedKeyFlow(d *store.Device, now time.Time, wls []wireless.
 		d.CfgVersion = nv
 	}
 	d.State = store.StateAdopting
-	sys, serr := e.systemCfg(*d, wls)
+	sys, deltas, serr := e.systemCfg(*d, wls)
 	if serr != nil {
 		// FID-23: provisioning content that cannot be rendered (e.g. an
 		// unusable/empty SSH password hash) fails the whole push, like the
 		// classic L.ÔO0000 crypt call — it must never silently emit a
 		// degraded config. Nothing was persisted (the store cycle aborts).
 		return Outcome{}, serr
-	}
-	// This is intentionally the only observability of the full config: the
-	// diagnostic contains a digest and ordered names, never config values.
-	if diagnostic, err := systemCfgDiagnostic(sys); err == nil {
-		e.lg.Debug(diagnostic)
-	} else {
-		// Keep the debug path bounded even for malformed passthrough input; do
-		// not log err because it includes a key name copied from the config.
-		e.lg.Debug("system_cfg diagnostic unavailable", "reason", "duplicate-key")
 	}
 	cur := wireless.WlanListHash(wls)
 	// Do not mark the configuration applied merely because system_cfg was
@@ -531,12 +528,13 @@ func (e *Engine) assignedKeyFlow(d *store.Device, now time.Time, wls []wireless.
 	st := loadWlanCfgState(d.Extra)
 	st.applyProvisioning(cur, now.Unix(), wls, placements)
 	return Outcome{
-		Kind:          KindSetparam,
-		FullProvision: true,
-		CfgVersion:    d.CfgVersion,
-		SystemCfg:     sys,
-		BlockedSta:    "",
-		MgmtCfg:       e.BuildMgmtCfg(*d, d.XAuthkey),
+		Kind:             KindSetparam,
+		FullProvision:    true,
+		CfgVersion:       d.CfgVersion,
+		SystemCfg:        sys,
+		BlockedSta:       "",
+		MgmtCfg:          e.BuildMgmtCfg(*d, d.XAuthkey),
+		CredentialDeltas: deltas,
 	}, nil
 }
 

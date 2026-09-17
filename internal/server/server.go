@@ -6,7 +6,6 @@
 package server
 
 import (
-	"crypto/md5"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -24,6 +23,7 @@ import (
 
 	"github.com/lucabecker/open-unifi/internal/inform"
 	"github.com/lucabecker/open-unifi/internal/server/adoption"
+	"github.com/lucabecker/open-unifi/internal/server/systemcfg"
 	"github.com/lucabecker/open-unifi/internal/store"
 	"github.com/lucabecker/open-unifi/internal/wireless"
 )
@@ -150,19 +150,16 @@ func New(cfg Config, st store.DeviceStore, lg *slog.Logger) *Server {
 		noopTarget: map[string]int64{},
 	}
 	// The adoption engine is a pure decider: randomness, key generation and
-	// the wireless source are injected, and the system_cfg producer stays
-	// right here in package server this checkpoint (UNCHANGED
-	// buildGeneratedSystemCfg code).
+	// the wireless source are injected, and the system_cfg producer is a
+	// thin closure over the pure systemcfg renderer.
 	s.engine = adoption.New(adoption.Deps{
 		Logger: lg,
 		Random: func() float64 { return noopRandom() },
 		KeyChars: func(n int) (string, error) {
 			return s.keyChars(n)
 		},
-		Wireless: s.currentWireless,
-		SystemCfg: func(d store.Device, wls []wireless.Wlan) (string, error) {
-			return s.buildSystemCfg(d, wls)
-		},
+		Wireless:         s.currentWireless,
+		SystemCfg:        s.renderSystemCfg,
 		ControllerURL:    cfg.ControllerURL,
 		InformListenAddr: cfg.InformListenAddr,
 	})
@@ -690,6 +687,13 @@ func (s *Server) applyOutcome(mac string, rec *store.Device, out adoption.Outcom
 		rec.Authkeys = out.Authkeys
 	}
 	rec.Extra = out.Extra
+	// Credential-cache deltas from the pure renderer: the renderer no longer
+	// mutates anything, so the adapter applies them at the same point the
+	// former in-place mutation landed (same keys, same values, same timing →
+	// persisted Extra bytes identical).
+	for k, v := range out.CredentialDeltas {
+		rec.Extra[k] = v
+	}
 	if out.PersistNoopTarget {
 		s.noopMu.Lock()
 		s.noopTarget[mac] = out.NewNoopTarget
@@ -794,431 +798,54 @@ func (s *Server) absorbInform(mac string, rec *store.Device, body map[string]any
 	}
 }
 
-// ---- config blob builders (docs/PROTOCOL-mgmt.md §2, §3) ------------------
+// ---- system_cfg producer wiring (the pure renderer) -----------------------
 
-// lineWriter returns the shared INJECTION-GUARDED key=value line writer used
-// by every system_cfg/mgmt_cfg emission site (the implementation lives in the
-// adoption engine package so both the system_cfg renderer here and the
-// engine's mgmt_cfg builder share it).
-func (s *Server) lineWriter(b *strings.Builder, where string) func(k, v string) {
-	return adoption.LineWriter(s.lg, b, where)
-}
-
-// sshPassword is the effective SSH password ("ubnt" default, cfg override).
-func (s *Server) sshPassword() string {
-	if s.cfg.SSHPassword != "" {
-		return s.cfg.SSHPassword
-	}
-	return defaultSSHPassword
-}
-
-func (s *Server) regulatoryCountryCode() int {
-	if s.cfg.RegulatoryCountryCode == 0 {
-		return DefaultRegulatoryCountryCode
-	}
-	return s.cfg.RegulatoryCountryCode
-}
-
-// buildSystemCfg renders the MINIMAL system_cfg text blob
-// (docs/PROTOCOL-mgmt.md §3; builder = com/ubnt/service/config/int).
-// Sections are plain "# name" headers followed by key=value lines, each
-// line \n-terminated. An error aborts the whole provisioning push (FID-23)
-// — the caller must answer the inform with the noop path instead of
-// persisting/shipping partial config.
-//
-// TODO(wireless): see docs/PROTOCOL-systemcfg-wireless.md when it lands —
-// the wireless/aaa.<n>, vlan/bridge/netconf, qos/bandsteering, syslog, snmp
-// and cron/ntp sections from the real int builder are pending
-// reverse-engineering and must NOT be invented here.
-func (s *Server) buildSystemCfg(d store.Device, wls []Wlan) (string, error) {
-	return s.buildGeneratedSystemCfg(d, wls)
-}
-
-// buildGeneratedSystemCfg renders the generated system_cfg from the record
-// and the PASSED wireless envelope (the engine threads one snapshot per
-// decision so the drift hash and the rendered config always agree).
-func (s *Server) buildGeneratedSystemCfg(d store.Device, wls []Wlan) (string, error) {
+// renderSystemCfg is the adapter's wiring of the pure systemcfg renderer
+// (the D5 producer shape): it assembles SiteFacts from the server config and
+// the engine-threaded WLAN snapshot, validates the config exactly like the
+// former render path did, and performs the render's observability here —
+// the renderer's diagnostics (warn-level alerts with their structured attrs,
+// debug-level warnings) and the full-config diagnostic (digest and ordered
+// names, never config values; the "unavailable" wording keeps the debug path
+// bounded for malformed passthrough input without echoing a key name). All
+// logging happens inside the producer call, before Decide returns, restoring
+// the pre-extraction relative order (inline-during-render → diagnostic-after).
+func (s *Server) renderSystemCfg(d store.Device, wls []wireless.Wlan) (string, map[string]string, error) {
 	if err := ValidateConfig(s.cfg); err != nil {
-		return "", err
+		return "", nil, err
 	}
-	var b strings.Builder
-	line := s.lineWriter(&b, "system_cfg")
-	raw := func(l string) {
-		if l != "" {
-			b.WriteString(l)
-			if !strings.HasSuffix(l, "\n") {
-				b.WriteString("\n")
-			}
-		}
+	country := s.cfg.RegulatoryCountryCode
+	if country == 0 {
+		// R3: defense-in-depth — ValidateConfig already defaults zero to the
+		// compatibility value; the renderer takes the code verbatim.
+		country = DefaultRegulatoryCountryCode
 	}
-
-	// 1/unifi-zone. Section head order (bytecode int.txt:17208-17216, the
-	// AP top-level else-branch): the real controller emits `# unifi` FIRST
-	// (int.Ó00000(sb,Device,Setting) = String's unifi writer + cfgcap_info
-	// appended), THEN `# system` (int.Ø00000 semantics), THEN `# users`.
-	// config_String unifi pair array — String.txt:1851-1897 — fixes the
-	// unifi row order below.
-	b.WriteString("# unifi\n")
-	line("unifi.version", "0.1.0-dev")
-	// Anonymous ids turn on only when present in the record; reporterid
-	// mirrors the controller anonymous id (same source in the jar); siteid
-	// carries the device's site name (getSiteId always set there; our
-	// fallback is the "default" site) — FID-17. Row order per the pair
-	// array: version, anonymous_controller_id, anonymous_site_id,
-	// reporterid, siteid (String.txt:1851-1897).
-	if v, ok := d.Extra["anonymous_controller_id"].(string); ok && v != "" {
-		line("unifi.anonymous_controller_id", v)
-	}
-	if v, ok := d.Extra["anonymous_site_id"].(string); ok && v != "" {
-		line("unifi.anonymous_site_id", v)
-	}
-	if v, ok := d.Extra["anonymous_controller_id"].(string); ok && v != "" {
-		// reporterid = the very same controller anonymous id.
-		line("unifi.reporterid", v)
-	}
-	line("unifi.siteid", adoption.SiteRef(d))
-	// unifi.idp — tail of String's unifi writer (String.txt:1898+,
-	// com__ubnt__service__config__String.txt:1899-1902): the bytecode pushes
-	// iconst_1, i.e. Setting.is("unifi_idp_enabled", true) — the JAR DEFAULT
-	// is ENABLED (which also emits the unifi.mcip/unifi.key rows that we do
-	// not carry). We deliberately emit `disabled` anyway: we have no IDP
-	// feature, and the AP validator ignores the row. This is a RECORDED
-	// DEVIATION from the real builder (docs agent tracks it in the §12
-	// deviation table); do not "fix" it back to enabled silently.
-	line("unifi.idp", "disabled")
-	// unifi.cfgcap_info — the `int` override appends it right after calling
-	// the base unifi writer (int.txt:16600-16630: "0x" +
-	// Integer.toHexString(Ô00000())). The capability int (int.Ô00000()I,
-	// int.txt:5332-5387) splits the CONTROLLER version: major ≤ 2 → 0x0,
-	// v3.0–3.2 → 0x3, v3.3+/v4+ → 0x7. Our advertised version is the
-	// placeholder "0.1.0-dev", which would compute 0x0 — deliberately NOT
-	// derived from it: we emit the literal 0x7 matching every modern real
-	// controller (v3.3+, the only value this firmware has ever been paired
-	// with). ubntconf reads it on the AP via
-	// get_uint32(cfg, 0, "unifi.cfgcap_info") — absent/0 can zero the
-	// plugin layer's capability gating
-	// (docs/AP-FIRMWARE-APPLY-PATH.md §6).
-	line("unifi.cfgcap_info", "0x7")
-
-	// 2. # system — deliberately OMITTED. The real builder skips the
-	//    timezone rows when the site locale is absent (PROTOCOL-mgmt.md
-	//    §3 step 2) and our site carries no locale; the factory baseline
-	//    (/tmp/harness/ap-forensics/tmp/system.cfg) has no system rows
-	//    either. The system_cfg apply is a full-config replacement, so
-	//    emitting rows here would DELETE-or-CHANGE a section the running
-	//    config does not carry and restart the system plugin for nothing.
-	//    Minimal-diff policy: /tmp/harness/minimal-diff-spec.md.
-
-	// 3. # users — config_String.java §197-206 / PROTOCOL-systemcfg-Config.
-	//    Real AP order (int.txt:17208-17216): unifi → system → users.
-	users1pw, uerr := s.usersPasswordHash(d)
-	if uerr != nil {
-		return "", uerr
-	}
-	b.WriteString("# users\n")
-	line("users.status", "enabled")
-	line("users.1.name", "ubnt")
-	line("users.1.password", users1pw)
-	line("users.1.status", "enabled")
-	line("users.2.name", "nobody")
-	line("users.2.password", "x")
-	line("users.2.shell", "/bin/false")
-	line("users.2.status", "enabled")
-
-	// 4. Wireless/VLAN compound (docs/PROTOCOL-systemcfg-wireless.md):
-	// `# wlans (radio)` + radio.<n>/virtual + aaa.<n>/wireless.<n> vaps +
-	// `# vlan`/`# bridge`/`# netconf`/`# dhcpc` wiring. Real section order
-	// per PROTOCOL-mgmt.md §3 puts this before the sshd/syslog ones.
-	s.emitWirelessCfg(&b, d, wls)
-
-	// 4b. Factory-baseline echo sections. The system_cfg apply is a
-	// FULL-CONFIG REPLACEMENT (mcad renames the staged file over
-	// /tmp/system.cfg; docs/AP-FIRMWARE-APPLY-PATH.md), and ubntconf's
-	// fast-apply restarts the on-device plugin for every section whose
-	// parsed tree CHANGES — including changes caused by ROW DELETION
-	// when the controller's render omits a section the running config
-	// carries. The two fatal live pushes (2026-09-16 09:43/13:54) proved
-	// the mechanism (net plugin restart → ifconfig br0/eth0 down → AP
-	// dark; /etc/sysinit/net.conf fetched 2026-09-17). The rows below
-	// therefore ECHO the running factory baseline
-	// (/tmp/harness/ap-forensics/tmp/system.cfg, fetched from the
-	// factory-reset AP 2026-09-17) so those parsed sections stay
-	// IDENTICAL and no plugin restarts fire. Section order follows the
-	// real builder where it emits these (PROTOCOL-mgmt.md §3 steps
-	// 7-9). These are device-class baseline constants, NOT controller
-	// state: do not "clean them up" without a live-validated apply.
-	// Full policy: /tmp/harness/minimal-diff-spec.md.
-
-	// # connectivity (§3 step 7 — mac/connectivity overrides). The
-	// plugin restarts the uplink-monitor inittab entry when this section
-	// changes; the echo keeps it quiet. uplink_eth follows the same eth
-	// inventory as the bridge writer; uplink_wds is the last radio slot
-	// (the 5g vap used for wireless uplink; factory ath1).
-	b.WriteString("# connectivity\n")
-	line("connectivity.status", "enabled")
-	line("connectivity.uplink_bridge", mgmtDevOf(d))
-	ethIfaces, _ := ethPortNames(d)
-	line("connectivity.uplink_eth", ethIfaces[0])
-	line("connectivity.uplink_wds", fmt.Sprintf("ath%d", len(wireless.StoredRadios(d))-1))
-
-	// # syslog (§3 step 8) — factory echo.
-	b.WriteString("# syslog\n")
-	line("syslog.status", "enabled")
-	line("syslog.file", "/var/log/messages")
-	line("syslog.level", "8")
-	line("syslog.remote.status", "disabled")
-	line("syslog.remote.ip", "192.168.1.1")
-	line("syslog.remote.port", "514")
-	line("syslog.rotate", "1")
-	line("syslog.size", "200")
-
-	// sshd rows — config_String.java §309-337 defaults: SSH on, password
-	// auth on, wildcard bind off, no injected keys, mgmt interface bound.
-	// FID-20: these rows carry NO "# sshd" section header in the classic
-	// builder (no such literal exists in int/String). hooksite: real mgmt
-	// dev is model-specific (record pass-through Extra["mgmt_dev"] allowed
-	// as the admin escape hatch).
-	line("sshd.status", "enabled")
-	line("sshd.auth.passwd", "enabled")
-	line("sshd.1.status", "enabled")
-	mgmtDev, _ := d.Extra["mgmt_dev"].(string)
-	if mgmtDev == "" {
-		mgmtDev = "br0"
-	}
-	line("sshd.1.ifname", mgmtDev)
-
-	// # route + # ntpclient (real builder: §3 step 9) — factory echo.
-	b.WriteString("# route\n")
-	line("route.status", "enabled")
-	line("route.1.status", "enabled")
-	line("route.1.devname", mgmtDevOf(d))
-	line("route.1.ip", "224.0.0.0")
-	line("route.1.netmask", "3")
-
-	b.WriteString("# ntpclient\n")
-	line("ntpclient.status", "enabled")
-	line("ntpclient.1.status", "enabled")
-	line("ntpclient.1.server", "0.ubnt.pool.ntp.org")
-
-	// Sections the real builder NEVER emits (PROTOCOL-mgmt.md §3 has no
-	// mgmt/dhcpd/httpd/ebtables writers) but the factory baseline
-	// carries: omitting them would DELETE the rows from the running
-	// config (full-config replacement) with unknown effects — e.g.
-	// mgmt.discovery.status gates the discovery announces, and the
-	// ebtables row is the EAPOL broute rule on the first vap slot.
-	// Factory echo = zero parsed diff = zero plugin restarts.
-	b.WriteString("# ebtables\n")
-	line("ebtables.status", "enabled")
-	line("ebtables.1.cmd", "-t broute -A BROUTING -p 0x888e -i ath0 -j DROP")
-	line("mgmt.discovery.status", "enabled")
-	line("mgmt.flavor", "ace")
-	line("mgmt.is_default", "true")
-	line("dhcpd.status", "disabled")
-	line("dhcpd.1.status", "disabled")
-	line("httpd.status", "disabled")
-
-	// What is still deliberately missing here (bandsteering, airtime,
-	// stamgr, qos, mesh, snmp, resolv, iptables, cron — config_String/
-	// int): the factory baseline carries none of those rows either, so
-	// omitting them keeps the parsed diff empty under the full-config
-	// replacement semantics. Adding any row requires a live-validated
-	// apply first (two AP resets already consumed 2026-09-16).
-
-	// 5. The admin "config.system_cfg.<idx>" passthrough lines
-	//    (config_String.java §appendix: raw pre-formatted lines). FID-62:
-	//    emitted without any "# misc" section header row.
-	if extra, ok := d.Extra["system_cfg_extra_lines"].([]any); ok {
-		for _, v := range extra {
-			if l, ok := v.(string); ok {
-				raw(l)
-			}
-		}
-	}
-	return b.String(), nil
-}
-
-// defaultSSHPassword is the site's default SSH password (docs §7:
-// x_ssh_password default "ubnt").
-const defaultSSHPassword = "ubnt"
-
-// usersPasswordHash selects and derives the users.1.password value for the
-// record (config_String §nine-branch: String.txt §1985-2006):
-//
-//	supportsSsh() && supportsSha512Password() → $6$ SHA-512 crypt (L.ÔO0000)
-//	supportsSsh() && !supportsSha512Password() → $1$ MD5 crypt (L.õ00000)
-//	!supportsSsh() → DES crypt — unreachable for our inform-driven model set
-//	(fw_caps-bearing APs/switches), deliberately not implemented.
-//
-// supportsSha512Password() = hasCapability(1024) — `(fw_caps & n) == n`
-// with a 0 default when the record doesn't report fw_caps (Device.java) —
-// or the UDM/firewall device type, which we don't model (flagged: no
-// device-type table in this MVP). The freshly generated hash is cached back
-// into the record (the jar writes x_ssh_sha512passwd/x_ssh_md5passwd into
-// the site mgmt setting) so repeated pushes are byte-identical.
-// FID-23: generation failure or an empty value fails the whole call — the
-// classic Crypt.crypt exceptions propagate out of the config build, and a
-// degraded/empty row must never ship silently.
-func (s *Server) usersPasswordHash(d store.Device) (string, error) {
-	pw := s.sshPassword()
-	if !supportsSha512Password(d) {
-		cached, _ := d.Extra["ssh_md5passwd"].(string)
-		if cached != "" && md5CryptMatches(pw, cached) {
-			return cached, nil
-		}
-		fresh, err := md5Crypt(pw)
-		if err != nil {
-			return "", fmt.Errorf("users.1 md5 password: %w", err)
-		}
-		if fresh == "" {
-			return "", errors.New("users.1 md5 password generated empty")
-		}
-		d.Extra["ssh_md5passwd"] = fresh
-		return fresh, nil
-	}
-	cached, _ := d.Extra["ssh_sha512passwd"].(string)
-	if cached != "" && sha512CryptMatches(pw, cached) {
-		return cached, nil
-	}
-	fresh, err := sha512Crypt(pw)
+	res, err := systemcfg.Render(d, systemcfg.SiteFacts{
+		ControllerURL: s.cfg.ControllerURL,
+		CountryCode:   country,
+		SSHPassword:   s.cfg.SSHPassword,
+		WLANs:         wls,
+	})
 	if err != nil {
-		return "", fmt.Errorf("users.1 sha512 password: %w", err)
+		return "", nil, err
 	}
-	if fresh == "" {
-		return "", errors.New("users.1 sha512 password generated empty")
+	for _, warn := range res.Warnings {
+		s.lg.Debug(warn)
 	}
-	d.Extra["ssh_sha512passwd"] = fresh
-	return fresh, nil
+	for _, alert := range res.Alerts {
+		if alert.Where != "" {
+			s.lg.Warn(alert.Msg, "where", alert.Where, "key", alert.Key)
+			continue
+		}
+		s.lg.Warn(alert.Msg)
+	}
+	if diagnostic, derr := systemcfg.Diagnostic(res.Text); derr == nil {
+		s.lg.Debug(diagnostic)
+	} else {
+		s.lg.Debug("system_cfg diagnostic unavailable", "reason", "duplicate-key")
+	}
+	return res.Text, res.CredentialDeltas, nil
 }
-
-// supportsSha512Password mirrors Device.supportsSha512Password(): the
-// fw_caps SHA-512 bit (0x0400); a record that does not report the field
-// evaluates to capability 0 (jar X.getInt default) → the $1$ branch.
-func supportsSha512Password(d store.Device) bool {
-	ok, caps := wireless.NumFromExtra(d.Extra, "fw_caps")
-	return ok && caps&0x400 == 0x400
-}
-
-// md5Crypt computes the classic $1$ md5crypt (Poul-Henning Kamp's public
-// domain algorithm, the same one commons-codec Md5Crypt ports and glibc
-// implements), verified byte-exact against
-// `openssl passwd -1 -salt <salt> <pw>`.
-func md5Crypt(key string) (string, error) {
-	salt, err := randAlphaSalt(8)
-	if err != nil {
-		return "", err
-	}
-	return "$1$" + salt + "$" + md5CryptRaw([]byte(key), []byte(salt)), nil
-}
-
-// md5CryptRaw is md5crypt with a caller-provided salt (max 8 bytes kept),
-// faithful to the classic unix md5crypt (Poul-Henning Kamp, verified
-// line-for-line against FreeBSD libcrypt crypt-md5.c): the initial digest
-// ctx = MD5(key ‖ "$1$" ‖ salt) carries the MAGIC, the "alternation" odd
-// iterations append a ZERO byte (the jar's commons-codec-1.11 zeroes the
-// alt buffer before the weird loop exactly like FreeBSD's explicit_bzero,
-// javap-verified at Md5Crypt crypt() offset 211 before the i&1 loop at
-// 223-262), and the output is to64 in the classic
-// (0,6,12)(1,7,13)(2,8,14)(3,9,15)(4,10,5) order plus the 2-char final[11]
-// tail. Byte-identical to both the controller jar (run directly) and
-// `openssl passwd -1`.
-func md5CryptRaw(key, salt []byte) string {
-	if len(salt) > 8 {
-		salt = salt[:8]
-	}
-
-	// alt = MD5(key ‖ salt ‖ key)   (NO magic in this digest)
-	h := md5.New()
-	h.Write(key)
-	h.Write(salt)
-	h.Write(key)
-	alt := h.Sum(nil)
-
-	// ctx = MD5(key ‖ "$1$" ‖ salt ‖ alt×chunks ‖ alternation(zero/key[0]))
-	h = md5.New()
-	h.Write(key)
-	h.Write([]byte("$1$"))
-	h.Write(salt)
-	for i := len(key); i > 0; i -= 16 {
-		if i > 16 {
-			h.Write(alt)
-		} else {
-			h.Write(alt[:i])
-		}
-	}
-	// /* Don't leave anything around in vm i could use. */ — the buffer is
-	// zeroed before this loop, so the odd branch appends a literal zero byte.
-	zero := []byte{0}
-	for i := len(key); i > 0; i >>= 1 {
-		if i&1 != 0 {
-			h.Write(zero)
-		} else if len(key) > 0 {
-			h.Write(key[:1])
-		}
-	}
-	final := h.Sum(nil)
-
-	// 1000-iteration burning loop: odd iterations update with key first and
-	// final second; even ones final first and key second.
-	for i := 0; i < 1000; i++ {
-		h = md5.New()
-		if i&1 != 0 {
-			h.Write(key)
-		} else {
-			h.Write(final)
-		}
-		if i%3 != 0 {
-			h.Write(salt)
-		}
-		if i%7 != 0 {
-			h.Write(key)
-		}
-		if i&1 != 0 {
-			h.Write(final)
-		} else {
-			h.Write(key)
-		}
-		final = h.Sum(nil)
-	}
-
-	// Encode 16 bytes in the md5crypt order: 4+4+4+4+4 output groups then a
-	// 2-byte tail — "22 chars" (crypto/b64 style, no padding).
-	number := func(b1, b2, b3 byte) uint32 {
-		return uint32(b1)<<16 | uint32(b2)<<8 | uint32(b3)
-	}
-	out := make([]byte, 0, 22)
-	emit := func(v uint32, n int) {
-		for i := 0; i < n; i++ {
-			out = append(out, b64cryptAlphabet[v&0x3f])
-			v >>= 6
-		}
-	}
-	emit(number(final[0], final[6], final[12]), 4)
-	emit(number(final[1], final[7], final[13]), 4)
-	emit(number(final[2], final[8], final[14]), 4)
-	emit(number(final[3], final[9], final[15]), 4)
-	emit(number(final[4], final[10], final[5]), 4)
-	emit(uint32(final[11]), 2)
-	return string(out)
-}
-
-// md5CryptMatches verifies a stored $1$ hash against the password (embedded
-// salt recomposition), the md5 analog of sha512CryptMatches.
-func md5CryptMatches(key, stored string) bool {
-	rest, ok := strings.CutPrefix(stored, "$1$")
-	if !ok {
-		return false
-	}
-	salt, _, cut := strings.Cut(rest, "$")
-	if !cut || salt == "" || len(salt) > 8 {
-		return false
-	}
-	return md5CryptRaw([]byte(key), []byte(salt)) == string(rest[len(salt)+1:])
-}
-
-// randAlphaSalt mirrors RandomStringUtils.randomAlphabetic(n) over
-// crypto/rand (the jar's md5-branch salt generator, commons-codec B64 set
-// aside: letters only). Var so tests can inject failure (FID-23 path).
-var randAlphaSalt = randAlphaSaltLive
 
 // noopRandom is a narrow seam for the jar's per-response random interval.
 // It deliberately does not use the process-global math/rand source.
@@ -1228,19 +855,6 @@ var noopRandom = func() float64 {
 		return 0
 	}
 	return float64(binary.LittleEndian.Uint64(b[:])) / float64(^uint64(0))
-}
-
-func randAlphaSaltLive(n int) (string, error) {
-	const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-	buf := make([]byte, n)
-	if _, err := rand.Read(buf); err != nil {
-		return "", err
-	}
-	out := make([]byte, n)
-	for i, b := range buf {
-		out[i] = letters[int(b)%len(letters)]
-	}
-	return string(out), nil
 }
 
 // noopResp is the exception/internal fallback. Record-aware normal noops use

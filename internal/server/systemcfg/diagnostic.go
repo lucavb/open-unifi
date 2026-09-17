@@ -1,4 +1,4 @@
-package adoption
+package systemcfg
 
 import (
 	"crypto/sha256"
@@ -7,14 +7,16 @@ import (
 	"strings"
 )
 
-// systemCfgDiagnostic returns a bounded representation of cfg. It deliberately
-// parses, rather than redacts, the input: only the complete blob's digest and
-// section/key names are copied to the result. In particular, never add a
-// value, or an error containing a value, to this format.
+// Diagnostic returns a bounded representation of cfg — the single
+// observability of a full provisioning push (logged by the adapter's render
+// closure). It deliberately parses, rather than redacts, the input: only the
+// complete blob's digest and section/key names are copied to the result. In
+// particular, never add a value, or an error containing a value, to this
+// format.
 //
 // The format is stable and intentionally plain:
 // system_cfg diagnostic sha256=<hex> sections=[a,b] keys=[a.k,b.k]
-func systemCfgDiagnostic(cfg string) (string, error) {
+func Diagnostic(cfg string) (string, error) {
 	sum := sha256.Sum256([]byte(cfg))
 	sections := make([]string, 0)
 	keys := make([]string, 0)

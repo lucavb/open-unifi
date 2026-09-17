@@ -1,8 +1,9 @@
-package server
+package systemcfg
 
 // Tests for the $6$ SHA-512 crypt used by users.1.password. The default
-// vectors live in server_test.go (TestSha512CryptVectorTests, OpenSSL
-// -generated goldens); this file pins the above-64-byte-block behavior —
+// vectors (TestSha512CryptVectorTests, OpenSSL-generated goldens) moved into
+// this package with the renderer; this file also pins the above-64-byte-block
+// behavior —
 // the round-chain P sequence chunk-fill (FID-21). Reference vectors
 // generated with OpenSSL 3.6.4 (`openssl passwd -6 -salt abcd1234 <key>`),
 // the same generator that produced the default-key goldens.
@@ -94,4 +95,37 @@ func containsByte(alphabet string, c byte) bool {
 		}
 	}
 	return false
+}
+
+// Golden vectors from OpenSSL 3.x (`openssl passwd -6 -salt S P`) — the
+// OpenSSL SHA-512 crypt implements the same SHA-crypt (Drepper) spec as
+// glibc and the bundled commons-codec on the classic controller; plus the
+// controller cache self-check. (Moved from package server with the
+// renderer extraction.)
+func TestSha512CryptVectorTests(t *testing.T) {
+	vv := []struct{ pw, salt, want string }{
+		{"ubnt", "abcd1234", "$6$abcd1234$zkx0G4Hd6kNhG.Pis3ng0rgjOuz3ZXjZ6EPChBV2anHZ3lRNKTUSYYj1g2jbmG0/vop6b9TKgKszoDdMeJE39."},
+		{"ubnt", "testsalt", "$6$testsalt$BOcp0ABcwNH6T6E6hVlHRAPmXVmWPjTdTBdbUOuQx4pRbu5jM1bflFSIVQpa/getBK25jGzZgMYbsIFhSSap3/"},
+		{"ubnt", "01234567", "$6$01234567$oPY8xJmDi4MvySVS8bYMY2fLLPzERYmsfHYofoivH4rpDgQeLmIIHX07W3Od32Q4cVg1FX75RdOJ3e4T5cTos."},
+		{"ubnt", "/0ab", "$6$/0ab$f3xVoSoW9z1rE.UG1lqLpck0HAVRs.iywxojvHm0HmhpoijLmUIfnhCmJe70l2DLqGDZjTY9xaJ.pw8qqETuY0"},
+		{"letmeinnow", "abcd1234", "$6$abcd1234$cy1En37fRI8Y7LYYDOvRRQNc.Ml.FNa7g7Fe.xAQ0MBd0fhX0jTu7BVvJ4.cPjhkj2FefvYf.9ODGzrSQSK2S/"},
+		{"letmeinnow", "testsalt", "$6$testsalt$wqpaSda43LzhSf60diJ0nWTRy1a52w5SsE4cquPVah5gJhPAtBffV/plRfW8hLU4N.fz6GShf9wZGChtHpz1y/"},
+		{"letmeinnow", "01234567", "$6$01234567$pNVV8eDqwPmRWmNUMkbXAU78mouUHAPQUMhfj8j0ylS/O9p4CxlWuT/9dtqJxbhx7.A8YbxGoNVQXJ4PlC0.H/"},
+		{"letmeinnow", "/0ab", "$6$/0ab$eP33xgO55Li7PT0DLMd/q/8QOcyYKchtx2YZRpssIqazJfWbBwCFwLCLzul5E3adon421ECqz6ANkhprwxDvg1"},
+		{"correcthorse", "abcd1234", "$6$abcd1234$Y/PARXisSI98RlkbOdASp5yUqeBK8LkQfXwyrr.gvPDUYTUIHXm2uSNBRV6Bzkp3xvll8aVxJM0OCvzr1h6R5/"},
+		{"correcthorse", "testsalt", "$6$testsalt$Tw0mpSk/FHPv7FUgG5EYIxY4BskslsTI2C9V78g4HvOrDMoLYageEbNMpuwIX1Vv26fQQgVXDmPp57z9SvdQt0"},
+		{"correcthorse", "01234567", "$6$01234567$wSEs7eXXvPURUjaP16otdkbL07jpN0zkg29rzkGPC8xITzmUHecAzkd6pcEa5eFj6Vd5E3T4iDp1vLAzK7/0K/"},
+		{"correcthorse", "/0ab", "$6$/0ab$IUuHnCRa136i8vXldE3gvWQxRa/f0L179MEoXUmpAQkkz9dxAk8QBeRrnEgEm91XLUPlffo3fvmwCfhEzQ7WE."},
+	}
+	for _, v := range vv {
+		got := sha512CryptRaw([]byte(v.pw), []byte(v.salt))
+		if got != v.want {
+			t.Errorf("sha512crypt(%q, %q)\n got %s\nwant %s", v.pw, v.salt, got, v.want)
+		}
+		// cache self-check must accept the reference hash (re-crypt with the
+		// embedded salt only).
+		if !sha512CryptMatches(v.pw, v.want) {
+			t.Errorf("cache self-check rejected reference hash for %q", v.pw)
+		}
+	}
 }

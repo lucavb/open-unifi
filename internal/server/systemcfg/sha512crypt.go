@@ -1,4 +1,4 @@
-package server
+package systemcfg
 
 // glibc SHA-512 crypt ($6$, "SHA-crypt" spec by Ulrich Drepper, the format
 // produced by commons-codec Sha2Crypt.sha512Crypt — the JAR the classic
@@ -43,6 +43,14 @@ func b64From24bit(b1, b2, b3 byte, out []byte) []byte {
 // Algorithm transcribed from libxcrypt lib/crypt-sha512.c (the canonical
 // Drepper SHA-crypt implementation).
 func sha512CryptRaw(key, salt []byte) string {
+	if len(salt) == 0 {
+		// Degenerate-input guard (mirror of the md5 side's clamp): an empty
+		// salt would ship a "$6$$…" hash; returning "" routes it into the
+		// FID-23 empty-value guard instead. Unreachable in production
+		// (randSaltLive always yields 8 chars) — reachable only through the
+		// test seam.
+		return ""
+	}
 	const defaultRounds = 5000 // fixed; no "rounds=" parameter is emitted
 
 	// Clamp the raw salt to the sha-crypt limit (≤16 chars); normal callers
@@ -165,8 +173,11 @@ func sha512CryptRaw(key, salt []byte) string {
 
 // randSalt returns n random characters drawn from the crypt B64 alphabet
 // (byte-drawn, index masked to the alphabet size like commons-codec's
-// B64.getRandomSalt).
-func randSalt(n int) (string, error) {
+// B64.getRandomSalt). Var seam so tests can inject failure/emptiness (the
+// FID-23 path), mirroring md5crypt.go's randAlphaSalt seam.
+var randSalt = randSaltLive
+
+func randSaltLive(n int) (string, error) {
 	buf := make([]byte, n)
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
