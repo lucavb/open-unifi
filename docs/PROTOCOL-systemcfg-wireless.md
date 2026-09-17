@@ -133,6 +133,82 @@ If the device has no radios: `# no wlan provisioned as no radio found` +
   table query `C("site_id", siteId).\u00d500000("ap_group_ids", ids)` — see §8
   note on ordering).
 
+### 2.1 Vap-set assembly before per-WLAN emission: no-radio guard + hidden synthetic vaps (2026-09-17 night pass)
+
+The 10-parameter collector (`super(Device, X, List<X>, List<WlanConf>, List<X>,
+Set<Integer>, List<String>, List<X>, List<String>, X)` — int.txt:L12629, Code
+int.txt:L12632, javap offsets 0–2874; args: dev, mgmtX, radios_out, wlans_out,
+vapXs_out, vlanIds, wdsAthdevs, bridges, mixedIfs, mgmtNet) is where a render's
+vap SET is assembled: site WLANs plus up to three kinds of synthetic vap the
+controller invents. The main entry `int.\u00d300000(Device)` (int.txt:L16860)
+calls it (call offset 494) and then hands `wlans_out` to the 6-parameter
+emitter (int.txt:L5489; call offset 767). "collector §N" below = javap offset
+inside this method's Code.
+
+- **No-radio guard (collector §109)**: `radio_table` empty ⇒ return; the
+  render then carries no `wireless.*`/`aaa.*` rows at all. That is the only
+  early-out — there is no WLAN-less-radio guard here: a radio with zero
+  surviving WLANs still gets its §3 `radio.<n4>` core rows (emitted per radio
+  unconditionally), but no vap rows or companions of its own.
+- **Site gates (collector §0–103)**: `local15 = device.supportVwire() &&
+  connectivitySetting.is("enabled", true)` — supportVwire() = wifi_caps mask 1
+  (Device.txt:7706-7714; live record wifi_caps=559857373=0x215EBEDD ⇒ bit 0
+  SET), and the site `connectivity` Setting defaults enabled ⇒ TRUE in the
+  normal site shape. `local16 = device.is("mesh_sta_vap_enabled", false)` ⇒
+  FALSE normally. `element_adopt` = site Setting
+  `"element_adopt".is("enabled", false) && device.supportElement()` ⇒ FALSE
+  normally.
+- **Per-radio synthesis** (inside the per-radio loop, collector §284–2250):
+  - `create_vport` (put at collector §771 ⇒ `radio.<n>.mode=managed`, §3):
+    set iff `local15 && local16 && (device.supportMultiVport() || radio is NA)`
+    ⇒ normally FALSE ⇒ `radio.<n>.mode=master`. This is the real-builder
+    mechanism behind the §12 `radio.<n>.mode` deviation row.
+  - vwire branch gate: `local38 = local15 && !device.is("disabled", false) &&
+    radio.is("vwire_enabled", true)` ⇒ TRUE normally.
+  - **mesh vap (collector §962–1103)**: when `local38 &&
+    device.supportMeshv3()` (wifi_caps mask 2048 — SET on U7PG2,
+    0x215EBEDD), the collector appends a mesh WlanConf per radio
+    UNCONDITIONALLY: security=WPA_PSK, wpa_mode=WPA2, wpa_enc=ccmp,
+    is_wds_downlink=true, hide_ssid=true, name=connectivity.getString(
+    "x_mesh_essid"), x_passphrase=connectivity.getString("x_mesh_psk"),
+    radio=<band>. It survives the §2 B/F instantiation filter (drops only
+    disabled/uid-iot/hotspot2) ⇒ emits `wireless.<n>`/`aaa.<n>` rows with
+    `usage=downlink` (§5) and devname `vwire<N>` (§2 athdev rule:
+    is_wds_downlink ⇒ "vwire"+N).
+  - **`vport-<serial>` vap (collector §868–962)**: when create_vport set:
+    is_wds_uplink=true, hide_ssid=true, radio=<band>, PREPENDED (`add(0, …)`)
+    ⇒ devname `ath<N>`, `usage=uplink`. The factory-baked default config
+    (harness ap-forensics/tmp/system.cfg, `mgmt.is_default=true`) corroborates
+    the shape: `aaa.2.ssid=vport`/`aaa.2.devname=ath1`, `wireless.2`
+    usage=uplink vport=enabled wds=enabled mode=managed security=none,
+    `radio.2.mode=managed` — the firmware baked the vport vap shape as its
+    factory default.
+  - **`vwire-<serial>` peer vap (collector §1104–1821)**: only when the
+    device `vwire_table` (X.\u00d3o0000) filtered to this radio's band is
+    non-empty AND `wds_peers` resolves non-empty (§1802): x_vwirekey =
+    32-char generate(), AES-encrypted payloads (x_authkey default
+    "ba86f2bbe107c7c57eb5f2690775c712" then OOoO.\u00d200000 hex-decode,
+    C.o00000 AES), wep_idx=4, wds_peers list. Absent on wired-uplink APs
+    (empty vwire_table ⇒ no peer vap; §1804 add never taken).
+- **Real renders on this U7PG2** (derived from instantiation order — per radio
+  the site WLANs (query order) instantiate, then the appended mesh vap; one
+  global 0-based counter across radios): a 2g-only site WLAN yields
+  ng = [user `ath0`, mesh `vwire1`], na = [mesh `vwire2`]; both-band yields
+  `ath0`, `ath1`, `vwire2`, `vwire3`. Every WLAN-count change therefore also
+  changes the bridge port list (eth0 + every untagged vap, mesh included) —
+  true of the real builder with or without our deviation; see
+  WLAN-ACCEPTANCE-6.8.2.15592.md §Bridge-apply verdict.
+- **AirView path (not ours)**: `int.\u00d400000(Device)` (int.txt:L17624) →
+  5-parameter collector (int.txt:L14090) synthesizes `vport-<serial>` per radio
+  with spectrum_enabled=true, security=OPEN — the spectrum/AirView
+  provisioning path; recorded so L14090's vport rows are not misread as the
+  main render.
+- **ours**: planVaps emits vaps only for site WLANs
+  (internal/wireless/plan.go:159-198); zero synthesis. This is byte-faithful
+  to the real builder's vwire-disabled site shape (site connectivity
+  `enabled=false` ⇒ local15 false ⇒ zero synthetics on the real path too).
+  §12 records the deviation.
+
 ## 3. `radio.<n4>` rows (one per device radio; `int` §518 — single verbatim call)
 
 | key (`radio.<n4>.` prefix) | default | source |
@@ -815,7 +891,7 @@ firmware rejection behind a misleading "contents are invalid" log line.
 exactly that log until `netconf.1.status` was emitted; `mgmt_cfg` pushes applied
 throughout because that path is unvalidated.)
 
-## 12. Known deviations from the real builder (accepted, 2026-09-16)
+## 12. Known deviations from the real builder (accepted 2026-09-16; extended by the 2026-09-17 night pass)
 
 A full javap↔generator diff was performed against the real builder bytecode.
 All per-object `.status` rows the real builder emits are present in ours (the
@@ -838,6 +914,7 @@ String.txt:1851-1930, int.txt:16600-16630). Remaining accepted deviations:
 | `# mgmt` ledbar block | emitted headerless between `# users` and `# wlans` (String.txt:2566-2745) | omitted | ledbar falls back to firmware defaults; revisit if LED behavior ever matters |
 | dhcpc guest `ip_only` rows, `system.analytics.status`, `system.resetbtn`, `system.monitor.memory.threshold`, `aaa.<n>.radius.macacl.emptypassword`/`.format`, `wireless.<n>.mgmt_rate`/`bcast.enhance` | condition-gated | omitted at defaults | feature-gated rows that do not affect VAP bring-up; add when the corresponding admin features exist |
 | `vlan.<n>.status` per-row | only in the `intsuper` bean; ABSENT on the AP `int` path | correctly absent | javap: `int extends String` inherits String's vlan writer (no per-row status); intsuper's extra row is not the AP path |
+| hidden mesh/vwire/vport synthetic vaps | per-radio synth in the collector (int.txt:L12629, §2.1): `vport-<serial>` uplink vap when create_vport (⇒ `ath<N>`, `radio.<n>.mode=managed`); per-radio **mesh vap** when `supportVwire() && site connectivity enabled && radio vwire_enabled && supportMeshv3()` (⇒ `vwire<N>`, `usage=downlink`); `vwire-<serial>` peer vap only when the device `vwire_table` has rows for the band with non-empty `wds_peers` | never — planVaps emits vaps only for site WLANs (internal/wireless/plan.go:159-198); a radio with no WLAN emits no vap rows | deliberate — open-unifi has no mesh/wireless-uplink feature; our renders are byte-faithful to the real builder's vwire-disabled site shape (connectivity `enabled=false` ⇒ zero synthetics on the real path too). Consequence: WLAN-count changes alter the real builder's bridge ports just as they alter ours — see §2.1 and WLAN-ACCEPTANCE-6.8.2.15592.md §Bridge-apply verdict |
 
 (End; see PROTOCOL-mgmt.md §3 for the surrounding `system_cfg` order and §6/§7 of
 PROTOCOL-mgmt.md for how system_cfg reaches the device.)
