@@ -216,6 +216,55 @@ the successive-push gates
   vap) and thereby re-IP br0 via the net restart is UNVERIFIED; that is
   the morning bytecode question behind C3's BLOCK.
 
+#### ubntbox fast-apply registry (2026-09-17 night Ghidra addendum)
+
+The night Ghidra pass over `u7pg2-ubntbox` pinned the fast-apply engine
+itself (corrections and refinements to the model above — the BLOCK
+verdict stands):
+
+- **In-binary plugin registry** at 0x650094: 54 entries × 36-byte
+  descriptors `[name, ?, deps, flags, ?, fn, ?, handler, ?]`
+  (big-endian). Located entries: system=e0 (slot 0x650094), users=e2
+  (0x6500dc), wireless=e8 (0x6501b4, flags 0x48, handler 0x0048ED29),
+  **bridge=e15 (0x6502b0: name "bridge"@0x6406FC, deps=NULL, flags=0,
+  in-binary handler 0x004AB1B9)**, **netconf=e17 (0x6502f8: flags=0x20,
+  handler 0x00487345, deps list @0x6b9ce4)**, unifi=e44 (0x6506c4).
+  The net plugin is named **netconf** in the registry.
+- **Runner** (0x004B1B94): for a changed plugin it first runs each
+  dependency plugin recursively (dep name strings resolve via
+  0x0045E16C; "Invalid dependency"/"Fast dependency %s failed"), then
+  builds the plugin's cfg_it as its own section PLUS each dependency's
+  section appended (get_cfg_it "%s"), and only then calls the handler.
+  `netconf`'s handler region references the "bridge" string
+  (0x00487214) — the netconf fast path touches the bridge; a
+  [netconf, bridge] dependency list exists at 0x6b9cd8.
+- **Gatekeeper** (0x004B18F4): (a) no in-binary handler → `ERROR: %s:
+  Unhandled fast apply for plugin` → fallback; (b) handler present but
+  the new slice carries a truthy `<name>.status` row and the entry lacks
+  flag 0x20 → `ERROR: %s: Unhandled status change` → fallback
+  (decompile: `if ((flags & 0x20) != 0 || get_value(cfg, 0, "%s.status",
+  name) == 0) return 1;` — the fast path runs only when the status row
+  is absent/falsy). Every normal config carries `bridge.status=enabled`
+  (PROTOCOL-systemcfg-wireless.md §12) and bridge has no 0x20
+  exemption, so a bridge-section change is REFUSED the incremental
+  in-binary path and takes the script-restart fallback — the
+  delbr/IP-blind path of §Bridge-apply verdict. This is the refusal
+  that makes the C3 BLOCK mechanical, not just script-forensic.
+  Caveat: the exact get_value polarity is read from one decompile;
+  the decisive test remains the live C3 run (or the handler bodies
+  below).
+- **Blocked residual**: the bridge fast handler body (0x4AB1B8, region
+  ~0x4AACB0–0x4AB8B0, consumes `bridge.%d.devname/.fd/.stp.status/
+  .port.%d.devname/.port.%d.prio` formats) and the netconf handler
+  (0x487344) are **microMIPS** (odd function pointers; creating a
+  function there disassembles MIPS32 garbage — the known sysmon
+  problem, AP-FIRMWARE-APPLY-PATH.md §7). Decompiling them needs
+  `GHIDRA_MCP_ALLOW_SCRIPTS=1` on the Ghidra host, then a TMode=1
+  context script over the region (drafted in
+  tmpwork/harness-20260917/NIGHT-REPORT.md). That decompile would
+  confirm or refute the bridge refusal reading and reveal whether
+  netconf's fast path re-IPs br0 — the recovery mechanism C3 needs.
+
 
 ### Per-case capture minimum
 
