@@ -46,7 +46,10 @@ go run ./cmd/openunifi \
 All flags: `--listen-inform` (device inform endpoint), `--listen-admin`
 (admin API/console/metrics), `--listen-discovery` + `--discovery` (UDP 10001
 announce listener), `--data-dir` (devices.json + wireless.json), `--controller-url`
-(the URL devices should inform to; embedded in the pushed config), `--admin-token`
+(the URL devices should inform to; embedded in the pushed config),
+`--regulatory-country-code` (ISO 3166-1 numeric code used in generated wireless
+configuration; defaults to 840/US and is not a claim of regulatory approval),
+`--admin-token`
 (bearer auth for `/api/v1/*` AND `/metrics`; empty disables auth entirely and logs
 a loud startup warning — env fallback `OPEN_UNIFI_ADMIN_TOKEN`), `--ap-ssh-password`
 (SSH password provisioned onto adopted APs; empty = site default `ubnt`),
@@ -82,9 +85,10 @@ GET           /metrics                  Prometheus (requires the token when one 
 GET           /healthz
 ```
 
-Wireless fields per WLAN: `name`, `ssid`, `security` (`open` | `wpa-p` |
-`wpa-eap`), `passphrase` (≥8, required for `wpa-p`/`wpa-eap`, rejected for
-`open`), `vlan` (1–4094), `enabled`. Control characters are rejected in all
+Wireless fields per WLAN: `name`, `ssid`, `security` (`open` | `wpa-p`),
+`passphrase` (≥8, required for `wpa-p`, rejected for `open`), `vlan` (1–4094),
+`enabled`. WPA-EAP/RADIUS is unsupported and a non-goal for this release.
+Control characters are rejected in all
 fields (they would inject `system_cfg` rows). Disabling a WLAN removes it
 from the pushed config entirely.
 
@@ -119,6 +123,12 @@ resource "open-unifi_wlan" "corp" {
 See `examples/terraform/` (includes filesystem-mirror dev overrides so
 `terraform init` isn't needed during development).
 
+## WLAN provisioning status
+
+Live WLAN provisioning is unsupported/gated pending an official-controller
+differential fixture. U7PG2 firmware 6.8.2.15592 with any nonempty managed
+WLAN fails closed with a typed status and never emits `system_cfg`.
+
 ## Protocol documentation
 
 - `docs/PROTOCOL.md` — inform wire format, crypto, JSON shapes, adoption FSM.
@@ -135,6 +145,14 @@ stay out of the tree.
 
 ## Threat model
 
+Operational security: the admin listener defaults to `127.0.0.1:8443` and
+requires a nonempty bearer token. For remote administration, place it behind
+an HTTPS reverse proxy; native admin TLS is intentionally not provided, and
+non-loopback plaintext requires the explicit lab-only `--allow-insecure-admin`.
+`--allow-anonymous-admin` and `--allow-default-ap-ssh-password` are likewise
+explicit lab-only exceptions. Use the proxy's HTTPS URL for controller and
+Terraform provider access.
+
 The inform protocol has no device certificates: pre-adoption identity is the
 public factory key (`MD5("ubnt")`) plus a MAC claim, and by protocol design
 any holder of a device's current or previous key can read that device's
@@ -149,6 +167,11 @@ is plain HTTP with bearer auth only.
 
 `data/devices.json` holds live per-device keys (chmod 0600, gitignored);
 `data/wireless.json` holds WLAN passphrases. Treat both as credentials.
+The data directory has an exclusive advisory lock to prevent concurrent JSON
+writes. Keep it private, encrypt backups, and restore the complete directory
+only while stopped. Terraform state can contain tokens and WLAN passphrases;
+store it in an encrypted, access-controlled backend with versioned backup and
+restore.
 
 ## Status & limitations
 
@@ -178,14 +201,19 @@ Still open (classic behavior vs open-unifi):
   classic replies when discoverable (`docs/PROTOCOL.md` §4); open-unifi is
   announce-only. Live note (2026-09-16): replies are not required for adoption
   — the U7PG2 adopted via set-inform with zero server-side UDP/10001 traffic.
-- WPA-EAP/RADIUS profiles are emitted structurally; server fields are not yet
-  part of the API surface.
+- WPA-EAP/RADIUS is unsupported and is a non-goal for this release; it is not
+  part of the open-unifi API or control-plane contract.
 - No firmware upgrade / `upgrade` responses; no hotspot2/WPA3/SAE emission.
 - `system.analytics.status` is not emitted (see Limitations).
-- Real-device acceptance test **passed 2026-09-16** (UAP-AC-Pro-Gen2 / U7PG2,
-  firmware 6.8.2.15592): adoption, default-key push + key rotation,
-  provisioning, WLAN push and steady-state noops all live-verified; the §7
-  verify-items are closed with evidence (`docs/PROTOCOL.md` §7).
+- Real-device **protocol/control-plane evidence** was captured on 2026-09-16
+  (UAP-AC-Pro-Gen2 / U7PG2, firmware 6.8.2.15592): adoption, default-key
+  push + key rotation, provisioning, WLAN config push, and steady-state noops
+  were live-verified; see `docs/PROTOCOL.md` §7. This is not an end-user WLAN
+  acceptance claim: client association, DHCP, traffic forwarding, tagged VLAN
+  observation, WLAN mutation/deletion, multi-radio coverage, loss/recovery,
+  and factory-reset/re-adoption remain release-gated. Use the repeatable
+  evidence matrix in `docs/WLAN-ACCEPTANCE-6.8.2.15592.md`; do not describe
+  unrun rows as passed.
 - Admin port is plain HTTP (token auth) — TLS is a TODO; run on a trusted LAN.
 
 ### Limitations

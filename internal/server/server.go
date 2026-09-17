@@ -34,6 +34,27 @@ const maxInformBody = 10 * 1024 * 1024
 // defaultKeyHex is the factory pre-adoption AES key (docs/PROTOCOL.md §2).
 const defaultKeyHex = "ba86f2bbe107c7c57eb5f2690775c712"
 
+const (
+	wlanRetryBase   = 2 * time.Second
+	wlanRetryMax    = 60 * time.Second
+	wlanMaxAttempts = 6
+)
+
+// ErrLiveWLANProvisioningUnsupported is returned for the exact U7PG2
+// firmware lane whose system_cfg WLAN template has not been differentially
+// verified against the official controller. The caller must not retry this as
+// a successful delivery.
+type ErrLiveWLANProvisioningUnsupported struct {
+	Model    string
+	Firmware string
+}
+
+func (e *ErrLiveWLANProvisioningUnsupported) Error() string {
+	return "live WLAN provisioning is unsupported for " + e.Model + " firmware " + e.Firmware + "; awaiting an official-controller differential fixture"
+}
+
+func (e *ErrLiveWLANProvisioningUnsupported) Status() int { return http.StatusNotImplemented }
+
 // Wire-shape constants of the classic controller (FID-54 dedupe: every
 // literal here recurs in more than one emission site).
 const (
@@ -41,7 +62,6 @@ const (
 	defaultMgmtPort     = "8443" // manage-port fallback  (mgmt_url)
 	defaultStunPort     = "3478" // unifi.stun.port default
 	defaultSiteName     = "default"
-	defaultTimezone     = "UTC"
 	informFactoryNotype = "inform:factory"
 )
 
@@ -82,6 +102,11 @@ type Config struct {
 	// e.g. "http://10.0.0.5:8080".
 	ControllerURL string
 
+	// RegulatoryCountryCode is the ISO 3166-1 numeric country code emitted
+	// into wireless system_cfg. Zero selects the conservative US default for
+	// backwards compatibility; operators should set this to their jurisdiction.
+	RegulatoryCountryCode int
+
 	// AllowPlainText permits unencrypted JSON inform bodies (classic
 	// controllers reject these unless pre-adoption plain text inform is on).
 	// Default false.
@@ -98,6 +123,41 @@ type Config struct {
 	// provisioned config; the passphrase itself never appears in mgmt_cfg.
 	// Treat records/config containing the hash as credentials.
 	SSHPassword string
+}
+
+const DefaultRegulatoryCountryCode = 840
+
+// ValidateConfig validates values that affect device addressing or generated
+// configuration. ControllerURL may include a path (for deployments using a
+// reverse proxy), but must not include query, fragment, or userinfo.
+func ValidateConfig(cfg Config) error {
+	if cfg.ControllerURL != "" {
+		if err := validateBaseURL(cfg.ControllerURL, "controller URL"); err != nil {
+			return err
+		}
+	}
+	code := cfg.RegulatoryCountryCode
+	if code == 0 {
+		code = DefaultRegulatoryCountryCode
+	}
+	if code < 1 || code > 999 {
+		return fmt.Errorf("regulatory country code must be an ISO 3166-1 numeric code from 001 to 999, got %d", code)
+	}
+	return nil
+}
+
+func validateBaseURL(raw, label string) error {
+	u, err := url.ParseRequestURI(raw)
+	if err != nil || u == nil || !u.IsAbs() || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("%s must be an absolute http or https URL with a host", label)
+	}
+	if u.User != nil {
+		return fmt.Errorf("%s must not contain userinfo", label)
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("%s must not contain a query or fragment", label)
+	}
+	return nil
 }
 
 // Server serves the UniFi inform protocol used for AP adoption.
@@ -459,6 +519,12 @@ func (s *Server) handlePacket(w http.ResponseWriter, pkt *inform.Packet, body []
 			w.WriteHeader(rej.status)
 			return
 		}
+		var unsupported *ErrLiveWLANProvisioningUnsupported
+		if errors.As(uerr, &unsupported) {
+			s.lg.Warn("inform: live WLAN provisioning gated", "mac", mac, "status", unsupported.Status())
+			w.WriteHeader(unsupported.Status())
+			return
+		}
 		// FID-71: UpdateExisting refuses to resurrect records — an
 		// ErrNotFound here means the device was deleted (or expired) between
 		// the Get and this write. The jar answers an unknown MAC with the
@@ -561,7 +627,8 @@ func (s *Server) writeInformResponse(w http.ResponseWriter, pkt *inform.Packet, 
 		s.internalPlainNoopResponse(w, "response serialize failed", serr)
 		return
 	}
-	s.lg.Debug("inform: reply", "mac", mac, "kind", outcome.kind, "key", usedKey, "gcm", gcmReq)
+	// Never log usedKey: it is a live decryption/adoption credential.
+	s.lg.Debug("inform: reply", "mac", mac, "kind", outcome.kind, "gcm", gcmReq)
 	w.Header().Set("Content-Type", "application/x-binary")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(serialized)
@@ -653,6 +720,12 @@ func (s *Server) handlePlain(w http.ResponseWriter, mac string, jm map[string]an
 		return nil
 	})
 	if uerr != nil {
+		var unsupported *ErrLiveWLANProvisioningUnsupported
+		if errors.As(uerr, &unsupported) {
+			s.lg.Warn("inform-plain: live WLAN provisioning gated", "mac", mac, "status", unsupported.Status())
+			w.WriteHeader(unsupported.Status())
+			return
+		}
 		// FID-71: a record deleted between the Get and this write answers
 		// the jar's unknown-MAC marker (404); any other failure is FID-69's
 		// 200 noop.
@@ -679,7 +752,8 @@ func (s *Server) handlePlain(w http.ResponseWriter, mac string, jm map[string]an
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	s.lg.Debug("inform-plain: reply", "mac", mac, "kind", outcome.kind, "claim", claim)
+	// Never log the plaintext auth claim.
+	s.lg.Debug("inform-plain: reply", "mac", mac, "kind", outcome.kind)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(out)
@@ -723,8 +797,13 @@ func (s *Server) advance(mac string, rec *store.Device, body map[string]any, use
 	// assignedKeyFlow having run first. The jar bumps device.cfgversion on
 	// operator config saves ("CONFIG changed" log); this hash comparison is
 	// open-unifi's equivalent trigger.
+	// A system_cfg transmission is only an offer.  Its hash remains pending
+	// until a later inform proves the VAPs are actually running.
+	settlePendingWLAN(rec)
+	wlanDrift := false
 	if prev, _ := rec.Extra["wlan_cfg_sha"].(string); prev != "" {
 		if cur := wlanListHash(s.currentWireless()); cur != prev {
+			wlanDrift = true
 			nv, kerr := s.keyChars(16)
 			if kerr != nil {
 				return nil, "", kerr
@@ -732,6 +811,15 @@ func (s *Server) advance(mac string, rec *store.Device, body map[string]any, use
 			rec.CfgVersion = nv
 			s.lg.Debug("inform: wireless envelope drift", "mac", mac)
 		}
+	}
+	if pending, ok := rec.Extra["wlan_cfg_pending_sha"].(string); ok && pending != "" {
+		// A changed envelope is a new delivery operation. For the unchanged
+		// operation, rate-limit retries before the switch below; importantly,
+		// this does not clear pending or treat cfgversion equality as success.
+		if pending == wlanListHash(s.currentWireless()) && !wlanRetryDue(rec, now) {
+			return s.noopRespFor(mac, rec, now.Unix()), "noop-pending-wlan", nil
+		}
+		wlanDrift = true
 	}
 
 	onAssigned := rec.XAuthkey != "" && strings.EqualFold(rec.XAuthkey, usedKey)
@@ -776,6 +864,19 @@ func (s *Server) advance(mac string, rec *store.Device, body map[string]any, use
 		s.lg.Debug("inform: adoption push (stale/rogue key, re-push existing assignment)", "mac", mac)
 		return s.adoptionPushResp(*rec, usedKey), "setparam", nil
 
+	// A WLAN change is a content change, not merely a version change.  In
+	// particular, U7 firmware commonly echoes the cfgversion from the previous
+	// mgmt_cfg on the first inform after an admin WLAN save.  Do not let that
+	// echoed value enter the equality/noop branch: the response must contain the
+	// newly rendered system_cfg in this inform.
+	case wlanDrift:
+		resp, kind, err := s.assignedKeyFlow(mac, rec, body)
+		if err != nil {
+			return nil, "", err
+		}
+		s.lg.Debug("inform: wireless envelope drift, forcing full provisioning", "mac", mac)
+		return resp, kind, nil
+
 	// Authenticated with our per-device key and the config applied → noop.
 	case rec.CfgVersion != "" && rec.AppliedCfg == rec.CfgVersion:
 		// Self-heal for records without a drift baseline (e.g. adopted
@@ -792,6 +893,9 @@ func (s *Server) advance(mac string, rec *store.Device, body map[string]any, use
 			s.lg.Debug("inform: no envelope baseline, forcing provisioning", "mac", mac)
 			return s.noopRespFor(mac, rec, now.Unix()), "noop", nil
 		}
+		if _, pending := rec.Extra["wlan_cfg_pending_sha"]; pending {
+			return s.noopRespFor(mac, rec, now.Unix()), "noop-pending-wlan", nil
+		}
 		rec.State = store.StateAdopted
 		s.lg.Debug("inform: connected noop", "mac", mac, "cfg", rec.CfgVersion)
 		return s.noopRespFor(mac, rec, now.Unix()), "noop", nil
@@ -806,12 +910,48 @@ func (s *Server) advance(mac string, rec *store.Device, body map[string]any, use
 	}
 }
 
+// fwMatches68215592 reports whether s identifies the U7PG2 6.8.2 build
+// 15592. The device-reported version may arrive as the short form
+// ("6.8.2.15592") or the long form the docs capture shows
+// ("BZ.qca956x_6.8.2+15592.260126.1358", docs/PROTOCOL.md:374-375) — both
+// name the same build; nothing else legitimately contains either fragment.
+// TODO(firmware): the exact wire form of the inform `version` field is still
+// unpinned (the only capture sample in docs shows "6.6.55"); once the
+// morning capture is fetched, pin the real string in the fixture
+// (docs/PROTOCOL.md:396-398).
+func fwMatches68215592(s string) bool {
+	return strings.Contains(s, "6.8.2.15592") || strings.Contains(s, "6.8.2+15592")
+}
+
+func (s *Server) rejectUnsupportedLiveWLAN(d store.Device) error {
+	if d.Model != "U7PG2" || !fwMatches68215592(d.Firmware) {
+		return nil
+	}
+	for _, w := range s.currentWireless() {
+		if w.Name != "" || w.SSID != "" {
+			return &ErrLiveWLANProvisioningUnsupported{Model: d.Model, Firmware: d.Firmware}
+		}
+	}
+	return nil
+}
+
 // assignedKeyFlow is the shared tail of the assigned-key (x_authkey-held)
 // path: at CFGVERSION MATCH it is unreachable (handled by the noop branch),
 // here it emits FULL PROVISIONING — fresh cfgversion when unset, adopting
 // state, ssh password-hash cache, and capture of the emitted wireless
 // envelope hash (the next identical-envelope inform after apply must noop).
 func (s *Server) assignedKeyFlow(mac string, rec *store.Device, body map[string]any) (map[string]any, string, error) {
+	// The unsupported-live-WLAN gate runs FIRST — before any record
+	// mutation (State/CfgVersion must not change on a rejected push) and
+	// before any emission. assignedKeyFlow is the single emission point
+	// shared by BOTH transports (encrypted advance() and plaintext
+	// plainAdvance()), so one call here gates both. mgmt_cfg-only paths
+	// (re-key pushes, adoption pushes, noop) never reach this function and
+	// are deliberately NOT gated — mgmt pushes keep working for gated
+	// devices.
+	if err := s.rejectUnsupportedLiveWLAN(*rec); err != nil {
+		return nil, "", err
+	}
 	if rec.CfgVersion == "" {
 		nv, err := s.keyChars(16)
 		if err != nil {
@@ -828,10 +968,40 @@ func (s *Server) assignedKeyFlow(mac string, rec *store.Device, body map[string]
 		// degraded config. Nothing was persisted (the store cycle aborts).
 		return nil, "", serr
 	}
-	if cur := wlanListHash(s.currentWireless()); cur != "" {
-		rec.Extra["wlan_cfg_sha"] = cur
+	// This is intentionally the only observability of the full config: the
+	// diagnostic contains a digest and ordered names, never config values.
+	if diagnostic, err := systemCfgDiagnostic(sys); err == nil {
+		s.lg.Debug(diagnostic)
 	} else {
-		delete(rec.Extra, "wlan_cfg_sha")
+		// Keep the debug path bounded even for malformed passthrough input; do
+		// not log err because it includes a key name copied from the config.
+		s.lg.Debug("system_cfg diagnostic unavailable", "reason", "duplicate-key")
+	}
+	cur := wlanListHash(s.currentWireless())
+	// Do not mark the configuration applied merely because system_cfg was
+	// sent.  Keep the desired snapshot as delivery evidence for the next AP
+	// inform (including deletions, where absence must be observed).
+	rec.Extra["wlan_cfg_pending_sha"] = cur
+	// Each emitted system_cfg is one bounded delivery attempt. Replacing the
+	// pending hash starts a fresh budget; retrying the same hash increments it.
+	if prev, _ := rec.Extra["wlan_cfg_attempt_sha"].(string); prev != cur {
+		rec.Extra["wlan_cfg_attempt_sha"] = cur
+		rec.Extra["wlan_cfg_attempts"] = 1
+	} else {
+		rec.Extra["wlan_cfg_attempts"] = wlanAttemptCount(rec) + 1
+	}
+	rec.Extra["wlan_cfg_last_attempt"] = time.Now().Unix()
+	rec.Extra["wlan_cfg_delivery_status"] = "pending"
+	if applied, ok := rec.Extra["wlan_cfg_applied_wlans"]; ok {
+		rec.Extra["wlan_cfg_pending_old_wlans"] = applied
+	}
+	if snapshot, err := json.Marshal(s.currentWireless()); err == nil {
+		rec.Extra["wlan_cfg_pending_wlans"] = string(snapshot)
+	}
+	// Record the intended SSID-to-radio placements so confirmation cannot be
+	// satisfied by a VAP on the wrong band/radio.
+	if placements, err := json.Marshal(wlanPlacements(*rec, s.currentWireless())); err == nil {
+		rec.Extra["wlan_cfg_pending_placements"] = string(placements)
 	}
 	resp := map[string]any{
 		"_type":              "setparam",
@@ -896,8 +1066,8 @@ func (s *Server) rotateKeys(mac string, rec *store.Device) error {
 //	               previous record if present, otherwise the key is DELETED
 //	               (the device can never introduce them).
 var (
-	extraPrevWins     = []string{"wlan_cfg_sha", "ssh_sha512passwd"}
-	extraFillIfAbsent = []string{"radio_table"}
+	extraPrevWins     = []string{"wlan_cfg_sha", "wlan_cfg_pending_sha", "wlan_cfg_pending_wlans", "wlan_cfg_pending_old_wlans", "wlan_cfg_applied_wlans", "wlan_cfg_pending_placements", "wlan_cfg_attempt_sha", "wlan_cfg_attempts", "wlan_cfg_last_attempt", "wlan_cfg_delivery_status", "ssh_sha512passwd"}
+	extraFillIfAbsent = []string{"radio_table", "wifi_caps", "fw_caps", "if_table", "ethernet_table", "uplink", "has_eth1"}
 	extraAdminOwned   = []string{"system_cfg_extra_lines", "mgmt_dev",
 		"anonymous_controller_id", "anonymous_site_id"}
 )
@@ -951,6 +1121,148 @@ func (s *Server) absorbInform(mac string, rec *store.Device, body map[string]any
 	}
 }
 
+// settlePendingWLAN promotes a sent WLAN hash only after the latest inform
+// proves both sides of the change: every desired SSID has RUN VAPs and every
+// previously enabled SSID being removed has disappeared. cfgversion equality
+// is deliberately not evidence of WLAN application.
+func settlePendingWLAN(rec *store.Device) {
+	pending, ok := rec.Extra["wlan_cfg_pending_sha"].(string)
+	if !ok {
+		return
+	}
+	vaps, ok := rec.Extra["vap_table"].([]any)
+	if !ok {
+		return
+	}
+	desired := pendingWLANs(rec)
+	old := storedWLANs(rec, "wlan_cfg_pending_old_wlans")
+	need := map[string]int{}
+	placements := map[string]int{}
+	if raw, ok := rec.Extra["wlan_cfg_pending_placements"].(string); ok {
+		_ = json.Unmarshal([]byte(raw), &placements)
+	}
+	removed := map[string]bool{}
+	for _, w := range old {
+		if w.Enabled && !containsEnabled(desired, ssidOf(w)) {
+			removed[ssidOf(w)] = true
+		}
+	}
+	for _, w := range desired {
+		if w.Enabled {
+			need[ssidOf(w)]++
+		}
+	}
+	// The old snapshot is not available as a separate desired/current pair in
+	// the record, so use the current source for positive proof and only require
+	// old names to be absent when they are no longer desired.
+	//
+	// Wire keys: the AP's real vap_table uses essid/state/radio_name/name
+	// (firmware-verified, mcad FUN_0041cecc; corroborated by the live log
+	// "vap_table reports state RUN", docs/PROTOCOL.md:388;
+	// docs/AP-FIRMWARE-APPLY-PATH.md). The ssid/status/parent spellings only
+	// ever existed in our synthetic test fixtures — status/parent are kept
+	// as fallbacks here pending the capture cross-check so in-flight
+	// fixtures keep working. The placement construction side
+	// (wlanPlacements) keys on radio_table `name` values; the device-side
+	// radio_name carries the same strings.
+	for _, raw := range vaps {
+		m, ok := raw.(map[string]any)
+		if !ok || !strings.EqualFold(jsonStr(m, "state", jsonStr(m, "status", "")), "RUN") {
+			continue
+		}
+		ssid := jsonStr(m, "essid", jsonStr(m, "ssid", ""))
+		if ssid == "" {
+			continue
+		}
+		if removed[ssid] {
+			return
+		}
+		parent := jsonStr(m, "radio_name", jsonStr(m, "parent", ""))
+		key := ssid + "\x00" + parent
+		if placements[key] > 0 {
+			placements[key]--
+			need[ssid]--
+		} else if need[ssid] > 0 && len(placements) == 0 {
+			need[ssid]--
+		}
+	}
+	for _, w := range desired {
+		if w.Enabled && need[ssidOf(w)] > 0 {
+			return
+		}
+	}
+	// A deleted WLAN is settled only when the old VAP is absent. Positive
+	// desired WLANs were checked above; no VAP table means unknown, not success.
+	rec.Extra["wlan_cfg_sha"] = pending
+	rec.Extra["wlan_cfg_applied_wlans"] = rec.Extra["wlan_cfg_pending_wlans"]
+	rec.Extra["wlan_cfg_delivery_status"] = "confirmed"
+	delete(rec.Extra, "wlan_cfg_pending_sha")
+	delete(rec.Extra, "wlan_cfg_pending_wlans")
+	delete(rec.Extra, "wlan_cfg_pending_placements")
+}
+
+func wlanPlacements(d store.Device, wls []Wlan) map[string]int {
+	out := map[string]int{}
+	vaps, _ := planVaps(d, wls)
+	for _, v := range vaps {
+		out[ssidOf(v.wlan)+"\x00"+v.phyname]++
+	}
+	return out
+}
+
+func wlanAttemptCount(rec *store.Device) int {
+	switch v := rec.Extra["wlan_cfg_attempts"].(type) {
+	case int:
+		return v
+	case float64:
+		return int(v)
+	}
+	return 0
+}
+
+func wlanRetryDue(rec *store.Device, now time.Time) bool {
+	count := wlanAttemptCount(rec)
+	if count >= wlanMaxAttempts {
+		rec.Extra["wlan_cfg_delivery_status"] = "exhausted"
+		return false
+	}
+	last := int64(0)
+	switch v := rec.Extra["wlan_cfg_last_attempt"].(type) {
+	case int64:
+		last = v
+	case float64:
+		last = int64(v)
+	}
+	delay := wlanRetryBase * time.Duration(1<<max(0, count-1))
+	if delay > wlanRetryMax {
+		delay = wlanRetryMax
+	}
+	return last == 0 || now.Unix() >= last+int64(delay/time.Second)
+}
+
+func pendingWLANs(rec *store.Device) []Wlan {
+	return storedWLANs(rec, "wlan_cfg_pending_wlans")
+}
+
+func storedWLANs(rec *store.Device, key string) []Wlan {
+	if raw, ok := rec.Extra[key].(string); ok {
+		var w []Wlan
+		if json.Unmarshal([]byte(raw), &w) == nil {
+			return w
+		}
+	}
+	return nil
+}
+
+func containsEnabled(wls []Wlan, ssid string) bool {
+	for _, w := range wls {
+		if w.Enabled && ssidOf(w) == ssid {
+			return true
+		}
+	}
+	return false
+}
+
 // ---- config blob builders (docs/PROTOCOL-mgmt.md §2, §3) ------------------
 
 // lineWriter returns the shared INJECTION-GUARDED key=value line writer used
@@ -980,6 +1292,13 @@ func (s *Server) sshPassword() string {
 		return s.cfg.SSHPassword
 	}
 	return defaultSSHPassword
+}
+
+func (s *Server) regulatoryCountryCode() int {
+	if s.cfg.RegulatoryCountryCode == 0 {
+		return DefaultRegulatoryCountryCode
+	}
+	return s.cfg.RegulatoryCountryCode
 }
 
 // addrHost extracts the hostname/IP of u, tolerating unparseable input.
@@ -1088,6 +1407,13 @@ func (s *Server) buildMgmtCfg(d store.Device, usedKey string) string {
 // and cron/ntp sections from the real int builder are pending
 // reverse-engineering and must NOT be invented here.
 func (s *Server) buildSystemCfg(d store.Device) (string, error) {
+	return s.buildGeneratedSystemCfg(d)
+}
+
+func (s *Server) buildGeneratedSystemCfg(d store.Device) (string, error) {
+	if err := ValidateConfig(s.cfg); err != nil {
+		return "", err
+	}
 	var b strings.Builder
 	line := s.lineWriter(&b, "system_cfg")
 	raw := func(l string) {
@@ -1099,39 +1425,65 @@ func (s *Server) buildSystemCfg(d store.Device) (string, error) {
 		}
 	}
 
-	// 1. # system — timezone rows (system.timezone + locale.timezone,
-	//    FID-19: config_String section writer emits BOTH rows with the
-	//    same value). analytics thresholds / resetbtn deliberately
-	//    deferred with the wireless sections.
-	b.WriteString("# system\n")
-	tz, _ := d.Extra["timezone"].(string)
-	if tz == "" {
-		tz = defaultTimezone
-	}
-	line("system.timezone", tz)
-	line("locale.timezone", tz)
-
-	// 2. # unifi — controller identity bits the AP relays back. Anonymous
-	//    ids turn on only when present in the record; reporterid mirrors
-	//    the controller anonymous id (same R.Øõ0000() source in the jar,
-	//    config_String unifi pair list — FID-17); siteid carries the
-	//    device's site name (getSiteId always set there; our fallback is
-	//    the "default" site). unifi.idp/unifi.key/unifi.mcip depend on the
-	//    idp + mgmt settings we do not model yet, and unifi.cfgcap_info on
-	//    the capability bitmask — genuinely underivable, left out.
+	// 1/unifi-zone. Section head order (bytecode int.txt:17208-17216, the
+	// AP top-level else-branch): the real controller emits `# unifi` FIRST
+	// (int.Ó00000(sb,Device,Setting) = String's unifi writer + cfgcap_info
+	// appended), THEN `# system` (int.Ø00000 semantics), THEN `# users`.
+	// config_String unifi pair array — String.txt:1851-1897 — fixes the
+	// unifi row order below.
 	b.WriteString("# unifi\n")
 	line("unifi.version", "0.1.0-dev")
+	// Anonymous ids turn on only when present in the record; reporterid
+	// mirrors the controller anonymous id (same source in the jar); siteid
+	// carries the device's site name (getSiteId always set there; our
+	// fallback is the "default" site) — FID-17. Row order per the pair
+	// array: version, anonymous_controller_id, anonymous_site_id,
+	// reporterid, siteid (String.txt:1851-1897).
 	if v, ok := d.Extra["anonymous_controller_id"].(string); ok && v != "" {
 		line("unifi.anonymous_controller_id", v)
-		// reporterid = the very same controller anonymous id.
-		line("unifi.reporterid", v)
 	}
 	if v, ok := d.Extra["anonymous_site_id"].(string); ok && v != "" {
 		line("unifi.anonymous_site_id", v)
 	}
+	if v, ok := d.Extra["anonymous_controller_id"].(string); ok && v != "" {
+		// reporterid = the very same controller anonymous id.
+		line("unifi.reporterid", v)
+	}
 	line("unifi.siteid", siteRef(d))
+	// unifi.idp — tail of String's unifi writer (String.txt:1898+,
+	// com__ubnt__service__config__String.txt:1899-1902): the bytecode pushes
+	// iconst_1, i.e. Setting.is("unifi_idp_enabled", true) — the JAR DEFAULT
+	// is ENABLED (which also emits the unifi.mcip/unifi.key rows that we do
+	// not carry). We deliberately emit `disabled` anyway: we have no IDP
+	// feature, and the AP validator ignores the row. This is a RECORDED
+	// DEVIATION from the real builder (docs agent tracks it in the §12
+	// deviation table); do not "fix" it back to enabled silently.
+	line("unifi.idp", "disabled")
+	// unifi.cfgcap_info — the `int` override appends it right after calling
+	// the base unifi writer (int.txt:16600-16630: "0x" +
+	// Integer.toHexString(Ô00000())). The capability int (int.Ô00000()I,
+	// int.txt:5332-5387) splits the CONTROLLER version: major ≤ 2 → 0x0,
+	// v3.0–3.2 → 0x3, v3.3+/v4+ → 0x7. Our advertised version is the
+	// placeholder "0.1.0-dev", which would compute 0x0 — deliberately NOT
+	// derived from it: we emit the literal 0x7 matching every modern real
+	// controller (v3.3+, the only value this firmware has ever been paired
+	// with). ubntconf reads it on the AP via
+	// get_uint32(cfg, 0, "unifi.cfgcap_info") — absent/0 can zero the
+	// plugin layer's capability gating
+	// (docs/AP-FIRMWARE-APPLY-PATH.md §6).
+	line("unifi.cfgcap_info", "0x7")
+
+	// 2. # system — deliberately OMITTED. The real builder skips the
+	//    timezone rows when the site locale is absent (PROTOCOL-mgmt.md
+	//    §3 step 2) and our site carries no locale; the factory baseline
+	//    (/tmp/harness/ap-forensics/tmp/system.cfg) has no system rows
+	//    either. The system_cfg apply is a full-config replacement, so
+	//    emitting rows here would DELETE-or-CHANGE a section the running
+	//    config does not carry and restart the system plugin for nothing.
+	//    Minimal-diff policy: /tmp/harness/minimal-diff-spec.md.
 
 	// 3. # users — config_String.java §197-206 / PROTOCOL-systemcfg-Config.
+	//    Real AP order (int.txt:17208-17216): unifi → system → users.
 	users1pw, uerr := s.usersPasswordHash(d)
 	if uerr != nil {
 		return "", uerr
@@ -1152,6 +1504,47 @@ func (s *Server) buildSystemCfg(d store.Device) (string, error) {
 	// per PROTOCOL-mgmt.md §3 puts this before the sshd/syslog ones.
 	s.emitWirelessCfg(&b, d, s.currentWireless())
 
+	// 4b. Factory-baseline echo sections. The system_cfg apply is a
+	// FULL-CONFIG REPLACEMENT (mcad renames the staged file over
+	// /tmp/system.cfg; docs/AP-FIRMWARE-APPLY-PATH.md), and ubntconf's
+	// fast-apply restarts the on-device plugin for every section whose
+	// parsed tree CHANGES — including changes caused by ROW DELETION
+	// when the controller's render omits a section the running config
+	// carries. The two fatal live pushes (2026-09-16 09:43/13:54) proved
+	// the mechanism (net plugin restart → ifconfig br0/eth0 down → AP
+	// dark; /etc/sysinit/net.conf fetched 2026-09-17). The rows below
+	// therefore ECHO the running factory baseline
+	// (/tmp/harness/ap-forensics/tmp/system.cfg, fetched from the
+	// factory-reset AP 2026-09-17) so those parsed sections stay
+	// IDENTICAL and no plugin restarts fire. Section order follows the
+	// real builder where it emits these (PROTOCOL-mgmt.md §3 steps
+	// 7-9). These are device-class baseline constants, NOT controller
+	// state: do not "clean them up" without a live-validated apply.
+	// Full policy: /tmp/harness/minimal-diff-spec.md.
+
+	// # connectivity (§3 step 7 — mac/connectivity overrides). The
+	// plugin restarts the uplink-monitor inittab entry when this section
+	// changes; the echo keeps it quiet. uplink_eth follows the same eth
+	// inventory as the bridge writer; uplink_wds is the last radio slot
+	// (the 5g vap used for wireless uplink; factory ath1).
+	b.WriteString("# connectivity\n")
+	line("connectivity.status", "enabled")
+	line("connectivity.uplink_bridge", mgmtDevOf(d))
+	ethIfaces, _ := ethPortNames(d)
+	line("connectivity.uplink_eth", ethIfaces[0])
+	line("connectivity.uplink_wds", fmt.Sprintf("ath%d", len(storedRadios(d))-1))
+
+	// # syslog (§3 step 8) — factory echo.
+	b.WriteString("# syslog\n")
+	line("syslog.status", "enabled")
+	line("syslog.file", "/var/log/messages")
+	line("syslog.level", "8")
+	line("syslog.remote.status", "disabled")
+	line("syslog.remote.ip", "192.168.1.1")
+	line("syslog.remote.port", "514")
+	line("syslog.rotate", "1")
+	line("syslog.size", "200")
+
 	// sshd rows — config_String.java §309-337 defaults: SSH on, password
 	// auth on, wildcard bind off, no injected keys, mgmt interface bound.
 	// FID-20: these rows carry NO "# sshd" section header in the classic
@@ -1167,12 +1560,42 @@ func (s *Server) buildSystemCfg(d store.Device) (string, error) {
 	}
 	line("sshd.1.ifname", mgmtDev)
 
-	// What is deliberately missing here (bandsteering, airtime, stamgr,
-	// qos, mesh, connectivity, syslog, snmp, resolv/route/iptables, cron,
-	// ntpclient — config_String/int): no admin-API fields exist yet; the
-	// wireless RE doc covers only the emitted set.
-	// TODO(wireless): see docs/PROTOCOL-systemcfg-wireless.md §9 when a
-	// follow-up RE pass lands. Do NOT invent those rows.
+	// # route + # ntpclient (real builder: §3 step 9) — factory echo.
+	b.WriteString("# route\n")
+	line("route.status", "enabled")
+	line("route.1.status", "enabled")
+	line("route.1.devname", mgmtDevOf(d))
+	line("route.1.ip", "224.0.0.0")
+	line("route.1.netmask", "3")
+
+	b.WriteString("# ntpclient\n")
+	line("ntpclient.status", "enabled")
+	line("ntpclient.1.status", "enabled")
+	line("ntpclient.1.server", "0.ubnt.pool.ntp.org")
+
+	// Sections the real builder NEVER emits (PROTOCOL-mgmt.md §3 has no
+	// mgmt/dhcpd/httpd/ebtables writers) but the factory baseline
+	// carries: omitting them would DELETE the rows from the running
+	// config (full-config replacement) with unknown effects — e.g.
+	// mgmt.discovery.status gates the discovery announces, and the
+	// ebtables row is the EAPOL broute rule on the first vap slot.
+	// Factory echo = zero parsed diff = zero plugin restarts.
+	b.WriteString("# ebtables\n")
+	line("ebtables.status", "enabled")
+	line("ebtables.1.cmd", "-t broute -A BROUTING -p 0x888e -i ath0 -j DROP")
+	line("mgmt.discovery.status", "enabled")
+	line("mgmt.flavor", "ace")
+	line("mgmt.is_default", "true")
+	line("dhcpd.status", "disabled")
+	line("dhcpd.1.status", "disabled")
+	line("httpd.status", "disabled")
+
+	// What is still deliberately missing here (bandsteering, airtime,
+	// stamgr, qos, mesh, snmp, resolv, iptables, cron — config_String/
+	// int): the factory baseline carries none of those rows either, so
+	// omitting them keeps the parsed diff empty under the full-config
+	// replacement semantics. Adding any row requires a live-validated
+	// apply first (two AP resets already consumed 2026-09-16).
 
 	// 5. The admin "config.system_cfg.<idx>" passthrough lines
 	//    (config_String.java §appendix: raw pre-formatted lines). FID-62:

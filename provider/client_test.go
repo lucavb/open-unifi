@@ -30,12 +30,13 @@ import (
 //
 //	GET/POST     /api/v1/devices
 //	GET/DELETE   /api/v1/devices/{mac}
-//	GET/PUT      /api/v1/wireless   (whole-document envelope)
+//	POST          /api/v1/wireless
+//	GET/PUT/DELETE /api/v1/wireless/{name}
 //	GET          /api/v1/whoami
 type fakeBackend struct {
 	token    string            // required bearer token; "" means anonymous allowed
 	devices  map[string]string // mac -> raw device JSON (DeviceView shape)
-	wireless string            // raw wireless envelope JSON
+	wireless map[string]string // name -> raw item JSON
 	lastAuth string            // observed Authorization header of the last request
 }
 
@@ -46,7 +47,7 @@ func newFakeBackend(token string) *fakeBackend {
 	fb := &fakeBackend{
 		token:    token,
 		devices:  map[string]string{},
-		wireless: `{"wlans":[]}`,
+		wireless: map[string]string{},
 	}
 	return fb
 }
@@ -124,20 +125,46 @@ func (fb *fakeBackend) handler() http.Handler {
 
 	mux.HandleFunc("/api/v1/wireless", auth(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
-		case http.MethodGet:
-			_, _ = w.Write([]byte(fb.wireless + "\n"))
-		case http.MethodPut:
-			var env struct {
-				Wlans []map[string]any `json:"wlans"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&env); err != nil {
+		case http.MethodPost:
+			var entry wirelessEntry
+			if err := json.NewDecoder(r.Body).Decode(&entry); err != nil {
 				writeFakeErr(w, http.StatusBadRequest, "invalid JSON body")
 				return
 			}
-			buf, _ := json.Marshal(env)
-			fb.wireless = string(buf)
-			// adminapi echoes the accepted envelope.
-			_, _ = w.Write([]byte(fb.wireless + "\n"))
+			buf, _ := json.Marshal(entry)
+			fb.wireless[entry.Name] = string(buf)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write(append(buf, '\n'))
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	mux.HandleFunc("/api/v1/wireless/", auth(func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/api/v1/wireless/")
+		value, ok := fb.wireless[name]
+		switch r.Method {
+		case http.MethodGet:
+			if !ok {
+				writeFakeErr(w, http.StatusNotFound, "wlan not found")
+				return
+			}
+			_, _ = w.Write([]byte(value + "\n"))
+		case http.MethodPut:
+			var entry wirelessEntry
+			if err := json.NewDecoder(r.Body).Decode(&entry); err != nil {
+				writeFakeErr(w, 400, "invalid JSON body")
+				return
+			}
+			buf, _ := json.Marshal(entry)
+			delete(fb.wireless, name)
+			fb.wireless[entry.Name] = string(buf)
+			_, _ = w.Write(append(buf, '\n'))
+		case http.MethodDelete:
+			if !ok {
+				writeFakeErr(w, http.StatusNotFound, "wlan not found")
+				return
+			}
+			delete(fb.wireless, name)
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
@@ -272,55 +299,47 @@ func TestInsecureSkipVerifyConfig(t *testing.T) {
 	}
 }
 
-func TestWlanEnvelopeRoundTrip(t *testing.T) {
+func TestWlanItemRoundTrip(t *testing.T) {
 	fb := newFakeBackend("")
 	ctx := context.Background()
 	c := clientFor(fb, "")
 
-	// Create: append a wpa-p wlan, PUT.
-	env, err := c.getWireless(ctx)
-	if err != nil {
-		t.Fatalf("getWireless: %v", err)
-	}
-	env.Wlans = append(env.Wlans, wirelessEntry{
+	entry := wirelessEntry{
 		Name: "main", SSID: "main", Security: "wpa-p",
 		Passphrase: "sup3rsecret", VLAN: 42, Enabled: true,
-	})
-	if err := c.putWireless(ctx, env); err != nil {
-		t.Fatalf("putWireless create: %v", err)
+	}
+	if err := c.createWireless(ctx, &entry); err != nil {
+		t.Fatalf("createWireless: %v", err)
 	}
 
 	// Read-back: server has the entry with its fields intact.
-	got, err := c.getWireless(ctx)
+	got, err := c.getWireless(ctx, "main")
 	if err != nil {
 		t.Fatalf("getWireless read-back: %v", err)
 	}
-	if len(got.Wlans) != 1 || got.Wlans[0].Name != "main" || got.Wlans[0].VLAN != 42 {
-		t.Fatalf("read-back mismatch: %+v", got.Wlans)
+	if got.Name != "main" || got.VLAN != 42 {
+		t.Fatalf("read-back mismatch: %+v", got)
 	}
-	if got.Wlans[0].Passphrase != "sup3rsecret" {
+	if got.Passphrase != "sup3rsecret" {
 		t.Fatal("passphrase not persisted server-side")
 	}
 
 	// Update: change vlan in place.
-	got.Wlans[0].VLAN = 100
-	if err := c.putWireless(ctx, got); err != nil {
-		t.Fatalf("putWireless update: %v", err)
+	got.VLAN = 100
+	if err := c.updateWireless(ctx, "main", got); err != nil {
+		t.Fatalf("updateWireless: %v", err)
 	}
-	got, _ = c.getWireless(ctx)
-	if got.Wlans[0].VLAN != 100 {
-		t.Fatalf("update not visible: %+v", got.Wlans)
+	got, _ = c.getWireless(ctx, "main")
+	if got.VLAN != 100 {
+		t.Fatalf("update not visible: %+v", got)
 	}
 
 	// Delete: drop and PUT.
-	env, _ = c.getWireless(ctx)
-	env.Wlans = env.Wlans[:0]
-	if err := c.putWireless(ctx, env); err != nil {
-		t.Fatalf("putWireless delete: %v", err)
+	if err := c.deleteWireless(ctx, "main"); err != nil {
+		t.Fatalf("deleteWireless: %v", err)
 	}
-	got, _ = c.getWireless(ctx)
-	if len(got.Wlans) != 0 {
-		t.Fatalf("expected empty wlans, got %+v", got.Wlans)
+	if _, err = c.getWireless(ctx, "main"); !errNotFound(err) {
+		t.Fatalf("expected deleted item 404, got %v", err)
 	}
 }
 

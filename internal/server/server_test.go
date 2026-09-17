@@ -309,7 +309,7 @@ func isHex(s string) bool { return len(s) > 0 && strings.Trim(s, "0123456789abcd
 
 func containsKey(keys []string, k string) bool {
 	for _, x := range keys {
-		if strings.ToLower(x) == strings.ToLower(k) {
+		if strings.EqualFold(x, k) {
 			return true
 		}
 	}
@@ -688,9 +688,14 @@ func TestCfgVersionDriftFullProvisioning(t *testing.T) {
 		t.Fatalf("blocked_sta = %q, want empty (no block list yet)", sta)
 	}
 	sys, _ := jm["system_cfg"].(string)
+	// Real section head order (int.txt:17208-17216): `# unifi` first
+	// (with the idp + cfgcap_info tail rows), then `# users`. The
+	// `# system` section is deliberately omitted (no site locale; the
+	// factory baseline carries no system rows — see
+	// buildGeneratedSystemCfg).
 	for _, want := range []string{
-		"# system\n", "system.timezone=UTC\n", "locale.timezone=UTC\n",
 		"# unifi\n", "unifi.version=0.1.0-dev\n", "unifi.siteid=default\n",
+		"unifi.idp=disabled\n", "unifi.cfgcap_info=0x7\n",
 		"# users\n", "users.status=enabled\n", "users.1.name=ubnt\n",
 		"users.2.name=nobody\n",
 		"sshd.status=enabled\n", "sshd.1.status=enabled\n",
@@ -866,14 +871,20 @@ func u7pg2Record() store.Device {
 // Worked-example snapshot: the emitted wireless compound must match the
 // doc §7 shape verbatim ( radios sorted by name ra0<rai0; corp vap on both
 // bands → ath0+ath1, wireless.1/2, aaa.1/2, br0.42 with both ath ports,
-// vlan.1 eth0/42, netconf br0.42 row only; disabled guest ABSENT everywhere).
+// vlan.1 eth0/42, netconf factory echo — 1=br0 mgmt (192.168.1.20/24),
+// 2=eth0 up, 3/4=ath0/ath1 slots down — then the tagged netconf.5=br0.42;
+// disabled guest ABSENT everywhere).
 func TestWorkedExampleWirelessSystemCfg(t *testing.T) {
 	s := New(Config{WirelessSource: func() []Wlan { return workedEnvelope() }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, u7pg2Record())
 	start := strings.Index(sys, "# wlans (radio)\n")
-	// FID-20: sshd rows follow the wireless block with no "# sshd" header
-	// row, so the block boundary is the first sshd row.
-	end := strings.Index(sys, "sshd.status=enabled\n")
+	// The wireless compound ends at the last dhcpc row; the factory-echo
+	// sections + sshd rows follow and are covered by the minimal-diff
+	// gate test, not this snapshot.
+	end := strings.Index(sys, "dhcpc.1.devname=br0\n")
+	if end >= 0 {
+		end += len("dhcpc.1.devname=br0\n")
+	}
 	if start < 0 || end <= start {
 		t.Fatalf("wireless block not found in system_cfg:\n%s", sys)
 	}
@@ -1064,11 +1075,36 @@ func TestWorkedExampleWirelessSystemCfg(t *testing.T) {
 		"bridge.2.port.3.devname=ath1",
 		"# netconf",
 		"netconf.status=enabled",
-		"netconf.1.devname=br0.42",
-		"netconf.1.ip=0.0.0.0",
 		"netconf.1.autoip.status=disabled",
-		"netconf.1.promisc=enabled",
+		"netconf.1.devname=br0",
+		"netconf.1.ip=192.168.1.20",
+		"netconf.1.netmask=255.255.255.0",
+		"netconf.1.status=enabled",
 		"netconf.1.up=enabled",
+		"netconf.2.autoip.status=disabled",
+		"netconf.2.devname=eth0",
+		"netconf.2.ip=0.0.0.0",
+		"netconf.2.promisc=enabled",
+		"netconf.2.status=enabled",
+		"netconf.2.up=enabled",
+		"netconf.3.autoip.status=disabled",
+		"netconf.3.devname=ath0",
+		"netconf.3.ip=0.0.0.0",
+		"netconf.3.promisc=enabled",
+		"netconf.3.status=enabled",
+		"netconf.3.up=disabled",
+		"netconf.4.autoip.status=disabled",
+		"netconf.4.devname=ath1",
+		"netconf.4.ip=0.0.0.0",
+		"netconf.4.promisc=enabled",
+		"netconf.4.status=enabled",
+		"netconf.4.up=disabled",
+		"netconf.5.status=enabled",
+		"netconf.5.devname=br0.42",
+		"netconf.5.ip=0.0.0.0",
+		"netconf.5.autoip.status=disabled",
+		"netconf.5.promisc=enabled",
+		"netconf.5.up=enabled",
 		"# dhcpc",
 		"dhcpc.status=enabled",
 		"dhcpc.1.status=enabled",
@@ -1139,7 +1175,10 @@ func TestWpaEapWirelessMinimal(t *testing.T) {
 // on; with no tagged WLAN the vlan table is empty → vlan.status=disabled
 // (classic writer: ports×vids empty ⇒ disabled) while the mgmt bridge row
 // keeps bridge.status=enabled, and netconf/dhcpc carry their unconditional
-// status rows with zero tagged rows.
+// status rows. netconf.1 is the mgmt instance (factory echo
+// 192.168.1.20/24 — the mcad validator REQUIRES netconf.1.status, so it
+// is emitted even with zero tagged rows); the eth/ath base inventory
+// follows (2=eth0, 3/4=ath0/ath1), tagged instances would start at 5.
 func TestVlanWiringStatusRowsAlwaysOn(t *testing.T) {
 	env := []Wlan{{Name: "net", SSID: "net", Security: "wpa-p",
 		Passphrase: "correcthorse", Enabled: true}} // untagged only
@@ -1148,18 +1187,90 @@ func TestVlanWiringStatusRowsAlwaysOn(t *testing.T) {
 	for _, want := range []string{
 		"# vlan\nvlan.status=disabled\n",
 		"bridge.status=enabled\nbridge.1.devname=br0\n",
-		"# netconf\nnetconf.status=enabled\n",
+		"# netconf\nnetconf.status=enabled\n" +
+			"netconf.1.autoip.status=disabled\nnetconf.1.devname=br0\n" +
+			"netconf.1.ip=192.168.1.20\nnetconf.1.netmask=255.255.255.0\n" +
+			"netconf.1.status=enabled\nnetconf.1.up=enabled\n" +
+			"netconf.2.autoip.status=disabled\nnetconf.2.devname=eth0\n" +
+			"netconf.2.ip=0.0.0.0\nnetconf.2.promisc=enabled\n" +
+			"netconf.2.status=enabled\nnetconf.2.up=enabled\n" +
+			"netconf.3.autoip.status=disabled\nnetconf.3.devname=ath0\n" +
+			"netconf.3.ip=0.0.0.0\nnetconf.3.promisc=enabled\n" +
+			"netconf.3.status=enabled\nnetconf.3.up=disabled\n" +
+			"netconf.4.autoip.status=disabled\nnetconf.4.devname=ath1\n" +
+			"netconf.4.ip=0.0.0.0\nnetconf.4.promisc=enabled\n" +
+			"netconf.4.status=enabled\nnetconf.4.up=disabled\n",
 		"dhcpc.status=enabled\ndhcpc.1.status=enabled\ndhcpc.1.devname=br0\n",
 	} {
 		if !strings.Contains(sys, want) {
 			t.Fatalf("status wiring missing %q in:\n%s", want, sys)
 		}
 	}
-	for _, wrong := range []string{"vlan.1.", "netconf.1.", "bridge.2."} {
+	for _, wrong := range []string{"vlan.1.", "netconf.5.", "bridge.2."} {
 		if strings.Contains(sys, wrong) {
 			t.Fatalf("no-tagged-wlans build must not emit %q rows:\n%s", wrong, sys)
 		}
 	}
+}
+
+// Regression gate for the mcad validator keys (the root-cause fix behind
+// the netconf.1 emission in emitNetconfSection): the AP firmware's mcad
+// daemon (fw 6.8.2.15592, Ghidra 0x0040a924 renamed
+// mcad_validate_system_cfg) hard-rejects any system_cfg whose parsed tree
+// lacks `users.1.status`, `netconf.1.status` or `sshd.status` — it logs
+// "[apply-config] Unable to write system.cfg or its contents are invalid."
+// and apply-config never runs (live-observed 2026-09-16;
+// docs/AP-FIRMWARE-APPLY-PATH.md §3). Every system_cfg generation path
+// must carry all three gate rows, each exactly once, with their emitted
+// values.
+//
+// Covered paths: (a) the worked-example device with radios + WLANs
+// (full wireless compound) and (b) the no-radio early-return variant
+// (u7pg2Record minus radio_table) — the path that now calls
+// emitNetconfSection with empty vids. Both generate through
+// buildSystemCfg/buildGeneratedSystemCfg (via mustBuildSys); the
+// fail-closed U7PG2 gate error path never reaches emission, so there is
+// nothing to cover there.
+func TestSystemCfgMcadValidatorGateKeysPresent(t *testing.T) {
+	gateRows := []string{
+		"users.1.status=enabled\n",
+		"netconf.1.status=enabled\n",
+		"sshd.status=enabled\n",
+	}
+	// Both cases carry no mgmt facts, so netconf.1 is the factory-echo
+	// mgmt instance (the eth/ath base inventory follows; tagged
+	// instances would start past the base inventory).
+	netconfDefault := "# netconf\nnetconf.status=enabled\n" +
+		"netconf.1.autoip.status=disabled\nnetconf.1.devname=br0\n" +
+		"netconf.1.ip=192.168.1.20\nnetconf.1.netmask=255.255.255.0\n" +
+		"netconf.1.status=enabled\nnetconf.1.up=enabled\n"
+
+	assertGate := func(label, sys string) {
+		t.Helper()
+		for _, row := range gateRows {
+			if n := strings.Count(sys, row); n != 1 {
+				t.Fatalf("%s: mcad gate row %q emitted %d times, want exactly 1:\n%s", label, row, n, sys)
+			}
+		}
+		if !strings.Contains(sys, netconfDefault) {
+			t.Fatalf("%s: factory-echo netconf.1 block missing:\n%s", label, sys)
+		}
+	}
+
+	// (a) radios + WLANs: the full worked-example generation path.
+	s := New(Config{WirelessSource: func() []Wlan { return workedEnvelope() }}, store.NewMemStore(), testLogger())
+	assertGate("with-radios", mustBuildSys(t, s, u7pg2Record()))
+
+	// (b) no radio_table: the "no wlan provisioned" early-return path
+	// still emits the netconf section (empty vids).
+	rec := u7pg2Record()
+	delete(rec.Extra, "radio_table")
+	s2 := New(Config{WirelessSource: func() []Wlan { return workedEnvelope() }}, store.NewMemStore(), testLogger())
+	sys2 := mustBuildSys(t, s2, rec)
+	if want := "# no wlan provisioned as no radio found\nradio.status=disabled\n"; !strings.Contains(sys2, want) {
+		t.Fatalf("case (b) did not hit the no-radio variant:\n%s", sys2)
+	}
+	assertGate("no-radio", sys2)
 }
 
 // FID-15: aaa.<n>.status for open WLANs is gated on the RECORD's wifi_caps
@@ -1414,6 +1525,41 @@ func radioBody(appliedCfg string) map[string]any {
 	return jm
 }
 
+// runningVAPs builds firmware-shaped vap_table entries for the worked
+// example: one entry per enabled WLAN per worked-example radio (every
+// caller seeds fixtures from u7pg2Record, whose radio_table names are
+// ra0/rai0). Keys are FIRMWARE-VERIFIED — mcad FUN_0041cecc;
+// docs/AP-FIRMWARE-APPLY-PATH.md, corroborated by the live log
+// "vap_table reports state RUN" (docs/PROTOCOL.md:388): essid/state/
+// radio_name/name (the old ssid/status/parent spellings were synthetic
+// fixture inventions that hid the settle break; pending capture
+// cross-check).
+func runningVAPs(wlans []Wlan) []any {
+	return vapTable(wlans, "ra0", "rai0")
+}
+
+// vapTable is runningVAPs with an explicit radio set, so tests can exercise
+// wrong-radio confirmation attempts.
+func vapTable(wlans []Wlan, radios ...string) []any {
+	var out []any
+	ath := 0
+	for _, w := range wlans {
+		if !w.Enabled {
+			continue
+		}
+		for _, r := range radios {
+			out = append(out, map[string]any{
+				"essid":      w.SSID,
+				"state":      "RUN",
+				"radio_name": r,
+				"name":       "ath" + strconv.Itoa(ath),
+			})
+			ath++
+		}
+	}
+	return out
+}
+
 // systemCfgUsersPassword extracts the users.1.password value.
 func systemCfgUsersPassword(t *testing.T, sys string) string {
 	t.Helper()
@@ -1473,8 +1619,8 @@ func TestWirelessDriftFSM(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantHash := wlanListHash(env)
-	if rec.Extra["wlan_cfg_sha"] != wantHash {
-		t.Fatalf("wlan_cfg_sha = %v, want %q", rec.Extra["wlan_cfg_sha"], wantHash)
+	if rec.Extra["wlan_cfg_pending_sha"] != wantHash {
+		t.Fatalf("wlan_cfg_pending_sha = %v, want %q", rec.Extra["wlan_cfg_pending_sha"], wantHash)
 	}
 	cached, _ := rec.Extra["ssh_sha512passwd"].(string)
 	if !sha512BodyRx.MatchString(cached) {
@@ -1482,7 +1628,9 @@ func TestWirelessDriftFSM(t *testing.T) {
 	}
 
 	// inform#2: applied matches, envelope unchanged → noop.
-	body = encryptCBC(t, mustJSON(t, radioBody(rec.CfgVersion)), hexKey(t, xkey), testIV)
+	settle := radioBody(rec.CfgVersion)
+	settle["vap_table"] = runningVAPs(env)
+	body = encryptCBC(t, mustJSON(t, settle), hexKey(t, xkey), testIV)
 	resp = post(t, h, body)
 	_, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
 	if jm["_type"] != "noop" {
@@ -1502,8 +1650,8 @@ func TestWirelessDriftFSM(t *testing.T) {
 		t.Fatal(err)
 	}
 	newHash := wlanListHash(env)
-	if rec.Extra["wlan_cfg_sha"] != newHash {
-		t.Fatalf("hash not refreshed: %v want %q", rec.Extra["wlan_cfg_sha"], newHash)
+	if rec.Extra["wlan_cfg_pending_sha"] != newHash {
+		t.Fatalf("pending hash not refreshed: %v want %q", rec.Extra["wlan_cfg_pending_sha"], newHash)
 	}
 	if rec.CfgVersion == "aaaa" {
 		t.Fatal("CfgVersion not regenerated on wireless drift")
@@ -1516,11 +1664,13 @@ func TestWirelessDriftFSM(t *testing.T) {
 	}
 
 	// inform#4: re-apply new config → noop again.
-	body = encryptCBC(t, mustJSON(t, radioBody(rec.CfgVersion)), hexKey(t, xkey), testIV)
+	settle = radioBody(rec.CfgVersion)
+	settle["vap_table"] = runningVAPs(env)
+	body = encryptCBC(t, mustJSON(t, settle), hexKey(t, xkey), testIV)
 	resp = post(t, h, body)
 	_, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
 	if jm["_type"] != "noop" {
-		t.Fatalf("inform#4 type = %v, want noop", jm["_type"])
+		t.Fatalf("inform#4 type = %v, want noop after confirmation", jm["_type"])
 	}
 }
 
@@ -1617,15 +1767,277 @@ func TestAdoptionEchoThenEnvelopeDrift(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec.Extra["wlan_cfg_sha"] != wlanListHash(env) {
-		t.Fatalf("hash not refreshed after provisioning: %v", rec.Extra["wlan_cfg_sha"])
+	if rec.Extra["wlan_cfg_pending_sha"] != wlanListHash(env) {
+		t.Fatalf("pending hash not refreshed after provisioning: %v", rec.Extra["wlan_cfg_pending_sha"])
 	}
 
 	// inform#4: applied → connected noop again.
-	resp = post(t, h, encryptCBC(t, mustJSON(t, radioBody(rec.CfgVersion)), hexKey(t, xkey), testIV))
+	settle := radioBody(rec.CfgVersion)
+	settle["vap_table"] = runningVAPs(env)
+	resp = post(t, h, encryptCBC(t, mustJSON(t, settle), hexKey(t, xkey), testIV))
 	_, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
 	if jm["_type"] != "noop" {
 		t.Fatalf("inform#4 type = %v, want noop", jm["_type"])
+	}
+}
+
+// The ENCRYPTED transport (the only one a real U7PG2 uses) is also gated:
+// the unsupported-live-WLAN rejection lives in assignedKeyFlow (the single
+// emission point both transports share), so a drifted/adopted U7PG2 on
+// 6.8.2.15592 with a managed WLAN answers the inform with the typed 501 and
+// NEVER emits a system_cfg — and the record is not mutated by the gate.
+func TestEncryptedGateBlocksSystemCfg(t *testing.T) {
+	env := workedEnvelope()
+	st := store.NewMemStore()
+	xkey := "11112222333344445555666677778888"
+	if err := st.Put(store.Device{
+		MAC: testMAC, State: store.StateAdopted,
+		CfgVersion: "aaaa", AppliedCfg: "",
+		XAuthkey: xkey, Authkeys: []string{xkey}, Model: "U7PG2",
+		Extra: u7pg2Record().Extra,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h := wiredServer(t, func() []Wlan { return env }, st)
+
+	body := infoBody("")
+	body["version"] = "6.8.2.15592"
+	resp := post(t, h, encryptCBC(t, mustJSON(t, body), hexKey(t, xkey), testIV))
+	if resp.Code != http.StatusNotImplemented {
+		t.Fatalf("gated inform status = %d, want 501", resp.Code)
+	}
+	if strings.Contains(resp.Body.String(), "system_cfg") {
+		t.Fatalf("gated inform leaked system_cfg: %q", resp.Body.String())
+	}
+	rec, err := st.Get(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.State != store.StateAdopted || rec.CfgVersion != "aaaa" {
+		t.Fatalf("gate must not mutate the record: state=%d cfg=%q", rec.State, rec.CfgVersion)
+	}
+}
+
+// Firmware normalization (fix 2): the gate must fire on BOTH wire spellings
+// of the 6.8.2 build 15592 — the short form and the long BZ.qca956x form
+// (docs/PROTOCOL.md:374-375) — and must NOT fire for other firmware or
+// other models.
+func TestGateFirmwareForms(t *testing.T) {
+	env := workedEnvelope()
+	s := New(Config{WirelessSource: func() []Wlan { return env }}, store.NewMemStore(), testLogger())
+	cases := []struct {
+		model, fw string
+		want      bool
+	}{
+		{"U7PG2", "6.8.2.15592", true},
+		{"U7PG2", "BZ.qca956x_6.8.2+15592.260126.1358", true},
+		{"U7PG2", "6.6.55", false},
+		{"U7PG2", "", false},
+		{"U6LR", "6.8.2.15592", false},
+	}
+	for _, c := range cases {
+		got := s.rejectUnsupportedLiveWLAN(store.Device{Model: c.model, Firmware: c.fw}) != nil
+		if got != c.want {
+			t.Fatalf("gate(model=%q, fw=%q) = %v, want %v", c.model, c.fw, got, c.want)
+		}
+	}
+}
+
+// With the gate moved into assignedKeyFlow, a plaintext mgmt_cfg-only
+// re-send (XAuthkey mismatch → adoption push) from a gated device SUCCEEDS:
+// mgmt pushes keep working, only system_cfg emission is blocked.
+func TestPlainMgmtResendNotGated(t *testing.T) {
+	env := workedEnvelope()
+	st := store.NewMemStore()
+	rec := store.Device{
+		MAC: testMAC, State: store.StateAdopted,
+		CfgVersion: "aaaa", AppliedCfg: "aaaa",
+		XAuthkey: "22223333444455556666777788889999",
+		Authkeys: []string{"22223333444455556666777788889999"}, Model: "U7PG2",
+	}
+	if err := st.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	h := New(Config{WirelessSource: func() []Wlan { return env }, AllowPlainText: true}, st, testLogger()).InformHandler()
+
+	body := infoBody("aaaa")
+	body["version"] = "6.8.2.15592"
+	body["_authkey"] = "stale-claim" // ≠ rec.XAuthkey → re-send current assignment
+	resp := post(t, h, mustJSON(t, body))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("mgmt-only push from gated device: %d %q", resp.Code, resp.Body.String())
+	}
+	var jm map[string]any
+	if err := json.Unmarshal(resp.Body.Bytes(), &jm); err != nil {
+		t.Fatal(err)
+	}
+	if jm["_type"] != "setparam" {
+		t.Fatalf("mgmt re-send type = %v, want setparam (adoption push)", jm["_type"])
+	}
+	if _, has := jm["system_cfg"]; has {
+		t.Fatalf("mgmt-only push must not carry system_cfg: %v", jm)
+	}
+	if _, has := jm["mgmt_cfg"]; !has {
+		t.Fatalf("mgmt re-send missing mgmt_cfg: %v", jm)
+	}
+}
+
+// Settle FSM with firmware-shaped vap_table (fix 3): confirmation requires
+// every desired SSID RUN on its PLACED radio (placements survive absorption
+// via extraPrevWins). A wrong-radio VAP cannot settle the delivery — the
+// guarantee the pre-fix placements loss made dead — and exhausted attempts
+// flip wlan_cfg_delivery_status to "exhausted".
+func TestSettleFSMPlacementsAndExhaustion(t *testing.T) {
+	env := workedEnvelope()
+	xkey := "11112222333344445555666677778888"
+
+	// helper: provision once and return the handler-bound store state.
+	provision := func(t *testing.T, st store.DeviceStore) store.Device {
+		t.Helper()
+		h := wiredServer(t, func() []Wlan { return env }, st)
+		resp := post(t, h, encryptCBC(t, mustJSON(t, radioBody("")), hexKey(t, xkey), testIV))
+		if resp.Code != http.StatusOK {
+			t.Fatalf("inform#1: %d", resp.Code)
+		}
+		_, jm := decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
+		if jm["_type"] != "setparam" || jm["system_cfg"] == nil {
+			t.Fatalf("inform#1 type = %v, want setparam", jm["_type"])
+		}
+		rec, err := st.Get(testMAC)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rec.Extra["wlan_cfg_delivery_status"] != "pending" {
+			t.Fatalf("delivery_status = %v, want pending", rec.Extra["wlan_cfg_delivery_status"])
+		}
+		if rec.Extra["wlan_cfg_pending_placements"] == nil {
+			t.Fatal("pending placements not recorded at provisioning time")
+		}
+		return rec
+	}
+
+	t.Run("confirmed", func(t *testing.T) {
+		st := store.NewMemStore()
+		if err := st.Put(store.Device{
+			MAC: testMAC, State: store.StateAdopted,
+			CfgVersion: "aaaa", AppliedCfg: "",
+			XAuthkey: xkey, Authkeys: []string{xkey}, Model: "U7PG2",
+			Extra: u7pg2Record().Extra,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		rec := provision(t, st)
+		h := wiredServer(t, func() []Wlan { return env }, st)
+		settle := radioBody(rec.CfgVersion)
+		settle["vap_table"] = runningVAPs(env) // corp RUN on ra0 AND rai0
+		resp := post(t, h, encryptCBC(t, mustJSON(t, settle), hexKey(t, xkey), testIV))
+		if resp.Code != http.StatusOK {
+			t.Fatalf("settle inform: %d", resp.Code)
+		}
+		rec, err := st.Get(testMAC)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rec.Extra["wlan_cfg_delivery_status"] != "confirmed" {
+			t.Fatalf("delivery_status = %v, want confirmed", rec.Extra["wlan_cfg_delivery_status"])
+		}
+		if rec.Extra["wlan_cfg_pending_sha"] != nil {
+			t.Fatalf("pending sha not cleared on confirmation: %v", rec.Extra["wlan_cfg_pending_sha"])
+		}
+	})
+
+	t.Run("wrong-radio-no-settle", func(t *testing.T) {
+		st := store.NewMemStore()
+		if err := st.Put(store.Device{
+			MAC: testMAC, State: store.StateAdopted,
+			CfgVersion: "aaaa", AppliedCfg: "",
+			XAuthkey: xkey, Authkeys: []string{xkey}, Model: "U7PG2",
+			Extra: u7pg2Record().Extra,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		rec := provision(t, st)
+		h := wiredServer(t, func() []Wlan { return env }, st)
+		settle := radioBody(rec.CfgVersion)
+		// A RUN VAP on a radio that is NOT in the placement set (ra1 is
+		// neither worked-example radio) consumes no placement: need stays
+		// positive → no settle. (Pre-fix this settled anyway — the
+		// placements map never survived absorption, so the
+		// len(placements)==0 fallback decremented need by ANY RUN VAP.)
+		settle["vap_table"] = vapTable(env, "ra1")
+		resp := post(t, h, encryptCBC(t, mustJSON(t, settle), hexKey(t, xkey), testIV))
+		if resp.Code != http.StatusOK {
+			t.Fatalf("wrong-radio inform: %d", resp.Code)
+		}
+		rec, err := st.Get(testMAC)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rec.Extra["wlan_cfg_delivery_status"] != "pending" {
+			t.Fatalf("wrong-radio VAP must not settle: status = %v", rec.Extra["wlan_cfg_delivery_status"])
+		}
+		if rec.Extra["wlan_cfg_pending_sha"] == nil {
+			t.Fatal("pending sha dropped without confirmation")
+		}
+	})
+
+	t.Run("exhausted", func(t *testing.T) {
+		// The retry budget check itself (wlanRetryDue): a pending hash with
+		// the attempt counter at the cap flips the delivery status to
+		// "exhausted" and stops rate-limiting (next inform re-provisions).
+		rec := store.Device{Extra: store.JSONMap{
+			"wlan_cfg_pending_sha": wlanListHash(env),
+			"wlan_cfg_attempt_sha": wlanListHash(env),
+			"wlan_cfg_attempts":    wlanMaxAttempts,
+		}}
+		if due := wlanRetryDue(&rec, time.Now()); due {
+			t.Fatal("attempts at cap must not still be retry-due")
+		}
+		if rec.Extra["wlan_cfg_delivery_status"] != "exhausted" {
+			t.Fatalf("delivery_status = %v, want exhausted", rec.Extra["wlan_cfg_delivery_status"])
+		}
+	})
+}
+
+// Section head order (H12): `# unifi` < `# users` in the generated
+// config — the Contains loop in the drift test cannot catch a swap,
+// these index-of assertions can (int.txt:17208-17216; the `# system`
+// section is deliberately omitted: no site locale, factory baseline
+// carries no system rows).
+func TestSystemCfgSectionHeadOrder(t *testing.T) {
+	s := New(Config{}, store.NewMemStore(), testLogger())
+	sys := mustBuildSys(t, s, u7pg2Record())
+	prev := -1
+	for _, sec := range []string{"# unifi\n", "# users\n"} {
+		i := strings.Index(sys, sec)
+		if i < 0 || i < prev {
+			t.Fatalf("section head order broken (want %q after offset %d):\n%s", sec, prev, sys)
+		}
+		prev = i
+	}
+}
+
+// Multi-VLAN contiguous numbering (fix 3 netconf scope): tagged instances
+// number continuously past the factory base inventory (1=br0 mgmt,
+// 2=eth0, 3/4=ath0/ath1) — netconf.5/netconf.6 for vid 42/43, and the
+// `# vlan` table numbers its eth×vid rows from 1 the same way.
+func TestMultiVLANContiguousNumbering(t *testing.T) {
+	env := []Wlan{
+		{Name: "corp", SSID: "corp", Security: "wpa-p", Passphrase: "correcthorse", VLAN: 42, Enabled: true},
+		{Name: "iot", SSID: "iot", Security: "wpa-p", Passphrase: "correcthorse", VLAN: 43, Enabled: true},
+	}
+	s := New(Config{WirelessSource: func() []Wlan { return env }}, store.NewMemStore(), testLogger())
+	sys := mustBuildSys(t, s, u7pg2Record())
+	for _, want := range []string{
+		"netconf.1.devname=br0\n",
+		"netconf.5.status=enabled\nnetconf.5.devname=br0.42\n",
+		"netconf.6.status=enabled\nnetconf.6.devname=br0.43\n",
+		"vlan.1.devname=eth0\nvlan.1.id=42\n",
+		"vlan.2.devname=eth0\nvlan.2.id=43\n",
+	} {
+		if !strings.Contains(sys, want) {
+			t.Fatalf("multi-VLAN numbering pin missing %q in:\n%s", want, sys)
+		}
 	}
 }
 
@@ -1679,12 +2091,14 @@ func TestMissingBaselineForcesProvisioning(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec.Extra["wlan_cfg_sha"] != wlanListHash(env) {
-		t.Fatalf("baseline not captured by forced provisioning: %v", rec.Extra["wlan_cfg_sha"])
+	if rec.Extra["wlan_cfg_pending_sha"] != wlanListHash(env) {
+		t.Fatalf("baseline not left pending before runtime proof: %v", rec.Extra["wlan_cfg_pending_sha"])
 	}
 
 	// inform#3: applied → plain connected noop (no further forcing).
-	resp = post(t, h, encryptCBC(t, mustJSON(t, radioBody(rec.CfgVersion)), hexKey(t, xkey), testIV))
+	settle := radioBody(rec.CfgVersion)
+	settle["vap_table"] = runningVAPs(env)
+	resp = post(t, h, encryptCBC(t, mustJSON(t, settle), hexKey(t, xkey), testIV))
 	_, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
 	if jm["_type"] != "noop" {
 		t.Fatalf("inform#3 type = %v, want noop", jm["_type"])
@@ -1733,7 +2147,7 @@ func (f *failingStore) UpdateExisting(mac string, fn func(*store.Device) error) 
 // jar answers an unknown MAC with the ÖoÓ000 marker → servlet 404.
 func TestInformVanishedMACRecord404(t *testing.T) {
 	st := &failingStore{DeviceStore: store.NewMemStore(), goneUpdate: true}
-	if err := st.DeviceStore.Put(store.Device{MAC: testMAC, State: store.StatePending}); err != nil {
+	if err := st.Put(store.Device{MAC: testMAC, State: store.StatePending}); err != nil {
 		t.Fatal(err)
 	}
 	h := New(Config{}, st, testLogger()).InformHandler()
@@ -1775,7 +2189,7 @@ func TestStoreGetErrorNoop(t *testing.T) {
 // per-device key was already established by the successful decryption.
 func TestStorePutErrorNoop(t *testing.T) {
 	st := &failingStore{DeviceStore: store.NewMemStore(), failUpdate: true}
-	if err := st.DeviceStore.Put(store.Device{MAC: testMAC, State: store.StatePending}); err != nil {
+	if err := st.Put(store.Device{MAC: testMAC, State: store.StatePending}); err != nil {
 		t.Fatal(err)
 	}
 	s := New(Config{}, st, testLogger())
@@ -2218,7 +2632,6 @@ func TestDiscoveryMarkPendingNote(t *testing.T) {
 // 0x0009, dataVersion untouched 1) that decrypts under the RESPONSE's own
 // header AAD rule.
 func TestGCMAdoptionMatrix(t *testing.T) {
-	const xk = "11112222333344445555666677778888"
 	for _, family := range []struct {
 		name      string
 		req       func(t *testing.T, plain []byte, key []byte) []byte
@@ -2261,7 +2674,7 @@ func TestGCMAdoptionMatrix(t *testing.T) {
 			if resp.Code != http.StatusOK {
 				t.Fatalf("inform#2: %d", resp.Code)
 			}
-			flags, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
+			_, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
 			if jm["_type"] != "noop" || flags != family.wantFlags {
 				t.Fatalf("inform#2 type=%v flags=%04x want noop/%04x", jm["_type"], flags, family.wantFlags)
 			}
@@ -2273,7 +2686,7 @@ func TestGCMAdoptionMatrix(t *testing.T) {
 			// inform#3: cfgversion drift on the assigned key → full provisioning.
 			body = family.req(t, mustJSON(t, radioBody("bogus-drift")), hexKey(t, xkey))
 			resp = post(t, h, body)
-			flags, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
+			_, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
 			if jm["_type"] != "setparam" || jm["system_cfg"] == nil {
 				t.Fatalf("inform#3 type = %v, want full provisioning", jm["_type"])
 			}
@@ -2448,8 +2861,6 @@ func TestUsers1PasswordIdenticalAcrossProvisionings(t *testing.T) {
 			}
 			// admin changes the envelope → drift bump → full provisioning again.
 			env[0].SSID = "net" + strconv.Itoa(i)
-		} else {
-			// initial: AppliedCfg mismatch triggers provisioning.
 		}
 		resp := post(t, h, encryptCBC(t, mustJSON(t, infoBody("zzz-drift")), hexKey(t, xk), testIV))
 		if resp.Code != http.StatusOK {
@@ -2690,6 +3101,23 @@ func TestSystemCfgIdentityRows(t *testing.T) {
 		if !strings.Contains(sys, want) {
 			t.Fatalf("missing %q in:\n%s", want, sys)
 		}
+	}
+	// String.txt:1851-1897 pair array row order: anonymous_site_id BEFORE
+	// reporterid (reporterid was emitted before anonymous_site_id until the
+	// order was verified against the decompiled builder).
+	ordered := []string{
+		"unifi.anonymous_controller_id=anonctrlid42\n",
+		"unifi.anonymous_site_id=anonsiteid42\n",
+		"unifi.reporterid=anonctrlid42\n",
+		"unifi.siteid=default\n",
+	}
+	last := 0
+	for _, w := range ordered {
+		i := strings.Index(sys, w)
+		if i < 0 || i < last {
+			t.Fatalf("unifi row order broken (want %q after offset %d):\n%s", w, last, sys)
+		}
+		last = i + len(w)
 	}
 
 	rec = u7pg2Record()

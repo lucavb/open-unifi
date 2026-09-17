@@ -225,12 +225,16 @@ device records (max_pending devices), optionally replies like O0oO does (mac+ip,
 21/22/23 TLVs). Adoption primarily happens via SSH set-inform; discovery UI shows
 candidates.
 
-## 5. Config blobs (`mgmt_cfg` / `system_cfg`) — RESOLVED
+## 5. Config blobs (`mgmt_cfg` / `system_cfg`) — WLAN GATED
+
+Live WLAN provisioning is unsupported pending an official-controller
+differential fixture. U7PG2 firmware 6.8.2.15592 with any nonempty managed
+WLAN is rejected with a typed status and no `system_cfg`.
 
 - `mgmt_cfg`: 10-line text blob (exact line order + the conditional `authkey=` rule):
   **PROTOCOL-mgmt.md §2** (bytecode-cited from the B-writer decompile). Historical
   `unifi.*`-prefixed spellings are superseded.
-- `system_cfg`: full AP system config text — sections `# system`, `# unifi`, `# users`,
+- `system_cfg`: full AP system config text — sections `# unifi`, `# system`, `# users`,
   the wireless compound (`# wlans (radio)`, `radio.<n>.*`, `aaa.<n>.*`,
   `wireless.<n>.*`, `# vlan`, `# bridge`, `# netconf`, `# dhcpc`), `# sshd`, `# misc`:
   **PROTOCOL-mgmt.md §3** for the frame and **PROTOCOL-systemcfg-wireless.md** for the
@@ -290,7 +294,9 @@ only `/` (web console) and `/healthz` stay open. Terraform provider uses this.
 Web UI (lane D): static page at `/`:
 - list of devices & pending adopters,
 - `Adopt` button → POST /pending/{mac}/adopt,
-- textarea/dropdowns for: SSID name, passphrase, security (open/wpa-p/wpa-eap),
+- textarea/dropdowns for: SSID name, passphrase, security (open/wpa-p). WPA-EAP/
+  RADIUS is unsupported and a non-goal for this release; it is not part of the
+  open-unifi control-plane contract.
   VLAN id; save → PUT /api/v1/wireless (whole-document envelope, adminapi shape).
 
 Package `provider` (lane E, at provider/ dir + cmd/tfprovider):

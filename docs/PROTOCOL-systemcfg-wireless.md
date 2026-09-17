@@ -1,5 +1,17 @@
 # PROTOCOL-systemcfg-wireless — `radio.*` / `aaa.*` / `wireless.*` schema for a classic Atheros AP (U7PG2)
 
+> **Open-unifi implementation note (experimental):** open-unifi emits a full
+> synthetic `radio.*`/`aaa.*`/`wireless.*` block for the accepted U7PG2
+> 6.8.2.15592 baseline, per the emitter contract in §2-§7 below (multiple
+> WLANs, both bands, tagged VLANs). The actual safety mechanism for live
+> delivery is the fail-closed gate that rejects ANY nonempty managed WLAN for
+> this model + firmware with a typed status and no `system_cfg` emission
+> (see `docs/PROTOCOL.md`); it remains gated pending live validation.
+> This is experimental pending live proof. (An earlier revision of this
+> banner described a one-WLAN/2 GHz/VLAN-1 design sketch that patches the
+> existing `ath0`/`wifi0` user-VAP slot — that was never implemented and has
+> been dropped.)
+
 Resolves UNRESOLVED item #1 of `docs/PROTOCOL-mgmt.md` §9 ("exact `wireless.<n>` line set").
 Complements `docs/PROTOCOL-mgmt.md` §3 (where this block sits inside `system_cfg`)
 and `docs/PROTOCOL.md` §5 (transport). Ground truth = CFR 0.152 decompiles of
@@ -233,7 +245,12 @@ Open+WPA3 transitional adds the `wpa3.support/transition` writer call
 (`this.\u00d8\u00f40000.o00000(sb, wlanConf, "aaa."+n, legacyEnabled)` §589-591).
 No `wpa.*` lines in this branch.
 
-### 4.3 WPA-PSK / WPA-EAP branch (int §595-612)
+### 4.3 WPA-PSK branch (int §595-612)
+
+The WPA-EAP/RADIUS material below is retained as a forensic record of the
+classic controller's writer, not as an open-unifi capability. WPA-EAP/RADIUS
+is unsupported and explicitly out of scope for this release: the current
+control plane does not expose or emit it.
 Fixed block (§597, one `C.o00000` call with pairs → each pair becomes one row):
 ```
 aaa.<n>.br.devname=…        aaa.<n>.devname=ath<X>       aaa.<n>.driver=madwifi
@@ -269,7 +286,8 @@ WPA3/SAE variant adds: `wpa.key.1.mgmt=SAE`, `wpa3.support/transition` rows and
 per-PSK entries via `config/B/O0OO` (`sae.sync`, `sae.groups.<i>.group`,
 `sae.psk.<i>.psk/.mac/.vlan/.id`) — cited, not part of the MVP contract.
 
-**WPA-Enterprise (`wpaeap` / `osen`)** — int §775-789, RADIUS helper §791-840:
+**Historical classic-controller WPA-Enterprise (`wpaeap` / `osen`)** — int
+§775-789, RADIUS helper §791-840. This is not a supported open-unifi option:
 ```
 aaa.<n>.wpa.key.1.mgmt=WPA-EAP               (OSEN → "OSEN")
 aaa.<n>.wpa.psk=<x_passphrase>               (same fallback "letmeinnow"!) + auth_cache=enabled|disabled
@@ -387,7 +405,7 @@ counter with `wireless.<n>`):
 |---|---|---|
 | `# vlan` | `vlan.<i>.devname=<eth iface>`, `vlan.<i>.id=<vid>` — nested (vlanIds × ethIfaces) loops | config_String §429-443 |
 | `# bridge` | `bridge.<j>.devname=br0.<vid>`, `.fd=1`, `.stp.status=disabled`, `bridge.<j>.port.<k>.devname=ath<X>` | config_String §494-515 |
-| `# netconf` | `netconf.<l>` for each bridge iface: `devname=br0.<vid>, ip=0.0.0.0, autoip.status=disabled, netmask=<unset>, promisc=enabled, up=enabled` | config_String §551-593 |
+| `# netconf` | `netconf.<l>` per netconf-inventory instance (instance skipped when `name` is null): `status=enabled` (literal, FIRST row), `devname=<name>`, `ip=<ip, default 0.0.0.0>`, `autoip.status=disabled` (literal), `netmask=<null-filtered>`, `promisc=<null-filtered lookup>`, `up=<up, default enabled>` | config_String §551-593 (javap offsets 4694-4764) |
 | `# dhcpc` | guest wlan on a tagged bridge: `dhcpc.<m>.status=enabled, .ip_only=true, .devname=br0.<vid>` | config/B/P §29-45 |
 | `aaa.<n>.br.devname` | = br_name of the bridge containing the athdev (search §556-561), fallback literal "br0" | int §555-561 |
 
@@ -539,11 +557,15 @@ bridge.2.port.1.devname=ath0
 bridge.2.port.2.devname=ath1
 
 # netconf (excerpt only; full inventory includes eth0 ip, br0, br0.42 …)
+# (row order per config_String §551-593 / javap 4694-4764: status is a literal
+#  "enabled" and always the FIRST row of the instance; netmask and promisc are
+#  null-filtered lookups; ip defaults to 0.0.0.0, up defaults to enabled.)
+netconf.<k>.status=enabled
 netconf.<k>.devname=br0.42
 netconf.<k>.ip=0.0.0.0
 netconf.<k>.autoip.status=disabled
 netconf.<k>.netmask=<null-filtered>
-netconf.<k>.promisc=enabled
+netconf.<k>.promisc=<null-filtered; promisc bridges carry enabled>
 netconf.<k>.up=enabled
 
 # dhcpc — the `# dhcpc` header + `dhcpc.status=enabled` are ALWAYS emitted
@@ -571,9 +593,9 @@ dhcpc.1.devname=<getMgmtDev() of the device>
 | `name` | `name` (same value used for `ssid`) | `wireless.<n>.name`/`ssid`, `aaa.<n>.ssid` |
 | `security=open` | `security=open` | NO `aaa.<n>.wpa.*`; `wireless.<n>.authmode=0`, `security=none`; `aaa.<n>.status` = enabled iff device `wifi_caps` bit `0x2000` (`supportOpenHostapd`, Device.java §1275 & §1247) — **device-record dependent; check per adopter** |
 | `security=wpa-p` | `security=wpapsk` (wpa_mode AUTO→3, wpa_enc AUTO→CCMP) | `aaa.<n>.wpa=3` (AUTO; jar truth — WPA1=1/WPA2=2/AUTO=3, WpaMode static-init `WpaMode.txt:197-211`), `.eapol_version=2`, `.wpa.key.1.mgmt=WPA-PSK`, `.wpa.psk=<passphrase>` (plaintext), `.wpa.1.pairwise=CCMP`, `.pmf.cipher=AES-128-CMAC`, `.wpa.group_rekey=3600`, `wireless.<n>.authmode=1`, `security=none` |
-| `security=wpa-eap` | `security=wpaeap` | `wpa.key.1.mgmt=WPA-EAP` + `wpa.psk` (⚠ same fallback "letmeinnow" if not set) + `radius.auth.<i>.{ip,port,secret}` + `dynamic_vlan=0` + `auth_cache=enabled`; acct servers need the RADIUS profile (int §1401-1405 copyAttrsIfPresent) |
+| `security=wpa-eap` | — | **Unsupported/non-goal for this release.** WPA-EAP/RADIUS is not part of the open-unifi API or control-plane contract. The classic-controller mapping is retained only in §4.3 as forensic history. |
 | `passphrase` | `x_passphrase` (fallback literal `"letmeinnow"`) | `aaa.<n>.wpa.psk` verbatim — **never hashed/obfuscated on this writer** |
-| `vlan=<vid>` | `vlan` (or bound `networkconf_id`) | new `br0.<vid>`: `# vlan` row(s), `# bridge` row + `port.*.devname=ath…`, `# netconf` row, `aaa.<n>.br.devname=br0.<vid>`; guard `vid != 1` (else br-trunk). For EAP: `aaa.<n>.dynamic_vlan=1|2` + DAS/DAD rows (optional) |
+| `vlan=<vid>` | `vlan` (or bound `networkconf_id`) | new `br0.<vid>`: `# vlan` row(s), `# bridge` row + `port.*.devname=ath…`, `# netconf` row, `aaa.<n>.br.devname=br0.<vid>`; guard `vid != 1` (else br-trunk). The historical EAP dynamic-VLAN/DAS/DAD behavior is not supported by the current control plane. |
 | `vlan` absent/0 | – | `aaa.<n>.br.devname=br0`; no `# vlan`/bridge additions; (device mgmt-network overridden → joins br-trunk, §6) |
 | `enabled=false` | `enabled` | **entire WLAN omitted** (F.super return null ⇒ no vap, no bridge membership, no dhcpc row) |
 | `enabled=true` | `enabled` | vap + all rows above with `wireless.<n>.status=enabled` (literal) |
@@ -759,7 +781,63 @@ matches site mgmt setting:
 fallback (no fw_caps bit, non-AP fw): "$1$" 8 char alpha salt… or 13-char DES for pre-SSH devices.
 ```
 First fix-7 assumption ("plain hex SHA-512") is **wrong in format but identical in
-spirit**: both are SHA-512-based, but the wire format is glibc `$6$salt$hash`.
+spirit**: both are SHA-512-based, but the wire format is glibc `$6$salt$hash`. 
+
+## 11. Firmware-side acceptance gate — mcad (live-confirmed 2026-09-16)
+
+The AP does not blindly apply the `system_cfg` it receives: the inform-reporting
+daemon `mcad` (`/usr/bin/mcad`, U7PG2 fw 6.8.2.15592) runs a VALIDATION GATE
+before promoting the file (reverse-engineered in Ghidra; full record:
+docs/AP-FIRMWARE-APPLY-PATH.md).
+
+* Response dispatch (`ace_reporter.reporter_handle_response_json`, 0x00414acc):
+  `mgmt_cfg` is written RAW to `/tmp/setmgmt.cfg` and parsed for
+  `stun_url`/`mgmt_url`/`authkey`/`cfgversion` (echoed back) — **no validation**.
+  `blocked_sta` is written raw and applied via `syswrapper_impl("apply-blocked-sta")`.
+* `system_cfg` goes through a VALIDATED write (0x0040aaa8 → 0x0040a97c →
+  0x0040a924): content is staged to `/tmp/system.cfg.tmp`, parsed with the external
+  `libubnt parse()`, and accepted ONLY if the parsed tree contains ALL of
+  * `users.1.status`
+  * `netconf.1.status`
+  * `sshd.status`
+  On success: rename to `/tmp/system.cfg`, mcad logs `[setparam] applying new
+  system.cfg` and calls `syswrapper_impl("apply-config", "/tmp/system.cfg")`.
+  On ANY failure: the tmp file is unlinked, mcad logs `[apply-config] Unable to
+  write system.cfg or its contents are invalid.`, dumps the whole response to
+  `/etc/persistent/bad-response.json` (re-serialized pretty JSON — not the
+  original bytes), and **apply-config never runs**.
+
+⇒ Generator contract: every emitted `system_cfg` must contain `users.1.status`,
+`netconf.1.status` and `sshd.status`. In particular `netconf.1` must ALWAYS exist
+with its `status` row — the "omit mgmt netconf rows" shortcut is a guaranteed
+firmware rejection behind a misleading "contents are invalid" log line.
+(Live-observed 2026-09-16: every generated `system_cfg` push was rejected with
+exactly that log until `netconf.1.status` was emitted; `mgmt_cfg` pushes applied
+throughout because that path is unvalidated.)
+
+## 12. Known deviations from the real builder (accepted, 2026-09-16)
+
+A full javap↔generator diff was performed against the real builder bytecode.
+All per-object `.status` rows the real builder emits are present in ours (the
+earlier suspicion of missing `radio.<n>.status`/`aaa.<n>.status`/
+`wireless.<n>.status` rows is NOT supported by the bytecode). The head section
+order (`# unifi` → `# system` → `# users`), the unifi pair order, `unifi.idp`
+and `unifi.cfgcap_info` match the bytecode (int.txt:17208-17221,
+String.txt:1851-1930, int.txt:16600-16630). Remaining accepted deviations:
+
+| deviation | real builder | ours | rationale |
+|---|---|---|---|
+| `system.timezone`/`locale.timezone` | both rows skipped when the site locale is absent | always emitted with the default tz | parse() tolerates both shapes; real site configs carry a locale; not a mcad gate key |
+| `bridge.status` | `disabled` when the bridge list is empty | always `enabled` | we always emit at least br0, so the real writer would emit enabled too |
+| `radio.<n>.mode` | `managed` iff `create_vport`, else `master` | literal `master` | AP VAPs are masters in every default site shape |
+| `aaa.<n>.verbose` | `4` when debug logging, else `2` | literal `2` | matches the non-debug default |
+| `wireless.<n>.parent` | `wlan.getString("parent", flag?"wifi0":"eth1")` | radio-table `name` | real reads the Wlan bean's stored parent (same value on this hardware); the wifi0/eth1 fallback never applies for AP WLANs |
+| `unifi.version` value | controller version string | `0.1.0-dev` placeholder | controller identity question, tracked separately |
+| `unifi.idp` | jar default **enabled** (`Setting.is("unifi_idp_enabled", true)`, String.txt:1899-1902): emits `unifi.idp=enabled` plus `unifi.mcip=239.254.127.63` and `unifi.key=<mgmt x_mgmt_key>` rows | `unifi.idp=disabled`; no `unifi.mcip`/`unifi.key` rows | deliberate — open-unifi has no IDP feature; the AP-side validator ignores `unifi.*` rows |
+| `unifi.cfgcap_info` value | version-derived bitmask (≤2.x→0x0, 3.0-3.2→0x3, 3.3+→0x7; int.txt:5332-5387) | literal `0x7` | running the algorithm on our `0.1.0-dev` placeholder would emit `0x0` and zero the AP plugin layer's capability gating (ubntconf `get_uint32` default 0); `0x7` is what every controller this firmware has paired with emits |
+| `# mgmt` ledbar block | emitted headerless between `# users` and `# wlans` (String.txt:2566-2745) | omitted | ledbar falls back to firmware defaults; revisit if LED behavior ever matters |
+| dhcpc guest `ip_only` rows, `system.analytics.status`, `system.resetbtn`, `system.monitor.memory.threshold`, `aaa.<n>.radius.macacl.emptypassword`/`.format`, `wireless.<n>.mgmt_rate`/`bcast.enhance` | condition-gated | omitted at defaults | feature-gated rows that do not affect VAP bring-up; add when the corresponding admin features exist |
+| `vlan.<n>.status` per-row | only in the `intsuper` bean; ABSENT on the AP `int` path | correctly absent | javap: `int extends String` inherits String's vlan writer (no per-row status); intsuper's extra row is not the AP path |
 
 (End; see PROTOCOL-mgmt.md §3 for the surrounding `system_cfg` order and §6/§7 of
 PROTOCOL-mgmt.md for how system_cfg reaches the device.)

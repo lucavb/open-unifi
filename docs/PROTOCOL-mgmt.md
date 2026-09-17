@@ -168,12 +168,15 @@ hostname ‖ device.inform_url host ‖ device IP; see L decompile §112-133.)
 
 `nullsuper.\u00f5o0000(Device)` → `bean.\u00d300000(Device)` → `int.\u00d300000(Device)`
 (config_int.java §1878-2019). Shape: `new StringBuilder(8192)`, sections appended in
-this order for a non-Element AP (`device.isElementDevice()` false → else-branch):
+this order for a non-Element AP (`device.isElementDevice()` false → else-branch;
+head order verified at javap int.txt:17208-17221 — the unifi writer
+`Ó00000(sb,Device,Setting)` runs FIRST, then `class(sb,Device)`, then
+`Ó00000(sb,Device)`, then the headerless ledbar `Ò00000(sb,Device,Setting)`):
 
-1. `# system` — `system.analytics.status`, `system.monitor.memory.threshold=90` (U6-LCM models), `system.timezone`/`locale.timezone`, `system.resetbtn` (config_String §147-172)
-2. `# unifi` — `unifi.version=<ctrl version>`, `unifi.anonymous_controller_id`, `unifi.anonymous_site_id`, `...reporterid`, `...siteid`, `unifi.idp`, `unifi.mcip=239.254.127.63`, `unifi.key=<mgmt x_mgmt_key>`, `mgmt.ubic.env` (config_String §184-197); + `unifi.cfgcap_info=0x...` (int §1822-1826)
+1. `# unifi` — `unifi.version=<ctrl version>`, `unifi.anonymous_controller_id`, `unifi.anonymous_site_id`, `...reporterid`, `...siteid`, `unifi.idp` (setting `unifi_idp_enabled`, jar default **enabled** — `Setting.is("unifi_idp_enabled", true)`, javap String.txt:1899-1902), then idp-gated rows emitted only when enabled: `unifi.mcip=239.254.127.63`, `unifi.key=<mgmt x_mgmt_key>`, `mgmt.ubic.env` (config_String §184-197; pair order at String.txt:1851-1930); + `unifi.cfgcap_info=0x<mask>` appended by the `int` override (javap int.txt:16600-16630) — mask derived from the controller version (`int.Ô00000()I`, int.txt:5332-5387): ≤2.x → `0x0`, v3.0-3.2 → `0x3`, v3.3+/v4+ → `0x7`. open-unifi deliberately emits `unifi.idp=disabled` (no IDP feature); see §12 of PROTOCOL-systemcfg-wireless.md
+2. `# system` — `system.analytics.status`, `system.monitor.memory.threshold=90` (U6-LCM models), `system.timezone`/`locale.timezone` (both skipped when the site locale is absent), `system.resetbtn` (config_String §147-172)
 3. `# users` — `users.status=enabled`, `users.1` (name=`L.\u00f400000(device)`=`ubnt`, password = sha-512 (`\u00d4O0000`) or md5 (`\u00f500000`) of site `mgmt.x_ssh_password` default `ubnt`, or `\u00d800000` crypted variant), `users.2=nobody`
-4. `# mgmt`-related device overrides (`\u00d200000(StringBuilder,Device,Setting)`, config_String via super)
+4. `# mgmt` ledbar block — HEADERLESS (no `#` row): `ledbar.status`, `ledbar.persistent`, `ledbar.brightness`, `ledbar.active`, `ledbar.color.1.{color,r,g,b}` (`Ò00000(StringBuilder,Device,Setting)`, config_String §2566-2745, called at int.txt:17221)
 5. WLANs: `cfr_renamed_1(sb, device, …)` — `wireless.<n>.…`/`aaa.<n>…`/`rmon` lines (config_int §530-etc, `aaa.<n>` has `driver=madwifi`, wpa group_rekey, p2p, proxy_arp, …)
 6. vWire/`cfr_renamed_1(... setting ...)` guest controls; `# vlan`, `# bridge`, `# bonding` (`cfr_renamed_0`)
 7. `cfr_renamed_1(builder, device, _Oo2 = Stringnew._Oo qos plan)` → `# bandsteering`, `# airtime`, `# mesh`, `# stamgr`, `# qos`, `# mac`/`# connectivity` overrides

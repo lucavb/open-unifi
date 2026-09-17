@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/lucabecker/open-unifi/internal/adminapi"
 	"github.com/lucabecker/open-unifi/internal/app"
@@ -150,6 +149,19 @@ func TestProviderDecodesRealServerDevices(t *testing.T) {
 	}
 }
 
+func TestAccessPointUpdateClearsName(t *testing.T) {
+	state := apModel{Name: types.StringValue("old"), SiteID: types.StringValue("default")}
+	plan := state
+	plan.Name = types.StringNull()
+	body := accessPointUpdateBody(plan, state)
+	if got := body["name"]; got != "" {
+		t.Fatalf("name update = %#v, want explicit empty name", body)
+	}
+	if _, ok := body["site_id"]; ok {
+		t.Fatalf("unchanged site_id should be absent: %#v", body)
+	}
+}
+
 // TestProviderDecodesRealServerWireless walks the wlan flow against the
 // real handler: GET empty envelope, PUT (server validates + echoes), the
 // provider's read-back decode (server echoes the passphrase), server-side
@@ -157,124 +169,25 @@ func TestProviderDecodesRealServerDevices(t *testing.T) {
 func TestProviderDecodesRealServerWireless(t *testing.T) {
 	c, _, status := composeAPI(t)
 	ctx := context.Background()
-
-	// Empty envelope decode.
-	env, err := c.getWireless(ctx)
-	if err != nil {
-		t.Fatalf("real GET /api/v1/wireless: %v", err)
+	for _, e := range []wirelessEntry{{Name: "home", SSID: "home", Security: "wpa-p", Passphrase: "sup3rsecret", VLAN: 42, Enabled: true}, {Name: "guest", SSID: "guest", Security: "open", VLAN: 1, Enabled: true}} {
+		if err := c.createWireless(ctx, &e); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if len(env.Wlans) != 0 {
-		t.Fatalf("fresh envelope should be empty, got %+v", env.Wlans)
+	home, err := c.getWireless(ctx, "home")
+	if err != nil || home.VLAN != 42 {
+		t.Fatalf("home read: %+v %v", home, err)
 	}
-
-	// Build a provider-shaped entry and PUT the whole document.
-	plan := &wlanModel{
-		Name:       types.StringValue("home"),
-		SSID:       types.StringValue("home"),
-		Security:   types.StringValue("wpa-p"),
-		Passphrase: types.StringValue("sup3rsecret"),
-		VLAN:       types.Int64Value(42),
-		Enabled:    types.BoolValue(true),
+	home.VLAN = 100
+	if err := c.updateWireless(ctx, "home", home); err != nil {
+		t.Fatal(err)
 	}
-	var d diag.Diagnostics
-	if !newWlan().validateWlan(plan, &d) || d.HasError() {
-		t.Fatal("wpa-p plan must validate")
+	guest, err := c.getWireless(ctx, "guest")
+	if err != nil || guest.Name != "guest" {
+		t.Fatalf("guest lost: %+v %v", guest, err)
 	}
-	entry := wlanEntryFromModel(plan)
-	if entry.Passphrase != "sup3rsecret" || entry.VLAN != 42 || !entry.Enabled {
-		t.Fatalf("wlanEntryFromModel dropped wire fields: %+v", entry)
-	}
-	env.Wlans = append(env.Wlans, entry)
-	if err := c.putWireless(ctx, env); err != nil {
-		t.Fatalf("real PUT /api/v1/wireless: %v (server must 200 valid payloads)", err)
-	}
-	if got := status["PUT /api/v1/wireless"]; got != http.StatusOK {
-		t.Fatalf("PUT wireless status = %d, want 200", got)
-	}
-
-	// Read-back: the REAL server echoes the stored document (including the
-	// passphrase) — the provider decode must carry that truth into the
-	// model.
-	got, err := c.getWireless(ctx)
-	if err != nil {
-		t.Fatalf("read-back GET: %v", err)
-	}
-	if len(got.Wlans) != 1 || got.Wlans[0].Name != "home" || got.Wlans[0].VLAN != 42 ||
-		got.Wlans[0].Passphrase != "sup3rsecret" || got.Wlans[0].Security != "wpa-p" {
-		t.Fatalf("server echo mismatch: %+v", got.Wlans)
-	}
-	m2 := *plan
-	entryToModel(&got.Wlans[0], &m2)
-	if m2.Passphrase.ValueString() != "sup3rsecret" || !m2.Enabled.ValueBool() || m2.VLAN.ValueInt64() != 42 {
-		t.Fatalf("entryToModel lost server truth: psk=%q enabled=%v vlan=%d",
-			m2.Passphrase.ValueString(), m2.Enabled.ValueBool(), m2.VLAN.ValueInt64())
-	}
-
-	// Open security: provider must strip the passphrase before PUT (the
-	// server rejects any passphrase on open) and validateWlan must reject
-	// an open plan that carries one (mirrors the server 400).
-	openPlan := &wlanModel{
-		Name:       types.StringValue("guest"),
-		SSID:       types.StringValue("guest"),
-		Security:   types.StringValue("open"),
-		Passphrase: types.StringValue("stale-psk"),
-		VLAN:       types.Int64Value(1),
-		Enabled:    types.BoolValue(true),
-	}
-	if newWlan().validateWlan(openPlan, &d) {
-		t.Fatal("open plan with stale psk must fail validateWlan")
-	}
-	if e := wlanEntryFromModel(openPlan); e.Passphrase != "" {
-		t.Fatalf("open entry must drop the passphrase, got %q", e.Passphrase)
-	}
-	openPlan.Passphrase = types.StringNull()
-	openDiag := diag.Diagnostics{}
-	if !newWlan().validateWlan(openPlan, &openDiag) || openDiag.HasError() {
-		t.Fatal("open plan must validate once the passphrase is dropped")
-	}
-	// Server-side double-check: PUT open-with-passphrase must 400.
-	badEnv := &wirelessEnvelope{Wlans: []wirelessEntry{{
-		Name: "bad", SSID: "bad", Security: "open",
-		Passphrase: "oops-oops", VLAN: 1, Enabled: true,
-	}}}
-	err = c.putWireless(ctx, badEnv)
-	if err == nil {
-		t.Fatal("open-with-passphrase PUT must be rejected by the server")
-	}
-	var ae *apiError
-	if !errors.As(err, &ae) || ae.status != http.StatusBadRequest {
-		t.Fatalf("expected typed 400 apiError, got %T (%v)", err, err)
-	}
-	if want := "http 400: wlan[0]: passphrase must be empty when security is open"; err.Error() != want {
-		t.Fatalf("clean server diagnostic expected, got %q", err.Error())
-	}
-
-	// wpa-eap validation parity (fix 6a): same >=8 server rule.
-	eapPlan := &wlanModel{
-		Name:       types.StringValue("corp"),
-		SSID:       types.StringValue("corp"),
-		Security:   types.StringValue("wpa-eap"),
-		Passphrase: types.StringValue("short"),
-		VLAN:       types.Int64Value(10),
-		Enabled:    types.BoolValue(true),
-	}
-	if newWlan().validateWlan(eapPlan, &d) {
-		t.Fatal("wpa-eap with <8 char passphrase must fail validateWlan")
-	}
-	eapPlan.Passphrase = types.StringValue("radius-shared")
-	eapDiag := diag.Diagnostics{}
-	if !newWlan().validateWlan(eapPlan, &eapDiag) || eapDiag.HasError() {
-		t.Fatal("wpa-eap with >=8 char passphrase must validate")
-	}
-
-	// Duplicate-SSID conflict detection (fix 6c), provider side.
-	env2, _ := c.getWireless(ctx)
-	var cd diag.Diagnostics
-	if newWlan().checkWlanConflicts(env2, "copy", "home", -1, &cd) {
-		t.Fatal("SSIDs must be unique: copy/home should conflict")
-	}
-	if !cd.HasError() {
-		t.Fatal("conflict must surface as a diagnostic error")
+	if status["POST /api/v1/wireless"] != http.StatusCreated {
+		t.Fatalf("POST status %d", status["POST /api/v1/wireless"])
 	}
 }
 
@@ -304,19 +217,28 @@ func TestRealServer404AndIDRoundTrip(t *testing.T) {
 		t.Fatalf("error message = %q, want %q", err.Error(), want)
 	}
 
-	// Envelope PUT/GET round trip preserves the server-assigned wlan ID.
-	env := &wirelessEnvelope{Wlans: []wirelessEntry{{
+	// Item PUT/GET round trip preserves the server-assigned wlan ID.
+	entry := &wirelessEntry{
 		ID: "srv-1", Name: "one", SSID: "one", Security: "wpa-p",
 		Passphrase: "eight+chars", VLAN: 2, Enabled: true,
-	}}}
-	if err := c.putWireless(ctx, env); err != nil {
+	}
+	if err := c.createWireless(ctx, entry); err != nil {
 		t.Fatalf("PUT: %v", err)
 	}
-	got, err := c.getWireless(ctx)
+	got, err := c.getWireless(ctx, "one")
 	if err != nil {
 		t.Fatalf("GET after PUT: %v", err)
 	}
-	if len(got.Wlans) != 1 || got.Wlans[0].ID != "srv-1" {
-		t.Fatalf("round trip lost server ID: %+v", got.Wlans)
+	if got.ID != "srv-1" {
+		t.Fatalf("round trip lost server ID: %+v", got)
+	}
+}
+
+func TestImportAndNormalizeHelpers(t *testing.T) {
+	if got, err := normalizeMAC("AA-BB-CC-DD-EE-FF"); err != nil || got != "aa:bb:cc:dd:ee:ff" {
+		t.Fatalf("normalize MAC: %q %v", got, err)
+	}
+	if _, err := normalizeMAC("not-a-mac"); err == nil {
+		t.Fatal("invalid MAC accepted")
 	}
 }

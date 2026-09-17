@@ -12,35 +12,16 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64default"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
 var _ resource.Resource = (*wlanResource)(nil)
 var _ resource.ResourceWithConfigure = (*wlanResource)(nil)
+var _ resource.ResourceWithImportState = (*wlanResource)(nil)
 
 // wlanResource manages one WLAN inside the controller's wireless config.
-//
-// IMPORTANT server constraint: the admin API exposes wireless as a
-// WHOLE-document upsert (GET/PUT /api/v1/wireless with {"wlans":[...]}).
-// To keep per-resource semantics safe, this resource uses a
-// single-source-of-truth strategy built on read-modify-write of the
-// envelope:
-//
-//   - id := the wlan `name` (the slug / key within the envelope)
-//   - Create: GET envelope; if a wlan with the same name OR ssid already
-//     exists -> error (a name-clone of a wifi resource is fine, but two
-//     resources claiming the same wlan would fight on every PUT); else
-//     append and PUT.
-//   - Read: GET envelope; match by name; missing -> resource is gone, drop
-//     from state.
-//   - Update: GET envelope; replace the matching entry in place; PUT.
-//   - Delete: GET envelope; drop the matching entry; PUT.
-//
-// Serialized applies are expected (normal Terraform behavior); concurrent
-// non-Terraform writers of the envelope will race with the read-modify-
-// write, which is why idempotent-retry guidance in client.go forbids
-// retrying PUTs.
 type wlanResource struct {
 	client *apiClient
 }
@@ -59,9 +40,7 @@ func (r *wlanResource) Configure(_ context.Context, req resource.ConfigureReques
 
 func (r *wlanResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "A WLAN (wifi network) on the open-unifi control plane.\n\n" +
-			"The server models wireless configuration as a single document, so each " +
-			"`open-unifi_wlan` resource maps to exactly one entry in that document, keyed by `name`. " +
+		MarkdownDescription: "A WLAN (wifi network) on the open-unifi control plane, keyed by `name`. " +
 			"Plan diffs for `passphrase` render as `(sensitive value)`.",
 		Attributes: map[string]schema.Attribute{
 			"name": schema.StringAttribute{
@@ -76,7 +55,7 @@ func (r *wlanResource) Schema(_ context.Context, _ resource.SchemaRequest, resp 
 				Required:            true,
 			},
 			"security": schema.StringAttribute{
-				MarkdownDescription: "One of `open`, `wpa-p` (WPA2 personal, needs passphrase), `wpa-eap` (enterprise; RADIUS handled server-side).",
+				MarkdownDescription: "One of `open` or `wpa-p` (WPA2 personal, needs passphrase).",
 				Required:            true,
 			},
 			"passphrase": schema.StringAttribute{
@@ -97,6 +76,7 @@ func (r *wlanResource) Schema(_ context.Context, _ resource.SchemaRequest, resp 
 				Computed:            true,
 				Default:             booldefault.StaticBool(true),
 			},
+			"band": schema.StringAttribute{MarkdownDescription: "Radio band: `2g`, `5g`, or `both`.", Optional: true, Computed: true, Default: stringdefault.StaticString("both")},
 			"id": schema.StringAttribute{
 				MarkdownDescription: "Resource id = the wlan name.",
 				Computed:            true,
@@ -117,33 +97,13 @@ type wlanModel struct {
 	Passphrase types.String `tfsdk:"passphrase"`
 	VLAN       types.Int64  `tfsdk:"vlan"`
 	Enabled    types.Bool   `tfsdk:"enabled"`
+	Band       types.String `tfsdk:"band"`
 }
 
 // checkWlanConflicts enforces the name/ssid uniqueness rules the envelope
 // (and every PUT) depends on: one resource per wlan `name`, globally unique
 // SSIDs. selfIdx (the entry currently being updated; -1 on Create) is
 // excluded so an update does not collide with itself.
-func (r *wlanResource) checkWlanConflicts(env *wirelessEnvelope, name, ssid string, selfIdx int, d *diag.Diagnostics) bool {
-	for i := range env.Wlans {
-		if i == selfIdx {
-			continue
-		}
-		if env.Wlans[i].Name == name {
-			d.AddError("wlan conflict",
-				fmt.Sprintf("wlan %q already exists on the controller (id %q); import it instead of re-creating",
-					name, env.Wlans[i].ID))
-			return false
-		}
-		if env.Wlans[i].SSID == ssid {
-			d.AddError("wlan conflict",
-				fmt.Sprintf("ssid %q is already broadcast by wlan %q; SSIDs must be unique",
-					ssid, env.Wlans[i].Name))
-			return false
-		}
-	}
-	return true
-}
-
 func (r *wlanResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	if r.client == nil {
 		notConfiguredErr(&resp.Diagnostics)
@@ -158,28 +118,15 @@ func (r *wlanResource) Create(ctx context.Context, req resource.CreateRequest, r
 		return
 	}
 
-	env, err := r.client.getWireless(ctx)
-	if err != nil {
-		resp.Diagnostics.AddError("Create wlan: read envelope", err.Error())
-		return
-	}
-	if !r.checkWlanConflicts(env, plan.Name.ValueString(), plan.SSID.ValueString(), -1, &resp.Diagnostics) {
-		return
-	}
-
 	entry := wlanEntryFromModel(&plan)
-	env.Wlans = append(env.Wlans, entry)
-
-	// No retry on PUT: a blind replay could clobber concurrent envelope
-	// writers (see wlanResource doc comment).
-	if err := r.client.putWireless(ctx, env); err != nil {
-		resp.Diagnostics.AddError("Create wlan: PUT envelope", err.Error())
+	if err := r.client.createWireless(ctx, &entry); err != nil {
+		resp.Diagnostics.AddError("Create wlan", err.Error())
 		return
 	}
 
 	// Read-back makes the state match server-normalized truth.
 	if err := readWlanInto(ctx, r.client, &plan); err != nil {
-		resp.Diagnostics.AddError("Create wlan: post-PUT read", err.Error())
+		resp.Diagnostics.AddError("Create wlan: post-create read", err.Error())
 		return
 	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
@@ -195,18 +142,17 @@ func (r *wlanResource) Read(ctx context.Context, req resource.ReadRequest, resp 
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	env, err := r.client.getWireless(ctx)
-	if err != nil {
-		resp.Diagnostics.AddError("Read wlan", err.Error())
-		return
-	}
-	idx := findWlan(env, state.Name.ValueString())
-	if idx < 0 {
+	entry, err := r.client.getWireless(ctx, state.Name.ValueString())
+	if errNotFound(err) {
 		// Missing = gone: remove from state so Terraform plans re-create.
 		resp.State.RemoveResource(ctx)
 		return
 	}
-	entryToModel(&env.Wlans[idx], &state)
+	if err != nil {
+		resp.Diagnostics.AddError("Read wlan", err.Error())
+		return
+	}
+	entryToModel(entry, &state)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -223,30 +169,10 @@ func (r *wlanResource) Update(ctx context.Context, req resource.UpdateRequest, r
 	if !r.validateWlan(&plan, &resp.Diagnostics) {
 		return
 	}
-	env, err := r.client.getWireless(ctx)
-	if err != nil {
-		resp.Diagnostics.AddError("Update wlan: read envelope", err.Error())
-		return
-	}
-	idx := findWlan(env, plan.Name.ValueString())
-	if idx < 0 {
-		resp.Diagnostics.AddError("Update wlan",
-			fmt.Sprintf("wlan %q disappeared from the controller; re-apply to re-create it", plan.Name.ValueString()))
-		return
-	}
-	// Same uniqueness rules as Create must hold after the change (e.g. an
-	// SSID rename could steal another wlan's SSID); the entry being updated
-	// is excluded so it cannot collide with itself.
-	if !r.checkWlanConflicts(env, plan.Name.ValueString(), plan.SSID.ValueString(), idx, &resp.Diagnostics) {
-		return
-	}
-	// Replace in place, carrying over the server-assigned id slot.
 	entry := wlanEntryFromModel(&plan)
-	entry.ID = env.Wlans[idx].ID
-	env.Wlans[idx] = entry
 	plan.ID = types.StringValue(plan.Name.ValueString())
-	if err := r.client.putWireless(ctx, env); err != nil {
-		resp.Diagnostics.AddError("Update wlan: PUT envelope", err.Error())
+	if err := r.client.updateWireless(ctx, plan.Name.ValueString(), &entry); err != nil {
+		resp.Diagnostics.AddError("Update wlan", err.Error())
 		return
 	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
@@ -262,37 +188,13 @@ func (r *wlanResource) Delete(ctx context.Context, req resource.DeleteRequest, r
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	env, err := r.client.getWireless(ctx)
-	if err != nil {
-		// If the whole envelope is gone/unreachable with 404 semantics,
-		// deletion has nothing left to remove.
-		if errNotFound(err) {
-			return
-		}
-		resp.Diagnostics.AddError("Delete wlan: read envelope", err.Error())
-		return
-	}
-	idx := findWlan(env, state.Name.ValueString())
-	if idx < 0 {
-		return // already gone: idempotent delete
-	}
-	env.Wlans = append(env.Wlans[:idx], env.Wlans[idx+1:]...)
-	if err := r.client.putWireless(ctx, env); err != nil {
-		resp.Diagnostics.AddError("Delete wlan: PUT envelope", err.Error())
+	if err := r.client.deleteWireless(ctx, state.Name.ValueString()); err != nil && !errNotFound(err) {
+		resp.Diagnostics.AddError("Delete wlan", err.Error())
 		return
 	}
 }
 
 // --- helpers ------------------------------------------------------------
-
-func findWlan(env *wirelessEnvelope, name string) int {
-	for i := range env.Wlans {
-		if env.Wlans[i].Name == name {
-			return i
-		}
-	}
-	return -1
-}
 
 // wlanEntryFromModel converts Terraform state into a server entry. When
 // security is "open" the passphrase is dropped: the server rejects any PUT
@@ -303,6 +205,7 @@ func wlanEntryFromModel(m *wlanModel) wirelessEntry {
 		SSID:     m.SSID.ValueString(),
 		Security: m.Security.ValueString(),
 		Enabled:  true,
+		Band:     m.Band.ValueString(),
 	}
 	if !m.VLAN.IsNull() && !m.VLAN.IsUnknown() {
 		e.VLAN = int(m.VLAN.ValueInt64())
@@ -336,6 +239,10 @@ func entryToModel(e *wirelessEntry, m *wlanModel) {
 		m.VLAN = types.Int64Value(1)
 	}
 	m.Enabled = types.BoolValue(e.Enabled)
+	if e.Band == "" {
+		e.Band = "both"
+	}
+	m.Band = types.StringValue(e.Band)
 	if e.Passphrase != "" {
 		m.Passphrase = types.StringValue(e.Passphrase)
 	} else {
@@ -345,15 +252,11 @@ func entryToModel(e *wirelessEntry, m *wlanModel) {
 
 // readWlanInto refreshes plan/state from the server for the wlan named by m.
 func readWlanInto(ctx context.Context, c *apiClient, m *wlanModel) error {
-	env, err := c.getWireless(ctx)
+	entry, err := c.getWireless(ctx, m.Name.ValueString())
 	if err != nil {
 		return err
 	}
-	idx := findWlan(env, m.Name.ValueString())
-	if idx < 0 {
-		return fmt.Errorf("wlan %q not present in envelope after PUT", m.Name.ValueString())
-	}
-	entryToModel(&env.Wlans[idx], m)
+	entryToModel(entry, m)
 	return nil
 }
 
@@ -366,13 +269,18 @@ func readWlanInto(ctx context.Context, c *apiClient, m *wlanModel) error {
 // system_cfg row injection, helpers.go hasControlChar/validateWlanID) —
 // those checks stay server-side-only.
 func (r *wlanResource) validateWlan(m *wlanModel, d *diag.Diagnostics) bool {
+	band := m.Band.ValueString()
+	if band != "2g" && band != "5g" && band != "both" {
+		d.AddAttributeError(path.Root("band"), "Invalid band", "band must be one of 2g|5g|both")
+		return false
+	}
 	sec := m.Security.ValueString()
 	switch sec {
-	case "open", "wpa-p", "wpa-eap":
+	case "open", "wpa-p":
 	default:
 		d.AddAttributeError(path.Root("security"),
 			"Invalid security value",
-			fmt.Sprintf("security must be one of open|wpa-p|wpa-eap, got %q", sec))
+			fmt.Sprintf("security must be one of open|wpa-p, got %q", sec))
 		return false
 	}
 	name := m.Name.ValueString()
@@ -413,4 +321,11 @@ func (r *wlanResource) validateWlan(m *wlanModel, d *diag.Diagnostics) bool {
 		return false
 	}
 	return true
+}
+
+func (r *wlanResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+	resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
+	if !resp.Diagnostics.HasError() {
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("name"), req.ID)...)
+	}
 }

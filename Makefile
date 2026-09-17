@@ -1,6 +1,6 @@
 GO ?= go
 
-.PHONY: build test run provider-build check
+.PHONY: build test run provider-build check acceptance
 
 build:
 	$(GO) build ./...
@@ -21,3 +21,9 @@ check:
 	fi
 	$(GO) vet ./...
 	$(GO) test -count=1 ./...
+
+# Hermetic black-box Terraform acceptance suite. The test itself is gated by
+# TF_ACC=1; this target makes that opt-in explicit and keeps all artifacts in
+# the test's temporary root.
+acceptance:
+	TF_ACC=1 $(GO) test -tags acceptance -count=1 ./acceptance -v

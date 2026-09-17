@@ -7,6 +7,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 
@@ -25,6 +26,23 @@ var (
 )
 
 type openUnifiProvider struct{}
+
+func validateProviderURL(raw string) error {
+	u, err := url.ParseRequestURI(raw)
+	if err != nil || u == nil || !u.IsAbs() || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("must be an absolute http or https URL with a host")
+	}
+	if u.User != nil {
+		return fmt.Errorf("must not contain userinfo")
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("must not contain a query or fragment")
+	}
+	if strings.Trim(u.Path, "/") != "" && strings.Trim(u.Path, "/") != "api" {
+		return fmt.Errorf("must be a controller base URL, not an API resource path")
+	}
+	return nil
+}
 
 func New() provider.Provider { return &openUnifiProvider{} }
 
@@ -70,6 +88,10 @@ func (p *openUnifiProvider) Configure(ctx context.Context, req provider.Configur
 			"Missing controller URL",
 			"The provider attribute `url` must be set, e.g. `url = \"http://192.168.1.2:8443\"`.",
 		)
+		return
+	}
+	if err := validateProviderURL(cfg.URL.ValueString()); err != nil {
+		resp.Diagnostics.AddAttributeError(path.Root("url"), "Invalid controller URL", fmt.Sprintf("The provider attribute `url` %s.", err))
 		return
 	}
 

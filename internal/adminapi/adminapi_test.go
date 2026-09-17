@@ -58,6 +58,26 @@ func (f *fakeBackend) GetDevice(_ context.Context, mac string) (DeviceView, erro
 	}
 	return DeviceView{}, fmt.Errorf("%w: %s", ErrNotFound, mac)
 }
+func (f *fakeBackend) PatchDevice(_ context.Context, mac string, p DevicePatch) (DeviceView, error) {
+	d, err := f.GetDevice(context.Background(), mac)
+	if err != nil {
+		return d, err
+	}
+	if p.Name != nil {
+		d.Name = *p.Name
+	}
+	if p.SiteID != nil {
+		d.SiteID = *p.SiteID
+	}
+	f.byMAC[mac] = d
+	return d, nil
+}
+func (f *fakeBackend) CreateWlan(context.Context, Wlan) (Wlan, error) { return Wlan{}, nil }
+func (f *fakeBackend) GetWlan(context.Context, string) (Wlan, error) {
+	return Wlan{}, fmt.Errorf("%w", ErrNotFound)
+}
+func (f *fakeBackend) UpdateWlan(context.Context, string, Wlan) (Wlan, error) { return Wlan{}, nil }
+func (f *fakeBackend) DeleteWlan(context.Context, string) error               { return nil }
 
 func (f *fakeBackend) CreateDevice(_ context.Context, up DeviceUpsert) (DeviceView, error) {
 	f.created = append(f.created, up)
@@ -571,6 +591,91 @@ func TestWirelessGetPutRoundTrip(t *testing.T) {
 	if len(got.Wlans) != 2 || got.Wlans[0].Name != "home" || got.Wlans[1].SSID != "guests" {
 		t.Fatalf("round trip mismatch: %+v", got)
 	}
+}
+
+// ---- device name validation (device-name hardening) -------------------------
+
+func TestValidateDeviceName(t *testing.T) {
+	if msg := ValidateDeviceName("office-ceiling"); msg != "" {
+		t.Fatalf("valid name rejected: %q", msg)
+	}
+	// exactly 64 bytes is the cap
+	if msg := ValidateDeviceName(strings.Repeat("n", 64)); msg != "" {
+		t.Fatalf("64-byte name rejected: %q", msg)
+	}
+	for _, bad := range []string{
+		strings.Repeat("n", 65), // over the cap
+		"row1\nfake row",        // \n is the system_cfg row separator
+		"bad\rname",
+		"del\x7f",
+	} {
+		if msg := ValidateDeviceName(bad); msg == "" {
+			t.Fatalf("invalid device name %q accepted", bad)
+		}
+	}
+	// Empty is legal: DeviceUpsert treats "" as leave-unset and DevicePatch
+	// treats it as a documented explicit clear.
+	if msg := ValidateDeviceName(""); msg != "" {
+		t.Fatalf("empty device name must stay legal: %q", msg)
+	}
+}
+
+// TestPatchDeviceRoute covers PATCH /api/v1/devices/{mac} against the real
+// handler (the provider's resource_access_point uses it): name+site_id happy
+// path, invalid-name rejection, unknown MAC 404.
+func TestPatchDeviceRoute(t *testing.T) {
+	be := newFakeBackend()
+	h := New(Config{}, be)
+
+	// Happy path: name + site_id patch reaches the backend.
+	req := httptest.NewRequest("PATCH", "/api/v1/devices/f0:9f:c2:84:8f:2a",
+		strings.NewReader(`{"name":"renamed","site_id":"lab"}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("patch: %d %q", rec.Code, rec.Body.String())
+	}
+	var dv DeviceView
+	if err := json.Unmarshal(rec.Body.Bytes(), &dv); err != nil || dv.Name != "renamed" || dv.SiteID != "lab" {
+		t.Fatalf("patch response: %+v err=%v", dv, err)
+	}
+	if got := be.byMAC["f0:9f:c2:84:8f:2a"]; got.Name != "renamed" || got.SiteID != "lab" {
+		t.Fatalf("backend state after patch: %+v", got)
+	}
+
+	// Control-char name -> 400 (matches the site_id 400 style).
+	req = httptest.NewRequest("PATCH", "/api/v1/devices/f0:9f:c2:84:8f:2a",
+		strings.NewReader(`{"name":"row1\nfake"}`))
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid name patch: %d %q, want 400", rec.Code, rec.Body.String())
+	}
+
+	// Unknown MAC -> 404 (wrapped ErrNotFound from the backend).
+	req = httptest.NewRequest("PATCH", "/api/v1/devices/aa:bb:cc:dd:ee:66",
+		strings.NewReader(`{"name":"x"}`))
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("patch unknown mac: %d, want 404", rec.Code)
+	}
+}
+
+// TestCreateDeviceRejectsInvalidName pins the 400 on POST /api/v1/devices
+// for a non-empty invalid name.
+func TestCreateDeviceRejectsInvalidName(t *testing.T) {
+	run(t, testCase{
+		name: "create device with control-char name", method: "POST", path: "/api/v1/devices",
+		body: `{"mac":"f0:9f:c2:84:8f:2a","name":"row1\nfake"}`,
+		want: http.StatusBadRequest,
+		checks: func(t *testing.T, be *fakeBackend, rec *httptest.ResponseRecorder) {
+			t.Helper()
+			if len(be.created) != 0 {
+				t.Fatalf("invalid create must not reach the backend: %+v", be.created)
+			}
+		},
+	})
 }
 
 // ---- web console / fallbacks --------------------------------------------------

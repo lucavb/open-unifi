@@ -36,14 +36,40 @@ type Config struct {
 // DeviceView is the read model for one managed device.
 // Actions mirrors what this device/record currently allows (e.g. "delete").
 type DeviceView struct {
-	MAC      string   `json:"mac"`
-	Name     string   `json:"name,omitempty"`
-	Model    string   `json:"model,omitempty"`
-	Firmware string   `json:"firmware,omitempty"`
-	IP       string   `json:"ip,omitempty"`
-	State    int      `json:"state"`
-	LastSeen int64    `json:"last_seen,omitempty"`
-	Actions  []string `json:"actions,omitempty"`
+	MAC      string `json:"mac"`
+	Name     string `json:"name,omitempty"`
+	Model    string `json:"model,omitempty"`
+	Firmware string `json:"firmware,omitempty"`
+	IP       string `json:"ip,omitempty"`
+	State    int    `json:"state"`
+	LastSeen int64  `json:"last_seen,omitempty"`
+	// CfgVersion is the desired configuration version last sent by the
+	// controller. It is omitted when the store has no desired version.
+	CfgVersion string `json:"cfg_version,omitempty"`
+	// AppliedCfg is the configuration version last reported by the device.
+	// It is omitted when the device has not reported one.
+	AppliedCfg string `json:"applied_cfg,omitempty"`
+	// InSync reports runtime WLAN delivery, not cfgversion echo equality. It
+	// is true only after the latest vap_table shows every enabled desired
+	// SSID RUNNING (SSID-presence check). It does NOT verify per-radio
+	// placement or that deleted WLANs have disappeared — that strict check
+	// lives in the server lane's settlePendingWLAN, which runs before this
+	// view is served on every inform. nil means runtime evidence is absent.
+	InSync *bool `json:"in_sync,omitempty"`
+	// WLAN delivery is controller-side bookkeeping. It is independent of
+	// cfgversion, which is not proof that the AP applied system_cfg.
+	WLANDeliveryStatus string   `json:"wlan_delivery_status,omitempty"`
+	WLANDeliveryCount  int      `json:"wlan_delivery_count,omitempty"`
+	WLANLastAttempt    int64    `json:"wlan_last_attempt,omitempty"`
+	SiteID             string   `json:"site_id,omitempty"`
+	Actions            []string `json:"actions,omitempty"`
+}
+
+// DevicePatch contains the mutable administrative device fields. Pointers
+// distinguish an omitted field from an explicit clear.
+type DevicePatch struct {
+	Name   *string `json:"name,omitempty"`
+	SiteID *string `json:"site_id,omitempty"`
 }
 
 // DeviceUpsert is the request body for manual device registration ("adopt
@@ -69,6 +95,7 @@ type Wlan struct {
 	Passphrase string `json:"passphrase,omitempty"`
 	VLAN       int    `json:"vlan"`
 	Enabled    bool   `json:"enabled"`
+	Band       string `json:"band,omitempty"`
 }
 
 // WlansEnvelope is the whole-document wireless config. PUT replaces it
@@ -81,6 +108,7 @@ type WlansEnvelope struct {
 type Backend interface {
 	ListDevices(ctx context.Context) []DeviceView
 	GetDevice(ctx context.Context, mac string) (DeviceView, error)
+	PatchDevice(ctx context.Context, mac string, patch DevicePatch) (DeviceView, error)
 	// CreateDevice registers a device manually (state PENDING = adopt whitelist).
 	CreateDevice(ctx context.Context, up DeviceUpsert) (DeviceView, error)
 	DeleteDevice(ctx context.Context, mac string) error
@@ -97,6 +125,10 @@ type Backend interface {
 	GetWireless(ctx context.Context) WlansEnvelope
 	// PutWireless replaces the whole wireless config document.
 	PutWireless(ctx context.Context, env WlansEnvelope) error
+	CreateWlan(ctx context.Context, wlan Wlan) (Wlan, error)
+	GetWlan(ctx context.Context, name string) (Wlan, error)
+	UpdateWlan(ctx context.Context, name string, wlan Wlan) (Wlan, error)
+	DeleteWlan(ctx context.Context, name string) error
 }
 
 // version reports the module version for /api/v1/whoami.
@@ -154,6 +186,12 @@ func New(cfg Config, be Backend) http.Handler {
 			return
 		}
 		up.MAC = mac
+		if up.Name != "" {
+			if msg := ValidateDeviceName(up.Name); msg != "" {
+				writeErr(w, http.StatusBadRequest, msg)
+				return
+			}
+		}
 		dv, err := be.CreateDevice(r.Context(), up)
 		if err != nil {
 			handleBackendErr(w, lg, err)
@@ -168,6 +206,36 @@ func New(cfg Config, be Backend) http.Handler {
 			return
 		}
 		dv, err := be.GetDevice(r.Context(), mac)
+		if err != nil {
+			handleBackendErr(w, lg, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, dv)
+	}))
+	mux.HandleFunc("PATCH /api/v1/devices/{mac}", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+		mac, err := normalizeMAC(r.PathValue("mac"))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid mac: "+err.Error())
+			return
+		}
+		var patch DevicePatch
+		if err := readJSON(r, &patch); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		if patch.SiteID != nil {
+			if msg := ValidateSiteID(*patch.SiteID); msg != "" {
+				writeErr(w, http.StatusBadRequest, msg)
+				return
+			}
+		}
+		if patch.Name != nil {
+			if msg := ValidateDeviceName(*patch.Name); msg != "" {
+				writeErr(w, http.StatusBadRequest, msg)
+				return
+			}
+		}
+		dv, err := be.PatchDevice(r.Context(), mac, patch)
 		if err != nil {
 			handleBackendErr(w, lg, err)
 			return
@@ -222,6 +290,7 @@ func New(cfg Config, be Backend) http.Handler {
 			writeErr(w, http.StatusBadRequest, "invalid JSON body")
 			return
 		}
+		// Backend performs the authoritative duplicate/ID checks.
 		for i := range env.Wlans {
 			if msg := ValidateWlan(&env.Wlans[i]); msg != "" {
 				writeErr(w, http.StatusBadRequest, "wlan["+strconv.Itoa(i)+"]: "+msg)
@@ -233,6 +302,79 @@ func New(cfg Config, be Backend) http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, env)
+	}))
+	mux.HandleFunc("POST /api/v1/wireless", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+		var wlan Wlan
+		if err := readJSON(r, &wlan); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		if msg := ValidateWlanName(wlan.Name); msg != "" {
+			writeErr(w, http.StatusBadRequest, msg)
+			return
+		}
+		if msg := ValidateWlan(&wlan); msg != "" {
+			writeErr(w, http.StatusBadRequest, msg)
+			return
+		}
+		out, err := be.CreateWlan(r.Context(), wlan)
+		if err != nil {
+			handleBackendErr(w, lg, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, out)
+	}))
+	mux.HandleFunc("GET /api/v1/wireless/{name}", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+		name := r.PathValue("name")
+		if msg := ValidateWlanName(name); msg != "" {
+			writeErr(w, http.StatusBadRequest, msg)
+			return
+		}
+		out, err := be.GetWlan(r.Context(), name)
+		if err != nil {
+			handleBackendErr(w, lg, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+	}))
+	mux.HandleFunc("PUT /api/v1/wireless/{name}", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+		name := r.PathValue("name")
+		if msg := ValidateWlanName(name); msg != "" {
+			writeErr(w, http.StatusBadRequest, msg)
+			return
+		}
+		var wlan Wlan
+		if err := readJSON(r, &wlan); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		if wlan.Name != "" && wlan.Name != name {
+			writeErr(w, http.StatusBadRequest, "name must match path")
+			return
+		}
+		wlan.Name = name
+		if msg := ValidateWlan(&wlan); msg != "" {
+			writeErr(w, http.StatusBadRequest, msg)
+			return
+		}
+		out, err := be.UpdateWlan(r.Context(), name, wlan)
+		if err != nil {
+			handleBackendErr(w, lg, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+	}))
+	mux.HandleFunc("DELETE /api/v1/wireless/{name}", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+		name := r.PathValue("name")
+		if msg := ValidateWlanName(name); msg != "" {
+			writeErr(w, http.StatusBadRequest, msg)
+			return
+		}
+		if err := be.DeleteWlan(r.Context(), name); err != nil {
+			handleBackendErr(w, lg, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "name": name})
 	}))
 	mux.HandleFunc("GET /api/v1/whoami", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, whoAmI{
@@ -283,6 +425,10 @@ func New(cfg Config, be Backend) http.Handler {
 // lg instead — internal messages can contain paths, addresses and store
 // internals and must not be serialized into an HTTP response.
 func handleBackendErr(w http.ResponseWriter, lg *slog.Logger, err error) {
+	if errors.Is(err, ErrConflict) {
+		writeErr(w, http.StatusConflict, err.Error())
+		return
+	}
 	if errors.Is(err, ErrNotFound) {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return

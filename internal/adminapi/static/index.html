@@ -302,11 +302,11 @@
   }
 
   function wlanRowInputs(w) {
-    var sec = w.security || "wpa-p";
+    var sec = w.security === "open" ? "open" : "wpa-p";
     return '<td><input name="ssid" value="' + esc(w.ssid || "") + '"></td>' +
       '<td><input name="name" value="' + esc(w.name || "") + '"></td>' +
       '<td><select name="security">' +
-      ["open", "wpa-p", "wpa-eap"].map(function (s) {
+      ["open", "wpa-p"].map(function (s) {
         return '<option value="' + s + '"' + (s === sec ? " selected" : "") + ">" + s + "</option>";
       }).join("") +
       "</select></td>" +
@@ -331,7 +331,7 @@
   }
 
   function validateWlan(w) {
-    if (["open", "wpa-p", "wpa-eap"].indexOf(w.security) < 0) { return "bad security"; }
+    if (["open", "wpa-p"].indexOf(w.security) < 0) { return "bad security"; }
     if (!w.ssid || w.ssid.length > 32) { return "ssid must be 1..32 characters"; }
     if (w.vlan < 1 || w.vlan > 4094) { return "vlan must be 1..4094"; }
     if (w.security === "open") {

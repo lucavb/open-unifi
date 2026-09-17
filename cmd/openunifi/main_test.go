@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestDiscoveryPort(t *testing.T) {
 	for addr, want := range map[string]struct {
@@ -24,5 +27,44 @@ func TestDiscoveryPort(t *testing.T) {
 		if _, _, err := discoveryPort(addr); err == nil {
 			t.Fatalf("unparseable spec %q must hard-fail at startup", addr)
 		}
+	}
+}
+
+func TestValidateRegulatoryCountryCode(t *testing.T) {
+	if err := validateRegulatoryCountryCode(840); err != nil {
+		t.Fatalf("validateRegulatoryCountryCode(840) = %v, want nil", err)
+	}
+	if err := validateRegulatoryCountryCode(276); err != nil {
+		t.Fatalf("validateRegulatoryCountryCode(276) = %v, want nil", err)
+	}
+	err := validateRegulatoryCountryCode(0)
+	if err == nil {
+		t.Fatal("validateRegulatoryCountryCode(0) = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "omit the flag") {
+		t.Fatalf("error should tell the user to omit the flag, got: %v", err)
+	}
+}
+
+func TestValidateAdminExposure(t *testing.T) {
+	tests := []struct {
+		name                         string
+		addr, token                  string
+		anonymous, insecure, wantErr bool
+	}{
+		{"loopback token", "127.0.0.1:8080", "token", false, false, false},
+		{"localhost anonymous", "localhost:8080", "", true, false, false},
+		{"missing token", "127.0.0.1:8080", "", false, false, true},
+		{"public plaintext", "0.0.0.0:8080", "token", false, false, true},
+		{"public insecure opt in", "0.0.0.0:8080", "", true, true, false},
+		{"malformed address", "8080", "token", false, false, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateAdminExposure(tc.addr, tc.token, tc.anonymous, tc.insecure)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("validateAdminExposure(%q, ...) error = %v, wantErr %v", tc.addr, err, tc.wantErr)
+			}
+		})
 	}
 }

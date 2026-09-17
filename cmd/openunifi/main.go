@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -36,19 +37,38 @@ func main() {
 
 func run() error {
 	listenInform := flag.String("listen-inform", ":8080", "listen address for the inform protocol server")
-	listenAdmin := flag.String("listen-admin", ":8443", "listen address for the admin API server")
+	listenAdmin := flag.String("listen-admin", "127.0.0.1:8443", "listen address for the admin API server")
 	listenDiscovery := flag.String("listen-discovery", ":10001", "UDP listen address for discovery")
 	discovery := flag.Bool("discovery", true, "enable the UDP discovery listener")
 	dataDir := flag.String("data-dir", "data", "directory for devices.json / wireless.json")
 	controllerURL := flag.String("controller-url", "", "base URL devices are pointed at during adoption (e.g. http://10.0.0.5:8080)")
+	regulatoryCountryCode := flag.Int("regulatory-country-code", server.DefaultRegulatoryCountryCode, "ISO 3166-1 numeric regulatory country code (001-999)")
 	apSSHPassword := flag.String("ap-ssh-password", os.Getenv("OPEN_UNIFI_AP_SSH_PASSWORD"),
-		"SSH password for adopted APs (empty uses the built-in site default \"ubnt\"; falls back to $OPEN_UNIFI_AP_SSH_PASSWORD)")
+		"SSH password for adopted APs (required; falls back to $OPEN_UNIFI_AP_SSH_PASSWORD)")
+	allowDefaultAPSSH := flag.Bool("allow-default-ap-ssh-password", false, "LAB ONLY: permit the insecure AP SSH password \"ubnt\" when --ap-ssh-password is empty")
 	// Default from the provider's token env var; --admin-token overrides it.
 	adminToken := flag.String("admin-token", os.Getenv("OPEN_UNIFI_ADMIN_TOKEN"),
-		"admin API bearer token (empty disables auth; defaults to $OPEN_UNIFI_ADMIN_TOKEN)")
+		"admin API bearer token (required; defaults to $OPEN_UNIFI_ADMIN_TOKEN)")
+	allowAnonymousAdmin := flag.Bool("allow-anonymous-admin", false, "LAB ONLY: allow anonymous admin API and metrics")
+	allowInsecureAdmin := flag.Bool("allow-insecure-admin", false, "LAB ONLY: allow non-loopback plaintext admin HTTP (normally use an HTTPS reverse proxy)")
 	allowPlainText := flag.Bool("allow-plaintext-inform", false, "accept unencrypted JSON inform bodies")
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, error")
 	flag.Parse()
+	if err := validateAdminExposure(*listenAdmin, *adminToken, *allowAnonymousAdmin, *allowInsecureAdmin); err != nil {
+		return err
+	}
+	if *apSSHPassword == "" && !*allowDefaultAPSSH {
+		return errors.New("AP SSH password is required; set --ap-ssh-password or explicitly opt in with --allow-default-ap-ssh-password for lab use")
+	}
+	// The flag default is nonzero, so a zero here can only come from an
+	// explicitly supplied --regulatory-country-code 0. Reject it before the
+	// server-side coercion silently maps 0 to the 840 default.
+	if err := validateRegulatoryCountryCode(*regulatoryCountryCode); err != nil {
+		return err
+	}
+	if err := server.ValidateConfig(server.Config{ControllerURL: *controllerURL, RegulatoryCountryCode: *regulatoryCountryCode}); err != nil {
+		return fmt.Errorf("invalid configuration: %w", err)
+	}
 
 	level, err := parseLevel(*logLevel)
 	if err != nil {
@@ -66,6 +86,11 @@ func run() error {
 	if err := os.MkdirAll(*dataDir, 0o755); err != nil {
 		return fmt.Errorf("create data dir %s: %w", *dataDir, err)
 	}
+	lock, err := acquireDataDirLock(*dataDir)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lock.Close() }()
 	st, err := store.NewJSONStore(filepath.Join(*dataDir, "devices.json"))
 	if err != nil {
 		return fmt.Errorf("open device store: %w", err)
@@ -81,11 +106,11 @@ func run() error {
 	}
 	adminH := adminapi.New(adminapi.Config{AdminToken: *adminToken}, ap)
 
-	if *adminToken == "" {
+	if *allowAnonymousAdmin {
 		// Prominent, not debug: without a token any LAN peer can read WLAN
 		// passphrases through the admin API and adopt devices through the
 		// metrics side of the house.
-		logger.Warn("admin API and metrics are UNAUTHENTICATED: any LAN peer can read WLAN passphrases and adopt devices; set --admin-token or $OPEN_UNIFI_ADMIN_TOKEN")
+		logger.Warn("admin API and metrics are ANONYMOUS (LAB ONLY)")
 	}
 
 	// WirelessSource feeds the admin-API WLAN envelope into inform-side
@@ -109,19 +134,21 @@ func run() error {
 				VLAN:       w.VLAN,
 				Enabled:    w.Enabled,
 				ID:         w.ID,
+				Band:       w.Band,
 			})
 		}
 		return out
 	}
 
 	srv := server.New(server.Config{
-		InformListenAddr: *listenInform,
-		DiscoveryListen:  *discovery,
-		DiscoveryPort:    dport,
-		ControllerURL:    *controllerURL,
-		SSHPassword:      *apSSHPassword,
-		AllowPlainText:   *allowPlainText,
-		WirelessSource:   wirelessSource,
+		InformListenAddr:      *listenInform,
+		DiscoveryListen:       *discovery,
+		DiscoveryPort:         dport,
+		ControllerURL:         *controllerURL,
+		RegulatoryCountryCode: *regulatoryCountryCode,
+		SSHPassword:           *apSSHPassword,
+		AllowPlainText:        *allowPlainText,
+		WirelessSource:        wirelessSource,
 	}, st, logger)
 	if *controllerURL == "" {
 		logger.Warn("no --controller-url configured: discovery/adopt replies cannot point the device at an inform URL; prefer SSH 'set-inform <this controller>/inform'")
@@ -155,10 +182,9 @@ func run() error {
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
 	}
-	// TODO(TLS): the classic controller terminates HTTPS on 8443; we serve
-	// plain HTTP on --listen-admin for the current milestone (same-host/
-	// trusted-lab setups). Front-load TLS via a reverse proxy, or wire
-	// crypto/tls + cert/key flags here.
+	// Admin TLS is intentionally terminated by a separately managed HTTPS
+	// reverse proxy. Native TLS is not implemented; non-loopback plaintext is
+	// refused unless the explicit lab-only opt-in was supplied.
 	adminLn, err := net.Listen("tcp", *listenAdmin)
 	if err != nil {
 		_ = informLn.Close()
@@ -329,4 +355,34 @@ func discoveryPort(addr string) (host string, port int, err error) {
 		return "", 0, errors.New("want numeric UDP port, got " + p)
 	}
 	return host, n, nil
+}
+
+// validateRegulatoryCountryCode rejects an explicitly supplied 0 before the
+// server-side coercion would silently map it to the 840 default; the flag
+// default is nonzero, so a zero here always means the user passed 0.
+func validateRegulatoryCountryCode(code int) error {
+	if code == 0 {
+		return errors.New("--regulatory-country-code 0 is not a valid ISO 3166-1 numeric code; omit the flag to use the default")
+	}
+	return nil
+}
+
+func validateAdminExposure(addr, token string, anonymous, insecure bool) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid --listen-admin %q: want host:port", addr)
+	}
+	loopback := false
+	if ip := net.ParseIP(host); ip != nil {
+		loopback = ip.IsLoopback()
+	} else if strings.EqualFold(host, "localhost") {
+		loopback = true
+	}
+	if token == "" && !anonymous {
+		return errors.New("admin token is required; set --admin-token or explicitly opt in with --allow-anonymous-admin for lab use")
+	}
+	if !loopback && !insecure {
+		return errors.New("non-loopback admin binding is plaintext; put it behind an HTTPS reverse proxy or explicitly opt in with --allow-insecure-admin for lab use")
+	}
+	return nil
 }

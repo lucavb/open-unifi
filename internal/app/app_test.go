@@ -101,6 +101,43 @@ func TestDuplicateCreateIsIdempotentUpsert(t *testing.T) {
 	}
 }
 
+func deviceNamePtr(s string) *string { return &s }
+
+// TestDeviceNameValidationBackstop pins the adapter-side fence for device
+// names (mirror of the wlan flows: the adminapi handler 400s first, every
+// Backend caller is fenced with ErrConflict). Empty stays legal: it is the
+// "leave unset" value for DeviceUpsert and the explicit clear for
+// DevicePatch.
+func TestDeviceNameValidationBackstop(t *testing.T) {
+	a, _, _ := testApp(t)
+	ctx := context.Background()
+
+	if _, err := a.CreateDevice(ctx, adminapi.DeviceUpsert{MAC: "aabbccddeeff", Name: "ok"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{Name: deviceNamePtr("bad\nname")}); !errors.Is(err, adminapi.ErrConflict) {
+		t.Fatalf("control-char name patch must be ErrConflict, got %v", err)
+	}
+	if _, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{Name: deviceNamePtr(strings.Repeat("n", 65))}); !errors.Is(err, adminapi.ErrConflict) {
+		t.Fatalf("over-long name patch must be ErrConflict, got %v", err)
+	}
+	if _, err := a.CreateDevice(ctx, adminapi.DeviceUpsert{MAC: "112233445566", Name: "bad\rname"}); !errors.Is(err, adminapi.ErrConflict) {
+		t.Fatalf("control-char name create must be ErrConflict, got %v", err)
+	}
+	// A rejected patch must not have touched the record.
+	dv, err := a.GetDevice(ctx, "aabbccddeeff")
+	if err != nil || dv.Name != "ok" {
+		t.Fatalf("rejected patch mutated the record: %+v err=%v", dv, err)
+	}
+	// Empty patch is the documented explicit clear — still legal.
+	if _, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{Name: deviceNamePtr("")}); err != nil {
+		t.Fatalf("explicit empty-name clear must stay legal: %v", err)
+	}
+	if dv, err = a.GetDevice(ctx, "aabbccddeeff"); err != nil || dv.Name != "" {
+		t.Fatalf("empty clear: name=%q err=%v", dv.Name, err)
+	}
+}
+
 func TestAdoptPendingFlow(t *testing.T) {
 	a, st, _ := testApp(t)
 	ctx := context.Background()
@@ -484,6 +521,158 @@ func TestPutWirelessFailureLeavesCacheUntouched(t *testing.T) {
 	if got := a.GetWireless(ctx); len(got.Wlans) != 1 || got.Wlans[0].Name != "ok" {
 		t.Fatalf("failed persist must leave the cache unchanged, got %+v", got)
 	}
+}
+
+// assertWirelessEnv compares two envelopes by the fields the cache-vs-disk
+// invariants care about (name + ssid, in order).
+func assertWirelessEnv(t *testing.T, got, want adminapi.WlansEnvelope) {
+	t.Helper()
+	if len(got.Wlans) != len(want.Wlans) {
+		t.Fatalf("wlan count %d != want %d: %+v", len(got.Wlans), len(want.Wlans), got.Wlans)
+	}
+	for i, w := range want.Wlans {
+		if got.Wlans[i].Name != w.Name || got.Wlans[i].SSID != w.SSID {
+			t.Fatalf("wlan[%d] = {name=%q ssid=%q}, want {name=%q ssid=%q}",
+				i, got.Wlans[i].Name, got.Wlans[i].SSID, w.Name, w.SSID)
+		}
+	}
+}
+
+func wirelessFixture() adminapi.WlansEnvelope {
+	return adminapi.WlansEnvelope{Wlans: []adminapi.Wlan{
+		{Name: "a", SSID: "aa", Security: "open", VLAN: 1, Enabled: true},
+		{Name: "b", SSID: "bb", Security: "open", VLAN: 2, Enabled: true},
+	}}
+}
+
+// TestUpdateWlanFailureLeavesCacheUntouched pins the clone-before-mutate
+// discipline: UpdateWlan used to write the new wlan into the SHARED backing
+// array of a.cachedWireless BEFORE validate/persist, so a rejected edit or
+// a failed persist left the rejected state live in the cache that
+// CurrentWireless serves to AP provisioning. Mirror of
+// TestPutWirelessFailureLeavesCacheUntouched.
+func TestUpdateWlanFailureLeavesCacheUntouched(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	wpath := filepath.Join(dir, "wireless.json")
+	a := New(store.NewMemStore(), wpath, quietLogger())
+	pre := wirelessFixture()
+	if err := a.PutWireless(ctx, pre); err != nil {
+		t.Fatal(err)
+	}
+
+	// Validation rejection: renaming "a" onto "b"'s SSID must fail.
+	_, err := a.UpdateWlan(ctx, "a", adminapi.Wlan{Name: "a", SSID: "bb", Security: "open", VLAN: 1, Enabled: true})
+	if !errors.Is(err, adminapi.ErrConflict) {
+		t.Fatalf("duplicate-SSID update must be rejected with ErrConflict, got %v", err)
+	}
+	got, cerr := a.CurrentWireless()
+	if cerr != nil {
+		t.Fatalf("CurrentWireless: %v", cerr)
+	}
+	assertWirelessEnv(t, got, pre)
+
+	// Persist failure: a 0000 directory forces CreateTemp to fail AFTER
+	// validation. The rejected state must never become live.
+	if err := os.Chmod(dir, 0o000); err != nil {
+		t.Fatalf("chmod inject: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	if _, err = a.UpdateWlan(ctx, "a", adminapi.Wlan{Name: "a", SSID: "a2", Security: "open", VLAN: 1, Enabled: true}); err == nil {
+		t.Fatal("update into an unwritable directory must fail")
+	}
+	_ = os.Chmod(dir, 0o755)
+
+	got, cerr = a.CurrentWireless()
+	if cerr != nil {
+		t.Fatalf("CurrentWireless: %v", cerr)
+	}
+	assertWirelessEnv(t, got, pre)
+	// Disk must still hold the pre-call document (memory==disk invariant).
+	fromDisk, derr := loadWirelessFile(wpath)
+	if derr != nil {
+		t.Fatalf("disk readback: %v", derr)
+	}
+	assertWirelessEnv(t, fromDisk, pre)
+
+	// Success path: only a PERSISTED clone may become the cached value.
+	if _, err = a.UpdateWlan(ctx, "a", adminapi.Wlan{Name: "a", SSID: "a2", Security: "open", VLAN: 1, Enabled: true}); err != nil {
+		t.Fatalf("valid update must persist: %v", err)
+	}
+	got, cerr = a.CurrentWireless()
+	if cerr != nil {
+		t.Fatalf("CurrentWireless: %v", cerr)
+	}
+	if len(got.Wlans) != 2 || got.Wlans[0].SSID != "a2" || got.Wlans[1].SSID != "bb" {
+		t.Fatalf("post-update cache: %+v", got.Wlans)
+	}
+	if fromDisk, derr = loadWirelessFile(wpath); derr != nil {
+		t.Fatalf("disk readback: %v", derr)
+	}
+	assertWirelessEnv(t, fromDisk, got)
+}
+
+// TestDeleteWlanFailureLeavesCacheUntouched pins the same invariant for
+// DeleteWlan: the old in-place compaction (Wlans[:0]) left the cache at
+// [b,b] over disk [a,b] when persist failed — duplicate entries in the
+// cache that AP provisioning would then serve.
+func TestDeleteWlanFailureLeavesCacheUntouched(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	wpath := filepath.Join(dir, "wireless.json")
+	a := New(store.NewMemStore(), wpath, quietLogger())
+	pre := wirelessFixture()
+	if err := a.PutWireless(ctx, pre); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unknown name: not-found, cache untouched.
+	if err := a.DeleteWlan(ctx, "nope"); !errors.Is(err, adminapi.ErrNotFound) {
+		t.Fatalf("unknown delete: want not-found, got %v", err)
+	}
+	got, cerr := a.CurrentWireless()
+	if cerr != nil {
+		t.Fatalf("CurrentWireless: %v", cerr)
+	}
+	assertWirelessEnv(t, got, pre)
+
+	// Persist failure: the deleted state must never go live before persist
+	// succeeds — neither as [b] nor as the old compaction bug's [b,b].
+	if err := os.Chmod(dir, 0o000); err != nil {
+		t.Fatalf("chmod inject: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	if err := a.DeleteWlan(ctx, "a"); err == nil {
+		t.Fatal("delete into an unwritable directory must fail")
+	}
+	_ = os.Chmod(dir, 0o755)
+
+	got, cerr = a.CurrentWireless()
+	if cerr != nil {
+		t.Fatalf("CurrentWireless: %v", cerr)
+	}
+	assertWirelessEnv(t, got, pre)
+	fromDisk, derr := loadWirelessFile(wpath)
+	if derr != nil {
+		t.Fatalf("disk readback: %v", derr)
+	}
+	assertWirelessEnv(t, fromDisk, pre)
+
+	// Success path: the filtered clone is swapped in only after persist.
+	if err := a.DeleteWlan(ctx, "a"); err != nil {
+		t.Fatalf("valid delete must persist: %v", err)
+	}
+	got, cerr = a.CurrentWireless()
+	if cerr != nil {
+		t.Fatalf("CurrentWireless: %v", cerr)
+	}
+	if len(got.Wlans) != 1 || got.Wlans[0].Name != "b" || got.Wlans[0].SSID != "bb" {
+		t.Fatalf("post-delete cache: %+v", got.Wlans)
+	}
+	if fromDisk, derr = loadWirelessFile(wpath); derr != nil {
+		t.Fatalf("disk readback: %v", derr)
+	}
+	assertWirelessEnv(t, fromDisk, got)
 }
 
 // ---- lost sweep (StateLost finally has a producer) ------------------------

@@ -15,6 +15,7 @@ import (
 // Backend implementations should return it (possibly wrapped — the mapping
 // uses errors.Is) wherever a referenced device/MAC does not exist.
 var ErrNotFound = errors.New("device not found")
+var ErrConflict = errors.New("conflict")
 
 // ---- response helpers ---------------------------------------------------
 
@@ -37,7 +38,7 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 // silently drop inputs — fail loud), and NO trailing data after the top
 // level value (trailing bytes are never accidental).
 func readJSON(r *http.Request, v any) error {
-	defer r.Body.Close()
+	defer func() { _ = r.Body.Close() }()
 	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
@@ -139,6 +140,54 @@ var validSecurities = map[string]bool{
 // when valid, else a short human message.
 func ValidateWlan(wl *Wlan) string { return validateWlan(wl) }
 
+func ValidateWlanName(name string) string {
+	if name == "" || len(name) > 64 {
+		return "name must be 1..64 characters"
+	}
+	if hasControlChar(name) {
+		return "name must not contain control characters"
+	}
+	return ""
+}
+
+// ValidateDeviceName enforces the same defense-in-depth rules as WLAN
+// names for device names: control characters rejected (a \n is the
+// system_cfg row separator, so a \n inside a device name could inject a
+// forged row) and a 64-byte cap matching the WLAN name cap. Empty is
+// ALLOWED here — DeviceUpsert treats "" as "leave unset" and DevicePatch's
+// nil-vs-empty pointer semantics treat "" as a documented explicit clear —
+// so the callers skip validation for empty values; only non-empty names
+// carry injection risk. Returns "" when valid, else a short human message
+// for the 400/409 body.
+func ValidateDeviceName(name string) string {
+	if name == "" {
+		return ""
+	}
+	if len(name) > 64 {
+		return "name must be at most 64 characters"
+	}
+	if hasControlChar(name) {
+		return "name must not contain control characters"
+	}
+	return ""
+}
+
+func ValidateSiteID(id string) string {
+	if len(id) < 1 || len(id) > 64 {
+		return "site_id must be 1..64 characters"
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		valid := (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-'
+		first := (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+		if valid && (i != 0 || first) {
+			continue
+		}
+		return "invalid site_id"
+	}
+	return ""
+}
+
 // validateWlan enforces server-side rules. The web console mirrors the
 // length/security rules client-side (see static/index.html validateWlan);
 // the control-character and ID-charset checks are deliberately
@@ -156,6 +205,9 @@ func ValidateWlan(wl *Wlan) string { return validateWlan(wl) }
 // open-unifi has no RADIUS support, so any wpa-eap we accept would ship a
 // dead vap configuration to hardware. Fail loud instead.
 func validateWlan(wl *Wlan) string {
+	if wl.Band != "" && wl.Band != "2g" && wl.Band != "5g" && wl.Band != "both" {
+		return "band must be one of 2g, 5g, both"
+	}
 	if wl.Security == "wpa-eap" {
 		return "wpa-eap requires RADIUS profiles, which open-unifi does not support"
 	}

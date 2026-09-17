@@ -10,6 +10,7 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -93,17 +95,140 @@ func New(st store.DeviceStore, wirelessPath string, lg *slog.Logger) *App {
 
 // view maps a store record to the admin API read model. Actions is the
 // minimal supported set (delete) and is omitted only if empty.
-func view(d store.Device) adminapi.DeviceView {
+func (a *App) view(d store.Device) adminapi.DeviceView {
+	a.wmu.RLock()
+	desired := append([]adminapi.Wlan(nil), a.cachedWireless.Wlans...)
+	a.wmu.RUnlock()
+	inSync := runtimeInSync(d, desired)
 	return adminapi.DeviceView{
-		MAC:      store.ColonMAC(d.MAC),
-		Name:     d.Name,
-		Model:    d.Model,
-		Firmware: d.Firmware,
-		IP:       d.IP,
-		State:    d.State,
-		LastSeen: d.LastSeen,
-		Actions:  []string{"delete"},
+		MAC:                store.ColonMAC(d.MAC),
+		Name:               d.Name,
+		Model:              d.Model,
+		Firmware:           d.Firmware,
+		IP:                 d.IP,
+		State:              d.State,
+		LastSeen:           d.LastSeen,
+		CfgVersion:         d.CfgVersion,
+		AppliedCfg:         d.AppliedCfg,
+		InSync:             inSync,
+		WLANDeliveryStatus: stringExtra(d.Extra, "wlan_cfg_delivery_status"),
+		WLANDeliveryCount:  intExtra(d.Extra, "wlan_cfg_attempts"),
+		WLANLastAttempt:    int64Extra(d.Extra, "wlan_cfg_last_attempt"),
+		SiteID:             d.SiteID,
+		Actions:            []string{"delete"},
 	}
+}
+
+func stringExtra(m store.JSONMap, key string) string { v, _ := m[key].(string); return v }
+func intExtra(m store.JSONMap, key string) int {
+	if v, ok := m[key].(float64); ok {
+		return int(v)
+	}
+	if v, ok := m[key].(int); ok {
+		return v
+	}
+	return 0
+}
+func int64Extra(m store.JSONMap, key string) int64 {
+	if v, ok := m[key].(float64); ok {
+		return int64(v)
+	}
+	if v, ok := m[key].(int64); ok {
+		return v
+	}
+	return 0
+}
+
+// runtimeInSync deliberately does not infer runtime WLAN health from the
+// controller/device cfgversion pair.  Devices can echo a matching version
+// before applying the WLAN, so that pair is only transport bookkeeping.
+// This read-side predicate is SSID-PRESENCE-ONLY by design: a positive
+// result requires a reported vap_table in which every enabled desired SSID
+// is observed RUNNING. It does NOT verify per-radio placement or that a
+// deleted WLAN has disappeared from the table — that strict check lives in
+// the server lane's settlePendingWLAN, which runs before this view is
+// served on every inform. Missing runtime evidence is unknown (nil), while
+// an observed table that lacks a desired RUN SSID is false.
+//
+// The vap_table wire keys are firmware-verified: APs report "essid" (not
+// "ssid") and "state" (not "status"). The alternate spellings are tolerated
+// defensively, but "essid"/"state" are the primaries.
+func runtimeInSync(d store.Device, desired []adminapi.Wlan) *bool {
+	if d.Extra == nil {
+		return nil
+	}
+	if _, pending := d.Extra["wlan_cfg_pending_sha"]; pending {
+		v := false
+		return &v
+	}
+	vaps, ok := d.Extra["vap_table"].([]any)
+	if !ok || len(vaps) == 0 {
+		return nil
+	}
+	// A vap_table with no RUN desired SSIDs is meaningful evidence of being out
+	// of sync, but a missing/empty table is unknown rather than false.
+	want := make(map[string]bool)
+	for _, wlan := range desired {
+		if wlan.Enabled {
+			want[wlan.SSID] = true
+		}
+	}
+	if len(want) == 0 {
+		return nil
+	}
+	running := make(map[string]bool)
+	for _, raw := range vaps {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		ssid, _ := m["essid"].(string)
+		if ssid == "" {
+			ssid, _ = m["ssid"].(string) // tolerated fallback spelling
+		}
+		state, _ := m["state"].(string)
+		if state == "" {
+			state, _ = m["status"].(string) // tolerated fallback spelling
+		}
+		if ssid != "" && strings.EqualFold(state, "RUN") && want[ssid] {
+			running[ssid] = true
+		}
+	}
+	v := len(running) == len(want)
+	return &v
+}
+
+func (a *App) PatchDevice(_ context.Context, mac string, patch adminapi.DevicePatch) (adminapi.DeviceView, error) {
+	canon, err := store.CanonicalMAC(mac)
+	if err != nil {
+		return adminapi.DeviceView{}, unknownDevice(mac)
+	}
+	var rec store.Device
+	err = a.st.UpdateExisting(canon, func(d *store.Device) error {
+		if patch.Name != nil {
+			// Same backstop the wlan flows apply (CreateWlan): the handler
+			// 400s first, but every Backend caller is still fenced in.
+			if msg := adminapi.ValidateDeviceName(*patch.Name); msg != "" {
+				return fmt.Errorf("%w: %s", adminapi.ErrConflict, msg)
+			}
+			d.Name = *patch.Name
+		}
+		if patch.SiteID != nil {
+			d.SiteID = *patch.SiteID
+		}
+		rec = *d
+		rec.LastUps = nil
+		rec.Extra = nil
+		rec.Authkeys = nil
+		return nil
+	})
+	if errors.Is(err, store.ErrNotFound) {
+		return adminapi.DeviceView{}, unknownDevice(canon)
+	}
+	if err != nil {
+		return adminapi.DeviceView{}, fmt.Errorf("device store: %w", err)
+	}
+	return a.view(rec), nil
 }
 
 // ---- adminapi.Backend ----------------------------------------------------
@@ -117,7 +242,7 @@ func (a *App) ListDevices(_ context.Context) []adminapi.DeviceView {
 	}
 	out := make([]adminapi.DeviceView, 0, len(list))
 	for _, d := range list {
-		out = append(out, view(d))
+		out = append(out, a.view(d))
 	}
 	return out
 }
@@ -137,7 +262,7 @@ func (a *App) GetDevice(_ context.Context, mac string) (adminapi.DeviceView, err
 		}
 		return adminapi.DeviceView{}, fmt.Errorf("device store: %w", err)
 	}
-	return view(d), nil
+	return a.view(d), nil
 }
 
 // CreateDevice registers a device manually as the adopt whitelist (state
@@ -164,6 +289,9 @@ func (a *App) CreateDevice(_ context.Context, up adminapi.DeviceUpsert) (adminap
 			d.FirstSeen = time.Now().Unix()
 		}
 		if up.Name != "" {
+			if msg := adminapi.ValidateDeviceName(up.Name); msg != "" {
+				return fmt.Errorf("%w: %s", adminapi.ErrConflict, msg)
+			}
 			d.Name = up.Name
 		}
 		if up.SiteID != "" {
@@ -173,6 +301,7 @@ func (a *App) CreateDevice(_ context.Context, up adminapi.DeviceUpsert) (adminap
 		rec = store.Device{
 			MAC: d.MAC, Name: d.Name, Model: d.Model, Firmware: d.Firmware,
 			IP: d.IP, State: d.State, LastSeen: d.LastSeen,
+			CfgVersion: d.CfgVersion, AppliedCfg: d.AppliedCfg,
 		}
 		return nil
 	}); err != nil {
@@ -180,7 +309,7 @@ func (a *App) CreateDevice(_ context.Context, up adminapi.DeviceUpsert) (adminap
 	}
 	a.lg.Debug("device created/updated via admin api", "mac", store.ColonMAC(mac),
 		"state", rec.State, "created", created)
-	return view(rec), nil
+	return a.view(rec), nil
 }
 
 // DeleteDevice removes a device record. Unknown MACs wrap
@@ -263,7 +392,7 @@ func (a *App) AdoptPending(_ context.Context, mac string) (adminapi.DeviceView, 
 		return adminapi.DeviceView{}, err
 	}
 	a.lg.Debug("device promoted to pending", "mac", store.ColonMAC(mac))
-	return view(rec), nil
+	return a.view(rec), nil
 }
 
 // ---- wireless config file -------------------------------------------------
@@ -277,7 +406,7 @@ func (a *App) AdoptPending(_ context.Context, mac string) (adminapi.DeviceView, 
 func (a *App) GetWireless(_ context.Context) adminapi.WlansEnvelope {
 	a.wmu.RLock()
 	defer a.wmu.RUnlock()
-	return a.cachedWireless
+	return cloneWireless(a.cachedWireless)
 }
 
 // CurrentWireless exposes the cached wireless envelope without the Backend
@@ -292,7 +421,7 @@ func (a *App) GetWireless(_ context.Context) adminapi.WlansEnvelope {
 func (a *App) CurrentWireless() (adminapi.WlansEnvelope, error) {
 	a.wmu.RLock()
 	defer a.wmu.RUnlock()
-	return a.cachedWireless, a.loadErr
+	return cloneWireless(a.cachedWireless), a.loadErr
 }
 
 // loadWirelessFile reads and decodes the wireless config document exactly
@@ -327,6 +456,9 @@ func loadWirelessFile(path string) (adminapi.WlansEnvelope, error) {
 				path, i, wl.Name, wl.SSID, msg)
 		}
 	}
+	if err := validateWlanUniqueness(env); err != nil {
+		return def, err
+	}
 	return env, nil
 }
 
@@ -339,6 +471,17 @@ func (a *App) PutWireless(_ context.Context, env adminapi.WlansEnvelope) error {
 	defer a.wmu.Unlock()
 	if env.Wlans == nil {
 		env.Wlans = []adminapi.Wlan{}
+	}
+	for i := range env.Wlans {
+		env.Wlans[i].ID = wlanID(env.Wlans[i])
+	}
+	for _, w := range env.Wlans {
+		if msg := adminapi.ValidateWlanName(w.Name); msg != "" {
+			return fmt.Errorf("%w: %s", adminapi.ErrConflict, msg)
+		}
+	}
+	if err := validateWlanUniqueness(env); err != nil {
+		return err
 	}
 	blob, err := json.MarshalIndent(env, "", "  ")
 	if err != nil {
@@ -377,6 +520,163 @@ func (a *App) PutWireless(_ context.Context, env adminapi.WlansEnvelope) error {
 	syncDir(dir)           // best effort: make the rename itself durable
 	a.cachedWireless = env // persist succeeded: swap the cache atomically
 	a.lg.Debug("wireless config replaced", "wlans", len(env.Wlans))
+	return nil
+}
+
+func wlanID(w adminapi.Wlan) string {
+	if w.ID != "" {
+		return w.ID
+	}
+	sum := sha256.Sum256([]byte(w.Name + w.SSID))
+	return fmt.Sprintf("%x", sum[:12])
+}
+func (a *App) validateWlans(env *adminapi.WlansEnvelope) error {
+	names, ssids, ids := map[string]bool{}, map[string]bool{}, map[string]bool{}
+	for i := range env.Wlans {
+		w := &env.Wlans[i]
+		if msg := adminapi.ValidateWlanName(w.Name); msg != "" {
+			return fmt.Errorf("%w: wlan[%d]: %s", adminapi.ErrConflict, i, msg)
+		}
+		if msg := adminapi.ValidateWlan(w); msg != "" {
+			return fmt.Errorf("%w: wlan[%d]: %s", adminapi.ErrConflict, i, msg)
+		}
+		if names[w.Name] || ssids[w.SSID] || (w.ID != "" && ids[w.ID]) {
+			return fmt.Errorf("%w: duplicate wlan", adminapi.ErrConflict)
+		}
+		names[w.Name], ssids[w.SSID], ids[w.ID] = true, true, w.ID != ""
+	}
+	return nil
+}
+
+func validateWlanUniqueness(env adminapi.WlansEnvelope) error {
+	names, ssids, ids := map[string]bool{}, map[string]bool{}, map[string]bool{}
+	for _, w := range env.Wlans {
+		if names[w.Name] || ssids[w.SSID] || (w.ID != "" && ids[w.ID]) {
+			return fmt.Errorf("%w: duplicate wlan", adminapi.ErrConflict)
+		}
+		names[w.Name], ssids[w.SSID], ids[w.ID] = true, true, w.ID != ""
+	}
+	return nil
+}
+func (a *App) CreateWlan(_ context.Context, wlan adminapi.Wlan) (adminapi.Wlan, error) {
+	a.wmu.Lock()
+	defer a.wmu.Unlock()
+	env := a.cachedWireless
+	if msg := adminapi.ValidateWlanName(wlan.Name); msg != "" {
+		return adminapi.Wlan{}, fmt.Errorf("%w: %s", adminapi.ErrConflict, msg)
+	}
+	wlan.ID = wlanID(wlan)
+	env.Wlans = append(append([]adminapi.Wlan(nil), env.Wlans...), wlan)
+	if err := a.validateWlans(&env); err != nil {
+		return adminapi.Wlan{}, err
+	}
+	if err := a.persistWirelessLocked(env); err != nil {
+		return adminapi.Wlan{}, err
+	}
+	return wlan, nil
+}
+func (a *App) GetWlan(_ context.Context, name string) (adminapi.Wlan, error) {
+	a.wmu.RLock()
+	defer a.wmu.RUnlock()
+	for _, w := range a.cachedWireless.Wlans {
+		if w.Name == name {
+			return w, nil
+		}
+	}
+	return adminapi.Wlan{}, fmt.Errorf("%w: wlan %s", adminapi.ErrNotFound, name)
+}
+func (a *App) UpdateWlan(_ context.Context, name string, wlan adminapi.Wlan) (adminapi.Wlan, error) {
+	a.wmu.Lock()
+	defer a.wmu.Unlock()
+	// Clone BEFORE any mutation: a shallow copy shares the backing array of
+	// a.cachedWireless, so writing env.Wlans[i] here would leak the new
+	// (possibly rejected) wlan into the live cache that CurrentWireless
+	// serves to AP provisioning before validateWlans/persistWirelessLocked
+	// have a say. persistWirelessLocked swaps the clone in on success.
+	env := cloneWireless(a.cachedWireless)
+	if msg := adminapi.ValidateWlanName(name); msg != "" {
+		return adminapi.Wlan{}, fmt.Errorf("%w: %s", adminapi.ErrConflict, msg)
+	}
+	if wlan.Name != "" && wlan.Name != name {
+		return adminapi.Wlan{}, fmt.Errorf("%w: name must match path", adminapi.ErrConflict)
+	}
+	wlan.Name = name
+	found := false
+	for i := range env.Wlans {
+		if env.Wlans[i].Name == name {
+			wlan.ID = env.Wlans[i].ID
+			env.Wlans[i] = wlan
+			found = true
+			break
+		}
+	}
+	if !found {
+		return adminapi.Wlan{}, fmt.Errorf("%w: wlan %s", adminapi.ErrNotFound, name)
+	}
+	if err := a.validateWlans(&env); err != nil {
+		return adminapi.Wlan{}, err
+	}
+	if err := a.persistWirelessLocked(env); err != nil {
+		return adminapi.Wlan{}, err
+	}
+	return wlan, nil
+}
+
+func cloneWireless(env adminapi.WlansEnvelope) adminapi.WlansEnvelope {
+	env.Wlans = append([]adminapi.Wlan(nil), env.Wlans...)
+	return env
+}
+func (a *App) DeleteWlan(_ context.Context, name string) error {
+	a.wmu.Lock()
+	defer a.wmu.Unlock()
+	// Clone BEFORE any mutation (same discipline as UpdateWlan): the old
+	// in-place compaction via Wlans[:0] wrote the filtered list into the
+	// SHARED backing array of a.cachedWireless, so a failed persist left
+	// the deleted state live in the cache while disk kept the old document.
+	env := cloneWireless(a.cachedWireless)
+	out := make([]adminapi.Wlan, 0, len(env.Wlans))
+	found := false
+	for _, w := range env.Wlans {
+		if w.Name == name {
+			found = true
+		} else {
+			out = append(out, w)
+		}
+	}
+	if !found {
+		return fmt.Errorf("%w: wlan %s", adminapi.ErrNotFound, name)
+	}
+	env.Wlans = out
+	return a.persistWirelessLocked(env)
+}
+func (a *App) persistWirelessLocked(env adminapi.WlansEnvelope) error {
+	blob, err := json.MarshalIndent(env, "", "  ")
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(a.wirelessPath)
+	tmp, err := os.CreateTemp(dir, filepath.Base(a.wirelessPath)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer func() { _ = os.Remove(name) }()
+	if _, err = tmp.Write(blob); err == nil {
+		err = tmp.Sync()
+	}
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	if err = os.Rename(name, a.wirelessPath); err != nil {
+		return err
+	}
+	// Same durability contract as PutWireless: flush the rename itself so
+	// every wireless mutation path survives a crash identically.
+	syncDir(dir)
+	a.cachedWireless = env
 	return nil
 }
 

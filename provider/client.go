@@ -176,13 +176,20 @@ func errNotFound(err error) bool {
 // site_id is request-only on device creation and never appears in a
 // response body, so it is deliberately absent here.
 type device struct {
-	Mac      string `json:"mac"`
-	Name     string `json:"name"`
-	Model    string `json:"model,omitempty"`
-	State    int    `json:"state"`
-	IP       string `json:"ip,omitempty"`
-	Firmware string `json:"firmware,omitempty"`
-	LastSeen int64  `json:"last_seen,omitempty"`
+	Mac                string `json:"mac"`
+	Name               string `json:"name"`
+	Model              string `json:"model,omitempty"`
+	State              int    `json:"state"`
+	IP                 string `json:"ip,omitempty"`
+	Firmware           string `json:"firmware,omitempty"`
+	LastSeen           int64  `json:"last_seen,omitempty"`
+	CfgVersion         string `json:"cfg_version,omitempty"`
+	AppliedCfg         string `json:"applied_cfg,omitempty"`
+	InSync             *bool  `json:"in_sync,omitempty"`
+	WLANDeliveryStatus string `json:"wlan_delivery_status,omitempty"`
+	WLANDeliveryCount  int    `json:"wlan_delivery_count,omitempty"`
+	WLANLastAttempt    int64  `json:"wlan_last_attempt,omitempty"`
+	SiteID             string `json:"site_id,omitempty"`
 }
 
 // stateNames maps the server's numeric device states (internal/store
@@ -241,7 +248,7 @@ func (c *apiClient) getDevice(ctx context.Context, mac string) (*apDevice, error
 	return &dev, nil
 }
 
-// wirelessEntry is one wlan inside the /api/v1/wireless envelope.
+// wirelessEntry is one wlan returned by the item wireless API.
 type wirelessEntry struct {
 	ID         string `json:"id,omitempty"`
 	Name       string `json:"name"`
@@ -250,28 +257,27 @@ type wirelessEntry struct {
 	Passphrase string `json:"passphrase,omitempty"`
 	VLAN       int    `json:"vlan,omitempty"`
 	Enabled    bool   `json:"enabled"`
+	Band       string `json:"band,omitempty"`
 }
 
-// wirelessEnvelope is the WHOLE-document payload of /api/v1/wireless.
-// The server upserts this document on PUT; all per-wlan operations build on
-// read-modify-write of this envelope (single-source-of-truth strategy).
-type wirelessEnvelope struct {
-	Wlans []wirelessEntry `json:"wlans"`
+func (c *apiClient) createWireless(ctx context.Context, entry *wirelessEntry) error {
+	return c.do(ctx, http.MethodPost, "/api/v1/wireless", entry, nil)
 }
 
-// getWireless GETs the wireless envelope.
-func (c *apiClient) getWireless(ctx context.Context) (*wirelessEnvelope, error) {
-	var env wirelessEnvelope
-	if err := c.do(ctx, http.MethodGet, "/api/v1/wireless", nil, &env); err != nil {
+func (c *apiClient) getWireless(ctx context.Context, name string) (*wirelessEntry, error) {
+	var entry wirelessEntry
+	if err := c.do(ctx, http.MethodGet, "/api/v1/wireless/"+url.PathEscape(name), nil, &entry); err != nil {
 		return nil, err
 	}
-	return &env, nil
+	return &entry, nil
 }
 
-// putWireless PUTs the (whole) wireless envelope. No retry: a lost PUT can
-// clobber a concurrent editor's changes if blindly replayed.
-func (c *apiClient) putWireless(ctx context.Context, env *wirelessEnvelope) error {
-	return c.do(ctx, http.MethodPut, "/api/v1/wireless", env, nil)
+func (c *apiClient) updateWireless(ctx context.Context, name string, entry *wirelessEntry) error {
+	return c.do(ctx, http.MethodPut, "/api/v1/wireless/"+url.PathEscape(name), entry, nil)
+}
+
+func (c *apiClient) deleteWireless(ctx context.Context, name string) error {
+	return c.do(ctx, http.MethodDelete, "/api/v1/wireless/"+url.PathEscape(name), nil, nil)
 }
 
 // whoami is a cheap health/auth probe: GET /api/v1/whoami. It always
