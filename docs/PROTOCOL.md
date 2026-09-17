@@ -273,6 +273,18 @@ last, capped at 2 — the factory default key is NEVER stored here), XAuthkey, A
 LastUps, Extra (inform-body passthrough; controller-owned `wlan_cfg_sha`/
 `ssh_sha512passwd` and admin-owned keys are preserved/protected across informs).
 
+Trust-policy asymmetries (mirror the classic controller's observed behavior;
+recorded so they read as fidelity, not oversight):
+- `ssh_md5passwd` is not controller-owned: unlike its sha512 sibling, the
+  device may overwrite the md5 password cache through an inform. Only
+  `ssh_sha512passwd` rides the protection list.
+- `Extra["watching"]` is device-writable: nothing protects it, and the noop
+  scheduler honors a truthy value with the 5-second watching cadence, so a
+  device can select its own fast cadence.
+- `has_eth1` is fill-if-absent but never read: the eth inventory derives from
+  if_table/ethernet_table (system_cfg renderer), so the key is a vestige the
+  classic controller also carries.
+
 Package `internal/adminapi`: REST over JSON at the `--listen-admin` addr:
 ```
 GET    /api/v1/devices            (list; state/last_seen are JSON numbers)
