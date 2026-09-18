@@ -299,17 +299,21 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, d *store.Devi
 	// Wireless envelope drift (FSM hash bump): BEFORE the cfgversion drift
 	// check, compare sha256(canonical wireless envelope) with the stored
 	// Extra["wlan_cfg_sha"]. A mismatch regenerates CfgVersion, which the
-	// drift check then sees as unknown → full provisioning. The hash is
-	// minted together with the cfgversion it belongs to: the adoption push
-	// seeds it (rotateKeys case below) and full provisioning refreshes it
-	// (assignedKeyFlow). Live finding (2026-09-16 acceptance session, U7PG2
-	// on BZ.6.8.2): real firmware echoes the adoption mgmt_cfg's cfgversion
-	// back on its first re-keyed inform — matching the jar's equal path
-	// (voidsuper bytes 3287-3306 jump to 3549) — so full provisioning never
-	// follows adoption on its own, and the drift baseline must NOT depend on
-	// assignedKeyFlow having run first. The jar bumps device.cfgversion on
-	// operator config saves ("CONFIG changed" log); this hash comparison is
-	// open-unifi's equivalent trigger.
+	// drift check then sees as unknown → full provisioning. The baseline
+	// is captured exclusively by settle — the drift-settle confirmation of
+	// a delivered system_cfg — and adoption deliberately does NOT seed it
+	// (2026-09-18 F-row live round: a seed equal to the current envelope
+	// hash made this check compare the intent against itself, so a freshly
+	// adopted device answered connected noops forever without ever
+	// receiving system_cfg). Live finding (2026-09-16 acceptance session,
+	// U7PG2 on BZ.6.8.2): real firmware echoes the adoption mgmt_cfg's
+	// cfgversion back on its first re-keyed inform — matching the jar's
+	// equal path (voidsuper bytes 3287-3306 jump to 3549) — so full
+	// provisioning never follows adoption on its own, and the drift
+	// baseline must NOT depend on assignedKeyFlow having run first. The
+	// jar bumps device.cfgversion on operator config saves ("CONFIG
+	// changed" log); this hash comparison is open-unifi's equivalent
+	// trigger.
 	// A system_cfg transmission is only an offer.  Its hash remains pending
 	// until a later inform proves the VAPs are actually running.
 	st := loadWlanCfgState(d.Extra)
@@ -358,15 +362,11 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, d *store.Devi
 		if err := e.rotateKeys(d); err != nil {
 			return Outcome{}, err
 		}
-		// Seed the wireless-envelope baseline for the cfgversion just
-		// minted (see the drift block above): the device would reach
-		// connected-noop on its very next inform (mgmt_cfg echo) without
-		// ever seeing system_cfg, and without a baseline a later WLAN
-		// change could never be detected as drift. Envelope changes made
-		// AFTER this push then mismatch the seed → full provisioning.
-		if cur := wireless.WlanListHash(wls); cur != "" {
-			d.Extra["wlan_cfg_sha"] = cur
-		}
+		// No baseline is seeded here (see the drift block above): the
+		// post-adoption echo reaches the no-baseline self-heal below,
+		// which forces exactly one full provisioning — the real-controller
+		// sequence the 2026-09-16 session captured — and settle captures
+		// the baseline only once that delivery is proven on the wire.
 		e.lg.Debug("inform: adoption push (default key)", "mac", d.MAC, "prevState", prev)
 		return e.adoptionPush(*d, req.UsedKey), nil
 
@@ -409,6 +409,25 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, d *store.Devi
 		}
 		if st.pendingSHAPresent {
 			return e.noopFor(d, now, req.PrevNoopTarget, KindNoopPendingWLAN), nil
+		}
+		// Settled-state regression (2026-09-18 F-row live round, A2
+		// finding): a device can echo a matching cfgversion while running
+		// something else — a rebooted AP re-materializes factory config
+		// yet still reports the provisioned stamp, and the settle
+		// watchdog is one-shot. A PRESENT vap_table that disproves the
+		// applied WLANs re-arms delivery the same way the self-heal
+		// does: mint a fresh cfgversion so the NEXT inform mismatches
+		// and flows through full provisioning, re-entering drift
+		// settle. Absent/empty tables are unknown, not regression —
+		// sparse heartbeats must never re-arm delivery.
+		if st.appliedNotRunning() {
+			nv, kerr := e.keyChars(16)
+			if kerr != nil {
+				return Outcome{}, kerr
+			}
+			d.CfgVersion = nv
+			e.lg.Debug("inform: applied WLANs not running, forcing re-provisioning", "mac", d.MAC)
+			return e.noopFor(d, now, req.PrevNoopTarget, KindNoop), nil
 		}
 		d.State = store.StateAdopted
 		e.lg.Debug("inform: connected noop", "mac", d.MAC, "cfg", d.CfgVersion)

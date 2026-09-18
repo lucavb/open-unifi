@@ -1197,13 +1197,15 @@ func TestWirelessDriftFSM(t *testing.T) {
 	}
 }
 
-// Adoption push (default key) SEEDS the wireless-envelope baseline: the
-// cfgversion minted in the push and the envelope it corresponds to are one
-// unit. Live finding (2026-09-16 acceptance session): real firmware reaches
-// connected-noop on its first re-keyed inform (mgmt_cfg echo) without ever
-// receiving system_cfg, so a baseline seeded only by full provisioning would
-// never appear and WLAN changes could not be detected as drift.
-func TestAdoptionPushSeedsHash(t *testing.T) {
+// Adoption push (default key) must NOT seed the wireless-envelope baseline
+// (2026-09-18 F-row live finding): a seed equal to the current envelope
+// hash made the drift check compare the intent against itself, so a
+// freshly adopted device with a pre-existing envelope answered connected
+// noops forever without ever receiving system_cfg. The post-adoption echo
+// instead reaches the no-baseline self-heal (minting cfgversion → forced
+// full provisioning), which delivers the envelope; settle captures the
+// baseline only after delivery proof.
+func TestAdoptionDoesNotSeedBaseline(t *testing.T) {
 	env := []Wlan{{Name: "corp", SSID: "corp", Security: "wpa-p", Passphrase: "correcthorse", VLAN: 42, Enabled: true}}
 	st := store.NewMemStore()
 	if err := st.Put(store.Device{MAC: testMAC, State: store.StatePending}); err != nil {
@@ -1211,6 +1213,7 @@ func TestAdoptionPushSeedsHash(t *testing.T) {
 	}
 	h := wiredServer(t, func() []Wlan { return env }, st)
 
+	// inform#1 (factory key): adoption push; NO baseline seeded.
 	body := encryptCBC(t, mustJSON(t, infoBody("")), hexKey(t, inform.DefaultKeyHex), testIV)
 	resp := post(t, h, body)
 	_, jm := decryptResponse(t, resp.Body.Bytes(), hexKey(t, inform.DefaultKeyHex))
@@ -1221,22 +1224,62 @@ func TestAdoptionPushSeedsHash(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec.Extra["wlan_cfg_sha"] != wireless.WlanListHash(env) {
-		t.Fatalf("adoption push wlan_cfg_sha = %v, want %q", rec.Extra["wlan_cfg_sha"], wireless.WlanListHash(env))
+	if _, ok := rec.Extra["wlan_cfg_sha"]; ok {
+		t.Fatalf("adoption push seeded wlan_cfg_sha = %v, want none", rec.Extra["wlan_cfg_sha"])
 	}
 	if !containsKey(rec.Authkeys, rec.XAuthkey) {
 		t.Fatal("x_authkey not appended")
 	}
+	xkey, cfg := rec.XAuthkey, rec.CfgVersion
+
+	// inform#2 (re-keyed, echoes the mgmt cfgversion): self-heal noop, mint.
+	body = encryptCBC(t, mustJSON(t, radioBody(cfg)), hexKey(t, xkey), testIV)
+	resp = post(t, h, body)
+	_, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
+	if jm["_type"] != "noop" {
+		t.Fatalf("inform#2 type = %v, want noop", jm["_type"])
+	}
+	rec, err = st.Get(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.CfgVersion == cfg {
+		t.Fatal("post-adoption echo did not self-heal-mint a cfgversion")
+	}
+	if rec.State != store.StateAdopting {
+		t.Fatalf("state after echo = %d, want adopting", rec.State)
+	}
+
+	// inform#3 (device still echoes the mgmt cfgversion): mismatch → full
+	// provisioning DELIVERS the pre-existing envelope.
+	body = encryptCBC(t, mustJSON(t, radioBody(cfg)), hexKey(t, xkey), testIV)
+	resp = post(t, h, body)
+	_, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
+	if jm["_type"] != "setparam" || jm["system_cfg"] == nil {
+		t.Fatalf("inform#3 type = %v, want setparam full provisioning", jm["_type"])
+	}
+	if !strings.Contains(jm["system_cfg"].(string), "aaa.1.ssid=corp") {
+		t.Fatalf("inform#3 system_cfg missing the pre-existing SSID:\n%q", jm["system_cfg"])
+	}
+	rec, err = st.Get(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Extra["wlan_cfg_pending_sha"] != wireless.WlanListHash(env) {
+		t.Fatalf("pending hash not captured: %v", rec.Extra["wlan_cfg_pending_sha"])
+	}
 }
 
-// Live-sequence regression (2026-09-16 acceptance session, U7PG2 on
-// BZ.6.8.2): adoption happened with zero WLANs; the device echoed the
-// adoption mgmt_cfg's cfgversion on its first re-keyed inform (connected
-// noop, no system_cfg ever sent — matches the jar's cfgversion-equal path,
-// voidsuper bytes 3287-3306); the operator then added the first WLAN and
-// the envelope drift must force full provisioning. Before the seeding fix
-// the baseline was never captured on this path and the WLAN change was
-// silently never pushed.
+// Live-sequence regression (2026-09-16 acceptance session + 2026-09-18
+// F-row round): adoption happened with zero WLANs; the device echoed the
+// adoption mgmt_cfg's cfgversion on its first re-keyed inform (matching
+// the jar's cfgversion-equal path, voidsuper bytes 3287-3306). Adoption
+// deliberately does NOT seed the drift baseline (seeding suppressed
+// delivery of pre-existing envelopes — the 2026-09-18 finding), so the
+// echo reaches the self-heal, which mints a cfgversion and forces exactly
+// one full provisioning; the operator's first WLAN either lands in that
+// forced push or mismatches via the minted cfgversion. The baseline is
+// captured exclusively by settle, after delivery is proven on the wire.
 func TestAdoptionEchoThenEnvelopeDrift(t *testing.T) {
 	env := []Wlan{} // the live AP adopted with an empty wireless config
 	st := store.NewMemStore()
@@ -1256,11 +1299,13 @@ func TestAdoptionEchoThenEnvelopeDrift(t *testing.T) {
 		t.Fatal(err)
 	}
 	xkey, cfg := rec.XAuthkey, rec.CfgVersion
-	if rec.Extra["wlan_cfg_sha"] != wireless.WlanListHash(env) {
-		t.Fatalf("adoption push did not seed the empty-envelope baseline: %v", rec.Extra["wlan_cfg_sha"])
+	if _, ok := rec.Extra["wlan_cfg_sha"]; ok {
+		t.Fatalf("adoption push seeded wlan_cfg_sha = %v, want none (settle captures the baseline)", rec.Extra["wlan_cfg_sha"])
 	}
 
-	// inform#2 (re-keyed, echoes the mgmt_cfg cfgversion): connected noop.
+	// inform#2 (re-keyed, echoes the mgmt_cfg cfgversion): the self-heal
+	// answers a noop and mints a fresh cfgversion; the state stays
+	// adopting until the forced delivery settles.
 	resp = post(t, h, encryptCBC(t, mustJSON(t, radioBody(cfg)), hexKey(t, xkey), testIV))
 	_, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
 	if jm["_type"] != "noop" {
@@ -1270,14 +1315,19 @@ func TestAdoptionEchoThenEnvelopeDrift(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec.State != store.StateAdopted {
-		t.Fatalf("state after echo = %d, want adopted", rec.State)
+	if rec.CfgVersion == cfg {
+		t.Fatal("post-adoption echo did not self-heal-mint a cfgversion")
+	}
+	if rec.State != store.StateAdopting {
+		t.Fatalf("state after echo = %d, want adopting (delivery outstanding)", rec.State)
 	}
 
 	// Operator configures the first WLAN (live: PUT /api/v1/wireless).
 	env = append(env, Wlan{Name: "corp", SSID: "openunifi-test", Security: "wpa-p", Passphrase: "live-validate-2026", VLAN: 1, Enabled: true})
 
-	// inform#3: envelope drift → full provisioning.
+	// inform#3: the device still echoes the mgmt_cfg cfgversion, which
+	// mismatches the self-heal mint → full provisioning carrying the new
+	// envelope.
 	resp = post(t, h, encryptCBC(t, mustJSON(t, radioBody(cfg)), hexKey(t, xkey), testIV))
 	_, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
 	if jm["_type"] != "setparam" || jm["system_cfg"] == nil {
@@ -1294,13 +1344,23 @@ func TestAdoptionEchoThenEnvelopeDrift(t *testing.T) {
 		t.Fatalf("pending hash not refreshed after provisioning: %v", rec.Extra["wlan_cfg_pending_sha"])
 	}
 
-	// inform#4: applied → connected noop again.
+	// inform#4: applied → settle confirms, connected noop, adopted.
 	settle := radioBody(rec.CfgVersion)
 	settle["vap_table"] = runningVAPs(env)
 	resp = post(t, h, encryptCBC(t, mustJSON(t, settle), hexKey(t, xkey), testIV))
 	_, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
 	if jm["_type"] != "noop" {
 		t.Fatalf("inform#4 type = %v, want noop", jm["_type"])
+	}
+	rec, err = st.Get(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.State != store.StateAdopted {
+		t.Fatalf("state after settle = %d, want adopted", rec.State)
+	}
+	if rec.Extra["wlan_cfg_sha"] != wireless.WlanListHash(env) {
+		t.Fatalf("settle did not capture the baseline: %v", rec.Extra["wlan_cfg_sha"])
 	}
 }
 
@@ -1552,6 +1612,108 @@ func TestMissingBaselineForcesProvisioning(t *testing.T) {
 	}
 	if rec, err = st.Get(testMAC); err != nil || rec.State != store.StateAdopted {
 		t.Fatalf("state after re-provision = %+v (%v)", rec, err)
+	}
+}
+
+// Settled-state regression (live 2026-09-18 F-row round, A2 finding): a
+// rebooted AP re-materializes factory config while still echoing the
+// provisioned cfgversion — the engine must re-arm delivery (mint → forced
+// full provisioning → settle) instead of nooping forever. Sparse informs
+// WITHOUT a vap_table are unknown and must not re-arm.
+func TestRebootRegressionReprovisions(t *testing.T) {
+	env := workedEnvelope()
+	st := store.NewMemStore()
+	xkey := "11112222333344445555666677778888"
+	extra := u7pg2Record().Extra
+	extra["wlan_cfg_sha"] = wireless.WlanListHash(env)
+	snapshot, err := json.Marshal(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extra["wlan_cfg_applied_wlans"] = string(snapshot)
+	if err := st.Put(store.Device{
+		MAC: testMAC, State: store.StateAdopted,
+		CfgVersion: "aaaa", AppliedCfg: "aaaa",
+		XAuthkey: xkey, Authkeys: []string{xkey}, Model: "U7PG2",
+		Extra: extra,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h := wiredServer(t, func() []Wlan { return env }, st)
+
+	// inform#0 (sparse, no vap_table): unknown → plain connected noop, no
+	// re-arm.
+	body := encryptCBC(t, mustJSON(t, radioBody("aaaa")), hexKey(t, xkey), testIV)
+	resp := post(t, h, body)
+	_, jm := decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
+	if jm["_type"] != "noop" {
+		t.Fatalf("inform#0 type = %v, want noop", jm["_type"])
+	}
+	rec, err := st.Get(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.CfgVersion != "aaaa" {
+		t.Fatalf("sparse inform re-armed delivery: cfgversion = %q", rec.CfgVersion)
+	}
+
+	// inform#1 (post-reboot factory table): present vap_table disproving
+	// the applied WLANs → minting noop.
+	factory := radioBody("aaaa")
+	factory["vap_table"] = []any{map[string]any{
+		"essid": "factory-default", "state": "RUN", "radio_name": "ra0", "name": "ath0",
+	}}
+	body = encryptCBC(t, mustJSON(t, factory), hexKey(t, xkey), testIV)
+	resp = post(t, h, body)
+	_, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
+	if jm["_type"] != "noop" {
+		t.Fatalf("inform#1 type = %v, want noop (re-arm mint)", jm["_type"])
+	}
+	rec, err = st.Get(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.CfgVersion == "aaaa" {
+		t.Fatal("regression did not re-arm (no fresh cfgversion minted)")
+	}
+
+	// inform#2 (device still echoes the old stamp): full provisioning
+	// re-delivers the envelope.
+	body = encryptCBC(t, mustJSON(t, radioBody("aaaa")), hexKey(t, xkey), testIV)
+	resp = post(t, h, body)
+	_, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
+	if jm["_type"] != "setparam" || jm["system_cfg"] == nil {
+		t.Fatalf("inform#2 type = %v, want setparam full provisioning", jm["_type"])
+	}
+	if !strings.Contains(jm["system_cfg"].(string), "aaa.1.ssid=corp") {
+		t.Fatalf("inform#2 system_cfg missing the applied SSID:\n%q", jm["system_cfg"])
+	}
+	rec, err = st.Get(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Extra["wlan_cfg_pending_sha"] != wireless.WlanListHash(env) {
+		t.Fatalf("pending hash not re-captured: %v", rec.Extra["wlan_cfg_pending_sha"])
+	}
+
+	// inform#3 (applied, vaps proven): settle re-confirms, connected noop.
+	settle := radioBody(rec.CfgVersion)
+	settle["vap_table"] = runningVAPs(env)
+	body = encryptCBC(t, mustJSON(t, settle), hexKey(t, xkey), testIV)
+	resp = post(t, h, body)
+	_, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
+	if jm["_type"] != "noop" {
+		t.Fatalf("inform#3 type = %v, want noop", jm["_type"])
+	}
+	rec, err = st.Get(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.State != store.StateAdopted {
+		t.Fatalf("state after re-settle = %d, want adopted", rec.State)
+	}
+	if rec.Extra["wlan_cfg_delivery_status"] != "confirmed" {
+		t.Fatalf("delivery status = %v, want confirmed", rec.Extra["wlan_cfg_delivery_status"])
 	}
 }
 

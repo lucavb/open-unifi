@@ -7,6 +7,7 @@ package adoption
 // helper here mirrors that contract.
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -195,8 +196,10 @@ func TestHappyAdoption(t *testing.T) {
 		t.Fatalf("inform#1 adoption mgmt_cfg missing authkey rotation line: %q", mgmt)
 	}
 	// Deltas: State → adopting, fresh 32-hex x_authkey (in Authkeys), fresh
-	// 16-hex cfgversion, and the wireless-envelope baseline seeded for the
-	// cfgversion just minted.
+	// 16-hex cfgversion. NO wireless baseline is seeded at adoption (the
+	// 2026-09-18 F-row live round: a seed equal to the current envelope
+	// hash suppressed delivery; settle captures the baseline after
+	// delivery proof instead).
 	if !out.SetState || out.State != store.StateAdopting {
 		t.Fatalf("state delta after inform#1: %+v", out)
 	}
@@ -211,12 +214,16 @@ func TestHappyAdoption(t *testing.T) {
 	if !out.SetCfgVersion || len(cfg) != 16 || !isHexStr(cfg) {
 		t.Fatalf("cfgversion not 16 hex: %q", cfg)
 	}
-	if out.Extra["wlan_cfg_sha"] != wireless.WlanListHash(nil) {
-		t.Fatalf("adoption push wlan_cfg_sha = %v, want %q", out.Extra["wlan_cfg_sha"], wireless.WlanListHash(nil))
+	if _, ok := out.Extra["wlan_cfg_sha"]; ok {
+		t.Fatalf("adoption push seeded wlan_cfg_sha = %v, want none", out.Extra["wlan_cfg_sha"])
 	}
 	applyDeltas(&dev, out)
 
-	// Inform #2: device re-keyed to x_authkey and applied the config.
+	// Inform #2: device re-keyed to x_authkey and echoes the adoption
+	// mgmt_cfg's cfgversion. No baseline was seeded, so the self-heal
+	// answers a noop and mints a fresh cfgversion (forcing full
+	// provisioning on the next inform); the state stays adopting until
+	// that delivery settles.
 	dev.AppliedCfg = cfg
 	out, err = e.Decide(Request{
 		Transport: TransportEncrypted,
@@ -236,12 +243,144 @@ func TestHappyAdoption(t *testing.T) {
 	if out.Interval != 12 {
 		t.Fatalf("interval = %d, want 12", out.Interval)
 	}
+	if !out.SetCfgVersion || out.CfgVersion == cfg {
+		t.Fatalf("post-adoption echo did not self-heal-mint a cfgversion: %q vs %q", out.CfgVersion, cfg)
+	}
+	applyDeltas(&dev, out)
+	if dev.State != store.StateAdopting {
+		t.Fatalf("state after inform#2 = %d, want adopting (delivery outstanding)", dev.State)
+	}
+
+	// Inform #3: device still echoes the mgmt cfgversion → mismatch against
+	// the minted one → full provisioning (the real-controller post-adoption
+	// sequence captured on 2026-09-16).
+	out, err = e.Decide(Request{
+		Transport: TransportEncrypted,
+		Device:    dev,
+		Body:      engineBody(cfg),
+		UsedKey:   xkey,
+		Now:       time.Unix(1010, 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Kind != KindSetparam || !out.FullProvision || out.SystemCfg == "" {
+		t.Fatalf("inform#3 outcome = %+v, want setparam full provisioning", out)
+	}
+	applyDeltas(&dev, out)
+	if dev.State != store.StateAdopting {
+		t.Fatalf("state after inform#3 = %d, want adopting", dev.State)
+	}
+
+	// Inform #4: device applied the provisioned config and reports an
+	// (empty) vap_table → settle confirms, connected noop, adopted.
+	dev.AppliedCfg = dev.CfgVersion
+	dev.Extra["vap_table"] = []any{}
+	out, err = e.Decide(Request{
+		Transport: TransportEncrypted,
+		Device:    dev,
+		Body:      engineBody(dev.CfgVersion),
+		UsedKey:   xkey,
+		Now:       time.Unix(1020, 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Kind != KindNoop {
+		t.Fatalf("inform#4 kind = %v, want noop", out.Kind)
+	}
 	applyDeltas(&dev, out)
 	if dev.State != store.StateAdopted {
-		t.Fatalf("state after inform#2 = %d, want adopted", dev.State)
+		t.Fatalf("state after inform#4 = %d, want adopted", dev.State)
 	}
-	if dev.CfgVersion != cfg {
-		t.Fatalf("record cfgversion = %q, want %q", dev.CfgVersion, cfg)
+	if _, ok := dev.Extra["wlan_cfg_sha"]; !ok {
+		t.Fatal("settle did not capture the envelope baseline")
+	}
+}
+
+// Settled-state regression (2026-09-18 F-row live round, A2 finding): a
+// PRESENT vap_table that disproves the confirmed WLAN set must re-arm
+// delivery (minting noop → full provisioning on the next inform), while an
+// absent or empty table is unknown (sparse heartbearts never re-arm) and a
+// table proving the applied SSID RUNNING is steady state.
+func TestSettledRegressionRearms(t *testing.T) {
+	env := []wireless.Wlan{{Name: "corp", SSID: "corpnet", Security: "wpa-p", Passphrase: "pw", VLAN: 1, Enabled: true}}
+	counter := 0
+	e := New(Deps{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Random: func() float64 { return 0.5 },
+		KeyChars: func(n int) (string, error) {
+			counter++
+			s := strconv.FormatInt(int64(counter), 16)
+			return strings.Repeat("0", n-len(s)) + s, nil
+		},
+		Wireless: func() []wireless.Wlan { return env },
+		SystemCfg: func(store.Device, []wireless.Wlan) (string, map[string]string, error) {
+			return "sys\n", nil, nil
+		},
+	})
+	snap, err := json.Marshal(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const k = "11112222333344445555666677778888"
+	factoryTable := []any{map[string]any{"essid": "factory-default", "state": "RUN", "radio_name": "ra0", "name": "ath0"}}
+	runningTable := []any{map[string]any{"essid": "corpnet", "state": "RUN", "radio_name": "ra0", "name": "ath0"}}
+	fixture := func(vaps any) store.Device {
+		return store.Device{
+			MAC: engineMAC, State: store.StateAdopted,
+			CfgVersion: "aaaa", AppliedCfg: "aaaa",
+			XAuthkey: k, Authkeys: []string{k}, Model: "U7PG2",
+			Extra: store.JSONMap{
+				"wlan_cfg_sha":           wireless.WlanListHash(env),
+				"wlan_cfg_applied_wlans": string(snap),
+				"vap_table":              vaps,
+			},
+		}
+	}
+
+	// Regression: present table, applied SSID missing → minting noop.
+	dev := fixture(factoryTable)
+	out, oerr := e.Decide(Request{Transport: TransportEncrypted, Device: dev, Body: engineBody("aaaa"), UsedKey: k, Now: time.Unix(1000, 0)})
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	if out.Kind != KindNoop || !out.SetCfgVersion || out.CfgVersion == "aaaa" {
+		t.Fatalf("regression outcome = %+v, want minting noop", out)
+	}
+	// Next inform (device still echoes the old stamp) → full provisioning.
+	applyDeltas(&dev, out)
+	out, oerr = e.Decide(Request{Transport: TransportEncrypted, Device: dev, Body: engineBody("aaaa"), UsedKey: k, Now: time.Unix(1010, 0)})
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	if out.Kind != KindSetparam || !out.FullProvision || out.SystemCfg == "" {
+		t.Fatalf("post-regression outcome = %+v, want full provisioning", out)
+	}
+
+	// Unknown (absent table): plain connected noop, no re-arm.
+	out, oerr = e.Decide(Request{Transport: TransportEncrypted, Device: fixture(nil), Body: engineBody("aaaa"), UsedKey: k, Now: time.Unix(1020, 0)})
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	if out.Kind != KindNoop || out.SetCfgVersion {
+		t.Fatalf("absent-table outcome = %+v, want plain connected noop", out)
+	}
+	// Unknown (empty table): plain connected noop, no re-arm.
+	out, oerr = e.Decide(Request{Transport: TransportEncrypted, Device: fixture([]any{}), Body: engineBody("aaaa"), UsedKey: k, Now: time.Unix(1030, 0)})
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	if out.Kind != KindNoop || out.SetCfgVersion {
+		t.Fatalf("empty-table outcome = %+v, want plain connected noop", out)
+	}
+	// Steady state (applied SSID RUNNING): plain connected noop, no re-arm.
+	out, oerr = e.Decide(Request{Transport: TransportEncrypted, Device: fixture(runningTable), Body: engineBody("aaaa"), UsedKey: k, Now: time.Unix(1040, 0)})
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	if out.Kind != KindNoop || out.SetCfgVersion {
+		t.Fatalf("running-table outcome = %+v, want plain connected noop", out)
 	}
 }
 

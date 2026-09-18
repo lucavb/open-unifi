@@ -212,6 +212,51 @@ func (st *wlanCfgState) settle() {
 	st.placements = nil
 }
 
+// appliedNotRunning reports whether THIS inform's vap_table positively
+// disproves the confirmed WLAN set: a present, non-empty table in which an
+// enabled applied SSID has no RUN VAP. Live evidence (2026-09-18 F-row
+// round, A2): a rebooted AP re-materializes factory config while still
+// echoing the provisioned cfgversion — settle's one-shot watchdog must be
+// backed by a continuous check or that regression noops forever.
+//
+// Evidence semantics mirror runtimeInSync (internal/app): an absent or
+// empty table is UNKNOWN, not regression (sparse heartbeats carry no
+// vap_table and the record keeps the last observed one); SSID presence is
+// the proof bar, not per-radio placement — re-arming must not false-fire
+// on a band detail. The applied snapshot is re-read from extra (not the
+// typed load) because settle() may have promoted it in this same decision.
+func (st *wlanCfgState) appliedNotRunning() bool {
+	vaps, ok := st.extra["vap_table"].([]any)
+	if !ok || len(vaps) == 0 {
+		return false
+	}
+	raw, _ := st.extra["wlan_cfg_applied_wlans"].(string)
+	if raw == "" {
+		return false
+	}
+	var applied []wireless.Wlan
+	if json.Unmarshal([]byte(raw), &applied) != nil {
+		return false
+	}
+	need := map[string]bool{}
+	for _, w := range applied {
+		if w.Enabled {
+			need[wireless.SSIDOf(w)] = true
+		}
+	}
+	if len(need) == 0 {
+		return false
+	}
+	for _, v := range vaps {
+		m, ok := v.(map[string]any)
+		if !ok || !strings.EqualFold(wireless.JSONStr(m, "state", wireless.JSONStr(m, "status", "")), "RUN") {
+			continue
+		}
+		delete(need, wireless.JSONStr(m, "essid", wireless.JSONStr(m, "ssid", "")))
+	}
+	return len(need) > 0
+}
+
 // retryDue rate-limits the unchanged pending WLAN delivery: a bounded
 // attempt budget (WlanMaxAttempts) with exponential backoff (WlanRetryBase
 // doubling up to WlanRetryMax). At the cap the delivery status flips to
