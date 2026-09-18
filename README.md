@@ -97,7 +97,7 @@ from the pushed config entirely.
 ```hcl
 terraform {
   required_providers {
-    open-unifi = { source = "registry.terraform.io/lucabecker/open-unifi" }
+    open-unifi = { source = "registry.terraform.io/lucavb/open-unifi" }
   }
 }
 

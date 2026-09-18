@@ -23,8 +23,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/lucabecker/open-unifi/internal/store"
-	"github.com/lucabecker/open-unifi/internal/wireless"
+	"github.com/lucavb/open-unifi/internal/store"
+	"github.com/lucavb/open-unifi/internal/wireless"
 )
 
 // wlanEnvelopeShape is a work-in-progress marker for the band model.

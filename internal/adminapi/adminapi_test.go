@@ -15,7 +15,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/lucabecker/open-unifi/internal/server"
+	"github.com/lucavb/open-unifi/internal/server"
 )
 
 // fakeBackend implements Backend with fixed fixtures; it records calls so

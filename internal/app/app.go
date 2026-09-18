@@ -22,9 +22,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/lucabecker/open-unifi/internal/adminapi"
-	"github.com/lucabecker/open-unifi/internal/metrics"
-	"github.com/lucabecker/open-unifi/internal/store"
+	"github.com/lucavb/open-unifi/internal/adminapi"
+	"github.com/lucavb/open-unifi/internal/metrics"
+	"github.com/lucavb/open-unifi/internal/store"
 )
 
 // unknownDevice builds the canonical wrapped not-found error for a MAC.

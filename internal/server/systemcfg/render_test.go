@@ -12,8 +12,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/lucabecker/open-unifi/internal/store"
-	"github.com/lucabecker/open-unifi/internal/wireless"
+	"github.com/lucavb/open-unifi/internal/store"
+	"github.com/lucavb/open-unifi/internal/wireless"
 )
 
 // renderRecord mirrors the server test fixture: a U7PG2 record whose Extra

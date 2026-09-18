@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strconv"
 
-	"github.com/lucabecker/open-unifi/internal/store"
+	"github.com/lucavb/open-unifi/internal/store"
 )
 
 // wlanBandDefault is the band value our admin API cannot express today.

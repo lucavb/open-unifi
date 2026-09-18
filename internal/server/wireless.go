@@ -5,7 +5,7 @@ package server
 // type alias and the adapter's configured wireless source.
 
 import (
-	"github.com/lucabecker/open-unifi/internal/wireless"
+	"github.com/lucavb/open-unifi/internal/wireless"
 )
 
 // Wlan aliases the shared WLAN type (internal/wireless): every existing

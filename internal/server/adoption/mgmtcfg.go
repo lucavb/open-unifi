@@ -5,8 +5,8 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/lucabecker/open-unifi/internal/configtext"
-	"github.com/lucabecker/open-unifi/internal/store"
+	"github.com/lucavb/open-unifi/internal/configtext"
+	"github.com/lucavb/open-unifi/internal/store"
 )
 
 // Wire-shape constants of the classic controller (FID-54 dedupe: every

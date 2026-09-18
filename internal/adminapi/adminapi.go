@@ -15,7 +15,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/lucabecker/open-unifi/internal/metrics"
+	"github.com/lucavb/open-unifi/internal/metrics"
 )
 
 // Config is the minimal wiring input for New.

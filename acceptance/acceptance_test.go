@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-const providerAddress = "registry.terraform.io/lucabecker/open-unifi"
+const providerAddress = "registry.terraform.io/lucavb/open-unifi"
 
 func TestTerraformAcceptance(t *testing.T) {
 	if os.Getenv("TF_ACC") != "1" {

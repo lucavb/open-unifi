@@ -21,11 +21,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/lucabecker/open-unifi/internal/adminapi"
-	"github.com/lucabecker/open-unifi/internal/app"
-	"github.com/lucabecker/open-unifi/internal/metrics"
-	"github.com/lucabecker/open-unifi/internal/server"
-	"github.com/lucabecker/open-unifi/internal/store"
+	"github.com/lucavb/open-unifi/internal/adminapi"
+	"github.com/lucavb/open-unifi/internal/app"
+	"github.com/lucavb/open-unifi/internal/metrics"
+	"github.com/lucavb/open-unifi/internal/server"
+	"github.com/lucavb/open-unifi/internal/store"
 )
 
 func main() {

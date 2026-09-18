@@ -17,9 +17,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/lucabecker/open-unifi/internal/configtext"
-	"github.com/lucabecker/open-unifi/internal/store"
-	"github.com/lucabecker/open-unifi/internal/wireless"
+	"github.com/lucavb/open-unifi/internal/configtext"
+	"github.com/lucavb/open-unifi/internal/store"
+	"github.com/lucavb/open-unifi/internal/wireless"
 )
 
 // SiteFacts are the controller-level inputs a render needs (CONTEXT.md:

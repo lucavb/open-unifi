@@ -7,7 +7,7 @@ package configtext
 import (
 	"strings"
 
-	"github.com/lucabecker/open-unifi/internal/store"
+	"github.com/lucavb/open-unifi/internal/store"
 )
 
 // LineWriter returns the shared INJECTION-GUARDED key=value line writer used

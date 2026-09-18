@@ -2,7 +2,7 @@
 #
 # Prereqs (see README.md in this directory):
 #   * provider binary built from ./cmd/tfprovider staged under
-#     ~/.terraform.d/plugins/dev.open-unifi/lucabecker/open-unifi/0.0.1/<os>_<arch>/
+#     ~/.terraform.d/plugins/dev.open-unifi/lucavb/open-unifi/0.0.1/<os>_<arch>/
 #   * dev_overrides block in ~/.terraformrc
 #
 # Variables keep the token out of state; Configure() also honors
@@ -24,7 +24,7 @@ variable "admin_token" {
 terraform {
   required_providers {
     open-unifi = {
-      source = "lucabecker/open-unifi" # resolved via dev_overrides
+      source = "lucavb/open-unifi" # resolved via dev_overrides
     }
   }
 }

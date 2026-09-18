@@ -9,9 +9,9 @@ import (
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/types"
-	"github.com/lucabecker/open-unifi/internal/adminapi"
-	"github.com/lucabecker/open-unifi/internal/app"
-	"github.com/lucabecker/open-unifi/internal/store"
+	"github.com/lucavb/open-unifi/internal/adminapi"
+	"github.com/lucavb/open-unifi/internal/app"
+	"github.com/lucavb/open-unifi/internal/store"
 )
 
 // composition_test.go is the missing contract test: it drives the REAL

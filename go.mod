@@ -1,4 +1,4 @@
-module github.com/lucabecker/open-unifi
+module github.com/lucavb/open-unifi
 
 go 1.25.0
 

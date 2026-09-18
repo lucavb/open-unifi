@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/lucabecker/open-unifi/internal/adminapi"
+	"github.com/lucavb/open-unifi/internal/adminapi"
 )
 
 // The tests in this file run without opening any TCP socket: the sandbox

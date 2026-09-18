@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/lucabecker/open-unifi/internal/inform"
-	"github.com/lucabecker/open-unifi/internal/store"
+	"github.com/lucavb/open-unifi/internal/inform"
+	"github.com/lucavb/open-unifi/internal/store"
 )
 
 func TestDebugReplyLogsDoNotContainAdoptionOrDecryptionKeys(t *testing.T) {

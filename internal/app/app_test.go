@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lucabecker/open-unifi/internal/adminapi"
-	"github.com/lucabecker/open-unifi/internal/store"
+	"github.com/lucavb/open-unifi/internal/adminapi"
+	"github.com/lucavb/open-unifi/internal/store"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 )

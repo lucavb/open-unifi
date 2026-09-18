@@ -21,10 +21,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lucabecker/open-unifi/internal/inform"
-	"github.com/lucabecker/open-unifi/internal/server/adoption"
-	"github.com/lucabecker/open-unifi/internal/store"
-	"github.com/lucabecker/open-unifi/internal/wireless"
+	"github.com/lucavb/open-unifi/internal/inform"
+	"github.com/lucavb/open-unifi/internal/server/adoption"
+	"github.com/lucavb/open-unifi/internal/store"
+	"github.com/lucavb/open-unifi/internal/wireless"
 )
 
 // Wire-shape constants for the forged informs come from the codec itself

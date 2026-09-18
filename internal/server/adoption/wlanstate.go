@@ -5,8 +5,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lucabecker/open-unifi/internal/store"
-	"github.com/lucabecker/open-unifi/internal/wireless"
+	"github.com/lucavb/open-unifi/internal/store"
+	"github.com/lucavb/open-unifi/internal/wireless"
 )
 
 // ControllerOwnedKeys lists the controller-owned wlan_cfg_* Extra keys the

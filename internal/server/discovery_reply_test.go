@@ -5,7 +5,7 @@ import (
 	"net"
 	"testing"
 
-	"github.com/lucabecker/open-unifi/internal/store"
+	"github.com/lucavb/open-unifi/internal/store"
 )
 
 func TestDiscoveryCmd8ReplyEncoding(t *testing.T) {

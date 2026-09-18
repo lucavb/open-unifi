@@ -9,7 +9,7 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
 
-	"github.com/lucabecker/open-unifi/provider"
+	"github.com/lucavb/open-unifi/provider"
 )
 
 func main() {
@@ -18,8 +18,8 @@ func main() {
 	err := providerserver.Serve(ctx, provider.New, providerserver.ServeOpts{
 		// Address stanza for the built-in "local development override"
 		// workflow (filesystem_mirror with
-		// dev.open-unifi/lucabecker/open-unifi, see examples/terraform/).
-		Address: "registry.terraform.io/lucabecker/open-unifi",
+		// dev.open-unifi/lucavb/open-unifi, see examples/terraform/).
+		Address: "registry.terraform.io/lucavb/open-unifi",
 	})
 	if err != nil {
 		log.Fatalf("tfprovider: serve: %v", err)

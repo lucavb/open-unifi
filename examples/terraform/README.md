@@ -5,14 +5,14 @@
 registry release, use Terraform's *filesystem mirror* development override
 (modern local-dev naming:
 
-    dev.open-unifi/lucabecker/open-unifi
+    dev.open-unifi/lucavb/open-unifi
 
 ## 1. Build and stage the provider binary
 
 ```sh
 GOFLAGS=-buildvcs=false go build -o terraform-provider-open-unifi_v0.0.1 ./cmd/tfprovider
 
-MIRROR="${HOME}/.terraform.d/plugins/dev.open-unifi/lucabecker/open-unifi/0.0.1/darwin_arm64"
+MIRROR="${HOME}/.terraform.d/plugins/dev.open-unifi/lucavb/open-unifi/0.0.1/darwin_arm64"
 mkdir -p "$MIRROR"
 mv terraform-provider-open-unifi_v0.0.1 "$MIRROR/"
 ```
@@ -28,12 +28,12 @@ Put this in `~/.terraformrc` (Linux) or
 ```hcl
 provider_installation {
   dev_overrides {
-    # "lucabecker/open-unifi" is resolved from this local mirror directory:
-    registry.terraform.io/lucabecker/open-unifi = "$HOME/.terraform.d/plugins"
+    # "lucavb/open-unifi" is resolved from this local mirror directory:
+    registry.terraform.io/lucavb/open-unifi = "$HOME/.terraform.d/plugins"
   }
   # dev_overrides have no implicit registry fallback:
   direct {
-    exclude = ["registry.terraform.io/lucabecker/open-unifi"]
+    exclude = ["registry.terraform.io/lucavb/open-unifi"]
   }
 }
 ```
