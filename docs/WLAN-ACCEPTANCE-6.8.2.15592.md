@@ -549,14 +549,17 @@ client-side rows unchanged). All times UTC; controller log lines are
   guard is indicated by live evidence; a DFS channel (radar-driven
   vap downtime) stays untested and would re-open the question — the
   guard remains one counter away in `wlanstate.go`.
-- **make check regression found and fixed (`512f58c`)**: this round's
+- **make check regression found and fixed**: this round's
   first check was red — `TestSetupTracingExportsOTLPHTTP` (landed
-  hours earlier in `106193b`, self-skipping under a loopback-denying
-  sandbox, so never truly exercised) proved otlptracehttp v1.46 uses a
-  `WithEndpointURL` path as-is: a bare `http://host:port`
-  `--otlp-endpoint` exported spans to `/` where no collector listens.
-  Fixed in `512f58c` (pathless scheme-URLs gain the canonical
-  `/v1/traces`, explicit paths stay verbatim; both cases test-pinned);
+  hours earlier in the telemetry feature commit, self-skipping under
+  a loopback-denying sandbox, so never truly exercised) proved
+  otlptracehttp v1.46 uses a `WithEndpointURL` path as-is: a bare
+  `http://host:port` `--otlp-endpoint` exported spans to `/` where no
+  collector listens. The fix (pathless scheme-URLs gain the canonical
+  `/v1/traces`, explicit paths stay verbatim; both cases test-pinned)
+  landed as `512f58c` on the original feature hash `106193b`; both
+  were later consolidated into `c07a48b` by an autosquash rebase on
+  2026-09-18, so the fix and its tests live there now.
   `make check` green end-to-end after the fix. The bench binary
   predates the telemetry feature and tracing is opt-in (not in the
   bench run flags) — no round impact.
