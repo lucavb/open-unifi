@@ -50,6 +50,8 @@ package server
 // Spec: tmpwork/harness-20260917/minimal-diff-spec.md.
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -227,6 +229,31 @@ func TestZZMinimalDiffGate(t *testing.T) {
 // This verifies the EXACT system_cfg bytes the live AP would receive on
 // the gate-check push, before anything is deployed or pushed. Skips when
 // the fetched record is absent.
+// zzRecordFacts echoes the record's eth inventory and mgmt dev for the gate
+// listing. The production resolvers are unexported inside
+// internal/server/systemcfg (ethPortNames: ethernet_table → if_table ethN →
+// uplink → "eth0"; mgmtDevOf: Extra["mgmt_dev"] → "br0" —
+// systemcfg/wireless.go); this echo re-derives only the facts the gate
+// records actually exercise (6.8.2 sends no ethernet_table and neither
+// gate record carries a mgmt_dev override) so the gate stays in package
+// server. Faithful only for records of that shape.
+func zzRecordFacts(rec store.Device) (eth []string, mgmt string) {
+	mgmt = "br0"
+	if v, ok := rec.Extra["mgmt_dev"].(string); ok && v != "" {
+		mgmt = v
+	}
+	if rows, ok := rec.Extra["if_table"].([]any); ok {
+		for _, r := range rows {
+			if m, ok := r.(map[string]any); ok {
+				if n, ok := m["name"].(string); ok && strings.HasPrefix(n, "eth") {
+					eth = append(eth, n)
+				}
+			}
+		}
+	}
+	return eth, mgmt
+}
+
 func TestZZMinimalDiffGateLiveRecord(t *testing.T) {
 	factoryRaw, err := os.ReadFile(zzFactoryCfg)
 	if err != nil {
@@ -246,9 +273,9 @@ func TestZZMinimalDiffGateLiveRecord(t *testing.T) {
 	if !ok {
 		t.Fatalf("live AP aa:bb:cc:dd:ee:02 absent from fetched record: %d devices", len(file.Devices))
 	}
-	ports, _ := ethPortNames(rec)
+	ports, mgmt := zzRecordFacts(rec)
 	fmt.Printf("[minimal-diff gate:live] eth inventory %v, radios %d, mgmt dev %q, vap rows %d\n",
-		ports, len(wireless.StoredRadios(rec)), mgmtDevOf(rec), len(rec.Extra["vap_table"].([]any)))
+		ports, len(wireless.StoredRadios(rec)), mgmt, len(rec.Extra["vap_table"].([]any)))
 	env := []Wlan{{
 		ID: "7a5326f64be2c3c13c18eb4f", Name: "gate-check",
 		SSID: "openunifi-gate-check", Security: "open",
@@ -263,6 +290,164 @@ func TestZZMinimalDiffGateLiveRecord(t *testing.T) {
 	if len(violations) > 0 {
 		t.Fatalf("minimal-diff invariant broken: %d unmanaged row(s) differ from the factory baseline — the push would restart/delete unmanaged plugins", len(violations))
 	}
+}
+
+// TestZZLiveIntentVsApplied — the CURRENT live intent: the record and the
+// wireless envelope as fetched from the RUNNING controller
+// (live-devices.json + live-wireless.json), rendered and diffed against
+// the DEVICE-VERIFIED running bytes (live-applied-sys.txt — seeded by a
+// confirmed round: the 2026-09-18 C1 push, whose candidate the AP's
+// /tmp/system.cfg reproduced at sha256 9891d9ff… byte-for-byte) and against
+// the factory baseline. This is the steady-state drift check: in steady
+// state the render must be byte-identical to what the device runs (zero
+// intended, zero violations); ANY delta is real drift or record change to
+// investigate before the next push. History: the 2026-09-18 round found
+// the night-pass "APPLIED" baseline (render-fixed-sys.txt, id
+// 7a5326f6…=sha256("gate-check")[:24]) was never the pushed bytes — the
+// live envelope carries the admin API's sha256(name+ssid)[:24] stamp
+// (internal/app/app.go:530) and the accepted 2026-09-17 19:17 CEST push
+// rendered from it — so that file stays only as the night regression
+// gates' reference, not as the live baseline.
+func TestZZLiveIntentVsApplied(t *testing.T) {
+	factoryRaw, err := os.ReadFile(zzFactoryCfg)
+	if err != nil {
+		t.Skipf("factory baseline not present (%v)", err)
+	}
+	appliedRaw, err := os.ReadFile(zzHarnessDir + "/live-applied-sys.txt")
+	if err != nil {
+		t.Skipf("device-verified live applied baseline not present — seed it from a confirmed push (%v)", err)
+	}
+	raw, err := os.ReadFile(zzHarnessDir + "/live-devices.json")
+	if err != nil {
+		t.Skipf("live record not present (%v)", err)
+	}
+	wraw, err := os.ReadFile(zzHarnessDir + "/live-wireless.json")
+	if err != nil {
+		t.Skipf("live envelope not present (%v)", err)
+	}
+	var file struct {
+		Devices map[string]store.Device `json:"devices"`
+	}
+	if err := json.Unmarshal(raw, &file); err != nil {
+		t.Fatalf("live devices.json: %v", err)
+	}
+	rec, ok := file.Devices["aabbccddee02"]
+	if !ok {
+		t.Fatalf("live AP aa:bb:cc:dd:ee:02 absent from fetched record: %d devices", len(file.Devices))
+	}
+	var envFile struct {
+		Wlans []Wlan `json:"wlans"`
+	}
+	if err := json.Unmarshal(wraw, &envFile); err != nil {
+		t.Fatalf("live wireless.json: %v", err)
+	}
+	if len(envFile.Wlans) == 0 {
+		t.Fatalf("live wireless envelope is empty")
+	}
+	s := New(Config{WirelessSource: func() []Wlan { return envFile.Wlans }}, store.NewMemStore(), testLogger())
+	sys := mustBuildSys(t, s, rec)
+	if err := os.WriteFile(zzHarnessDir+"/live-intent-sys.txt", []byte(sys), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fmt.Printf("[live-intent] envelope wlans=%d, render sha256=%s\n",
+		len(envFile.Wlans), func() string { sum := sha256.Sum256([]byte(sys)); return hex.EncodeToString(sum[:]) }())
+
+	_, violations := zzRunGate(t, "live-intent vs FACTORY baseline (factory-echo invariant)", factoryRaw, sys, zzManagedAllow)
+	if len(violations) > 0 {
+		t.Fatalf("minimal-diff invariant broken for the live intent: %d unmanaged row(s) differ from the factory baseline", len(violations))
+	}
+	intended, violations := zzRunGate(t, "live-intent vs DEVICE-VERIFIED APPLIED bytes (steady state)", appliedRaw, sys, zzManagedAllow)
+	if len(violations) > 0 {
+		t.Fatalf("minimal-diff invariant broken for the live intent: %d unmanaged row(s) differ from the device-verified applied bytes", len(violations))
+	}
+	if len(intended) > 0 {
+		t.Fatalf("steady-state drift: %d row(s) differ between the live intent and the device-verified applied bytes — investigate before any push: %v", len(intended), intended)
+	}
+	fmt.Printf("[live-intent] steady state: byte-identical to the device-verified applied bytes\n")
+}
+
+// zzLiveWpaPSK is the test-only passphrase for the 2026-09-18 C1-shape
+// live push. It is synthetic bench material, not a site secret; the same
+// constant must be used by the PUT that performs the live push so the
+// gated candidate and the pushed bytes are identical.
+const zzLiveWpaPSK = "openunifi-fake-c1-psk-20260918"
+
+// TestZZLiveWpaCandidateVsApplied — the push gate that pre-cleared the
+// 2026-09-18 C1 round: the live record + the live envelope (id preserved
+// verbatim) mutated to wpa-p, rendered and diffed against the RUNNING
+// config. The round EXECUTED and the AP verified: /tmp/system.cfg
+// reproduced the candidate at sha256 9891d9ff… byte-for-byte, wpa rows
+// present, AP reachable through the {wireless, aaa} restart. Kept as the
+// template for the next candidate gate (any future push shape: mutate the
+// envelope here, enforce zero deltas outside the intended sections,
+// ABORT on anything else). Enforced: zero deltas outside the managed
+// aaa.*/wireless.* prefixes — the restart set stays {wireless, aaa},
+// both live-evidenced survivable; any netconf/bridge/connectivity/
+// dhcpc row moving is the fatal shape and must abort the push.
+func TestZZLiveWpaCandidateVsApplied(t *testing.T) {
+	raw, err := os.ReadFile(zzHarnessDir + "/live-devices.json")
+	if err != nil {
+		t.Skipf("live record not present (%v)", err)
+	}
+	wraw, err := os.ReadFile(zzHarnessDir + "/live-wireless.json")
+	if err != nil {
+		t.Skipf("live envelope not present (%v)", err)
+	}
+	runningRaw, err := os.ReadFile(zzHarnessDir + "/live-applied-sys.txt")
+	if err != nil {
+		t.Skipf("device-verified running bytes not present — run TestZZLiveIntentVsApplied or seed from a confirmed push (%v)", err)
+	}
+	var file struct {
+		Devices map[string]store.Device `json:"devices"`
+	}
+	if err := json.Unmarshal(raw, &file); err != nil {
+		t.Fatalf("live devices.json: %v", err)
+	}
+	rec, ok := file.Devices["aabbccddee02"]
+	if !ok {
+		t.Fatalf("live AP aa:bb:cc:dd:ee:02 absent from fetched record: %d devices", len(file.Devices))
+	}
+	var envFile struct {
+		Wlans []Wlan `json:"wlans"`
+	}
+	if err := json.Unmarshal(wraw, &envFile); err != nil {
+		t.Fatalf("live wireless.json: %v", err)
+	}
+	if len(envFile.Wlans) != 1 {
+		t.Fatalf("expected exactly the one live gate-check WLAN, got %d", len(envFile.Wlans))
+	}
+	cand := envFile.Wlans[0]
+	if cand.Security == "wpa-p" && cand.Passphrase == zzLiveWpaPSK {
+		t.Skipf("the 2026-09-18 C1 round is complete: the live envelope already carries this round's wpa-p candidate (device-verified at sha256 9891d9ff…); the steady-state check lives in TestZZLiveIntentVsApplied")
+	}
+	if cand.Security != "open" {
+		t.Fatalf("live envelope security = %q, expected the open baseline before the C1 mutation", cand.Security)
+	}
+	cand.Security, cand.Passphrase = "wpa-p", zzLiveWpaPSK
+	env := []Wlan{cand}
+	s := New(Config{WirelessSource: func() []Wlan { return env }}, store.NewMemStore(), testLogger())
+	sys := mustBuildSys(t, s, rec)
+	if err := os.WriteFile(zzHarnessDir+"/live-wpa-candidate-sys.txt", []byte(sys), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fmt.Printf("[live-wpa-candidate] render sha256=%s\n",
+		func() string { sum := sha256.Sum256([]byte(sys)); return hex.EncodeToString(sum[:]) }())
+
+	intended, violations := zzRunGate(t, "live-wpa-candidate vs RUNNING (device-verified bytes)", runningRaw, sys, zzManagedAllow)
+	if len(violations) > 0 {
+		t.Fatalf("minimal-diff invariant broken for the wpa-p candidate: %d unmanaged row(s) differ — ABORT the push: %v", len(violations), violations)
+	}
+	var outside []string
+	for _, d := range intended {
+		k := strings.SplitN(d, ":", 2)[0]
+		if !strings.HasPrefix(k, "aaa.") && !strings.HasPrefix(k, "wireless.") {
+			outside = append(outside, d)
+		}
+	}
+	if len(outside) > 0 {
+		t.Fatalf("wpa-p candidate touches rows beyond {wireless, aaa} — ABORT the push: %v", outside)
+	}
+	fmt.Printf("[live-wpa-candidate] %d intended deltas, all inside {wireless, aaa}; restart set = {wireless, aaa} — PUSH-PRE-CLEARED shape\n", len(intended))
 }
 
 // TestZZSuccessivePushControlVsApplied — the both-band open control
