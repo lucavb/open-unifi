@@ -52,6 +52,8 @@ func run() error {
 	allowAnonymousAdmin := flag.Bool("allow-anonymous-admin", false, "LAB ONLY: allow anonymous admin API and metrics")
 	allowInsecureAdmin := flag.Bool("allow-insecure-admin", false, "LAB ONLY: allow non-loopback plaintext admin HTTP (normally use an HTTPS reverse proxy)")
 	allowPlainText := flag.Bool("allow-plaintext-inform", false, "accept unencrypted JSON inform bodies")
+	allowGatedLiveWLAN := flag.Bool("allow-gated-live-wlan", false,
+		"LAB ONLY: lift the fail-closed live WLAN provisioning gate for U7PG2 fw 6.8.2.15592 (typed 501 without this flag); requires a push candidate pre-cleared by the offline minimal-diff harness")
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, error")
 	flag.Parse()
 	if err := validateAdminExposure(*listenAdmin, *adminToken, *allowAnonymousAdmin, *allowInsecureAdmin); err != nil {
@@ -148,8 +150,12 @@ func run() error {
 		RegulatoryCountryCode: *regulatoryCountryCode,
 		SSHPassword:           *apSSHPassword,
 		AllowPlainText:        *allowPlainText,
+		AllowGatedLiveWLAN:    *allowGatedLiveWLAN,
 		WirelessSource:        wirelessSource,
 	}, st, logger)
+	if *allowGatedLiveWLAN {
+		logger.Warn("live WLAN provisioning gate LIFTED for U7PG2 6.8.2.15592 (--allow-gated-live-wlan): live WLAN pushes are enabled — bench use only, candidate must be pre-cleared by the offline minimal-diff harness")
+	}
 	if *controllerURL == "" {
 		logger.Warn("no --controller-url configured: discovery/adopt replies cannot point the device at an inform URL; prefer SSH 'set-inform <this controller>/inform'")
 	}

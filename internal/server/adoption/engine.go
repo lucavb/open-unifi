@@ -194,6 +194,14 @@ type Deps struct {
 	// InformListenAddr is the inform TCP listen address (inform_url port
 	// fallback).
 	InformListenAddr string
+
+	// AllowGatedLiveWLAN lifts the fail-closed live-WLAN gate for the
+	// exact U7PG2 6.8.2.15592 lane (see RejectUnsupportedLiveWLAN). The
+	// default false keeps live WLAN provisioning fail-closed; this is the
+	// explicit bench opt-in for a sanctioned live push whose candidate has
+	// passed the offline minimal-diff gates (tmpwork harness). It changes
+	// nothing else: the gate remains on for every normal start.
+	AllowGatedLiveWLAN bool
 }
 
 // Engine is the pure adoption decider.
@@ -205,6 +213,7 @@ type Engine struct {
 	systemCfg        func(store.Device, []wireless.Wlan) (string, map[string]string, error)
 	controllerURL    string
 	informListenAddr string
+	allowGatedWLAN   bool
 }
 
 // New builds an Engine. A nil logger falls back to a discarding one.
@@ -221,6 +230,7 @@ func New(d Deps) *Engine {
 		systemCfg:        d.SystemCfg,
 		controllerURL:    d.ControllerURL,
 		informListenAddr: d.InformListenAddr,
+		allowGatedWLAN:   d.AllowGatedLiveWLAN,
 	}
 }
 
@@ -457,8 +467,14 @@ func (e *Engine) decidePlain(req Request, wls []wireless.Wlan, d *store.Device) 
 // RejectUnsupportedLiveWLAN gates the exact U7PG2 firmware lane whose
 // system_cfg WLAN template has not been differentially verified against the
 // official controller. wls is the decision's resolved WLAN envelope (the
-// caller's single snapshot for this inform), not the live source.
+// caller's single snapshot for this inform), not the live source. The gate
+// is the fail-closed default; Deps.AllowGatedLiveWLAN is the explicit
+// bench opt-in that lifts it for a sanctioned live push — every normal
+// start keeps the gate on.
 func (e *Engine) RejectUnsupportedLiveWLAN(d store.Device, wls []wireless.Wlan) error {
+	if e.allowGatedWLAN {
+		return nil
+	}
 	if d.Model != "U7PG2" || !fwMatches68215592(d.Firmware) {
 		return nil
 	}

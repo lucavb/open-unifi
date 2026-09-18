@@ -77,6 +77,14 @@ type Config struct {
 	// detection. nil ⇒ empty list ⇒ no wlans provisioned.
 	WirelessSource func() []Wlan
 
+	// AllowGatedLiveWLAN lifts the fail-closed live-WLAN gate for the
+	// U7PG2 6.8.2.15592 lane (the typed 501, "live WLAN provisioning
+	// gated"). Default false: live WLAN provisioning for that exact
+	// model+firmware stays rejected unless a sanctioned live round
+	// explicitly opts in — the offline minimal-diff harness gates the
+	// push candidate separately, before any bytes reach the AP.
+	AllowGatedLiveWLAN bool
+
 	// SSHPassword overrides the default SSH password ("ubnt") hashed into
 	// system_cfg users.1. SECURITY NOTE: this string lives in server memory
 	// and, by protocol design, travels VERBATIM (hashed) inside the
@@ -158,10 +166,11 @@ func New(cfg Config, st store.DeviceStore, lg *slog.Logger) *Server {
 		KeyChars: func(n int) (string, error) {
 			return s.keyChars(n)
 		},
-		Wireless:         s.currentWireless,
-		SystemCfg:        s.renderSystemCfg,
-		ControllerURL:    cfg.ControllerURL,
-		InformListenAddr: cfg.InformListenAddr,
+		Wireless:           s.currentWireless,
+		SystemCfg:          s.renderSystemCfg,
+		ControllerURL:      cfg.ControllerURL,
+		InformListenAddr:   cfg.InformListenAddr,
+		AllowGatedLiveWLAN: cfg.AllowGatedLiveWLAN,
 	})
 	return s
 }
