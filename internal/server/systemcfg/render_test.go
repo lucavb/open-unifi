@@ -473,12 +473,18 @@ func TestRenderGolden(t *testing.T) {
 		"ebtables.1.cmd=-t broute -A BROUTING -p 0x888e -i ath0 -j DROP\n" +
 		"mgmt.discovery.status=enabled\n" +
 		"mgmt.flavor=ace\n" +
-		"mgmt.is_default=true\n" +
 		"dhcpd.status=disabled\n" +
 		"dhcpd.1.status=disabled\n" +
 		"httpd.status=disabled\n"
 	if !strings.Contains(sys, echoBlock) {
 		t.Fatalf("golden factory-echo block mismatch:\n--- got tail ---\n%s", sys[strings.Index(sys, "# connectivity"):])
+	}
+	// A2 boot-guard hazard: the row must NEVER be emitted in any value.
+	// /lib/preinit/99_21_ubnt_ubntconf replaces a restored blob text
+	// containing mgmt.is_default=true with the factory template (fw
+	// 6.8.2), factory-resetting the WLANs on every reboot.
+	if strings.Contains(sys, "mgmt.is_default") {
+		t.Fatalf("mgmt.is_default row emitted — boot guard would factory-reset on reboot:\n%s", sys[strings.Index(sys, "# ebtables"):])
 	}
 	// Site facts override: sshd.1.ifname + route.1.devname follow mgmt_dev.
 	recDev := renderRecord()

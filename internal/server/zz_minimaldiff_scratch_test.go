@@ -65,12 +65,22 @@ import (
 )
 
 const (
-	zzKeyHex        = "11112222333344445555666677778888"
-	zzHarnessDir    = "../../tmpwork/harness-20260917"
-	zzFactoryCfg    = zzHarnessDir + "/ap-forensics/tmp/system.cfg"
-	zzAppliedCfg    = zzHarnessDir + "/render-fixed-sys.txt"
-	zzNightDeltas   = zzHarnessDir + "/night-deltas.txt"
-	zzZZAllowPrefix = "unifi. users. sshd. radio. wireless. aaa. vlan."
+	zzKeyHex      = "11112222333344445555666677778888"
+	zzHarnessDir  = "../../tmpwork/harness-20260917"
+	zzFactoryCfg  = zzHarnessDir + "/ap-forensics/tmp/system.cfg"
+	zzAppliedCfg  = zzHarnessDir + "/render-fixed-sys.txt"
+	zzNightDeltas = zzHarnessDir + "/night-deltas.txt"
+	// mgmt.is_default is permitted as an EXACT row-key (not the mgmt.
+	// prefix): the renderer deliberately omits it since 2026-09-19. The
+	// fw 6.8.2 boot path (/lib/preinit/99_21_ubnt_ubntconf do_ubntconf)
+	// greps the MTD-restored blob text for `mgmt.is_default=true` and
+	// replaces it with the factory template — the pre-fix factory-echo
+	// carried the row, so every reboot of a provisioned AP
+	// factory-reset the WLAN text while mgmt/authkey survived via the
+	// tar part (WLAN-ACCEPTANCE A2). Baselines captured before the fix
+	// still contain the row; its removal is intended. Any OTHER mgmt.*
+	// delta remains a violation.
+	zzZZAllowPrefix = "unifi. users. sshd. radio. wireless. aaa. vlan. mgmt.is_default"
 )
 
 // zzHarnessRecord mirrors harness devices.json (mac aabbccddeeff):
@@ -139,6 +149,25 @@ func zzManagedAllow(k string) bool {
 		}
 	}
 	return false
+}
+
+// zzExemptIsDefaultMigration filters the known one-time renderer
+// migration delta (the mgmt.is_default row removal, 2026-09-19 — see the
+// zzZZAllowPrefix comment for the fw 6.8.2 boot-guard rationale) out of
+// an intended-delta list. The APPLIED baselines were captured from
+// pushes rendered BEFORE the fix, so every current render differs from
+// them by exactly this row until the next live apply refreshes the
+// capture. Once the device-verified applied bytes are re-captured
+// post-fix this filter becomes inert. Any other intended row still
+// trips the zero-drift gates.
+func zzExemptIsDefaultMigration(rows []string) (out []string) {
+	for _, r := range rows {
+		if strings.HasPrefix(r, "mgmt.is_default:") {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 var zzDeltasOnce sync.Once
@@ -360,6 +389,7 @@ func TestZZLiveIntentVsApplied(t *testing.T) {
 	if len(violations) > 0 {
 		t.Fatalf("minimal-diff invariant broken for the live intent: %d unmanaged row(s) differ from the device-verified applied bytes", len(violations))
 	}
+	intended = zzExemptIsDefaultMigration(intended)
 	if len(intended) > 0 {
 		t.Fatalf("steady-state drift: %d row(s) differ between the live intent and the device-verified applied bytes — investigate before any push: %v", len(intended), intended)
 	}
@@ -474,6 +504,7 @@ func TestZZSuccessivePushControlVsApplied(t *testing.T) {
 	if len(violations) > 0 {
 		t.Fatalf("minimal-diff invariant broken: %d unmanaged row(s) differ from the APPLIED baseline — the push would restart/delete unmanaged plugins", len(violations))
 	}
+	intended = zzExemptIsDefaultMigration(intended)
 	if len(intended) > 0 {
 		t.Fatalf("generator drift: %d managed row(s) differ from the APPLIED baseline (control must be byte-stable): %v", len(intended), intended)
 	}

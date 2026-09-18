@@ -136,7 +136,7 @@ SSID and each intended radio where the row says `2.4 GHz` or `5 GHz`.
 | ID | Required case and pass criteria | Status | Evidence refs |
 | --- | --- | --- | --- |
 | A1 | **Factory adoption:** factory AP is discovered/adopted; AP reports adopted/connected; controller records the expected model and firmware; post-adoption inform is received. | `PROVEN` | §2026-09-18 F-row live round — adoption chain 07:32:47–07:34:09Z (adoption-seed engine finding recorded there); §2026-09-18 verify round — re-proven under the fixed engine, adoption delivers the envelope automatically 11:21:45–11:23:13Z |
-| A2 | **Restart with retained key:** adopted AP is restarted without deleting controller state; it re-informs using the retained key, returns to connected, and receives/retains the expected configuration. | `FAILED` | §2026-09-18 F-row live round — 74 s gap + retained-key re-inform + cfg echo unchanged proven 08:09–08:12Z; applied config did NOT survive the reboot (recovery via the tested self-heal remedy); §2026-09-18 verify round — retention failure re-confirmed (factory vap + matching cfg echo on the first re-inform) and automatic watchdog recovery live-proven 11:29:59–11:30:48Z, unattended |
+| A2 | **Restart with retained key:** adopted AP is restarted without deleting controller state; it re-informs using the retained key, returns to connected, and receives/retains the expected configuration. | `FAILED` | §2026-09-18 F-row live round — 74 s gap + retained-key re-inform + cfg echo unchanged proven 08:09–08:12Z; applied config did NOT survive the reboot (recovery via the tested self-heal remedy); §2026-09-18 verify round — retention failure re-confirmed (factory vap + matching cfg echo on the first re-inform) and automatic watchdog recovery live-proven 11:29:59–11:30:48Z, unattended; §2026-09-19 root cause resolved — the renderer's `mgmt.is_default=true` factory-echo row tripped the AP preinit boot guard (`/lib/preinit/99_21_ubnt_ubntconf` replaces the MTD-restored text containing it with the factory template; docs/AP-FIRMWARE-APPLY-PATH.md §6.5); fix in render.go, re-run pending |
 | B1 | **WPA-Personal association:** WPA-Personal test client associates to the intended SSID on 2.4 GHz and 5 GHz as applicable; client receives DHCP lease and can pass the defined allowed traffic test. | `NOT RUN` | `________________` |
 | B2 | **Open association:** open test client associates; client receives DHCP lease and can pass the defined allowed traffic test. | `NOT RUN` | `________________` |
 | B3 | **Tagged VLAN:** WPA-Personal and/or open test WLAN configured with a tagged VLAN; client associates and receives DHCP on the intended subnet; traffic passes; capture on the AP uplink visibly records 802.1Q with the expected VID (or records the exact reason the observation point cannot see the tag). | `NOT RUN` | `________________` |
@@ -593,6 +593,53 @@ client-side rows unchanged). All times UTC; controller log lines are
   sub-criterion is now proven with the fix, without surgery.
   B1/B2/B3/C1/C2/D1/E1 unchanged `NOT RUN`; C3 unchanged `BLOCKED`;
   release claim unchanged.
+
+### 2026-09-19 root-cause resolution — A2 retention failure is a controller renderer bug, fixed
+
+**Method (AP forensics, ssh lane):** fetched `/usr/etc/syswrapper.sh`,
+`/etc/inittab`, `/etc/init.d/*`, `/etc/rc.d/*`, the full 33-plugin
+`/etc/sysinit/*` set, `/proc/mtd`, `/tmp/system.cfg`,
+`/etc/persistent/cfg/mgmt`, and `/var/log/messages` (to
+`tmpwork/harness-20260917/ap-persist/`); live-probed the persist mechanism
+on the AP — flag-consume timing ≤10 s (touch 1789740294 → gone 1789740304),
+`cfgmtd -r` MTD-blob extraction returning the applied text sha
+`0485dca7…` == the then-current `/tmp/system.cfg`; read the boot preinit
+hook `/lib/preinit/99_21_ubnt_ubntconf`.
+
+**Mechanism (every stage now proven; AP-FIRMWARE-APPLY-PATH.md §6.5):**
+`save-config`/`apply-config` only set the flag `/var/run/need_cfg_save`;
+mca-monitor consumes it via `syswrapper cfg_save_check` →
+`cfgmtd -w -p /etc /tmp/system.cfg` packs the applied cfg text +
+`/etc/persistent` into the 3-slot MTD blob — the pack chain works and the
+blob held the APPLIED text at the A2 reboot. At boot the preinit hook
+restores the blob (`cfgmtd -r -p /etc/ -f /tmp/running.cfg`), then guards
+the restored text: `grep 'mgmt.is_default=true'` — a hit replaces it with
+the factory template before `sort → /tmp/system.cfg`.
+
+**Root cause:** our system_cfg renderer's factory-echo block emitted
+`mgmt.is_default=true` (pre-fix render.go:304, echoing the factory
+baseline for the zero-diff property). Every reboot of a provisioned AP
+therefore factory-reset the cfg text while the tar part still restored
+mgmt — retained-key re-inform carrying our cfgversion + factory
+vap_table, exactly the observed A2. The real controller never emits the
+row (no mgmt writer in config_String/int; `is_default` appears only in
+device-state classes).
+
+**Fix (2026-09-19):** `internal/server/systemcfg/render.go` no longer
+emits `mgmt.is_default` in any value (comment cites the boot guard);
+`render_test.go` golden updated plus a negative guard asserting the row
+never returns; `zz_minimaldiff_scratch_test.go` permits exactly the
+`mgmt.is_default` row-key as an intended one-time migration delta vs the
+pre-fix applied captures — every other mgmt.* delta stays a violation.
+Full `go test ./...` green.
+
+**A2 re-run protocol (pending — live bench):** deploy the fixed
+controller → let drift or the watchdog land the corrected push → wait
+≥15 s (flag consume + pack) → raw reboot → expect the first re-inform
+RETAINED key, UNCHANGED cfgversion, RUNNING vaps, no watchdog
+re-provision; post-boot `/tmp/system.cfg` = the applied text ROW-SORTED
+(compare row-sets, not sha — the boot `sort` reorders rows). Row A2
+flips to `PROVEN` only on that round.
 
 ### Per-case capture minimum
 

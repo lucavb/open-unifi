@@ -296,12 +296,24 @@ func Render(d store.Device, facts SiteFacts) (Result, error) {
 	// mgmt.discovery.status gates the discovery announces, and the
 	// ebtables row is the EAPOL broute rule on the first vap slot.
 	// Factory echo = zero parsed diff = zero plugin restarts.
+	//
+	// EXCEPT mgmt.is_default: never echo it in any value. The AP boot
+	// path (/lib/preinit/99_21_ubnt_ubntconf do_ubntconf, fw 6.8.2)
+	// restores the MTD blob text via `cfgmtd -r`, then greps it for
+	// `mgmt.is_default=true` — a hit replaces the restored text with the
+	// factory template before /tmp/system.cfg is sorted into place, so
+	// echoing the factory's is_default=true makes every reboot drop the
+	// provisioned WLANs while the tar part still restores mgmt/authkey
+	// (retained-key echo + watchdog re-provision ≈49 s). The real
+	// controller emits no mgmt.is_default row at all (no writer in
+	// config_String/int), so absence is the byte-exact form. AP boot
+	// evidence 2026-09-18: /tmp/system.cfg line 258 carried
+	// mgmt.is_default=true from this echo; WLAN-ACCEPTANCE A2.
 	b.WriteString("# ebtables\n")
 	line("ebtables.status", "enabled")
 	line("ebtables.1.cmd", "-t broute -A BROUTING -p 0x888e -i ath0 -j DROP")
 	line("mgmt.discovery.status", "enabled")
 	line("mgmt.flavor", "ace")
-	line("mgmt.is_default", "true")
 	line("dhcpd.status", "disabled")
 	line("dhcpd.1.status", "disabled")
 	line("httpd.status", "disabled")
