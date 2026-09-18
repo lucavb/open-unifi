@@ -1,7 +1,10 @@
 # Live WLAN acceptance evidence template
 
 This remains a pending evidence template, not an acceptance claim. Live WLAN
-provisioning is gated pending an official-controller differential fixture.
+provisioning is gated by default (the fail-closed runtime gate rejects any
+managed WLAN for U7PG2 6.8.2.15592 with a typed 501); the gate lifts only by
+the explicit lab opt-in `--allow-gated-live-wlan`, and end-user acceptance
+still requires the matrix below.
 
 This is a repeatable, firmware-specific acceptance record for a
 **UAP-AC-Pro-Gen2 (`U7PG2`) running firmware `6.8.2.15592`**. Copy this file
@@ -265,6 +268,56 @@ verdict stands):
   confirm or refute the bridge refusal reading and reveal whether
   netconf's fast path re-IPs br0 — the recovery mechanism C3 needs.
 
+
+### 2026-09-18 C1-shape live round (post-refactor; controller 296fb60b29cfa9cc)
+
+Scope: redeploy the server-deepen-refactored build and prove the C1
+SHAPE (security mutation, vap shape unchanged) live. This is NOT the
+full C1 case: no test client was at the bench, so every client-side
+criterion of B1/B2/C1 stays `NOT RUN`. Operator present with console
+access; AP SSH open.
+
+- **Pre-deploy**: `make check` on main had been broken by the refactor
+  merge (the night gate test still called the pre-refactor helpers);
+  fixed in `zz_minimaldiff_scratch_test.go` (`zzRecordFacts`). All five
+  night gates reproduced their 2026-09-17 results in main's tree.
+- **Deploy**: `openunifi.linux` sha256 `296fb60b29cfa9cc…` (rollback
+  saved by ctl.sh). The AP re-informed 10 s after the swap with a GCM
+  noop — the refactored inform codec and adoption engine live-validated
+  on the retained-key steady state.
+- **Finding — the night "APPLIED" baseline was never the pushed bytes**:
+  `render-fixed-sys.txt` carries env id `7a5326f6…` =
+  sha256("gate-check")[:24] (the `wireless.WlanID` name-only derivation)
+  while the live envelope carries the admin API's sha256(name+ssid)[:24]
+  stamp `2dab5684…` (internal/app/app.go:530), and its seeded
+  `ssh_sha512passwd` was stale against the live record's cache. The
+  confirmed 2026-09-17 19:17 CEST push rendered from the live envelope.
+  The file remains the night regression gates' reference only; live
+  rounds now use the rolling device-verified baseline
+  (`live-applied-sys.txt`), enforced by `TestZZLiveIntentVsApplied`
+  (steady state must be 0/0) and the candidate-gate template
+  (`TestZZLiveWpaCandidateVsApplied`).
+- **Runtime gate discovery**: the deployed build refused the push — the
+  fail-closed live-WLAN gate (adoption engine, typed 501) had no unlock
+  path. Added the explicit lab opt-in `--allow-gated-live-wlan`
+  (`adoption.Deps.AllowGatedLiveWLAN`; fail-closed default preserved;
+  wiring covered by `TestEncryptedGateLiftedByOptIn`); `scripts/ctl.sh`
+  runs the bench with it.
+- **Push (08:42:12–08:42:55 CEST)**: envelope mutated to wpa-p (id
+  preserved); candidate gated at 30 deltas, all inside `{wireless, aaa}`;
+  pushed bytes sha256 `9891d9ff…` proven on the wire (system_cfg
+  diagnostic) AND on the device (`sha256sum /tmp/system.cfg` =
+  `9891d9ff…`, `aaa.1/2.wpa=3`, `wpa.key.1.mgmt=WPA-PSK` present). One
+  delivery retry fired on the previous-config echo (`dd0a…` → `d0ba…`);
+  settle confirmed: vap_table shows both vaps RUN (ath0 ng ch 6, ath1 na
+  ch 157), cfg echo `d0ba82ecdbfdccd6` == controller intent, `in_sync`
+  true, steady ~15 s noops resumed. **The AP stayed reachable through
+  the apply — the {wireless, aaa} restart-set survival prediction held
+  live.** The round passphrase is synthetic bench material
+  (`openunifi-fake-c1-psk-20260918`), recorded here as such.
+- **Still open**: B1/B2/C1 client-side evidence (no client); C3 unchanged
+  (`BLOCKED`, bench+console run or Ghidra microMIPS pin); release claim
+  unchanged.
 
 ### Per-case capture minimum
 

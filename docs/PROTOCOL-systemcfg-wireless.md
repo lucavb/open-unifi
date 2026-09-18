@@ -1,15 +1,22 @@
 # PROTOCOL-systemcfg-wireless — `radio.*` / `aaa.*` / `wireless.*` schema for a classic Atheros AP (U7PG2)
 
-> **Open-unifi implementation note (experimental):** open-unifi emits a full
-> synthetic `radio.*`/`aaa.*`/`wireless.*` block for the accepted U7PG2
-> 6.8.2.15592 baseline, per the emitter contract in §2-§7 below (multiple
-> WLANs, both bands, tagged VLANs). The actual safety mechanism for live
-> delivery is the fail-closed gate that rejects ANY nonempty managed WLAN for
-> this model + firmware with a typed status and no `system_cfg` emission
-> (see `docs/PROTOCOL.md`); it remains gated pending live validation.
-> This is experimental pending live proof. (An earlier revision of this
-> banner described a one-WLAN/2 GHz/VLAN-1 design sketch that patches the
-> existing `ath0`/`wifi0` user-VAP slot — that was never implemented and has
+> **Open-unifi implementation note:** open-unifi emits a full synthetic
+> `radio.*`/`aaa.*`/`wireless.*` block for the accepted U7PG2 6.8.2.15592
+> baseline, per the emitter contract in §2-§7 below (multiple WLANs, both
+> bands, tagged VLANs). The safety mechanism for live delivery is the
+> fail-closed gate that rejects ANY nonempty managed WLAN for this model +
+> firmware with a typed 501 and no `system_cfg` emission; it stays on for
+> every normal start and lifts only by the explicit lab opt-in
+> (`--allow-gated-live-wlan`, `adoption.Deps.AllowGatedLiveWLAN`), used
+> for sanctioned pushes whose candidate passed the offline minimal-diff
+> harness. The 2026-09-18 C1-shape round did exactly that: the gated
+> wpa-p candidate (sha256 `9891d9ff…`) was pushed, applied, and
+> device-verified byte-for-byte (`/tmp/system.cfg` sha match) with the AP
+> reachable through the `{wireless, aaa}` restart — evidence in
+> `docs/WLAN-ACCEPTANCE-6.8.2.15592.md` §2026-09-18. (An earlier revision
+> of this banner described a one-WLAN/2 GHz/VLAN-1 design sketch that
+> patches the existing `ath0`/`wifi0` user-VAP slot — that was never
+> implemented and has
 > been dropped.)
 
 Resolves UNRESOLVED item #1 of `docs/PROTOCOL-mgmt.md` §9 ("exact `wireless.<n>` line set").
