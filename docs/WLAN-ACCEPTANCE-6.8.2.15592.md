@@ -135,8 +135,8 @@ SSID and each intended radio where the row says `2.4 GHz` or `5 GHz`.
 
 | ID | Required case and pass criteria | Status | Evidence refs |
 | --- | --- | --- | --- |
-| A1 | **Factory adoption:** factory AP is discovered/adopted; AP reports adopted/connected; controller records the expected model and firmware; post-adoption inform is received. | `PROVEN` | §2026-09-18 F-row live round — adoption chain 07:32:47–07:34:09Z (adoption-seed engine finding recorded there) |
-| A2 | **Restart with retained key:** adopted AP is restarted without deleting controller state; it re-informs using the retained key, returns to connected, and receives/retains the expected configuration. | `FAILED` | §2026-09-18 F-row live round — 74 s gap + retained-key re-inform + cfg echo unchanged proven 08:09–08:12Z; applied config did NOT survive the reboot (recovery via the tested self-heal remedy) |
+| A1 | **Factory adoption:** factory AP is discovered/adopted; AP reports adopted/connected; controller records the expected model and firmware; post-adoption inform is received. | `PROVEN` | §2026-09-18 F-row live round — adoption chain 07:32:47–07:34:09Z (adoption-seed engine finding recorded there); §2026-09-18 verify round — re-proven under the fixed engine, adoption delivers the envelope automatically 11:21:45–11:23:13Z |
+| A2 | **Restart with retained key:** adopted AP is restarted without deleting controller state; it re-informs using the retained key, returns to connected, and receives/retains the expected configuration. | `FAILED` | §2026-09-18 F-row live round — 74 s gap + retained-key re-inform + cfg echo unchanged proven 08:09–08:12Z; applied config did NOT survive the reboot (recovery via the tested self-heal remedy); §2026-09-18 verify round — retention failure re-confirmed (factory vap + matching cfg echo on the first re-inform) and automatic watchdog recovery live-proven 11:29:59–11:30:48Z, unattended |
 | B1 | **WPA-Personal association:** WPA-Personal test client associates to the intended SSID on 2.4 GHz and 5 GHz as applicable; client receives DHCP lease and can pass the defined allowed traffic test. | `NOT RUN` | `________________` |
 | B2 | **Open association:** open test client associates; client receives DHCP lease and can pass the defined allowed traffic test. | `NOT RUN` | `________________` |
 | B3 | **Tagged VLAN:** WPA-Personal and/or open test WLAN configured with a tagged VLAN; client associates and receives DHCP on the intended subnet; traffic passes; capture on the AP uplink visibly records 802.1Q with the expected VID (or records the exact reason the observation point cannot see the tag). | `NOT RUN` | `________________` |
@@ -145,8 +145,8 @@ SSID and each intended radio where the row says `2.4 GHz` or `5 GHz`.
 | C3 | **Bridge-apply survival (WLAN-count change):** change the WLAN count so the rendered bridge port list changes (e.g. remove the 5 GHz vap); the AP stays reachable through the apply (inform continues), br0 recovers its address and uplink, and remaining WLAN service recovers. If the AP darks, capture the failure with console access ready — the offline verdict predicts exactly that. | `NOT RUN` | offline: §Bridge-apply verdict; tmpwork/harness-20260917/night-deltas.txt |
 | D1 | **Multiple WLANs on both radios:** configure at least two WLANs, with intended 2.4 GHz and 5 GHz coverage; each expected VAP is present, clients associate to each, receive the correct DHCP/VLAN result, and pass the defined traffic test. | `NOT RUN` | `________________` |
 | E1 | **AP lost/recovery:** isolate or power off the AP; controller marks it lost within the documented window; restore connectivity/power; AP re-informs, returns connected, and WLAN client service recovers. | `NOT RUN` | `________________` |
-| F1 | **Controller-side deletion:** delete the adopted AP/controller device record using the approved procedure; record resulting AP state and confirm the expected re-adoption path without claiming success unless completed. | `PROVEN` | §2026-09-18 F-row live round — deletion 07:25:55Z; decrypt-failure informs at escalated cadence; pending sourced from discovery announces; re-adoption completed under F2 |
-| F2 | **Factory reset, deletion, and re-adoption:** after approved backup, factory-reset the AP, verify it returns to factory state, remove/clean its old controller record as required, adopt it again, and repeat the minimum WLAN association/DHCP check. | `BLOCKED` | §2026-09-18 F-row live round — backup/reset/factory verify/re-adopt all proven 07:27–07:34Z; final association/DHCP check NOT RUN: no test client at the bench (same environment condition as the C1-shape round) |
+| F1 | **Controller-side deletion:** delete the adopted AP/controller device record using the approved procedure; record resulting AP state and confirm the expected re-adoption path without claiming success unless completed. | `PROVEN` | §2026-09-18 F-row live round — deletion 07:25:55Z; decrypt-failure informs at escalated cadence; pending sourced from discovery announces; re-adoption completed under F2; §2026-09-18 verify round — re-proven under the fixed engine 11:14:39Z |
+| F2 | **Factory reset, deletion, and re-adoption:** after approved backup, factory-reset the AP, verify it returns to factory state, remove/clean its old controller record as required, adopt it again, and repeat the minimum WLAN association/DHCP check. | `BLOCKED` | §2026-09-18 F-row live round — backup/reset/factory verify/re-adopt all proven 07:27–07:34Z; final association/DHCP check NOT RUN: no test client at the bench (same environment condition as the C1-shape round); §2026-09-18 verify round — full chain re-proven automatically under the fixed engine 11:17–11:23Z (mint → provisioning → byte-exact settle, no store surgery); client-side sub-criterion unchanged |
 
 ### Bridge-apply verdict (2026-09-17 night pass — offline plugin forensics; no live run)
 
@@ -458,6 +458,138 @@ where noted below). All times UTC; controller log lines are +02:00.
   green — go vet + all packages; `TestZZLiveIntentVsApplied` reproduces
   the 0/0 steady state with the refreshed record, all night gates pass,
   `TestZZLiveWpaCandidateVsApplied` skips (envelope unchanged).
+
+### 2026-09-18 verify round (fixed adoption baseline + not-running re-arm; controller 97a7e095d1e4a0e8)
+
+Scope: live-prove both engine fixes from `0a21a3f` end-to-end with NO
+store surgery — the F-chain re-run (F1 → factory reset → re-adopt →
+automatic envelope delivery) and the A2 reboot — then re-seed the
+harness caches. Same bench, operator remote, no test client (all
+client-side rows unchanged). All times UTC; controller log lines are
++02:00.
+
+- **Pre-round state**: repo main `0a21a3f`; controller redeployed from
+  it (`97a7e095d1e4a0e8…`; rollback
+  `openunifi.rollback-20260918T111204Z` holds the pre-fix
+  `296fb60b…`); approved backups: bench
+  `devices.json.bak-20260918T111339Z` +
+  `wireless.json.bak-20260918T111339Z`, local
+  `tmpwork/harness-20260917/f2-backup-20260918T111339Z/`; envelope
+  untouched (id `2dab5684…`). Retained-key steady state on the new
+  binary verified before the round: GCM noops ~15 s cadence, cfg echo
+  `ce4b246b…`, state 3, `in_sync` true, delivery confirmed, zero mints.
+- **F1 re-proven (11:14:39Z)**: `DELETE /api/v1/devices/aabbccddee02`
+  → `200 {"mac":"aa:bb:cc:dd:ee:02","status":"deleted"}`; list empty;
+  retained-key informs escalate to `unregistered device` + `no key
+  produced a valid JSON payload` (`tried:1`, ~5.4 s cadence); pending
+  candidate sourced `discovery`, `factory=false`.
+- **F2a — factory reset (11:17:27–11:20:16Z)**: `syswrapper.sh
+  restore-default` over the password lane (host keys regenerate at
+  reset — the expect runner pins `UserKnownHostsFile=/dev/null`, no
+  impact); ~2 min 45 s dark; factory state verified 11:20:16Z:
+  `/etc/version` `BZ.6.8.2`; authorized_keys 0 lines;
+  `/tmp/system.cfg` sha256 `b1df1da2…` (factory baseline byte-exact);
+  `mca-cli-op info` → `Status: Unable to resolve
+  (http://unifi:8080/inform)`; factory announces `factory=true` at the
+  10 s cadence.
+- **F2b/A1 — fixed-engine adoption chain (11:21:37–11:23:13Z, fully
+  automatic)**: `set-inform` 11:21:37Z; `POST
+  /api/v1/pending/aabbccddee02/adopt` 11:21:45Z → `200 {"state":1,
+  "actions":["delete"]}`; 11:21:53Z flags `0x0003` → `inform: adoption
+  push (default key)` → setparam `gcm:false` (mgmt_cfg only, fresh
+  per-device key); 11:21:56Z the re-keyed echo (885 B) hits the fix:
+  **`inform: no envelope baseline, forcing provisioning`** mints
+  `1b42c9d36a01e64a` — exactly where the pre-fix engine answered a
+  `connected noop` and never provisioned; 11:22:08Z echo mismatch →
+  `inform: full provisioning` (`ours=1b42c9d3…` vs
+  `device=08315776…`), system_cfg diagnostic sha256 `0485dca7…`;
+  apply-window delivery retries as designed — two `wireless envelope
+  drift, forcing full provisioning` re-pushes (11:22:51Z, 11:22:58Z;
+  byte-identical, bounded at count 3), one `noop-pending-wlan`
+  (11:23:03Z), then **settle 11:23:13Z**: `connected noop` cfg echo
+  `1b42c9d3…`, `in_sync` true, delivery `confirmed`; both vaps RUN
+  with the envelope id `2dab5684…` (`openunifi-gate-check`; ath0 ng
+  ch6, ath1 na ch157). Byte-exact: on-device `sha256sum
+  /tmp/system.cfg` = `0485dca7…` = the pushed diagnostic.
+  `mca-cli-op info` → `Status: Connected (http://10.10.10.10:8080/inform)`;
+  authorized_keys regenerated empty by the users-section apply
+  (password lane unaffected). **No store surgery anywhere.**
+- **Steady state (11:23:13–11:28:42Z)**: 28 consecutive
+  `connected noop`s, ~12 s cadence, zero mints — the self-heal does
+  not re-fire once the baseline is captured by delivery proof.
+- **A2 re-run — fix #2 live (11:28:47–11:30:48Z, unattended)**: reboot
+  over SSH 11:28:47Z; last inform 11:28:42Z, first re-inform
+  11:29:59Z — a 77 s gap; re-inform flags `0x000b` (RETAINED
+  per-device key, no factory-key phase, no re-adoption), cfg echo
+  UNCHANGED `1b42c9d3…` — but the vap_table proves the factory vap
+  running (mac-derived essid `AABBCCDDEE02`; only the 2.4 GHz vap up
+  at that instant): **retention fails exactly as the morning round
+  diagnosed.** The new watchdog catches it on the first inform:
+  `inform: applied WLANs not running, forcing re-provisioning`
+  (11:29:59Z) → mint `5d16465c6fb7a64b` → `inform: full provisioning`
+  11:30:13Z (`ours=5d16465c…` vs `device=1b42c9d3…`) with a
+  **byte-identical push `0485dca7…`** (the record's ssh_sha512 cache
+  renders deterministically — no fresh salt across re-provisioning);
+  settle 11:30:48Z `connected noop` cfg `5d16465c…`, `in_sync` true,
+  delivery `confirmed` (count 4); both vaps RUN the envelope again.
+  First re-inform to settled: 49 s, zero operator action.
+- **A2 criterion outcome**: retention stays `FAILED` device-side — the
+  device boots the factory vap while echoing our cfgversion, so the
+  save/persist pairing the real controller evidently performs
+  (docs/AP-FIRMWARE-APPLY-PATH.md, the standing bytecode question)
+  remains the only true fix. With the fixed engine the failure is a
+  bounded automatic recovery: the re-armed watchdog re-provisions
+  exactly once per not-running proof. Row A2 keeps the `FAILED`
+  status on the retention criterion with the automatic recovery now
+  live-proven.
+- **Watchdog false-positive check / DFS-guard decision**: the watchdog
+  fired exactly once per genuine failure (the reboot); zero mints
+  across the 28-noop and 54-noop steady windows (vaps RUN, ch 6/157 —
+  non-DFS); sparse heartbeats never re-armed. No two-consecutive-miss
+  guard is indicated by live evidence; a DFS channel (radar-driven
+  vap downtime) stays untested and would re-open the question — the
+  guard remains one counter away in `wlanstate.go`.
+- **make check regression found and fixed (`512f58c`)**: this round's
+  first check was red — `TestSetupTracingExportsOTLPHTTP` (landed
+  hours earlier in `106193b`, self-skipping under a loopback-denying
+  sandbox, so never truly exercised) proved otlptracehttp v1.46 uses a
+  `WithEndpointURL` path as-is: a bare `http://host:port`
+  `--otlp-endpoint` exported spans to `/` where no collector listens.
+  Fixed in `512f58c` (pathless scheme-URLs gain the canonical
+  `/v1/traces`, explicit paths stay verbatim; both cases test-pinned);
+  `make check` green end-to-end after the fix. The bench binary
+  predates the telemetry feature and tracing is opt-in (not in the
+  bench run flags) — no round impact.
+- **Bench log hygiene**: `openunifi.log` lines 16684–16690 are stale
+  sh errors from the 2026-09-17 09:33–09:36 deploy attempt (a
+  non-Linux binary exec'd by the shell between `open-unifi stopped`
+  and the next `starting`); they are not runtime data — parse the log
+  with `errors='replace'` and skip non-JSON lines.
+- **Harness/zz steady state**: `live-applied-sys.txt` re-seeded to the
+  device-verified bytes `0485dca7…` (6515 B, fetched as `busybox
+  base64 /tmp/system.cfg` over the password lane — through the expect
+  pty the output carries a trailing `\r` per line, so strip it before
+  decoding); `live-devices.json` refreshed from the post-A2 store
+  (35253 B) — its ssh_sha512 cache pairs with the baseline's
+  `users.1.password` row (the `TestZZLiveIntentVsApplied` 0/0
+  contract); `live-wireless.json` unchanged (envelope untouched).
+  `make check` green; `TestZZLiveIntentVsApplied` and all
+  `TestZZMinimalDiff*`/`TestZZSuccessivePush*` gates pass;
+  `TestZZLiveWpaCandidateVsApplied` skips (envelope unchanged).
+- **Bench end state**: settled (state 3, `in_sync` true, both vaps RUN
+  the envelope; 54 consecutive clean noops through 11:41:58Z); operator
+  key re-deployed over the password lane after the round (it does not
+  survive reboots or provisioning applies) — key-only BatchMode ssh to
+  the AP verified; backups and the pre-fix rollback binary remain in
+  place.
+- **Matrix outcome this round**: A1 `PROVEN` (re-proven under the
+  fixed engine — adoption now delivers the envelope automatically);
+  A2 `FAILED` on the retention criterion with automatic recovery
+  live-proven; F1 `PROVEN` (re-proven); F2 still `BLOCKED` on the
+  final client-side sub-criterion only — every controller-side
+  sub-criterion is now proven with the fix, without surgery.
+  B1/B2/B3/C1/C2/D1/E1 unchanged `NOT RUN`; C3 unchanged `BLOCKED`;
+  release claim unchanged.
 
 ### Per-case capture minimum
 
