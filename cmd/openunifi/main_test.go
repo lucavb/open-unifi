@@ -46,6 +46,35 @@ func TestValidateRegulatoryCountryCode(t *testing.T) {
 	}
 }
 
+func TestParseLogFormat(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      string
+		want    string
+		wantErr bool
+	}{
+		{"empty defaults to text", "", "text", false},
+		{"text", "text", "text", false},
+		{"TEXT uppercase", "TEXT", "text", false},
+		{"Text mixed case", "Text", "text", false},
+		{"json", "json", "json", false},
+		{"JSON uppercase", "JSON", "json", false},
+		{"invalid", "xml", "", true},
+		{"invalid spaced", "text json", "", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseLogFormat(tc.in)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("parseLogFormat(%q) error = %v, wantErr %v", tc.in, err, tc.wantErr)
+			}
+			if err == nil && got != tc.want {
+				t.Fatalf("parseLogFormat(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestValidateAdminExposure(t *testing.T) {
 	tests := []struct {
 		name                         string

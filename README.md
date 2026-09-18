@@ -54,8 +54,17 @@ configuration; defaults to 840/US and is not a claim of regulatory approval),
 a loud startup warning — env fallback `OPEN_UNIFI_ADMIN_TOKEN`), `--ap-ssh-password`
 (SSH password provisioned onto adopted APs; empty = site default `ubnt`),
 `--allow-plaintext-inform` (reject by default, like the real controller),
-`--log-level`. A corrupt `wireless.json` refuses startup rather than silently
-provisioning the AP with zero WLANs.
+`--log-level`, `--log-format` (logging is human-readable TEXT by default;
+`--log-format json` / env `OPEN_UNIFI_LOG_FORMAT=json` opts into one-JSON-object-per-line
+output — this flips the prior always-JSON behavior),
+`--otlp-endpoint` (opt-in OTLP/HTTP tracing, e.g. `http://127.0.0.1:4318`; empty = tracing
+off unless `OTEL_EXPORTER_OTLP_ENDPOINT(_TRACES)` is set; `http://` = plaintext transport,
+`https://` = TLS; `OTEL_SDK_DISABLED=true` force-disables; standard
+`OTEL_EXPORTER_OTLP_HEADERS/TIMEOUT/COMPRESSION`, `OTEL_SERVICE_NAME`,
+`OTEL_RESOURCE_ATTRIBUTES` are honored natively by the SDK). When tracing is on, JSON
+log lines carry `trace_id`/`span_id` (see `docs/alloy-openunifi.example.alloy` for a
+Grafana Alloy example wiring OTLP into Tempo and the controller log into Loki). A corrupt
+`wireless.json` refuses startup rather than silently provisioning the AP with zero WLANs.
 
 ## Onboarding a factory AP
 

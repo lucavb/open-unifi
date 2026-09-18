@@ -26,6 +26,9 @@ import (
 	"github.com/lucavb/open-unifi/internal/metrics"
 	"github.com/lucavb/open-unifi/internal/server"
 	"github.com/lucavb/open-unifi/internal/store"
+	"github.com/lucavb/open-unifi/internal/telemetry"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 func main() {
@@ -55,6 +58,8 @@ func run() error {
 	allowGatedLiveWLAN := flag.Bool("allow-gated-live-wlan", false,
 		"LAB ONLY: lift the fail-closed live WLAN provisioning gate for U7PG2 fw 6.8.2.15592 (typed 501 without this flag); requires a push candidate pre-cleared by the offline minimal-diff harness")
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, error")
+	logFormat := flag.String("log-format", os.Getenv("OPEN_UNIFI_LOG_FORMAT"), "log format: text (default) or json")
+	otlpEndpoint := flag.String("otlp-endpoint", os.Getenv("OPEN_UNIFI_OTLP_ENDPOINT"), "OTLP/HTTP trace endpoint (e.g. http://127.0.0.1:4318); empty = tracing off unless OTEL_EXPORTER_OTLP_ENDPOINT(_TRACES) is set")
 	flag.Parse()
 	if err := validateAdminExposure(*listenAdmin, *adminToken, *allowAnonymousAdmin, *allowInsecureAdmin); err != nil {
 		return err
@@ -76,8 +81,28 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("invalid --log-level %q: %w", *logLevel, err)
 	}
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+	format, err := parseLogFormat(*logFormat)
+	if err != nil {
+		return fmt.Errorf("invalid --log-format %q: %w", *logFormat, err)
+	}
+	logger := telemetry.NewLogger(format, level, os.Stdout)
 	slog.SetDefault(logger)
+
+	// Opt-in tracing: the gate inside SetupTracing decides whether a real
+	// provider is built; without an endpoint nothing is ever constructed.
+	tracerShutdown, err := telemetry.SetupTracing(context.Background(), *otlpEndpoint, logger)
+	if err != nil {
+		return fmt.Errorf("tracing setup: %w", err)
+	}
+	// Every return path (graceful, server error, fatal) flushes the batcher
+	// once on the way out.
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tracerShutdown(sctx); err != nil {
+			logger.Warn("otel: flush failed", "err", err)
+		}
+	}()
 
 	dhost, dport, err := discoveryPort(*listenDiscovery)
 	if err != nil {
@@ -163,12 +188,21 @@ func run() error {
 	// Every inform request increments the inform counter, then the server
 	// lane handler takes over. InformHandler() is fetched ONCE here — the
 	// bare per-request call in the wrapper would allocate a fresh handler
-	// on the hot path of every inform.
+	// on the hot path of every inform. The completion log uses the request
+	// context so traceHandler injects trace_id/span_id when tracing is on.
 	inform := srv.InformHandler()
-	informH := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	informH := otelhttp.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		metrics.IncInform()
-		inform.ServeHTTP(w, r)
-	})
+		start := time.Now()
+		sw := &statusWriter{ResponseWriter: w, code: http.StatusOK}
+		inform.ServeHTTP(sw, r)
+		logger.InfoContext(r.Context(), "inform: request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", sw.code,
+			"duration_ms", float64(time.Since(start).Microseconds())/1000,
+		)
+	}), "openunifi: inform")
 
 	// ---- serving ---------------------------------------------------------
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -182,8 +216,10 @@ func run() error {
 	// per-connection deadline (com/ubnt/ace/J.ø00000)); mirror that with
 	// explicit http.Server timeouts here (FID-10).
 	adminSrv := &http.Server{
-		Addr:              *listenAdmin,
-		Handler:           adminH,
+		Addr: *listenAdmin,
+		// otelhttp is OUTERMOST: the adminapi auth (requireToken) and its
+		// metrics wrapper stay inside so the span covers the full request.
+		Handler:           otelhttp.NewHandler(adminH, "openunifi: admin"),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -325,6 +361,24 @@ func drainShutdown(servers ...*http.Server) {
 	}
 }
 
+// statusWriter captures the response code for the inform request-completion
+// log (same pattern as internal/adminapi.statusWriter).
+type statusWriter struct {
+	http.ResponseWriter
+	code int
+}
+
+func (s *statusWriter) WriteHeader(code int) {
+	s.code = code
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusWriter) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // parseLevel maps a flag string onto a slog level.
 func parseLevel(s string) (slog.Level, error) {
 	switch s {
@@ -338,6 +392,19 @@ func parseLevel(s string) (slog.Level, error) {
 		return slog.LevelError, nil
 	default:
 		return slog.LevelInfo, errors.New("want debug|info|warn|error")
+	}
+}
+
+// parseLogFormat maps a flag string onto the logger format; an empty value
+// (the flag default) selects text.
+func parseLogFormat(s string) (string, error) {
+	switch strings.ToLower(s) {
+	case "", "text":
+		return "text", nil
+	case "json":
+		return "json", nil
+	default:
+		return "", errors.New("want text|json")
 	}
 }
 

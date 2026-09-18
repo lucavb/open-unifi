@@ -1,0 +1,94 @@
+// Grafana Alloy config for open-unifi observability.
+//
+// Receive: OTLP traces from the controller when tracing is opted in, e.g.
+//   openunifi --otlp-endpoint http://<alloy-host>:4318 ...
+// Tail:     the controller's own log file (the scripts/ctl.sh redirect
+//           target) and forward it to Loki; when the controller emits JSON
+//           (--log-format=json), trace_id/span_id become Loki structured
+//           metadata so log lines link to their Tempo trace.
+//
+// Placeholders to fill in: Tempo endpoint, Loki endpoint, and (if your
+// Tempo requires auth) the otelcol.auth.basic block below.
+
+// ---- traces: OTLP receiver -> batch -> Tempo ----
+
+otelcol.receiver.otlp "openunifi" {
+	grpc { endpoint = "0.0.0.0:4317" }
+	http { endpoint = "0.0.0.0:4318" }
+}
+
+otelcol.processor.batch "default" {
+	timeout = "2s"
+}
+
+// otlphttp matches Tempo's OTLP/HTTP ingestion port; the exporter appends
+// /v1/traces to the endpoint itself.
+otelcol.exporter.otlphttp "tempo" {
+	client {
+		// PLACEHOLDER: point at your Tempo OTLP/HTTP ingestion.
+		endpoint = "https://tempo.example:4318"
+
+		# Uncomment for Tempo-side credentials (auth here authenticates the
+		# EXPORTER towards Tempo; receiver auth above would instead gate who
+		# may ship telemetry INTO Alloy):
+		# auth {
+		# 	authenticator = otelcol.auth.basic.tempo_auth
+		# }
+	}
+}
+# otelcol.auth.basic "tempo_auth" {
+# 	username = "tempo-user"
+# 	password = "tempo-password"
+# }
+
+otelcol.service "traces" {
+	pipelines {
+		traces {
+			receivers = [otelcol.receiver.otlp.openunifi.receiver]
+			processors = [otelcol.processor.batch.default]
+			exporters  = [otelcol.exporter.otlp.tempo]
+		}
+	}
+}
+
+// ---- logs: tail openunifi.log -> Loki (with trace linkage) ----
+
+// This file is the ctl.sh nohup redirect target: nohup ./openunifi ... >> openunifi.log 2>&1
+loki.source.file "openunifi" {
+	targets = [
+		{ __path__ = "/root/openunifi-live/openunifi.log" },
+	]
+	forward_to = [loki.process.openunifi.receiver]
+}
+
+// Parse JSON log lines (--log-format=json) so trace_id/span_id become
+// structured metadata; text-format lines simply fail the JSON stage and are
+// forwarded as-is.
+loki.process "openunifi" {
+	stage.json {
+		expressions = {
+			trace_id = "trace_id",
+			span_id  = "span_id",
+		}
+	}
+
+	stage.structured_metadata {
+		values = {
+			trace_id = "",
+			span_id  = "",
+		}
+	}
+
+	forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+	// PLACEHOLDER: point at your Loki instance.
+	endpoint = "https://loki.example/loki/api/v1/push"
+}
+
+// Grafana-side note: in Loki, add a derived field of type "Label" with
+// pattern "trace[_]?id" (label: trace_id) and link it to Tempo — log lines
+// then open the matching trace in one click. Works because the controller's
+// JSON log lines carry trace_id/span_id, and the stage above promotes them
+// to structured metadata (searchable as a label).

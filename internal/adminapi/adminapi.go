@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/lucavb/open-unifi/internal/metrics"
 )
@@ -406,12 +407,23 @@ func New(cfg Config, be Backend) http.Handler {
 	})
 
 	// Instrument every response: pattern-based route label keeps MACs out
-	// of the label space.
+	// of the label space. The completion log rides the request context, so
+	// the wrapped logger injects trace_id/span_id when tracing is on.
+	// /metrics and /healthz are skipped (scrape noise).
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w, code: http.StatusOK}
 		mux.ServeHTTP(sw, r)
 		if route := classifyRoute(r.Method, r.Pattern, r.URL.Path); route != "" {
 			metrics.ObserveAPIRequest(sw.code, route)
+		}
+		if r.URL.Path != "/metrics" && r.URL.Path != "/healthz" {
+			lg.InfoContext(r.Context(), "admin: request",
+				"method", r.Method,
+				"path", r.URL.Path,
+				"status", sw.code,
+				"duration_ms", float64(time.Since(start).Microseconds())/1000,
+			)
 		}
 	})
 }
