@@ -9,17 +9,21 @@ import (
 	"github.com/lucavb/open-unifi/internal/wireless"
 )
 
-// ControllerOwnedKeys lists the controller-owned wlan_cfg_* Extra keys the
-// typed state owns (the trust-policy "controller-owned keys" class), in the
-// order the adapter's prev-wins preservation list uses them. Single source:
-// package server builds extraPrevWins from this list plus its server-side
-// ssh_sha512passwd cache key.
+// ControllerOwnedKeys lists the controller-owned Extra keys the typed
+// state owns (the trust-policy "controller-owned keys" class): the
+// wlan_cfg_* WLAN delivery bookkeeping plus the client-session family
+// (internal/store sessions — the session rows and the one-shot §6.2(e)
+// disconnect-event flag). Single source: package server builds
+// extraPrevWins from this list plus its server-side ssh_sha512passwd
+// cache key, and the §6.6 setdefault demotion sweeps the whole list — a
+// factory-reset device re-adoption starts with fresh session state.
 var ControllerOwnedKeys = []string{
 	"wlan_cfg_sha", "wlan_cfg_pending_sha", "wlan_cfg_pending_wlans",
 	"wlan_cfg_pending_old_wlans", "wlan_cfg_applied_wlans",
 	"wlan_cfg_pending_placements", "wlan_cfg_attempt_sha", "wlan_cfg_attempts",
 	"wlan_cfg_last_attempt", "wlan_cfg_delivery_status",
 	"wlan_cfg_not_running_misses", "wlan_cfg_offered_cfgversion",
+	store.SessionsExtraKey, store.SessionDisconnectEventExtraKey,
 }
 
 // wlanCfgState is the typed view over the controller-owned wlan_cfg_* Extra

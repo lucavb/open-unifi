@@ -179,8 +179,10 @@ type Outcome struct {
 	// setparam payloads. The adoption push (§6.2 a/b/c/f) carries ONLY
 	// MgmtCfg; full provisioning additionally carries CfgVersion, SystemCfg
 	// and BlockedSta (the §4 wire string rendered from the admin-owned
-	// blocked-client set; "" when none). CfgVersion is also the record
-	// delta target value.
+	// blocked-client set; "" when none). The §6.2(e) reconnect push
+	// (KindBlockedStaReconnect) carries BlockedSta ONLY — no MgmtCfg, no
+	// CfgVersion, no FullProvision. CfgVersion is also the record delta
+	// target value.
 	FullProvision bool
 	SystemCfg     string
 	BlockedSta    string
@@ -301,12 +303,17 @@ func (e *Engine) currentWireless() []wireless.Wlan {
 // Decide applies the adoption state machine (docs/PROTOCOL-mgmt.md §6.2) for
 // one decoded inform and returns the response outcome plus record deltas.
 //
-//		setparam variants (exactly three shapes):
+//		setparam variants (exactly four shapes):
 //		  - adoption push:  {"_type":"setparam","mgmt_cfg":...} + server_time
 //		    (mgmt_cfg ONLY; fresh 16-hex cfgversion stored on the record first,
 //		    carried in the mgmt_cfg "cfgversion=" line).
 //		  - full provisioning: {"_type":"setparam","cfgversion":...,
 //		    "system_cfg":...,"blocked_sta":...,"mgmt_cfg":...} + server_time.
+//		  - blocked_sta reconnect push (§6.2(e)):
+//		    {"_type":"setparam","blocked_sta":...} + server_time — blocked_sta
+//		    ONLY, fired once on the connected path when a session refresh armed
+//		    a client-disconnect event; NO cfgversion mint (see
+//		    blockedStaReconnectPush).
 //	  - noop: {"_type":"noop","interval":N} + server_time (N = 10 default,
 //	    5 while watching, else the devmgr scheduling formula — see noopFor).
 //
@@ -612,6 +619,21 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, d *store.Devi
 		if st.pendingSHAPresent {
 			return e.noopFor(d, now, req.PrevNoopTarget, KindNoopPendingWLAN), nil
 		}
+		// §6.2(e) reconnect push: a client-disconnect event pending on a
+		// connected device preempts the noop (the session store arms
+		// store.SessionDisconnectEventExtraKey; this is the only §6.2
+		// catalog row with no mint site, so NO cfgversion is minted). The
+		// event is consumed one-shot whether or not the push fires — see
+		// blockedStaReconnectPush. This runs AFTER the pending-WLAN gate
+		// above: an outstanding WLAN delivery is an unfinished (d)
+		// operation that outranks (e) (the jar's dispatcher order, §1316
+		// before §1391), and BEFORE the not-running watchdog: the (e) push
+		// is a real pending outcome; the miss counter re-arms on the next
+		// inform.
+		if out, fired := e.blockedStaReconnectPush(d); fired {
+			d.State = store.StateAdopted
+			return out, nil
+		}
 		// Settled-state regression (2026-09-18 F-row live round, A2
 		// finding): a device can echo a matching cfgversion while running
 		// something else — a rebooted AP re-materializes factory config
@@ -801,6 +823,10 @@ func (e *Engine) assignedKeyFlow(d *store.Device, now time.Time, wls []wireless.
 	// the plain cfgversion mismatch keeps re-OFFERING it until applied.
 	blocked := blockedStaWire(*d)
 	stampBlockedSta(d, blocked)
+	// A pending client-disconnect event is satisfied by this emission:
+	// full provisioning carries blocked_sta (§6.2(d)), so the event must
+	// not survive it to fire a redundant §6.2(e) push after settle.
+	consumeSessionDisconnectEvent(d)
 	return Outcome{
 		Kind:             KindSetparam,
 		FullProvision:    true,
