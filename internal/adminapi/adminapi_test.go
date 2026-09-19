@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -32,6 +34,11 @@ type fakeBackend struct {
 	rebootArmed       []string
 	factoryResetArmed []string
 	byMAC             map[string]DeviceView
+	// Blocked-set state (device MAC -> clients in the boundary-normalized
+	// colon-hex spelling) plus call recording for routing assertions.
+	blocked        map[string][]string
+	blockedAdded   []string
+	blockedRemoved []string
 }
 
 func newFakeBackend() *fakeBackend {
@@ -95,6 +102,66 @@ func (f *fakeBackend) DeleteDevice(_ context.Context, mac string) error {
 	f.deleted = append(f.deleted, mac)
 	delete(f.byMAC, mac)
 	return nil
+}
+
+// ---- blocked-set fake -----------------------------------------------------
+
+// blockedView renders the fake's set with the same never-nil, canonical-
+// order contract the real adapter exposes: sorted colon-hex, like the
+// store-backed adapter, so route tests pin the ordering too.
+func (f *fakeBackend) blockedView(mac string) BlockedClientsView {
+	set := append([]string{}, f.blocked[mac]...)
+	sort.Strings(set)
+	if set == nil {
+		set = []string{}
+	}
+	return BlockedClientsView{MAC: mac, Blocked: set}
+}
+
+func (f *fakeBackend) ListBlockedClients(_ context.Context, mac string) (BlockedClientsView, error) {
+	if _, ok := f.byMAC[mac]; !ok {
+		return BlockedClientsView{}, fmt.Errorf("%w: %s", ErrNotFound, mac)
+	}
+	return f.blockedView(mac), nil
+}
+
+func (f *fakeBackend) BlockClient(_ context.Context, mac, client string) (BlockedClientsView, error) {
+	if _, ok := f.byMAC[mac]; !ok {
+		return BlockedClientsView{}, fmt.Errorf("%w: %s", ErrNotFound, mac)
+	}
+	f.blockedAdded = append(f.blockedAdded, mac+"/"+client)
+	for _, c := range f.blocked[mac] {
+		if strings.EqualFold(c, client) {
+			return f.blockedView(mac), nil // idempotent
+		}
+	}
+	if f.blocked == nil {
+		f.blocked = map[string][]string{}
+	}
+	f.blocked[mac] = append(f.blocked[mac], client)
+	return f.blockedView(mac), nil
+}
+
+func (f *fakeBackend) UnblockClient(_ context.Context, mac, client string) (BlockedClientsView, error) {
+	if _, ok := f.byMAC[mac]; !ok {
+		return BlockedClientsView{}, fmt.Errorf("%w: %s", ErrNotFound, mac)
+	}
+	set := f.blocked[mac]
+	kept := set[:0:0] // fresh slice; never alias the stored one
+	found := false
+	for _, c := range set {
+		if strings.EqualFold(c, client) {
+			found = true
+			continue
+		}
+		kept = append(kept, c)
+	}
+	if !found {
+		return BlockedClientsView{}, fmt.Errorf("%w: client not blocked: %s", ErrNotFound, client)
+	}
+	f.blocked[mac] = kept
+	f.blockedRemoved = append(f.blockedRemoved, mac+"/"+client)
+	return f.blockedView(mac), nil
 }
 
 func (f *fakeBackend) ListPending(context.Context) []PendingView { return f.pending }
@@ -1228,5 +1295,141 @@ func TestWlanStructParityWithServer(t *testing.T) {
 	}
 	for name := range afields {
 		t.Fatalf("adminapi.Wlan field %q missing in server.Wlan — add to BOTH structs, the cmd/openunifi converter AND server's wlanListHash", name)
+	}
+}
+
+// ---- blocked-client routes --------------------------------------------------
+
+// TestBlockedClientRoutes walks the three blocked-set endpoints end-to-end:
+// never-null listing, boundary MAC normalization, idempotent blocking, 404
+// on not-blocked unblock and unknown devices, 400 on invalid MACs and
+// strict/ malformed bodies, and token enforcement.
+func TestBlockedClientRoutes(t *testing.T) {
+	be := newFakeBackend()
+	h := New(Config{AdminToken: "s3cret"}, be)
+	const dev = "f0:9f:c2:84:8f:2a" // fixture device from newFakeBackend
+	do := func(method, path, body string) *httptest.ResponseRecorder {
+		var rdr io.Reader
+		if body != "" {
+			rdr = strings.NewReader(body)
+		}
+		req := httptest.NewRequest(method, path, rdr)
+		req.Header.Set("Authorization", "Bearer s3cret")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	decode := func(t *testing.T, rec *httptest.ResponseRecorder) BlockedClientsView {
+		t.Helper()
+		var v BlockedClientsView
+		if err := json.Unmarshal(rec.Body.Bytes(), &v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+
+	// Fresh listing: 200 with an EMPTY LIST (never null).
+	rec := do("GET", "/api/v1/devices/"+dev+"/blocked", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list fresh: %d %q", rec.Code, rec.Body.String())
+	}
+	v := decode(t, rec)
+	if v.Blocked == nil || len(v.Blocked) != 0 || v.MAC != dev {
+		t.Fatalf("fresh view = %+v, want empty non-nil list", v)
+	}
+
+	// Block a client in a non-normalized spelling: the boundary normalizes
+	// before the backend sees it.
+	rec = do("POST", "/api/v1/devices/"+dev+"/blocked", `{"mac":"AA-BB-CC-DD-EE-FF"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("block: %d %q", rec.Code, rec.Body.String())
+	}
+	if v = decode(t, rec); len(v.Blocked) != 1 || v.Blocked[0] != "aa:bb:cc:dd:ee:ff" {
+		t.Fatalf("block view = %+v, want normalized colon-hex", v)
+	}
+
+	// Idempotent re-block (other spelling): 200 with the SAME set.
+	rec = do("POST", "/api/v1/devices/"+dev+"/blocked", `{"mac":"aabbccddeeff"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("re-block: %d %q", rec.Code, rec.Body.String())
+	}
+	if v = decode(t, rec); len(v.Blocked) != 1 {
+		t.Fatalf("re-block must be idempotent: %+v", v)
+	}
+
+	// Second client, then list both.
+	rec = do("POST", "/api/v1/devices/"+dev+"/blocked", `{"mac":"00:11:22:33:44:55"}`)
+	if rec.Code != http.StatusOK || len(decode(t, rec).Blocked) != 2 {
+		t.Fatalf("second block: %d %q", rec.Code, rec.Body.String())
+	}
+	rec = do("GET", "/api/v1/devices/"+dev+"/blocked", "")
+	if v = decode(t, rec); len(v.Blocked) != 2 ||
+		v.Blocked[0] != "00:11:22:33:44:55" || v.Blocked[1] != "aa:bb:cc:dd:ee:ff" {
+		t.Fatalf("list after two blocks = %+v, want canonical (sorted) order", v)
+	}
+
+	// Unblock one (dotted spelling in the path): 200 with the remainder.
+	rec = do("DELETE", "/api/v1/devices/"+dev+"/blocked/AA.BB.CC.DD.EE.FF", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unblock: %d %q", rec.Code, rec.Body.String())
+	}
+	if v = decode(t, rec); len(v.Blocked) != 1 || v.Blocked[0] != "00:11:22:33:44:55" {
+		t.Fatalf("post-unblock view = %+v", v)
+	}
+
+	// Unblock a client that is not blocked: 404.
+	rec = do("DELETE", "/api/v1/devices/"+dev+"/blocked/ff:ee:dd:cc:bb:aa", "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unblock not-blocked: %d %q, want 404", rec.Code, rec.Body.String())
+	}
+
+	// Unknown device: 404 on all three.
+	for _, c := range []struct{ method, path, body string }{
+		{"GET", "/api/v1/devices/aa:bb:cc:dd:ee:ff/blocked", ""},
+		{"POST", "/api/v1/devices/aa:bb:cc:dd:ee:ff/blocked", `{"mac":"00:11:22:33:44:55"}`},
+		{"DELETE", "/api/v1/devices/aa:bb:cc:dd:ee:ff/blocked/00:11:22:33:44:55", ""},
+	} {
+		rec = do(c.method, c.path, c.body)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s unknown device: %d %q, want 404", c.method, rec.Code, rec.Body.String())
+		}
+	}
+
+	// Invalid MACs are boundary 400s, never backend calls.
+	if rec = do("GET", "/api/v1/devices/zz/blocked", ""); rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad device mac: %d, want 400", rec.Code)
+	}
+	if rec = do("POST", "/api/v1/devices/"+dev+"/blocked", `{"mac":"not-a-mac"}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad client body: %d, want 400", rec.Code)
+	}
+	if rec = do("DELETE", "/api/v1/devices/"+dev+"/blocked/zz", ""); rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad client path: %d, want 400", rec.Code)
+	}
+
+	// Strict body validation and malformed JSON.
+	if rec = do("POST", "/api/v1/devices/"+dev+"/blocked", `{"mac":"00:11:22:33:44:55","extra":true}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("unknown field: %d, want 400", rec.Code)
+	}
+	if rec = do("POST", "/api/v1/devices/"+dev+"/blocked", `{`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("malformed body: %d, want 400", rec.Code)
+	}
+	if rec = do("POST", "/api/v1/devices/"+dev+"/blocked", ""); rec.Code != http.StatusBadRequest {
+		t.Fatalf("empty body: %d, want 400", rec.Code)
+	}
+
+	// Token required, same as every other route.
+	req := httptest.NewRequest("GET", "/api/v1/devices/"+dev+"/blocked", nil)
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req)
+	if rec2.Code != http.StatusUnauthorized {
+		t.Fatalf("no token: %d, want 401", rec2.Code)
+	}
+
+	// The routes reached the backend (recorded calls, normalized spellings).
+	if len(be.blockedAdded) != 3 || be.blockedAdded[0] != dev+"/aa:bb:cc:dd:ee:ff" {
+		t.Fatalf("block calls recorded = %v", be.blockedAdded)
+	}
+	if len(be.blockedRemoved) != 1 || be.blockedRemoved[0] != dev+"/aa:bb:cc:dd:ee:ff" {
+		t.Fatalf("unblock calls recorded = %v", be.blockedRemoved)
 	}
 }

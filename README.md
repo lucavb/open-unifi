@@ -86,6 +86,9 @@ Grafana Alloy example wiring OTLP into Tempo and the controller log into Loki). 
 ```
 GET/POST      /api/v1/devices          list / register (adopt whitelist)
 GET/DELETE    /api/v1/devices/{mac}
+GET/POST      /api/v1/devices/{mac}/blocked     list / block a client
+                                          (POST body {"mac":"<client>"}; idempotent)
+DELETE        /api/v1/devices/{mac}/blocked/{client}   unblock (404 when not blocked)
 POST          /api/v1/devices/{mac}/reboot          arm remote reboot
                                           (fires on the device's next inform)
 POST          /api/v1/devices/{mac}/factory-reset   arm remote factory reset
@@ -97,6 +100,12 @@ GET           /api/v1/whoami
 GET           /metrics                  Prometheus (requires the token when one is set)
 GET           /healthz
 ```
+
+Blocking a client takes effect on the device's next inform: the controller
+delivers the blocked list inside the same `setparam` that carries
+`system_cfg` (the `blocked_sta` field), exactly like a WLAN change — a
+fresh `cfgversion` is minted and the AP confirms it by echoing the new
+version back.
 
 Wireless fields per WLAN: `name`, `ssid`, `security` (`open` | `wpa-p`),
 `passphrase` (≥8, required for `wpa-p`, rejected for `open`), `vlan` (1–4094),

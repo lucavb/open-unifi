@@ -107,3 +107,10 @@ _Avoid_: builder, emitter.
 
 **Site facts**: the controller-level inputs a render needs: controller URL,
 regulatory country code, AP SSH password, and the current WLANs.
+
+## Commits
+
+Scope commits by the package they change: `adminapi` (the REST surface),
+`app` (the Backend), `adoption` (engine decisions), `server` (transport),
+`acceptance` (live-round records) — so `git log --grep` works. Feature-word
+scopes (`admin`, `wireless`, `led`, `radio`) are drift; do not add new ones.

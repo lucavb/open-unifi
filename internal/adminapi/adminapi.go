@@ -112,6 +112,22 @@ type WlansEnvelope struct {
 	Wlans []Wlan `json:"wlans"`
 }
 
+// BlockedClientsView is the admin-facing projection of the per-device
+// blocked-client set — the admin-owned record row behind the blocked_sta
+// wire field (docs/PROTOCOL-mgmt.md §4/§6.2(d)). MACs are colon-hex in the
+// set's canonical (sorted) order; Blocked is never nil so the JSON is
+// always a list, never null.
+type BlockedClientsView struct {
+	MAC     string   `json:"mac"`
+	Blocked []string `json:"blocked"`
+}
+
+// blockClientRequest is the POST body of the block route: the client MAC in
+// any common spelling (normalized at the boundary).
+type blockClientRequest struct {
+	MAC string `json:"mac"`
+}
+
 // Backend is the storage/service contract implemented by the server lane.
 type Backend interface {
 	ListDevices(ctx context.Context) []DeviceView
@@ -120,6 +136,17 @@ type Backend interface {
 	// CreateDevice registers a device manually (state PENDING = adopt whitelist).
 	CreateDevice(ctx context.Context, up DeviceUpsert) (DeviceView, error)
 	DeleteDevice(ctx context.Context, mac string) error
+	// Blocked-client set of a device (the admin-owned row the inform path
+	// preserves verbatim; block/unblock changes ride full provisioning
+	// exactly like a WLAN envelope change).
+	//
+	// Wire contract: BlockClient is IDEMPOTENT (blocking an already-blocked
+	// client is a 200 with the unchanged set); UnblockClient returns
+	// ErrNotFound when the client is not currently blocked; all three
+	// return ErrNotFound when the DEVICE does not exist.
+	ListBlockedClients(ctx context.Context, mac string) (BlockedClientsView, error)
+	BlockClient(ctx context.Context, mac, client string) (BlockedClientsView, error)
+	UnblockClient(ctx context.Context, mac, client string) (BlockedClientsView, error)
 	// ListPending returns discovery-beacon candidates.
 	ListPending(ctx context.Context) []PendingView
 	// AdoptPending attempts adoption of a pending candidate.
@@ -306,6 +333,66 @@ func New(cfg Config, be Backend) http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, dv)
+	}))
+	// Blocked-client set of one device. GET lists; POST adds one client
+	// (idempotent state change — a repeat POST while the set is unchanged
+	// is a 200 with the unchanged set, not a 409: the set is a projection
+	// of admin intent, not an inventory with identity); DELETE removes one
+	// client and 404s when it was not blocked (mirroring the
+	// DeleteDevice/DeleteWlan not-found semantics).
+	mux.HandleFunc("GET /api/v1/devices/{mac}/blocked", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+		mac, err := normalizeMAC(r.PathValue("mac"))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid mac: "+err.Error())
+			return
+		}
+		v, err := be.ListBlockedClients(r.Context(), mac)
+		if err != nil {
+			handleBackendErr(w, lg, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, v)
+	}))
+	mux.HandleFunc("POST /api/v1/devices/{mac}/blocked", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+		mac, err := normalizeMAC(r.PathValue("mac"))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid mac: "+err.Error())
+			return
+		}
+		var req blockClientRequest
+		if err := readJSON(r, &req); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		client, err := normalizeMAC(req.MAC)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid client mac: "+err.Error())
+			return
+		}
+		v, err := be.BlockClient(r.Context(), mac, client)
+		if err != nil {
+			handleBackendErr(w, lg, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, v)
+	}))
+	mux.HandleFunc("DELETE /api/v1/devices/{mac}/blocked/{client}", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+		mac, err := normalizeMAC(r.PathValue("mac"))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid mac: "+err.Error())
+			return
+		}
+		client, err := normalizeMAC(r.PathValue("client"))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid client mac: "+err.Error())
+			return
+		}
+		v, err := be.UnblockClient(r.Context(), mac, client)
+		if err != nil {
+			handleBackendErr(w, lg, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, v)
 	}))
 	mux.HandleFunc("GET /api/v1/pending", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, pendingEnvelope{be.ListPending(r.Context())})

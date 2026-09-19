@@ -370,6 +370,115 @@ func (a *App) DeleteDevice(_ context.Context, mac string) error {
 	return nil
 }
 
+// ---- Blocked-client set (the admin-owned row behind blocked_sta) ---------
+
+// blockedPair canonicalizes the device and client MACs — the shared prelude
+// of the blocked-set endpoints. An unparseable DEVICE MAC cannot exist in
+// the store (not-found semantics, mirroring GetDevice); an unparseable
+// CLIENT MAC is a backstop conflict (adminapi already 400'd it at its
+// boundary).
+func blockedPair(mac, client string) (string, string, error) {
+	canon, err := store.CanonicalMAC(mac)
+	if err != nil {
+		return "", "", fmt.Errorf("%w: %s (%v)", adminapi.ErrNotFound, mac, err)
+	}
+	cclient, err := store.CanonicalMAC(client)
+	if err != nil {
+		return "", "", fmt.Errorf("%w: invalid client mac: %s (%v)", adminapi.ErrConflict, client, err)
+	}
+	return canon, cclient, nil
+}
+
+// blockedClientsView renders the admin-facing projection: colon-hex in the
+// set's canonical order, never a nil slice (the JSON is always a list).
+func blockedClientsView(canon string, set []string) adminapi.BlockedClientsView {
+	out := make([]string, len(set))
+	for i, c := range set {
+		out[i] = store.ColonMAC(c)
+	}
+	return adminapi.BlockedClientsView{MAC: store.ColonMAC(canon), Blocked: out}
+}
+
+// ListBlockedClients returns the device's blocked-client set.
+func (a *App) ListBlockedClients(_ context.Context, mac string) (adminapi.BlockedClientsView, error) {
+	canon, cerr := store.CanonicalMAC(mac)
+	if cerr != nil {
+		return adminapi.BlockedClientsView{}, fmt.Errorf("%w: %s (%v)", adminapi.ErrNotFound, mac, cerr)
+	}
+	d, err := a.st.Get(canon)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return adminapi.BlockedClientsView{}, unknownDevice(canon)
+		}
+		return adminapi.BlockedClientsView{}, fmt.Errorf("device store: %w", err)
+	}
+	return blockedClientsView(canon, store.BlockedClients(d)), nil
+}
+
+// BlockClient adds one client MAC to the device's blocked-client set.
+// Idempotent: re-blocking returns the unchanged set, like the adopt route's
+// state-change semantics. The set is an admin-owned record row; the engine
+// delivers it inside full provisioning on the next inform via its
+// blocked_sta drift — no admin-time cfgversion mint (exactly the WLAN
+// envelope change machinery).
+func (a *App) BlockClient(_ context.Context, mac, client string) (adminapi.BlockedClientsView, error) {
+	canon, cclient, perr := blockedPair(mac, client)
+	if perr != nil {
+		return adminapi.BlockedClientsView{}, perr
+	}
+	var view adminapi.BlockedClientsView
+	err := a.st.UpdateExisting(canon, func(d *store.Device) error {
+		if _, err := store.AddBlockedClient(d, cclient); err != nil {
+			return err
+		}
+		// Render INSIDE the closure: the clone is only authoritative within
+		// the RMW cycle, and nothing aliases the record out of it.
+		view = blockedClientsView(canon, store.BlockedClients(*d))
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return adminapi.BlockedClientsView{}, unknownDevice(canon)
+		}
+		return adminapi.BlockedClientsView{}, fmt.Errorf("device store: %w", err)
+	}
+	return view, nil
+}
+
+// UnblockClient removes one client MAC from the device's blocked-client
+// set. A client that is not currently blocked is ErrNotFound (the route
+// maps it to 404, mirroring DeleteDevice/DeleteWlan semantics).
+func (a *App) UnblockClient(_ context.Context, mac, client string) (adminapi.BlockedClientsView, error) {
+	canon, cclient, perr := blockedPair(mac, client)
+	if perr != nil {
+		return adminapi.BlockedClientsView{}, perr
+	}
+	var view adminapi.BlockedClientsView
+	err := a.st.UpdateExisting(canon, func(d *store.Device) error {
+		removed, rerr := store.RemoveBlockedClient(d, cclient)
+		if rerr != nil {
+			return rerr
+		}
+		if !removed {
+			return fmt.Errorf("%w: client not blocked: %s", adminapi.ErrNotFound, store.ColonMAC(cclient))
+		}
+		view = blockedClientsView(canon, store.BlockedClients(*d))
+		return nil
+	})
+	if err != nil {
+		// The not-blocked abort already carries the canonical 404 shape;
+		// only store-level faults get wrapped opaque.
+		if errors.Is(err, adminapi.ErrNotFound) {
+			return adminapi.BlockedClientsView{}, err
+		}
+		if errors.Is(err, store.ErrNotFound) {
+			return adminapi.BlockedClientsView{}, unknownDevice(canon)
+		}
+		return adminapi.BlockedClientsView{}, fmt.Errorf("device store: %w", err)
+	}
+	return view, nil
+}
+
 // ListPending returns discovery/inform-reported candidates that do not have
 // a device record yet.
 func (a *App) ListPending(_ context.Context) []adminapi.PendingView {
