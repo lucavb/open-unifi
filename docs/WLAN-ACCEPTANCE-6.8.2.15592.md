@@ -718,10 +718,20 @@ channel-intent push:**
 3. Live-verify intent-vs-echo precedence: after apply, a full inform
    carrying the old channel in its radio_table must NOT revert the
    rendered row (admin intent wins in the next full provisioning render).
-4. txpower_mode admin semantics and country-specific channel legality
-   (DFS) remain unrecovered from the jar — deliberately not implemented
-   (PROTOCOL-systemcfg-wireless.md §3.2/§9). Do not mint either from a
-   bench observation without a jar citation first.
+4. txpower_mode is RESOLVED as a pure echo (2026-09-19 txpower lane,
+   PROTOCOL-systemcfg-wireless.md §9: the config classes carry no
+   controller-side writer — echo reads int.txt 5687-5696 with default
+   "auto", row emission int.txt 5942-5958, pool-ref sweep; echo-pinned
+   by internal/server/systemcfg/render_txpower_test.go) — admin
+   semantics stay forbidden: no bench observation may mint them without
+   a further jar citation first. Country-specific channel legality
+   (DFS): the gate machinery is recovered as evidence only (§9 —
+   country row via `R.forfloat()` default 840, `channels_na_dfs`,
+   `has_dfs`/`has_fccdfs` capability words, the guarded dfs-reset cron
+   row), but the gate's caller and the cron-guard producer stay
+   untranscribed, so channel legality remains the device's apply-time
+   oracle; those two links close only from a full int.txt/String.txt
+   session.
 
 ### 2026-09-19 full-chain round — EAP push, delivery-storm fix, §6.5 reboot, §6.6 factory reset (controller `1e4c14f4a226` → `95bfc84fe3b2b6a5`)
 
@@ -846,6 +856,48 @@ For every `PROVEN` or `FAILED` case, attach or hash (without secrets):
 5. packet-capture evidence where applicable, including capture interface,
    direction, 802.1Q VID/PCP, and the capture hash; and
 6. the exact redacted command/UI action and reviewer sign-off.
+
+### 2026-09-19 gap-closure round 1 — five offline citation lanes (controller `77fa34f` → `f4a2af5`)
+
+**Scope:** offline implementation round only — no bench traffic, no
+live evidence claimed. Five lanes ran as isolated Orca worktree
+workers (run `run_c869df330cd9`), each citation-first (jar javap
+transcription packets or protocol-doc sections in code comments; unsettleable
+values shipped as BLOCKED verdicts), each with a green scoped
+verification trio in its worktree, merged in order sessions → tasks →
+acct → ledbar → txpower (rebase + ff-only; conflicts resolved at the
+adoption-engine key list, the console, the app view, and the §12
+deviation table — all additive unions). Post-merge main: gofmt/vet
+clean, full `go test ./...` green including all ZZ live gates.
+
+| lane | commits | outcome |
+|---|---|---|
+| sessions | `38860b9`…`37372f3` (8) | client session tracking end-to-end: per-client station-table decode (inform), session rows + connect/disconnect events (store), the §6.2(e) blocked_sta reconnect push fired on a client disconnect while blocked (adoption engine, one-shot, no cfgversion mint), connect/disconnect counters (metrics), session refresh in the inform RMW cycle (server), `GET /api/v1/devices/{mac}/clients` + console listing (adminapi) |
+| tasks | `31838f8`,`eed4122`,`e93c304` (3) | §6.3 cmd task passthrough: stored admin-owned `cmd_task` row (at most one armed), engine branch after setdefault/reboot (armed task outranks drift), byte-exact `_type:"cmd"` replay over the inform codec, `POST /api/v1/devices/{mac}/cmd`; six §6.3-silent choices recorded as BLOCKED |
+| acct | `064bd9a` (1) | §12 rows 1013-1014: `aaa.<n>.radius.acct.<i>.*` rows emitted per accounting server (port 0→1813, profile secret, auth-mirrored slot semantics), `interim_update.*` at the jar's 3600 default; das/dad BLOCKED (client-IP source unrecovered), row 1015 stays omitted (Uid gate unreachable for U7PG2) |
+| ledbar | `e28e329`,`6c6b3c6`,`f3334d3` (3) | §12 row 1007 block emitted row-for-row per the javap packet (supportLedBar guard, status/persistent/brightness/active/color rows, `(255*b)/100` truncation, `Color.decode` fallback); knobs `led_override_color_brightness`/`led_override_color` wired adminapi→app→renderer + console; §12 row 1007 flipped implemented |
+| txpower | `c1451a3`,`f4a2af5` (2) | §9 txpower_mode RESOLVED as a pure echo (end-2 BLOCKED verdict: no controller-side writer exists — packet pool-ref sweep); echo-pinning tests; DFS gate machinery + guarded dfs-reset cron recorded as evidence-only with two open links |
+
+**ZZ permit:** the ledbar block renders for every capture-predating
+baseline, so `f79c826` adds the self-inerting `zzExemptLedBarMigration`
+filter (the `zzExemptIsDefaultMigration` precedent) at the stale-baseline
+gates; it becomes inert at the next device-verified applied-bytes
+re-capture, after which a `ledbar.*` drift trips the gates again.
+
+**Live-proof obligations (the parent's bench queue; none are
+live-evidenced yet):** sessions — pin the `sta_table`/`mac` wire key,
+the (e) trigger mapping and byte shape, empty-table semantics, session
+retention, console/API smoke (WORKER-REPORT-sessions.md §LIVE-PROOF);
+tasks — classic-controller enqueue capture (row `type` value, second
+enqueue, task fate across reboot/factory reset, accepted cmd bounds);
+acct — jar-recover the dad/das client-IP source first, then the live
+accounting push/Interim-Update session proof, accounting-off revert,
+console round-trip; ledbar — the block's bytes in a captured full
+provisioning and real LED state changes per override; txpower — the
+echo rows on the next captured provisioning and the §3.2 txpower arm
+live-proven (observation may not mint admin semantics — obligation 4
+above). Full lane reports: scratch
+`/tmp/3fe1d3752fe0b1c6/opencode/fleet-20260919/reports/`.
 
 ## Release gate summary
 
