@@ -240,8 +240,8 @@ inside this method's Code.
 | `bgscan.status` | disabled | literal |
 | `antenna.gain` | 0 | `builtin_antenna ? builtin_ant_gain : antenna_gain` (default 6 absent, §510) |
 | `antenna` | -1 | radio_table `antenna_id` (default -1) |
-| `txpower_mode` | auto | radio_table `tx_power_mode` (default `\u00f4\u00f40000` = "auto"); never intent-driven (§3.2) |
-| `txpower` | auto | radio_table `tx_power`; open-unifi: admin intent overlay wins (§3.2) |
+| `txpower_mode` | auto | radio_table `tx_power_mode` (default "auto", const #252; read int.txt 5687-5691, emitted as row `txpower_mode` int.txt 5942-5949 — the row name drops the underscore); never intent-driven (§3.2, resolved §9) |
+| `txpower` | auto | radio_table `tx_power` (default "auto"; read int.txt 5692-5696, emitted as row `txpower` int.txt 5950-5958); open-unifi: admin intent overlay wins (§3.2) |
 | `hard_noisefloor.*` | `status=disabled` | when `sens_level_enabled` + advanced: `enabled, max_sens=-40, minrssi.value=…, minrssi_backoff=0` (§519-525) |
 | `stamgr.<n4>.*` | (separate key, radio-index) | only when `advanced_feature_enabled` + any of min-rssi/load-balance: `status=true, radio=ng, minrssi.status, minrssi.rssi, loadbalance.status, loadbalance.maxsta` (§527-531) |
 
@@ -301,16 +301,21 @@ instead of a hardcoded `20`).
 
 The jar source for every `radio.<n>` row is the device's radio_table echo — the
 classic controller never stores an admin channel/txpower wish for U7PG2 in any
-field this decompile set exposes. open-unifi adds one admin-owned record field
-(the device record's `Extra["radio_intent"]`) that the renderer overlays on two
-rows of §3, so an admin's saved radio setting survives every inform echo
-and is what actually ships:
+field this decompile set exposes. The 2026-09-19 txpower packet verified this
+for the tx rows by constant-pool sweep (§9): every ref to the
+`tx_power_mode`/`tx_power` strings in `config.int` is consumed at the pure
+echo sites (int.txt 5687-5696 → 5942-5958) and `config.String` carries no
+tx_power/txpower strings at all — no controller-side writer for these rows
+exists anywhere in the config classes. open-unifi adds one admin-owned record
+field (the device record's `Extra["radio_intent"]`) that the renderer overlays
+on two rows of §3, so an admin's saved radio setting survives every inform
+echo and is what actually ships:
 
 | row | jar default/source (§3) | with intent overlay |
 |---|---|---|
 | `radio.<n>.channel` | radio_table `channel` echo, default `0` (auto) | `Extra["radio_intent"][radioName]["channel"]` wins when present; `0` = explicit auto |
 | `radio.<n>.txpower` | radio_table `tx_power` echo, default `auto` | `Extra["radio_intent"][radioName]["txpower"]` wins when present; `"auto"` or fixed dBm |
-| `radio.<n>.txpower_mode` | radio_table `tx_power_mode` echo, default `auto` | **never intent-driven** — no admin semantics were recovered for this row (see §9) |
+| `radio.<n>.txpower_mode` | radio_table `tx_power_mode` echo, default `auto` | **never intent-driven — and never was on the jar side either**: no controller-side writer for this row exists in the config classes (constant-pool sweep: every ref to the `tx_power_mode`/`tx_power` strings — Utf8 #1695/#1697, row names #1729/#1730 — is consumed at the pure echo sites int.txt 5687-5696 → 5942-5958; `config.String` carries no tx_power/txpower strings at all; resolved-as-echo §9) |
 
 Semantics (Go contract, `internal/wireless.RadioIntents` +
 `internal/server/systemcfg` renderer):
@@ -328,7 +333,8 @@ Semantics (Go contract, `internal/wireless.RadioIntents` +
   `min_txpower..max_txpower` bounds; `"auto"` is always valid on ng/na; any
   intent on an unknown band token is rejected rather than shipped unvalidated.
   Country-specific channel legality (e.g. DFS) is intentionally NOT re-validated
-  — that is the device/jar's job — see the omission ledger in §9.
+  — that is the device/jar's job; the jar's recovered DFS-legality machinery
+  and its open linkage points are recorded in §9.
 
 ## 4. Per-WLAN `aaa.<n>` rows (order = call order in the emitter)
 
@@ -769,26 +775,75 @@ writes don't bump. Validation and delivery semantics are in §3.2.
 
 - **Radio-intent lane omissions (2026-09-19)** — no new `radio.<n>` row shapes
   were minted; the admin intent overlay (§3.2) reuses the recovered
-  `radio.<n>.channel`/`txpower` rows verbatim. Not recovered from the jar /
-  live evidence, and therefore deliberately NOT implemented (see
-  `docs/WLAN-ACCEPTANCE-6.8.2.15592.md` radio-lane obligations):
-  - `radio.<n>.txpower_mode` admin semantics: how (or whether) the classic
-    controller flips `tx_power_mode` when an admin fixes txpower. Searched the
-    radio writer (§3 table cites); no writer of `tx_power_mode` other than the
-    radio_table echo was found. open-unifi leaves the row as the pure echo.
+  `radio.<n>.channel`/`txpower` rows verbatim. Deliberately NOT implemented
+  (see `docs/WLAN-ACCEPTANCE-6.8.2.15592.md` radio-lane obligations):
+  - ~~`radio.<n>.txpower_mode` admin semantics~~ **RESOLVED as pure echo
+    (2026-09-19 txpower lane)**: the classic controller has NO admin
+    semantics for this row — no controller-side writer for
+    `radio.<n>.txpower_mode` (or `radio.<n>.txpower`) exists in the config
+    classes. Evidence (txpower packet, transcribed by the fleet parent from
+    the `com__ubnt__service__config__int.txt` javap dump): the only reads
+    are `X.getString("tx_power_mode","auto")` / `X.getString("tx_power",
+    "auto")` off the device's radio_table entry — no setter, no admin
+    lookup, no controller-side override (int.txt 5687-5696, default const
+    #252 "auto"); the row emitter pairs those locals with the
+    underscore-less row names `txpower_mode`/`txpower` (int.txt 5942-5958,
+    array slots 40-43); and the constant-pool sweep found every ref to Utf8
+    #1695/#1697/#1729/#1730 consumed at those echo sites, while
+    `config.String` holds no tx_power/txpower refs at all. How (or whether)
+    the real controller ever flips `tx_power_mode` is therefore outside the
+    config classes — nothing in this evidence settles it, so minting an
+    admin meaning for the row remains forbidden (acceptance radio-lane
+    obligation 4: no bench observation may mint it without a jar citation
+    first). open-unifi leaves the row as the pure echo, pinned by
+    `internal/server/systemcfg/render_txpower_test.go`.
   - Country channel legality (DFS/passive) beyond the ng `0..14` / na
-    `36..165` band bounds: no country-limit table feeding `channel` was
-    recovered for the `radio.<n>` rows (the §3.1 width resolver reads country
-    limits, but no analogous channel-legality resolver surfaced). The device
-    rejects illegal channels at apply time; the admin API enforces only band
-    bounds.
+    `36..165` band bounds: the admin API still enforces only band bounds —
+    but the 2026-09-19 txpower packet recovered the jar's DFS-legality
+    MACHINERY, superseding the earlier "no analogous channel-legality
+    resolver surfaced" note:
+    - Read-side gate `int.super(String, List<X>)` (int.txt 16774-16845):
+      resolves the country row via `X.findOne` over the registry list
+      (`R.forfloat()`; site `country.code`, default `"840"` = US, `"124"` =
+      Canada; no country row ⇒ false), reads its `channels_na_dfs` integer
+      list (empty ⇒ false), selects the capability word `has_fccdfs` for
+      US/CA vs `has_dfs` for any other country (int.txt 1017-1021), and
+      returns true iff any radio row both carries the selected capability
+      word and has a channel inside the NA-DFS list.
+    - Backing data: `channels_na_dfs` is a country-table field with a static
+      fallback (com__ubnt__service__devmgr__c.txt 1222-1232, signature at
+      line 1240); `has_dfs`/`has_fccdfs` appear in the device capability
+      word lists (com__ubnt__service__devmgr__i.txt 6612-6629 and
+      6288-6304; com__ubnt__service__devmgr__IA.txt 2330-2345 and
+      2652-2668).
+    - Guarded dfs-reset cron row (com__ubnt__service__config__String.txt
+      5204-5242): the cron/mgmt emitter carries a guarded block emitting
+      `cron.1.job.<n>` with `status=enabled`, `schedule=0 2 * * *`,
+      `cmd=syswrapper.sh dfs-reset` (pool refs String.txt 400-408, 985-994),
+      sharing its job counter with the schedule-action /
+      refresh-walled-garden / 11k-scan rows emitted just above. The guard
+      local's producer is NOT transcribed — its link to the read-side gate
+      above is PLAUSIBLE BUT UNPROVEN (recorded open point, not a claim).
+      The dfs-reset cron rows are evidence for the legality story only,
+      NOT a render deliverable: open-unifi emits no dfs-reset row (the
+      factory baseline carries none).
+    - What remains unsettled: the packet does not show the gate's CALLER —
+      whether that boolean feeds `radio.<n>.channel` emission, admin-side
+      validation, or neither is unproven. Controller-side channel legality
+      for the `radio.<n>` rows is therefore still NOT re-validated by
+      open-unifi; the device rejects illegal channels at apply time.
   - The `{radio}` restart set: never live-evidenced (every live round so far
     restarted `{wireless, aaa}`). The successive-push channel-intent zz gate
     (added 2026-09-19) must run live once before the first production
     channel-intent push.
-  The javap index under `tmpwork/javap/` was unreadable during this lane
-  (sandbox denial), so all §3 citations were taken from the existing decompile
-  text files; no jar bytes were re-derived.
+  The javap index under `tmpwork/javap/` was unreadable during the original
+  radio-intent lane (sandbox denial), so that lane's §3 citations were taken
+  from the existing decompile text files; no jar bytes were re-derived. The
+  2026-09-19 txpower lane had javap access ONLY through the fleet parent's
+  embedded packet — a verbatim transcription of the same `tmpwork/javap/`
+  dumps (config int / config String / devmgr c / devmgr i / devmgr IA) —
+  and every txpower-lane citation above is a packet line number,
+  reproducible from the same jar dump.
 
 - ~~`radio.<n>.ieee_mode` `<ht>` value~~ **RESOLVED** (moved to §3.1): the resolver
   class `com/ubnt/service/devmgr/c.class` is now decompiled
@@ -1021,7 +1076,7 @@ String.txt:1851-1930, int.txt:16600-16630). Remaining accepted deviations:
 | `aaa.<n>.radius.acct.<i>.ip/.port/.secret` rows | emitted per radiusprofile accounting server (port 1813) when `accounting_enabled` | **implemented (2026-09-19 acct lane)**: `accounting_enabled` + `acct_servers` on the inline profile (admin API validated: ≤4 entries, non-empty IPs, port 0→1813, profile-level `radius_secret` on every row); renderer emits `radius.acct.<i>.ip/.port/.secret` per server by array position, auth-row slot semantics mirrored; accounting off renders byte-identically to no accounting fields (renderer goldens + drift-hash rule pin it) | resolved as the radius lane's omission note prescribed: the accounting feature and these rows landed together (2026-09-19 acct lane); the interim/das companions follow row 1014 |
 | `aaa.<n>.radius.das.*`/`radius.dad.*`/`interim_update.*` rows | gated on `radius_das_enabled` (+ accounting) and `interim_update_enabled` | **split (2026-09-19 acct lane)**: `interim_update.*` implemented — `accounting_enabled` + `interim_update_enabled` → `interim_update.status=enabled`, `interim_update.interval=3600` (jar default; no interval knob). `das.*`/`dad.*` rows still omitted — the dad/das client rows' `<ip>` source is unrecovered from the jar and is not invented; `radius_das_enabled` is modeled on the profile but rejected at the admin API until the client rows are recoverable (renderer flags out-of-API carriers with an Alert) | the jar's own gates make das/dad unreachable without accounting_enabled anyway; the interim rows now ride that gate exactly, while the das/dad client source stays an open jar-recovery obligation |
 | `aaa.<n>.radius_acct_send_keyid.status`/`aaa.<n>.filter_id` | gated on Uid device classes (IoT/wifi) + `radius_filter_id_enabled` + `supportsRadiusFilter` | omitted (2026-09-19 radius lane; rationale re-confirmed 2026-09-19 acct lane — the gate needs Uid device classes, which U7PG2 cannot report, so no accounting-side work reaches these rows) | no Uid/IoT device classes in the model set; not reachable for U7PG2 |
-| `radio.<n>.channel`/`txpower` when admin intent is set | always the radio_table echo (no admin storage recovered for U7PG2) | admin-owned `Extra["radio_intent"]` overlay wins (2026-09-19, §3.2/§8.1) | the feature this lane exists for: admin-saved radio settings must survive inform echoes and reach the device. No intent set ⇒ byte-identical echo render (pinned by tests); `txpower_mode` stays a pure echo |
+| `radio.<n>.channel`/`txpower` when admin intent is set | always the radio_table echo (no admin storage recovered for U7PG2; confirmed by the 2026-09-19 txpower packet's pool-ref sweep — §9) | admin-owned `Extra["radio_intent"]` overlay wins (2026-09-19, §3.2/§8.1) | the feature this lane exists for: admin-saved radio settings must survive inform echoes and reach the device. No intent set ⇒ byte-identical echo render (pinned by tests); `txpower_mode` stays a pure echo — no controller-side writer for it exists in the config classes (txpower packet: reads int.txt 5687-5696 with default "auto", row emission int.txt 5942-5958, pool-ref sweep; resolved-as-echo §9) |
 
 (End; see PROTOCOL-mgmt.md §3 for the surrounding `system_cfg` order and §6/§7 of
 PROTOCOL-mgmt.md for how system_cfg reaches the device.)
