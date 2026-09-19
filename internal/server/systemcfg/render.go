@@ -218,6 +218,24 @@ func Render(d store.Device, facts SiteFacts) (Result, error) {
 	line("users.2.shell", "/bin/false")
 	line("users.2.status", "enabled")
 
+	// 3b. `# mgmt` ledbar block — DELIBERATELY OMITTED (byte-exact or
+	// absent: fleet standing rule). The real builder emits a HEADERLESS
+	// block here — between `# users` and the wireless compound, no `#`
+	// row — with the keys ledbar.status, ledbar.persistent,
+	// ledbar.brightness, ledbar.active, ledbar.color.1.{color,r,g,b}
+	// (docs/PROTOCOL-mgmt.md §3 item 4, config_String §2566-2745, called
+	// at int.txt:17221). The VALUES/conditions/order of those rows are
+	// recoverable ONLY from the javap dump of config_String
+	// (tmpwork/javap — untracked, main checkout), which this lane could
+	// not read (sandbox path grant missing), so per the byte-exactness
+	// bar the whole block stays omitted and the omission is recorded in
+	// the §12 deviation ledger (docs/PROTOCOL-systemcfg-wireless.md).
+	// The AP falls back to firmware ledbar defaults. Live-proof
+	// obligations: (1) the ledbar block's real on-wire bytes in a
+	// captured full provisioning response, (2) real LED state changes
+	// per mgmt_cfg led_enabled value on the bench AP. Do not invent rows
+	// here — every emitted row must cite config_String §2566-2745.
+
 	// 4. Wireless/VLAN compound (docs/PROTOCOL-systemcfg-wireless.md):
 	// `# wlans (radio)` + radio.<n>/virtual + aaa.<n>/wireless.<n> vaps +
 	// `# vlan`/`# bridge`/`# netconf`/`# dhcpc` wiring. Real section order

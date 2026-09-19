@@ -2103,6 +2103,40 @@ func TestNewlineInjectionGuarded(t *testing.T) {
 	}
 }
 
+// TestAbsorbAdminOwnedLEDFieldsProtected pins the trust policy for the two
+// admin-owned LED record inputs (CONTEXT.md): a device inform body carrying
+// led_override / disabled can neither overwrite the typed admin fields nor
+// introduce a shadowing Extra copy — the classic controller reads both from
+// its own DB record (§2: device.getString("led_override"), device.is
+// ("disabled")), never from the wire, and the §2 led_enabled computation
+// must only ever see admin-controlled values.
+func TestAbsorbAdminOwnedLEDFieldsProtected(t *testing.T) {
+	s := New(Config{}, store.NewMemStore(), testLogger())
+	rec := u7pg2Record()
+	rec.LEDOverride = "on"
+	rec.Disabled = false
+	body := map[string]any{
+		"mac":          store.ColonMAC(testMAC),
+		"model":        "U7PG2",
+		"version":      "6.8.2.15592",
+		"led_override": "off", // forged device-side claim — must be dropped
+		"disabled":     true,  // forged device-side claim — must be dropped
+	}
+	s.absorbInform(testMAC, &rec, body, time.Now(), false)
+	if rec.LEDOverride != "on" {
+		t.Fatalf("device body overwrote admin LED override: %q", rec.LEDOverride)
+	}
+	if rec.Disabled {
+		t.Fatal("device body introduced the admin disabled flag")
+	}
+	if v, ok := rec.Extra["led_override"]; ok {
+		t.Fatalf("device-introduced Extra[led_override] survived absorb: %v", v)
+	}
+	if v, ok := rec.Extra["disabled"]; ok {
+		t.Fatalf("device-introduced Extra[disabled] survived absorb: %v", v)
+	}
+}
+
 // ---- discovery table tests (§8a) -------------------------------------------
 
 // mkTLV frames one TLV entry [type:1][len:2 BE][value] (oooO.o00000(B,[B)).
@@ -2752,6 +2786,64 @@ func TestRadioTablePreserveAndRefresh(t *testing.T) {
 	first, _ := rt[0].(map[string]any)
 	if first["name"] != "ra0" || first["channel"] != 6.0 {
 		t.Fatalf("refreshed radio_table wrong: %v", first)
+	}
+}
+
+// LED override delivery: an effective LEDOverride save mints a cfgversion
+// (the same operator-save trigger as the radio intent above); the device's
+// next inform still echoes the OLD applied version, so full provisioning
+// runs and its mgmt_cfg carries the new led_enabled row. A settled record
+// without a save stays on plain noops.
+func TestLEDOverrideRidesFullProvisioning(t *testing.T) {
+	st := store.NewMemStore()
+	xk := "11112222333344445555666677778888"
+	rec := u7pg2Record()
+	rec.XAuthkey, rec.Authkeys = xk, []string{xk}
+	rec.LEDOverride = "off"
+	rec.CfgVersion = "bbbb" // the admin save minted it
+	rec.AppliedCfg = "aaaa" // the device still runs/echoes the old version
+	if err := st.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	env := []Wlan{{Name: "net", SSID: "net", Security: "open", Enabled: true}}
+	s := New(Config{WirelessSource: func() []Wlan { return env }}, st, testLogger())
+	h := s.InformHandler()
+
+	body := infoBody("aaaa") // device echoes the applied, not the minted, version
+	body["_authkey"] = xk
+	resp := post(t, h, encryptCBC(t, mustJSON(t, body), hexKey(t, xk), testIV))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("inform: %d", resp.Code)
+	}
+	_, jm := decryptResponse(t, resp.Body.Bytes(), hexKey(t, xk))
+	if jm["_type"] != "setparam" || jm["cfgversion"] != "bbbb" {
+		t.Fatalf("admin-minted cfgversion must drive full provisioning, got %v (cfg %v)",
+			jm["_type"], jm["cfgversion"])
+	}
+	mgmt, _ := jm["mgmt_cfg"].(string)
+	if !strings.Contains(mgmt, "led_enabled=false\n") {
+		t.Fatalf("full provisioning mgmt_cfg missing the LED override row:\n%s", mgmt)
+	}
+
+	// Contrast: the settled record (echo matches, baseline current) with no
+	// save stays on plain noops — the mint is the only delivery trigger.
+	settled := u7pg2Record()
+	settled.XAuthkey, settled.Authkeys = xk, []string{xk}
+	settled.LEDOverride = "off"
+	settled.CfgVersion, settled.AppliedCfg = "cccc", "cccc"
+	settled.Extra["wlan_cfg_sha"] = wireless.WlanListHash(env)
+	if err := st.Put(settled); err != nil {
+		t.Fatal(err)
+	}
+	body = infoBody("cccc")
+	body["_authkey"] = xk
+	resp = post(t, h, encryptCBC(t, mustJSON(t, body), hexKey(t, xk), testIV))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("settled inform: %d", resp.Code)
+	}
+	_, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xk))
+	if jm["_type"] != "noop" {
+		t.Fatalf("settled record without a save must stay on plain noops, got %v", jm["_type"])
 	}
 }
 

@@ -1219,3 +1219,55 @@ func TestMgmtCfgGolden(t *testing.T) {
 		t.Fatalf("authkey line must be omitted when keys match: %q", got2)
 	}
 }
+
+// TestMgmtCfgLEDOverride pins the led_enabled row to the §2 B-writer
+// semantics (docs/PROTOCOL-mgmt.md §2): disabled wins over every override;
+// else "on" → true, "off" → false, "default"/unset → the site default (the
+// jar default true — no site table yet). Every case asserts the FULL golden
+// so the row's position (cfgversion → led_enabled → stun_url) and the byte
+// values ("true"/"false" only) are both pinned, not just the row's presence.
+func TestMgmtCfgLEDOverride(t *testing.T) {
+	e := newTestEngine(t)
+	e.controllerURL = "http://10.0.0.5:8080"
+	const k = "11112222333344445555666677778888"
+	base := store.Device{
+		MAC:        engineMAC,
+		CfgVersion: "aaaaaaaaaaaaaaaa",
+		XAuthkey:   k,
+		Authkeys:   []string{k},
+	}
+	cases := []struct {
+		name        string
+		override    string // record field; "" ≡ jar "default"
+		disabled    bool
+		wantLEDLine string // the exact led_enabled=<v>\n row
+	}{
+		{"default follows site default (jar true)", "", false, "led_enabled=true\n"},
+		{"explicit default follows site default (jar true)", "default", false, "led_enabled=true\n"},
+		{"override on", "on", false, "led_enabled=true\n"},
+		{"override off", "off", false, "led_enabled=false\n"},
+		{"disabled wins over default", "", true, "led_enabled=false\n"},
+		{"disabled wins over on", "on", true, "led_enabled=false\n"},
+		{"disabled wins over off", "off", true, "led_enabled=false\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := base
+			d.LEDOverride = tc.override
+			d.Disabled = tc.disabled
+			got := e.BuildMgmtCfg(d, d.XAuthkey) // on-key inform: no authkey row
+			want := "capability=notif,notif-assoc-stat\n" +
+				"selfrun_guest_mode=pass\n" +
+				"cfgversion=aaaaaaaaaaaaaaaa\n" +
+				tc.wantLEDLine +
+				"stun_url=stun://10.0.0.5:3478/\n" +
+				"mgmt_url=https://10.0.0.5:8443/manage/site/default\n" +
+				"inform_url=http://10.0.0.5:8080/inform\n" +
+				"use_aes_gcm=true\n" +
+				"report_crash=true\n"
+			if got != want {
+				t.Fatalf("mgmt_cfg mismatch:\n got %q\nwant %q", got, want)
+			}
+		})
+	}
+}

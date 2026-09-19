@@ -63,6 +63,10 @@ type DeviceView struct {
 	WLANDeliveryCount  int    `json:"wlan_delivery_count,omitempty"`
 	WLANLastAttempt    int64  `json:"wlan_last_attempt,omitempty"`
 	SiteID             string `json:"site_id,omitempty"`
+	// LEDOverride is the admin-set per-device LED override (record field
+	// led_override, docs/PROTOCOL-mgmt.md §2): "" (omitted) = the jar's
+	// "default" (follow the site default), "on", "off". Read-only here.
+	LEDOverride string `json:"led_override,omitempty"`
 	// PendingCommand is the read-only armed remote-command state: "reboot"
 	// when the armed §6.5 reboot flag is set, "factory-reset" when the armed
 	// §6.6 setdefault flag is set (outranking reboot, matching the engine's
@@ -78,6 +82,11 @@ type DeviceView struct {
 type DevicePatch struct {
 	Name   *string `json:"name,omitempty"`
 	SiteID *string `json:"site_id,omitempty"`
+	// LEDOverride sets/clears the per-device LED override. nil = leave
+	// unchanged; "default" = explicit clear back to the site default; "on"
+	// / "off" = the two override states (values validated by
+	// ValidateLEDOverride).
+	LEDOverride *string `json:"led_override,omitempty"`
 }
 
 // DeviceUpsert is the request body for manual device registration ("adopt
@@ -296,6 +305,12 @@ func New(cfg Config, be Backend) http.Handler {
 		}
 		if patch.Name != nil {
 			if msg := ValidateDeviceName(*patch.Name); msg != "" {
+				writeErr(w, http.StatusBadRequest, msg)
+				return
+			}
+		}
+		if patch.LEDOverride != nil {
+			if msg := ValidateLEDOverride(*patch.LEDOverride); msg != "" {
 				writeErr(w, http.StatusBadRequest, msg)
 				return
 			}

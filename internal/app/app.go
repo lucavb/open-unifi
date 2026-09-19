@@ -116,6 +116,7 @@ func (a *App) view(d store.Device) adminapi.DeviceView {
 		WLANDeliveryCount:  intExtra(d.Extra, "wlan_cfg_attempts"),
 		WLANLastAttempt:    int64Extra(d.Extra, "wlan_cfg_last_attempt"),
 		SiteID:             d.SiteID,
+		LEDOverride:        d.LEDOverride,
 		PendingCommand:     armedCommand(d.Extra),
 		Actions:            []string{"delete"},
 	}
@@ -251,6 +252,35 @@ func (a *App) PatchDevice(_ context.Context, mac string, patch adminapi.DevicePa
 		}
 		if patch.SiteID != nil {
 			d.SiteID = *patch.SiteID
+		}
+		if patch.LEDOverride != nil {
+			// ValidateLEDOverride is enforced at the route; this is the
+			// backend-side backstop (same fence style as Name). "default"
+			// is the explicit clear: the record's canonical unset is ""
+			// (the jar's getString default IS "default", so absence and
+			// "default" mean the same wire value — §2 treats them alike).
+			if msg := adminapi.ValidateLEDOverride(*patch.LEDOverride); msg != "" {
+				return fmt.Errorf("%w: %s", adminapi.ErrConflict, msg)
+			}
+			next := ""
+			if *patch.LEDOverride != "default" {
+				next = *patch.LEDOverride
+			}
+			// Delivery trigger, putRadioIntent's idempotence discipline:
+			// the LED override only reaches the device inside a full
+			// provisioning's mgmt_cfg (BuildMgmtCfg's led_enabled row), so
+			// an EFFECTIVE change mints a fresh cfgversion here — the
+			// device's next inform still echoes the OLD applied stamp and
+			// the engine's default arm full-provisions. A save that changes
+			// nothing mints nothing.
+			if next != d.LEDOverride {
+				nv, merr := mintCfgVersion()
+				if merr != nil {
+					return merr
+				}
+				d.CfgVersion = nv
+			}
+			d.LEDOverride = next
 		}
 		rec = *d
 		rec.LastUps = nil

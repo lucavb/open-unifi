@@ -47,6 +47,25 @@ type Device struct {
 	AESGCM     bool     `json:"aes_gcm,omitempty"`     // device advertised GCM support
 	LastUps    JSONMap  `json:"last_ups,omitempty"`    // decoded stats snapshot from last inform
 	Extra      JSONMap  `json:"extra,omitempty"`       // raw passthrough of interesting inform fields
+
+	// LEDOverride is the admin-set per-device LED override — the classic
+	// controller's device record field "led_override"
+	// (docs/PROTOCOL-mgmt.md §2: device.getString("led_override",
+	// "default")). Values: "" (unset ≡ the jar's "default"), "on", "off".
+	// ADMIN-OWNED (CONTEXT.md trust policy): the device can neither write
+	// nor introduce it — absorbInform never touches typed fields, and the
+	// server drops a device-supplied Extra["led_override"] copy (see
+	// server.extraAdminOwned).
+	LEDOverride string `json:"led_override,omitempty"`
+
+	// Disabled is the admin-set per-device disable flag — the classic
+	// controller's controller-side record field "disabled" that §2's B
+	// writer reads ("uap".equals(type) && device.is("disabled", false); all
+	// devices this controller manages are uap-class APs). No admin route
+	// sets it yet (reserved); the mgmt_cfg led_enabled computation consumes
+	// it so the §2 semantics are complete the day one lands. ADMIN-OWNED:
+	// a device body can neither write nor introduce it.
+	Disabled bool `json:"disabled,omitempty"`
 }
 
 // JSONMap is a loosely-typed JSON object (statistics passthrough etc.).

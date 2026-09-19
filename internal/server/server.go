@@ -789,10 +789,19 @@ var (
 	// INTRODUCE the baseline — a forged baseline matching a forged set
 	// would suppress delivery — so the baseline uses prev-or-delete too
 	// (only the engine's own emission ever writes it).
+	// led_override and disabled are the TYPED admin-owned record fields
+	// (store.Device) — the classic controller keeps both as controller-side
+	// record state (docs/PROTOCOL-mgmt.md §2 reads device.getString(
+	// "led_override")/device.is("disabled") from the controller DB, not the
+	// inform body), so a device-supplied Extra copy of either name is
+	// dropped here: the admin value lives in the typed field and a body
+	// echo can neither shadow nor introduce it (CONTEXT.md trust policy:
+	// admin-owned).
 	extraAdminOwned = []string{"system_cfg_extra_lines", "mgmt_dev",
 		"anonymous_controller_id", "anonymous_site_id",
 		adoption.FlagRebootOnConnect, adoption.FlagSetdefaultArmed,
-		"blocked_sta", "blocked_sta_sha"}
+		"blocked_sta", "blocked_sta_sha",
+		"led_override", "disabled"}
 )
 
 // absorbInform copies interesting fields from the inform body into the record.

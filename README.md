@@ -85,7 +85,7 @@ Grafana Alloy example wiring OTLP into Tempo and the controller log into Loki). 
 
 ```
 GET/POST      /api/v1/devices          list / register (adopt whitelist)
-GET/DELETE    /api/v1/devices/{mac}
+GET/PATCH/DELETE /api/v1/devices/{mac}
 GET/POST      /api/v1/devices/{mac}/blocked     list / block a client
                                           (POST body {"mac":"<client>"}; idempotent)
 DELETE        /api/v1/devices/{mac}/blocked/{client}   unblock (404 when not blocked)
@@ -100,6 +100,13 @@ GET           /api/v1/whoami
 GET           /metrics                  Prometheus (requires the token when one is set)
 GET           /healthz
 ```
+
+Device PATCH fields (strict body, unknown fields rejected): `name`
+(1–64 chars, no control characters; `""` clears), `site_id`
+(1–64 chars, `A–Z a–z 0–9 . _ -`, leading alphanumeric), and
+`led_override` (`"on"` | `"off"` | `"default"`, where `"default"` clears
+the override back to the site default). Omitted fields are left unchanged.
+The response is the updated device view.
 
 Blocking a client takes effect on the device's next inform: the controller
 delivers the blocked list inside the same `setparam` that carries

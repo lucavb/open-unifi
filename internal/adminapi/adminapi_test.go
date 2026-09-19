@@ -78,6 +78,13 @@ func (f *fakeBackend) PatchDevice(_ context.Context, mac string, p DevicePatch) 
 	if p.SiteID != nil {
 		d.SiteID = *p.SiteID
 	}
+	if p.LEDOverride != nil {
+		if *p.LEDOverride == "default" {
+			d.LEDOverride = "" // the explicit clear, mirroring the real adapter
+		} else {
+			d.LEDOverride = *p.LEDOverride
+		}
+	}
 	f.byMAC[mac] = d
 	return d, nil
 }
@@ -936,6 +943,53 @@ func TestPatchDeviceRoute(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("patch unknown mac: %d, want 404", rec.Code)
+	}
+}
+
+// TestPatchDeviceLEDOverrideRoute covers the per-device LED override on
+// PATCH /api/v1/devices/{mac}: the three §2 states round-trip ("default" is
+// the explicit clear → the view omits the field), an invalid enum value is
+// a 400, and an omitted field leaves the record untouched (pointer
+// semantics — only an explicit value changes state).
+func TestPatchDeviceLEDOverrideRoute(t *testing.T) {
+	be := newFakeBackend()
+	h := New(Config{}, be)
+
+	patch := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("PATCH", "/api/v1/devices/f0:9f:c2:84:8f:2a", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// on
+	if rec := patch(`{"led_override":"on"}`); rec.Code != http.StatusOK {
+		t.Fatalf("set on: %d %q", rec.Code, rec.Body.String())
+	}
+	var dv DeviceView
+	if err := json.Unmarshal(patch(`{"led_override":"off"}`).Body.Bytes(), &dv); err != nil || dv.LEDOverride != "off" {
+		t.Fatalf("set off round-trip: %+v err=%v", dv, err)
+	}
+	// "default" clears back to the jar default; the view omits the field.
+	clearRec := patch(`{"led_override":"default"}`)
+	if clearRec.Code != http.StatusOK {
+		t.Fatalf("clear: %d %q", clearRec.Code, clearRec.Body.String())
+	}
+	dv = DeviceView{}
+	if err := json.Unmarshal(clearRec.Body.Bytes(), &dv); err != nil || dv.LEDOverride != "" {
+		t.Fatalf("clear round-trip: %+v err=%v", dv, err)
+	}
+	if strings.Contains(clearRec.Body.String(), "led_override") {
+		t.Fatalf("cleared override must be omitted from the view: %q", clearRec.Body.String())
+	}
+	// invalid enum -> 400 with the validator message
+	if rec := patch(`{"led_override":"blink"}`); rec.Code != http.StatusBadRequest ||
+		!strings.Contains(rec.Body.String(), "led_override must be one of default, on, off") {
+		t.Fatalf("invalid enum: %d %q, want 400", rec.Code, rec.Body.String())
+	}
+	// empty string is not one of the three states -> 400 too
+	if rec := patch(`{"led_override":""}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("empty override: %d, want 400", rec.Code)
 	}
 }
 

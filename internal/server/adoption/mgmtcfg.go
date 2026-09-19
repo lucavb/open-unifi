@@ -39,7 +39,7 @@ func (e *Engine) BuildMgmtCfg(d store.Device, usedKey string) string {
 	// setting, default "pass"; we have no site table yet — emit the default.
 	line("selfrun_guest_mode", "pass")
 	line("cfgversion", d.CfgVersion)
-	line("led_enabled", "true")
+	line("led_enabled", ledEnabledValue(d))
 	line("stun_url", "stun://"+host+":"+defaultStunPort+"/")
 	if p := e.mgmtPort(); p == "443" {
 		line("mgmt_url", "https://"+host+"/manage/site/"+site)
@@ -60,6 +60,48 @@ func (e *Engine) BuildMgmtCfg(d store.Device, usedKey string) string {
 	line("use_aes_gcm", "true")
 	line("report_crash", "true")
 	return b.String()
+}
+
+// ledEnabledValue computes the mgmt_cfg led_enabled row EXACTLY like the
+// classic controller's B writer (docs/PROTOCOL-mgmt.md §2, com/ubnt/service/
+// config/B.cfr_renamed_0 — the decompile is normative for the value):
+//
+//	boolean disabled = "uap".equals(device.getType()) && device.is("disabled", false);
+//	String ledOverride = device.getString("led_override","default");
+//	boolean ledOn = !disabled && ("on".equals(ledOverride) || "default".equals(ledOverride)
+//	                && settings("mgmt").is("led_enabled", true));
+//	C.o00000(sb, "led_enabled", ledOn ? "true":"false");
+//
+// Mapping of the jar reads onto our record:
+//   - device.is("disabled"): the admin-owned typed record field
+//     store.Device.Disabled (a device body can neither write nor introduce
+//     it). The "uap".equals(type) gate is constant-true here: every device
+//     this controller manages is a uap-class AP (U7PG2), and the B writer
+//     only renders for AP beans.
+//   - device.getString("led_override","default"): the admin-owned typed
+//     record field store.Device.LEDOverride, where "" ≡ the jar default
+//     "default" (the record stores "" as the canonical unset).
+//   - settings("mgmt").is("led_enabled", true): the SITE default LED
+//     setting — the jar default is true. We have no site table yet, so the
+//     site default IS the jar default, the same policy selfrun_guest_mode
+//     follows above. When a site settings table lands, thread its
+//     mgmt.led_enabled value in here instead of widening this function's
+//     inputs ad hoc.
+//
+// Byte values are exactly "true"/"false" (§2's ternary), emitted by the
+// shared line writer in the fixed §2 row position.
+func ledEnabledValue(d store.Device) string {
+	const siteLEDEnabledDefault = true // settings("mgmt").is("led_enabled", true)
+	override := d.LEDOverride
+	if override == "" {
+		override = "default" // device.getString("led_override","default")
+	}
+	ledOn := !d.Disabled &&
+		(override == "on" || (override == "default" && siteLEDEnabledDefault))
+	if ledOn {
+		return "true"
+	}
+	return "false"
 }
 
 // addrHost extracts the hostname/IP of u, tolerating unparseable input.

@@ -103,6 +103,92 @@ func TestDuplicateCreateIsIdempotentUpsert(t *testing.T) {
 
 func deviceNamePtr(s string) *string { return &s }
 
+func ledOverridePtr(s string) *string { return &s }
+
+// TestPatchDeviceLEDOverride pins the real adapter's LED override write
+// path: the three §2 states reach the typed record field, "default" is the
+// explicit clear (record canonical unset ""), the view mirrors the record,
+// and the backend-side enum fence rejects anything else WITHOUT touching
+// the record.
+func TestPatchDeviceLEDOverride(t *testing.T) {
+	a, st, _ := testApp(t)
+	ctx := context.Background()
+
+	if _, err := a.CreateDevice(ctx, adminapi.DeviceUpsert{MAC: "aabbccddeeff"}); err != nil {
+		t.Fatal(err)
+	}
+	// set → record + view carry the override
+	if dv, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{LEDOverride: ledOverridePtr("on")}); err != nil || dv.LEDOverride != "on" {
+		t.Fatalf("set on: %+v err=%v", dv, err)
+	}
+	rec, err := st.Get("aabbccddeeff")
+	if err != nil || rec.LEDOverride != "on" {
+		t.Fatalf("record after set on: %+v err=%v", rec.LEDOverride, err)
+	}
+	if dv, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{LEDOverride: ledOverridePtr("off")}); err != nil || dv.LEDOverride != "off" {
+		t.Fatalf("set off: %+v err=%v", dv, err)
+	}
+	// explicit clear: "default" maps to the record's canonical unset
+	if dv, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{LEDOverride: ledOverridePtr("default")}); err != nil || dv.LEDOverride != "" {
+		t.Fatalf("clear: %+v err=%v", dv, err)
+	}
+	if rec, err = st.Get("aabbccddeeff"); err != nil || rec.LEDOverride != "" {
+		t.Fatalf("record after clear: %q err=%v", rec.LEDOverride, err)
+	}
+	// backend-side enum fence: invalid value is ErrConflict and mutates nothing
+	if _, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{LEDOverride: ledOverridePtr("blink")}); !errors.Is(err, adminapi.ErrConflict) {
+		t.Fatalf("invalid override must be ErrConflict, got %v", err)
+	}
+	if rec, err = st.Get("aabbccddeeff"); err != nil || rec.LEDOverride != "" {
+		t.Fatalf("rejected patch mutated the record: %q err=%v", rec.LEDOverride, err)
+	}
+}
+
+// TestPatchDeviceLEDMintsCfgVersionOncePerChange pins the LED override's
+// delivery trigger (putRadioIntent's operator-save discipline): an
+// EFFECTIVE override change mints a fresh 16-hex cfgversion — without the
+// mint, a settled device never re-provisions and led_enabled never reaches
+// the mgmt_cfg it rides. Idempotent saves mint nothing.
+func TestPatchDeviceLEDMintsCfgVersionOncePerChange(t *testing.T) {
+	a, st, _ := testApp(t)
+	ctx := context.Background()
+	if err := st.Put(store.Device{
+		MAC: "aabbccddeeff", Model: "U7PG2", State: store.StateAdopted,
+		CfgVersion: "aaaa", AppliedCfg: "aaaa",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Effective change (""): mint a fresh 16-hex cfgversion.
+	if _, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{LEDOverride: ledOverridePtr("off")}); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := st.Get("aabbccddeeff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.LEDOverride != "off" || rec.CfgVersion == "aaaa" || len(rec.CfgVersion) != 16 {
+		t.Fatalf("effective LED change must mint a fresh 16-hex cfgversion: %+v", rec)
+	}
+	bumped := rec.CfgVersion
+
+	// Idempotent re-save of the same value: no further mint.
+	if _, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{LEDOverride: ledOverridePtr("off")}); err != nil {
+		t.Fatal(err)
+	}
+	if rec, err = st.Get("aabbccddeeff"); err != nil || rec.CfgVersion != bumped {
+		t.Fatalf("idempotent LED save minted: %q -> %q", bumped, rec.CfgVersion)
+	}
+
+	// Explicit clear is an effective change again ("off" → ""): mint.
+	if _, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{LEDOverride: ledOverridePtr("default")}); err != nil {
+		t.Fatal(err)
+	}
+	if rec, err = st.Get("aabbccddeeff"); err != nil || rec.LEDOverride != "" || rec.CfgVersion == bumped {
+		t.Fatalf("effective clear must mint: %+v", rec)
+	}
+}
+
 // TestDeviceNameValidationBackstop pins the adapter-side fence for device
 // names (mirror of the wlan flows: the adminapi handler 400s first, every
 // Backend caller is fenced with ErrConflict). Empty stays legal: it is the

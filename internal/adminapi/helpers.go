@@ -188,6 +188,21 @@ func ValidateSiteID(id string) string {
 	return ""
 }
 
+// ValidateLEDOverride enforces the per-device LED override enum. The classic
+// controller's device record field is device.getString("led_override",
+// "default") (docs/PROTOCOL-mgmt.md §2, config/B writer) — exactly these
+// three strings; anything else would never round-trip through the §2
+// led_enabled computation. "default" is the explicit clear (the record
+// stores ""; an omitted patch field means "leave unchanged" instead).
+// Returns "" when valid, else a short human message for the 400 body.
+func ValidateLEDOverride(v string) string {
+	switch v {
+	case "default", "on", "off":
+		return ""
+	}
+	return "led_override must be one of default, on, off"
+}
+
 // validateWlan enforces server-side rules. The web console mirrors the
 // length/security rules client-side (see static/index.html validateWlan);
 // the control-character and ID-charset checks are deliberately

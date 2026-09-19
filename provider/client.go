@@ -190,6 +190,7 @@ type device struct {
 	WLANDeliveryCount  int    `json:"wlan_delivery_count,omitempty"`
 	WLANLastAttempt    int64  `json:"wlan_last_attempt,omitempty"`
 	SiteID             string `json:"site_id,omitempty"`
+	LEDOverride        string `json:"led_override,omitempty"`
 	PendingCommand     string `json:"pending_command,omitempty"`
 }
 
