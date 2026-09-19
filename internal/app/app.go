@@ -120,8 +120,13 @@ func (a *App) view(d store.Device) adminapi.DeviceView {
 		WLANLastAttempt:    int64Extra(d.Extra, "wlan_cfg_last_attempt"),
 		SiteID:             d.SiteID,
 		LEDOverride:        d.LEDOverride,
-		PendingCommand:     armedCommand(d),
-		Actions:            []string{"delete"},
+		// The two §12 ledbar knobs map straight through: the view keeps
+		// the pointer semantics (explicit 0 survives; nil = jar default)
+		// and the verbatim color string.
+		LEDOverrideColorBrightness: d.LEDOverrideColorBrightness,
+		LEDOverrideColor:           d.LEDOverrideColor,
+		PendingCommand:             armedCommand(d),
+		Actions:                    []string{"delete"},
 	}
 }
 
@@ -290,6 +295,55 @@ func (a *App) PatchDevice(_ context.Context, mac string, patch adminapi.DevicePa
 			}
 			d.LEDOverride = next
 		}
+		if patch.LEDOverrideColorBrightness != nil {
+			// ValidateLEDOverrideColorBrightness is enforced at the
+			// route; this is the backend-side backstop (same fence
+			// style as Name/LEDOverride). 100 is the explicit clear:
+			// the record's canonical unset is nil, because the jar's
+			// getInt default IS 100 (config_String.txt:2627-2630) — a
+			// saved 100 and an absent knob render the same §12 row.
+			// Every other in-domain value, including 0, is the admin's
+			// explicit pick.
+			if msg := adminapi.ValidateLEDOverrideColorBrightness(*patch.LEDOverrideColorBrightness); msg != "" {
+				return fmt.Errorf("%w: %s", adminapi.ErrConflict, msg)
+			}
+			var next *int
+			if *patch.LEDOverrideColorBrightness != 100 {
+				v := *patch.LEDOverrideColorBrightness
+				next = &v
+			}
+			// Same delivery trigger as the LED override: the knob only
+			// reaches the device inside a full provisioning's
+			// system_cfg ledbar block (§12), so an EFFECTIVE change
+			// mints a fresh cfgversion here — the device's next inform
+			// still echoes the OLD applied stamp and the engine full-
+			// provisions. A save that changes nothing mints nothing.
+			if !intPtrEq(next, d.LEDOverrideColorBrightness) {
+				nv, merr := mintCfgVersion()
+				if merr != nil {
+					return merr
+				}
+				d.CfgVersion = nv
+			}
+			d.LEDOverrideColorBrightness = next
+		}
+		if patch.LEDOverrideColor != nil {
+			// No format backstop for the color ON PURPOSE: the §12
+			// render owns the fallback (Color.decode — unparseable
+			// values land on #0000ff, config_String.txt:2669-2678);
+			// the jar accepts any string in this knob and so does the
+			// record. "" is the explicit clear (the jar's getString
+			// default is "#0000ff"). Same delivery trigger as above:
+			// an effective change mints cfgversion.
+			if *patch.LEDOverrideColor != d.LEDOverrideColor {
+				nv, merr := mintCfgVersion()
+				if merr != nil {
+					return merr
+				}
+				d.CfgVersion = nv
+			}
+			d.LEDOverrideColor = *patch.LEDOverrideColor
+		}
 		rec = *d
 		rec.LastUps = nil
 		rec.Extra = nil
@@ -303,6 +357,15 @@ func (a *App) PatchDevice(_ context.Context, mac string, patch adminapi.DevicePa
 		return adminapi.DeviceView{}, fmt.Errorf("device store: %w", err)
 	}
 	return a.view(rec), nil
+}
+
+// intPtrEq is the nil-aware *int equality for the ledbar brightness knob:
+// nil means "unset" (the jar default 100), never the number 0.
+func intPtrEq(a, b *int) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 // ---- adminapi.Backend ----------------------------------------------------

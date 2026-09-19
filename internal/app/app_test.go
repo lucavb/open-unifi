@@ -105,6 +105,8 @@ func deviceNamePtr(s string) *string { return &s }
 
 func ledOverridePtr(s string) *string { return &s }
 
+func brightPtr(v int) *int { return &v }
+
 // TestPatchDeviceLEDOverride pins the real adapter's LED override write
 // path: the three §2 states reach the typed record field, "default" is the
 // explicit clear (record canonical unset ""), the view mirrors the record,
@@ -186,6 +188,99 @@ func TestPatchDeviceLEDMintsCfgVersionOncePerChange(t *testing.T) {
 	}
 	if rec, err = st.Get("aabbccddeeff"); err != nil || rec.LEDOverride != "" || rec.CfgVersion == bumped {
 		t.Fatalf("effective clear must mint: %+v", rec)
+	}
+}
+
+// TestPatchDeviceLEDBarKnobs pins the real adapter's §12 ledbar knob write
+// path: the brightness knob's pointer semantics (explicit 0 survives the
+// round-trip; 100 is the explicit clear to the record's nil unset), the
+// backend-side domain fence (same fence style as LEDOverride), and the
+// color knob's deliberate NO-fence verbatim storage — the §12 render owns
+// the fallback (Color.decode; config_String.txt:2669-2678), so even a
+// "garbage" value is stored, and "" is the explicit clear. The mint
+// discipline follows TestPatchDeviceLEDMintsCfgVersionOncePerChange:
+// effective change → fresh 16-hex cfgversion; idempotent save → nothing.
+func TestPatchDeviceLEDBarKnobs(t *testing.T) {
+	a, st, _ := testApp(t)
+	ctx := context.Background()
+	if err := st.Put(store.Device{
+		MAC: "aabbccddeeff", Model: "U7PG2", State: store.StateAdopted,
+		CfgVersion: "aaaa", AppliedCfg: "aaaa",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Brightness: effective change mints; explicit 0 round-trips.
+	if dv, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{LEDOverrideColorBrightness: brightPtr(50)}); err != nil ||
+		dv.LEDOverrideColorBrightness == nil || *dv.LEDOverrideColorBrightness != 50 {
+		t.Fatalf("set 50: %+v err=%v", dv, err)
+	}
+	rec, err := st.Get("aabbccddeeff")
+	if err != nil || rec.LEDOverrideColorBrightness == nil || *rec.LEDOverrideColorBrightness != 50 ||
+		len(rec.CfgVersion) != 16 || rec.CfgVersion == "aaaa" {
+		t.Fatalf("effective brightness change must mint: %+v", rec)
+	}
+	bumped := rec.CfgVersion
+	if dv, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{LEDOverrideColorBrightness: brightPtr(0)}); err != nil ||
+		dv.LEDOverrideColorBrightness == nil || *dv.LEDOverrideColorBrightness != 0 {
+		t.Fatalf("explicit 0 must round-trip (not read as unset): %+v err=%v", dv, err)
+	}
+	// 50 → 0 was an effective change too: re-baseline before the
+	// idempotent re-save check.
+	if rec, err = st.Get("aabbccddeeff"); err != nil {
+		t.Fatal(err)
+	}
+	bumped = rec.CfgVersion
+	// Idempotent re-save of 0: no further mint.
+	if _, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{LEDOverrideColorBrightness: brightPtr(0)}); err != nil {
+		t.Fatal(err)
+	}
+	if rec, err = st.Get("aabbccddeeff"); err != nil || rec.CfgVersion != bumped {
+		t.Fatalf("idempotent brightness save minted: %q -> %q", bumped, rec.CfgVersion)
+	}
+	// 100 is the explicit clear: the record's canonical unset is nil.
+	if dv, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{LEDOverrideColorBrightness: brightPtr(100)}); err != nil ||
+		dv.LEDOverrideColorBrightness != nil {
+		t.Fatalf("clear brightness: %+v err=%v", dv, err)
+	}
+	if rec, err = st.Get("aabbccddeeff"); err != nil || rec.LEDOverrideColorBrightness != nil {
+		t.Fatalf("record after clear must be nil-unset: %+v err=%v", rec.LEDOverrideColorBrightness, err)
+	}
+	// Backend-side domain fence: out-of-domain is ErrConflict and
+	// mutates nothing.
+	if _, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{LEDOverrideColorBrightness: brightPtr(101)}); !errors.Is(err, adminapi.ErrConflict) {
+		t.Fatalf("out-of-domain brightness must be ErrConflict, got %v", err)
+	}
+	if rec, err = st.Get("aabbccddeeff"); err != nil || rec.LEDOverrideColorBrightness != nil {
+		t.Fatalf("rejected patch mutated the record: %+v err=%v", rec.LEDOverrideColorBrightness, err)
+	}
+
+	// Color: verbatim storage, no fence by design — the §12 render owns
+	// the fallback; "garbage" is stored exactly like a well-formed value.
+	for _, c := range []string{"#ff8c00", "garbage"} {
+		if dv, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{LEDOverrideColor: ledOverridePtr(c)}); err != nil ||
+			dv.LEDOverrideColor != c {
+			t.Fatalf("set color %q: %+v err=%v", c, dv, err)
+		}
+		if rec, err = st.Get("aabbccddeeff"); err != nil || rec.LEDOverrideColor != c {
+			t.Fatalf("record after color %q: %q err=%v", c, rec.LEDOverrideColor, err)
+		}
+	}
+	// "" is the explicit clear.
+	if dv, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{LEDOverrideColor: ledOverridePtr("")}); err != nil || dv.LEDOverrideColor != "" {
+		t.Fatalf("clear color: %+v err=%v", dv, err)
+	}
+	// Idempotent color save mints nothing (same value re-saved).
+	rec, err = st.Get("aabbccddeeff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bumped = rec.CfgVersion
+	if _, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{LEDOverrideColor: ledOverridePtr("")}); err != nil {
+		t.Fatal(err)
+	}
+	if rec, err = st.Get("aabbccddeeff"); err != nil || rec.CfgVersion != bumped {
+		t.Fatalf("idempotent color save minted: %q -> %q", bumped, rec.CfgVersion)
 	}
 }
 
