@@ -91,6 +91,16 @@ type Config struct {
 	// provisioned config; the passphrase itself never appears in mgmt_cfg.
 	// Treat records/config containing the hash as credentials.
 	SSHPassword string
+
+	// OnSessionEvents, when non-nil, receives the client-session
+	// transitions (connect/disconnect counts) each COMMITTED inform cycle
+	// observed in its station refresh — called after the store cycle
+	// persists (exactly-once per persisted transition; sparse heartbeats
+	// and eventless cycles are not called). deviceMAC is the device's
+	// colon-hex MAC. The transport stays Prometheus-free (package doc):
+	// main wires this hook to metrics.IncClientSessionEvents, the same
+	// ownership the inform middleware's IncInform has.
+	OnSessionEvents func(deviceMAC string, connects, disconnects int)
 }
 
 const DefaultRegulatoryCountryCode = 840
@@ -447,6 +457,7 @@ func (s *Server) handlePacket(w http.ResponseWriter, pkt *inform.Packet, body []
 	uerr := s.st.UpdateExisting(mac, func(rec *store.Device) error {
 		now := time.Now()
 		s.absorbInform(mac, rec, jm, now, gcmReq)
+		connects, disconnects := refreshClientSessions(rec, jm, now)
 		out, aerr := s.engine.Decide(adoption.Request{
 			Transport:      adoption.TransportEncrypted,
 			Device:         *rec,
@@ -458,7 +469,7 @@ func (s *Server) handlePacket(w http.ResponseWriter, pkt *inform.Packet, body []
 		if aerr != nil {
 			return s.mapEngineError(rec, aerr)
 		}
-		outcome = advanceResult{resp: s.applyOutcome(mac, rec, out), kind: string(out.Kind)}
+		outcome = advanceResult{resp: s.applyOutcome(mac, rec, out), kind: string(out.Kind), connects: connects, disconnects: disconnects}
 		return nil
 	})
 	if uerr != nil {
@@ -488,14 +499,32 @@ func (s *Server) handlePacket(w http.ResponseWriter, pkt *inform.Packet, body []
 		return
 	}
 
+	// The cycle committed: observe its client-session transitions now
+	// (exactly-once — an aborted cycle persists nothing and counts
+	// nothing).
+	s.countSessionEvents(mac, outcome)
 	s.writeInformResponse(w, pkt, keyBytes, outcome, mac, usedKey)
 }
 
 // advanceResult carries the inform response built inside the store's
-// read-modify-write cycle out to the HTTP writer.
+// read-modify-write cycle out to the HTTP writer, plus the client-session
+// event counts the cycle's refresh observed (observed through the
+// OnSessionEvents hook only after the cycle commits — exactly-once per
+// persisted transition).
 type advanceResult struct {
-	resp map[string]any
-	kind string
+	resp        map[string]any
+	kind        string
+	connects    int
+	disconnects int
+}
+
+// countSessionEvents observes a committed cycle's client-session events
+// through the configured hook. No-op for cycles without transitions (the
+// advanceResult zero value) and when no hook is wired.
+func (s *Server) countSessionEvents(mac string, outcome advanceResult) {
+	if (outcome.connects > 0 || outcome.disconnects > 0) && s.cfg.OnSessionEvents != nil {
+		s.cfg.OnSessionEvents(store.ColonMAC(mac), outcome.connects, outcome.disconnects)
+	}
 }
 
 // writeInformResponse renders outcome over the wire: plaintext informs get
@@ -602,6 +631,7 @@ func (s *Server) handlePlain(w http.ResponseWriter, mac string, jm map[string]an
 	uerr := s.st.UpdateExisting(mac, func(rec *store.Device) error {
 		now := time.Now()
 		s.absorbInform(mac, rec, jm, now, false)
+		connects, disconnects := refreshClientSessions(rec, jm, now)
 		out, aerr := s.engine.Decide(adoption.Request{
 			Transport:      adoption.TransportPlaintext,
 			Device:         *rec,
@@ -613,7 +643,7 @@ func (s *Server) handlePlain(w http.ResponseWriter, mac string, jm map[string]an
 		if aerr != nil {
 			return s.mapEngineError(rec, aerr)
 		}
-		outcome = advanceResult{resp: s.applyOutcome(mac, rec, out), kind: string(out.Kind)}
+		outcome = advanceResult{resp: s.applyOutcome(mac, rec, out), kind: string(out.Kind), connects: connects, disconnects: disconnects}
 		return nil
 	})
 	if uerr != nil {
@@ -643,6 +673,10 @@ func (s *Server) handlePlain(w http.ResponseWriter, mac string, jm map[string]an
 		_, _ = w.Write(out)
 		return
 	}
+	// The cycle committed: observe its client-session transitions now
+	// (exactly-once — an aborted cycle persists nothing and counts
+	// nothing).
+	s.countSessionEvents(mac, outcome)
 	out, merr := json.Marshal(outcome.resp)
 	if merr != nil {
 		s.lg.Error("inform-plain: response marshal failed", "err", merr)
@@ -681,7 +715,8 @@ func (s *Server) noopTargetSnapshot(mac string) int64 {
 // applyOutcome applies the engine's record deltas to the adapter's record
 // and serializes the outcome into the EXACT response JSON shapes of the
 // pre-extraction behavior (adoption push: mgmt_cfg only; full provisioning:
-// all four config keys; noop: interval).
+// all four config keys; §6.2(e) reconnect push: blocked_sta only; noop:
+// interval).
 func (s *Server) applyOutcome(mac string, rec *store.Device, out adoption.Outcome) map[string]any {
 	if out.SetState {
 		rec.State = out.State
@@ -727,6 +762,20 @@ func (s *Server) applyOutcome(mac string, rec *store.Device, out adoption.Outcom
 			"_type":              "setparam",
 			"server_time_in_utc": nowMS(),
 			"mgmt_cfg":           out.MgmtCfg,
+		}
+	case adoption.KindBlockedStaReconnect:
+		// §6.2(e) reconnect push (docs/PROTOCOL-mgmt.md §6.2 catalog row
+		// (e)): setparam carrying blocked_sta ONLY — the third setparam
+		// shape, distinct from the mgmt_cfg-only adoption push and full
+		// provisioning. No cfgversion mint rides it (the §6.2 mint-site
+		// list has no (e) site); server_time_in_utc rides every response
+		// per §5, as always. encoding/json sorts map keys, so the wire
+		// bytes are exactly {"_type":"setparam","blocked_sta":"…",
+		// "server_time_in_utc":"…"}.
+		return map[string]any{
+			"_type":              "setparam",
+			"server_time_in_utc": nowMS(),
+			"blocked_sta":        out.BlockedSta,
 		}
 	case adoption.KindReboot:
 		// §6.5 (voidsuper): `new Object("reboot")` +

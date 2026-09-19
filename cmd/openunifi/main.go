@@ -187,6 +187,11 @@ func run() error {
 		AllowPlainText:        *allowPlainText,
 		AllowGatedLiveWLAN:    *allowGatedLiveWLAN,
 		WirelessSource:        wirelessSource,
+		// Client-session transition observations ride the same ownership
+		// seam as IncInform: the transport stays Prometheus-free and main
+		// wires the hook (post-commit, exactly-once per persisted
+		// transition).
+		OnSessionEvents: metrics.IncClientSessionEvents,
 	}, st, logger)
 	if *allowGatedLiveWLAN {
 		logger.Warn("live WLAN provisioning gate LIFTED for U7PG2 6.8.2.15592 (--allow-gated-live-wlan): live WLAN pushes are enabled — bench use only, candidate must be pre-cleared by the offline minimal-diff harness")
