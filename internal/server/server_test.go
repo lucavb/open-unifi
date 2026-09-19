@@ -1615,11 +1615,32 @@ func TestMissingBaselineForcesProvisioning(t *testing.T) {
 	}
 }
 
-// Settled-state regression (live 2026-09-18 F-row round, A2 finding): a
+// intExtra reads a numeric Extra value tolerating both the engine's int
+// write and the JSON float64 reload shape.
+func intExtra(extra store.JSONMap, key string) (int, bool) {
+	v, ok := extra[key]
+	if !ok {
+		return 0, false
+	}
+	switch n := v.(type) {
+	case int:
+		return n, true
+	case float64:
+		return int(n), true
+	}
+	return 0, false
+}
+
+// Settled-state regression (live 2026-09-18 F-row round, A2 finding) with
+// the two-consecutive-miss arming (2026-09-19 boot-race finding): a
 // rebooted AP re-materializes factory config while still echoing the
-// provisioned cfgversion — the engine must re-arm delivery (mint → forced
-// full provisioning → settle) instead of nooping forever. Sparse informs
-// WITHOUT a vap_table are unknown and must not re-arm.
+// provisioned cfgversion — the engine re-arms delivery only on the SECOND
+// consecutive not-running proof (mint → forced full provisioning →
+// settle), recording the first as controller-owned bookkeeping. That
+// counter must survive the sparse heartbeats between the proofs
+// (absorbInform's prev-wins preservation) and must ignore device-supplied
+// values. Sparse informs WITHOUT a vap_table are unknown: they never
+// re-arm and never disturb the window.
 func TestRebootRegressionReprovisions(t *testing.T) {
 	env := workedEnvelope()
 	st := store.NewMemStore()
@@ -1642,7 +1663,7 @@ func TestRebootRegressionReprovisions(t *testing.T) {
 	h := wiredServer(t, func() []Wlan { return env }, st)
 
 	// inform#0 (sparse, no vap_table): unknown → plain connected noop, no
-	// re-arm.
+	// re-arm, nothing recorded.
 	body := encryptCBC(t, mustJSON(t, radioBody("aaaa")), hexKey(t, xkey), testIV)
 	resp := post(t, h, body)
 	_, jm := decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
@@ -1656,9 +1677,12 @@ func TestRebootRegressionReprovisions(t *testing.T) {
 	if rec.CfgVersion != "aaaa" {
 		t.Fatalf("sparse inform re-armed delivery: cfgversion = %q", rec.CfgVersion)
 	}
+	if n, ok := intExtra(rec.Extra, "wlan_cfg_not_running_misses"); ok {
+		t.Fatalf("sparse inform disturbed the window: counter = %v, want none", n)
+	}
 
-	// inform#1 (post-reboot factory table): present vap_table disproving
-	// the applied WLANs → minting noop.
+	// inform#1 (post-reboot factory table, miss#1): the boot-race grace
+	// records the miss as controller-owned bookkeeping WITHOUT minting.
 	factory := radioBody("aaaa")
 	factory["vap_table"] = []any{map[string]any{
 		"essid": "factory-default", "state": "RUN", "radio_name": "ra0", "name": "ath0",
@@ -1667,26 +1691,90 @@ func TestRebootRegressionReprovisions(t *testing.T) {
 	resp = post(t, h, body)
 	_, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
 	if jm["_type"] != "noop" {
-		t.Fatalf("inform#1 type = %v, want noop (re-arm mint)", jm["_type"])
+		t.Fatalf("inform#1 type = %v, want noop", jm["_type"])
+	}
+	rec, err = st.Get(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.CfgVersion != "aaaa" {
+		t.Fatalf("first not-running proof minted: cfgversion = %q, want aaaa (boot-race grace)", rec.CfgVersion)
+	}
+	if n, ok := intExtra(rec.Extra, "wlan_cfg_not_running_misses"); !ok || n != 1 {
+		t.Fatalf("miss#1 counter = %v/%v, want recorded 1", n, ok)
+	}
+
+	// inform#1b (sparse heartbeat between the proofs): the counter must
+	// SURVIVE absorbInform's full-Extra overwrite (controller-owned,
+	// prev-wins) and the inform must not fire.
+	body = encryptCBC(t, mustJSON(t, radioBody("aaaa")), hexKey(t, xkey), testIV)
+	resp = post(t, h, body)
+	_, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
+	if jm["_type"] != "noop" {
+		t.Fatalf("inform#1b type = %v, want noop", jm["_type"])
+	}
+	rec, err = st.Get(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.CfgVersion != "aaaa" {
+		t.Fatalf("sparse inform between proofs re-armed delivery: cfgversion = %q", rec.CfgVersion)
+	}
+	if n, ok := intExtra(rec.Extra, "wlan_cfg_not_running_misses"); !ok || n != 1 {
+		t.Fatalf("sparse inform disturbed the window: counter = %v/%v, want kept 1", n, ok)
+	}
+
+	// inform#1c (device body claims a counter value): controller-owned
+	// bookkeeping is prev-wins against device overwrite — a rogue
+	// wlan_cfg_not_running_misses in the body must be ignored.
+	rogue := radioBody("aaaa")
+	rogue["wlan_cfg_not_running_misses"] = 99
+	body = encryptCBC(t, mustJSON(t, rogue), hexKey(t, xkey), testIV)
+	resp = post(t, h, body)
+	_, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
+	if jm["_type"] != "noop" {
+		t.Fatalf("inform#1c type = %v, want noop", jm["_type"])
+	}
+	rec, err = st.Get(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.CfgVersion != "aaaa" {
+		t.Fatalf("rogue counter value re-armed delivery: cfgversion = %q", rec.CfgVersion)
+	}
+	if n, ok := intExtra(rec.Extra, "wlan_cfg_not_running_misses"); !ok || n != 1 {
+		t.Fatalf("device-supplied counter not prev-wins: counter = %v/%v, want kept 1", n, ok)
+	}
+
+	// inform#2 (factory table again — the proof is consecutive): minting
+	// noop; the window resets so it can re-arm.
+	body = encryptCBC(t, mustJSON(t, factory), hexKey(t, xkey), testIV)
+	resp = post(t, h, body)
+	_, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
+	if jm["_type"] != "noop" {
+		t.Fatalf("inform#2 type = %v, want noop (re-arm mint)", jm["_type"])
 	}
 	rec, err = st.Get(testMAC)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if rec.CfgVersion == "aaaa" {
-		t.Fatal("regression did not re-arm (no fresh cfgversion minted)")
+		t.Fatal("second consecutive not-running proof did not re-arm (no fresh cfgversion minted)")
+	}
+	if _, ok := intExtra(rec.Extra, "wlan_cfg_not_running_misses"); ok {
+		t.Fatalf("counter not reset after fire: %v", rec.Extra["wlan_cfg_not_running_misses"])
 	}
 
-	// inform#2 (device still echoes the old stamp): full provisioning
+	// inform#3 (device still echoes the old stamp): full provisioning
 	// re-delivers the envelope.
 	body = encryptCBC(t, mustJSON(t, radioBody("aaaa")), hexKey(t, xkey), testIV)
 	resp = post(t, h, body)
 	_, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
 	if jm["_type"] != "setparam" || jm["system_cfg"] == nil {
-		t.Fatalf("inform#2 type = %v, want setparam full provisioning", jm["_type"])
+		t.Fatalf("inform#3 type = %v, want setparam full provisioning", jm["_type"])
 	}
 	if !strings.Contains(jm["system_cfg"].(string), "aaa.1.ssid=corp") {
-		t.Fatalf("inform#2 system_cfg missing the applied SSID:\n%q", jm["system_cfg"])
+		t.Fatalf("inform#3 system_cfg missing the applied SSID:\n%q", jm["system_cfg"])
 	}
 	rec, err = st.Get(testMAC)
 	if err != nil {
@@ -1696,14 +1784,14 @@ func TestRebootRegressionReprovisions(t *testing.T) {
 		t.Fatalf("pending hash not re-captured: %v", rec.Extra["wlan_cfg_pending_sha"])
 	}
 
-	// inform#3 (applied, vaps proven): settle re-confirms, connected noop.
+	// inform#4 (applied, vaps proven): settle re-confirms, connected noop.
 	settle := radioBody(rec.CfgVersion)
 	settle["vap_table"] = runningVAPs(env)
 	body = encryptCBC(t, mustJSON(t, settle), hexKey(t, xkey), testIV)
 	resp = post(t, h, body)
 	_, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
 	if jm["_type"] != "noop" {
-		t.Fatalf("inform#3 type = %v, want noop", jm["_type"])
+		t.Fatalf("inform#4 type = %v, want noop", jm["_type"])
 	}
 	rec, err = st.Get(testMAC)
 	if err != nil {

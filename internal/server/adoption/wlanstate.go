@@ -19,6 +19,7 @@ var ControllerOwnedKeys = []string{
 	"wlan_cfg_pending_old_wlans", "wlan_cfg_applied_wlans",
 	"wlan_cfg_pending_placements", "wlan_cfg_attempt_sha", "wlan_cfg_attempts",
 	"wlan_cfg_last_attempt", "wlan_cfg_delivery_status",
+	"wlan_cfg_not_running_misses",
 }
 
 // wlanCfgState is the typed view over the controller-owned wlan_cfg_* Extra
@@ -32,7 +33,8 @@ var ControllerOwnedKeys = []string{
 //	wlan_cfg_sha, wlan_cfg_pending_sha, wlan_cfg_pending_wlans,
 //	wlan_cfg_pending_old_wlans, wlan_cfg_applied_wlans,
 //	wlan_cfg_pending_placements, wlan_cfg_attempt_sha, wlan_cfg_attempts,
-//	wlan_cfg_last_attempt, wlan_cfg_delivery_status.
+//	wlan_cfg_last_attempt, wlan_cfg_delivery_status,
+//	wlan_cfg_not_running_misses.
 type wlanCfgState struct {
 	// extra is the map the state was loaded from (apply functions write here).
 	extra store.JSONMap
@@ -70,6 +72,14 @@ type wlanCfgState struct {
 	attemptSHA  string
 	attempts    int
 	lastAttempt int64
+
+	// notRunningMisses is wlan_cfg_not_running_misses: the consecutive
+	// not-running-proof counter behind the settled-state watchdog's
+	// two-consecutive-miss arming (the engine's connected-noop fire site;
+	// see notRunningEvidence). Controller-owned bookkeeping, so it
+	// survives sparse heartbeats and device bodies cannot clobber it
+	// (extraPrevWins). Absent = 0 = window unarmed.
+	notRunningMisses int
 }
 
 // loadWlanCfgState reads the controller-owned keys from extra with exactly
@@ -121,6 +131,12 @@ func loadWlanCfgState(extra store.JSONMap) wlanCfgState {
 		st.lastAttempt = v
 	case float64:
 		st.lastAttempt = int64(v)
+	}
+	switch v := extra["wlan_cfg_not_running_misses"].(type) {
+	case int:
+		st.notRunningMisses = v
+	case float64:
+		st.notRunningMisses = int(v)
 	}
 	return st
 }
@@ -212,12 +228,33 @@ func (st *wlanCfgState) settle() {
 	st.placements = nil
 }
 
-// appliedNotRunning reports whether THIS inform's vap_table positively
-// disproves the confirmed WLAN set: a present, non-empty table in which an
-// enabled applied SSID has no RUN VAP. Live evidence (2026-09-18 F-row
-// round, A2): a rebooted AP re-materializes factory config while still
-// echoing the provisioned cfgversion — settle's one-shot watchdog must be
-// backed by a continuous check or that regression noops forever.
+// notRunningClass is the settled-state watchdog's three-valued reading of
+// ONE inform's vap_table evidence about the applied WLAN set.
+type notRunningClass int
+
+const (
+	// nrUnknown: no proof either way — an absent or empty table (a sparse
+	// heartbeat carries no vap_table), no applied snapshot, or an applied
+	// set with nothing enabled. The arming policy neither increments nor
+	// resets the counter on it.
+	nrUnknown notRunningClass = iota
+	// nrRun: a present, non-empty table proves every enabled applied SSID
+	// has a RUN VAP — the counter's reset condition.
+	nrRun
+	// nrMiss: a present, non-empty table positively disproves the applied
+	// set — an enabled applied SSID has no RUN VAP — the counter's
+	// increment condition.
+	nrMiss
+)
+
+// notRunningEvidence classifies THIS inform's vap_table evidence about the
+// applied WLAN set. Live evidence (2026-09-18 F-row round, A2): a rebooted
+// AP re-materializes factory config while still echoing the provisioned
+// cfgversion — settle's one-shot watchdog must be backed by a continuous
+// check or that regression noops forever; the 2026-09-19 A2 re-run then
+// proved the complementary hazard (the boot race: the first post-boot
+// table can show applied SSIDs not yet RUN while radios bring up), which
+// the two-consecutive-miss arming policy over this classification absorbs.
 //
 // Evidence semantics mirror runtimeInSync (internal/app): an absent or
 // empty table is UNKNOWN, not regression (sparse heartbeats carry no
@@ -225,18 +262,18 @@ func (st *wlanCfgState) settle() {
 // the proof bar, not per-radio placement — re-arming must not false-fire
 // on a band detail. The applied snapshot is re-read from extra (not the
 // typed load) because settle() may have promoted it in this same decision.
-func (st *wlanCfgState) appliedNotRunning() bool {
+func (st *wlanCfgState) notRunningEvidence() notRunningClass {
 	vaps, ok := st.extra["vap_table"].([]any)
 	if !ok || len(vaps) == 0 {
-		return false
+		return nrUnknown
 	}
 	raw, _ := st.extra["wlan_cfg_applied_wlans"].(string)
 	if raw == "" {
-		return false
+		return nrUnknown
 	}
 	var applied []wireless.Wlan
 	if json.Unmarshal([]byte(raw), &applied) != nil {
-		return false
+		return nrUnknown
 	}
 	need := map[string]bool{}
 	for _, w := range applied {
@@ -245,7 +282,7 @@ func (st *wlanCfgState) appliedNotRunning() bool {
 		}
 	}
 	if len(need) == 0 {
-		return false
+		return nrUnknown
 	}
 	for _, v := range vaps {
 		m, ok := v.(map[string]any)
@@ -254,7 +291,40 @@ func (st *wlanCfgState) appliedNotRunning() bool {
 		}
 		delete(need, wireless.JSONStr(m, "essid", wireless.JSONStr(m, "ssid", "")))
 	}
-	return len(need) > 0
+	if len(need) > 0 {
+		return nrMiss
+	}
+	return nrRun
+}
+
+// appliedNotRunning reports whether THIS inform's vap_table positively
+// disproves the confirmed WLAN set (the nrMiss class of
+// notRunningEvidence): a present, non-empty table in which an enabled
+// applied SSID has no RUN VAP. Proof semantics are unchanged from the
+// one-shot watchdog; only the arming policy around them (the
+// two-consecutive-miss counter, engine.go) is new.
+func (st *wlanCfgState) appliedNotRunning() bool {
+	return st.notRunningEvidence() == nrMiss
+}
+
+// recordNotRunningMiss increments the consecutive not-running-proof counter
+// (wlan_cfg_not_running_misses) and returns the new count. The write lands
+// in the same extra map every controller-owned bookkeeping write uses, so
+// it persists through the adapter's wholesale Extra assignment and survives
+// later sparse heartbeats via extraPrevWins.
+func (st *wlanCfgState) recordNotRunningMiss() int {
+	st.notRunningMisses++
+	st.extra["wlan_cfg_not_running_misses"] = st.notRunningMisses
+	return st.notRunningMisses
+}
+
+// clearNotRunningMisses resets the consecutive not-running-proof counter so
+// the two-consecutive-miss window can re-arm. Zero is stored as an absent
+// key, mirroring settle's consumed-key cleanup (no idle noise in the
+// persisted record).
+func (st *wlanCfgState) clearNotRunningMisses() {
+	st.notRunningMisses = 0
+	delete(st.extra, "wlan_cfg_not_running_misses")
 }
 
 // retryDue rate-limits the unchanged pending WLAN delivery: a bounded

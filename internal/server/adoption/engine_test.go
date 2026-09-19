@@ -298,15 +298,16 @@ func TestHappyAdoption(t *testing.T) {
 	}
 }
 
-// Settled-state regression (2026-09-18 F-row live round, A2 finding): a
-// PRESENT vap_table that disproves the confirmed WLAN set must re-arm
-// delivery (minting noop → full provisioning on the next inform), while an
-// absent or empty table is unknown (sparse heartbearts never re-arm) and a
-// table proving the applied SSID RUNNING is steady state.
-func TestSettledRegressionRearms(t *testing.T) {
+// notRunningHarness builds the settled-state fixture family the
+// not-running watchdog tests share: an adopted device on its per-device
+// key whose stored baseline matches the live envelope and whose applied
+// snapshot is that envelope (the state settle leaves behind).
+// factoryTable disposes the applied SSID; runningTable proves it RUN.
+func notRunningHarness(t *testing.T) (e *Engine, fixture func(vaps any) store.Device, factoryTable, runningTable []any) {
+	t.Helper()
 	env := []wireless.Wlan{{Name: "corp", SSID: "corpnet", Security: "wpa-p", Passphrase: "pw", VLAN: 1, Enabled: true}}
 	counter := 0
-	e := New(Deps{
+	e = New(Deps{
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Random: func() float64 { return 0.5 },
 		KeyChars: func(n int) (string, error) {
@@ -324,9 +325,9 @@ func TestSettledRegressionRearms(t *testing.T) {
 		t.Fatal(err)
 	}
 	const k = "11112222333344445555666677778888"
-	factoryTable := []any{map[string]any{"essid": "factory-default", "state": "RUN", "radio_name": "ra0", "name": "ath0"}}
-	runningTable := []any{map[string]any{"essid": "corpnet", "state": "RUN", "radio_name": "ra0", "name": "ath0"}}
-	fixture := func(vaps any) store.Device {
+	factoryTable = []any{map[string]any{"essid": "factory-default", "state": "RUN", "radio_name": "ra0", "name": "ath0"}}
+	runningTable = []any{map[string]any{"essid": "corpnet", "state": "RUN", "radio_name": "ra0", "name": "ath0"}}
+	fixture = func(vaps any) store.Device {
 		return store.Device{
 			MAC: engineMAC, State: store.StateAdopted,
 			CfgVersion: "aaaa", AppliedCfg: "aaaa",
@@ -338,49 +339,285 @@ func TestSettledRegressionRearms(t *testing.T) {
 			},
 		}
 	}
+	return e, fixture, factoryTable, runningTable
+}
 
-	// Regression: present table, applied SSID missing → minting noop.
+// missCounter reads the persisted consecutive-miss counter out of an
+// outcome Extra (engine writes int; tolerant of the JSON float64 shape).
+func missCounter(extra store.JSONMap) (int, bool) {
+	v, ok := extra["wlan_cfg_not_running_misses"]
+	if !ok {
+		return 0, false
+	}
+	switch n := v.(type) {
+	case int:
+		return n, true
+	case float64:
+		return int(n), true
+	}
+	return 0, false
+}
+
+// Settled-state regression (2026-09-18 F-row live round, A2 finding) under
+// the two-consecutive-miss arming (2026-09-19 boot-race finding): a
+// PRESENT vap_table that disproves the confirmed WLAN set re-arms delivery
+// only on the SECOND consecutive proof. Miss#1 is the boot-race grace — a
+// plain connected noop with the miss recorded as controller-owned
+// bookkeeping; miss#2 fires with the one-shot mechanics (minting noop →
+// full provisioning on the next inform) and resets the window. Absent or
+// empty tables stay unknown (sparse heartbearts never re-arm) and a table
+// proving the applied SSID RUNNING is steady state.
+func TestSettledRegressionRearms(t *testing.T) {
+	e, fixture, factoryTable, runningTable := notRunningHarness(t)
+	decide := func(dev store.Device, now int64) Outcome {
+		t.Helper()
+		out, err := e.Decide(Request{
+			Transport: TransportEncrypted, Device: dev,
+			Body: engineBody("aaaa"), UsedKey: dev.XAuthkey,
+			Now: time.Unix(now, 0),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	// Miss#1 (genuine factory, or the boot race): recorded, not fired.
 	dev := fixture(factoryTable)
-	out, oerr := e.Decide(Request{Transport: TransportEncrypted, Device: dev, Body: engineBody("aaaa"), UsedKey: k, Now: time.Unix(1000, 0)})
-	if oerr != nil {
-		t.Fatal(oerr)
+	out := decide(dev, 1000)
+	if out.Kind != KindNoop || out.SetCfgVersion {
+		t.Fatalf("miss#1 outcome = %+v, want plain connected noop (no mint under the boot-race grace)", out)
 	}
+	if n, ok := missCounter(out.Extra); !ok || n != 1 {
+		t.Fatalf("miss#1 counter = %v/%v, want recorded 1", n, ok)
+	}
+
+	// Miss#2 (the proof is consecutive): fire — minting noop, window reset.
+	applyDeltas(&dev, out)
+	dev.Extra["vap_table"] = factoryTable
+	out = decide(dev, 1010)
 	if out.Kind != KindNoop || !out.SetCfgVersion || out.CfgVersion == "aaaa" {
-		t.Fatalf("regression outcome = %+v, want minting noop", out)
+		t.Fatalf("miss#2 outcome = %+v, want minting noop (fire)", out)
 	}
+	if _, ok := missCounter(out.Extra); ok {
+		t.Fatalf("counter not reset after fire: %v", out.Extra["wlan_cfg_not_running_misses"])
+	}
+
 	// Next inform (device still echoes the old stamp) → full provisioning.
 	applyDeltas(&dev, out)
-	out, oerr = e.Decide(Request{Transport: TransportEncrypted, Device: dev, Body: engineBody("aaaa"), UsedKey: k, Now: time.Unix(1010, 0)})
-	if oerr != nil {
-		t.Fatal(oerr)
-	}
+	out = decide(dev, 1020)
 	if out.Kind != KindSetparam || !out.FullProvision || out.SystemCfg == "" {
-		t.Fatalf("post-regression outcome = %+v, want full provisioning", out)
+		t.Fatalf("post-fire outcome = %+v, want full provisioning", out)
 	}
 
-	// Unknown (absent table): plain connected noop, no re-arm.
-	out, oerr = e.Decide(Request{Transport: TransportEncrypted, Device: fixture(nil), Body: engineBody("aaaa"), UsedKey: k, Now: time.Unix(1020, 0)})
-	if oerr != nil {
-		t.Fatal(oerr)
-	}
+	// Unknown (absent table): plain connected noop, no re-arm, no counter.
+	out = decide(fixture(nil), 1030)
 	if out.Kind != KindNoop || out.SetCfgVersion {
 		t.Fatalf("absent-table outcome = %+v, want plain connected noop", out)
 	}
-	// Unknown (empty table): plain connected noop, no re-arm.
-	out, oerr = e.Decide(Request{Transport: TransportEncrypted, Device: fixture([]any{}), Body: engineBody("aaaa"), UsedKey: k, Now: time.Unix(1030, 0)})
-	if oerr != nil {
-		t.Fatal(oerr)
+	if _, ok := missCounter(out.Extra); ok {
+		t.Fatalf("absent table disturbed the window: %v", out.Extra["wlan_cfg_not_running_misses"])
 	}
+	// Unknown (empty table): plain connected noop, no re-arm.
+	out = decide(fixture([]any{}), 1040)
 	if out.Kind != KindNoop || out.SetCfgVersion {
 		t.Fatalf("empty-table outcome = %+v, want plain connected noop", out)
 	}
-	// Steady state (applied SSID RUNNING): plain connected noop, no re-arm.
-	out, oerr = e.Decide(Request{Transport: TransportEncrypted, Device: fixture(runningTable), Body: engineBody("aaaa"), UsedKey: k, Now: time.Unix(1040, 0)})
-	if oerr != nil {
-		t.Fatal(oerr)
+	if _, ok := missCounter(out.Extra); ok {
+		t.Fatalf("empty table disturbed the window: %v", out.Extra["wlan_cfg_not_running_misses"])
 	}
+	// Steady state (applied SSID RUNNING): plain connected noop, no re-arm.
+	out = decide(fixture(runningTable), 1050)
 	if out.Kind != KindNoop || out.SetCfgVersion {
 		t.Fatalf("running-table outcome = %+v, want plain connected noop", out)
+	}
+	if _, ok := missCounter(out.Extra); ok {
+		t.Fatalf("RUN proof must not write an idle counter: %v", out.Extra["wlan_cfg_not_running_misses"])
+	}
+}
+
+// Boot-race (2026-09-19 A2 re-run finding, WLAN-ACCEPTANCE 6.8.2.15592):
+// a rebooted AP's first re-inform can carry a present, non-empty
+// vap_table whose radios are still in bring-up — the applied SSID not yet
+// RUN is the race, not genuine factory regression. miss → later RUN = NO
+// fire, the RUN proof resets the window, and the reset window re-arms
+// fresh (it again takes two new consecutive misses to fire).
+func TestNotRunningBootRaceGrace(t *testing.T) {
+	e, fixture, factoryTable, runningTable := notRunningHarness(t)
+	decide := func(dev store.Device, now int64) Outcome {
+		t.Helper()
+		out, err := e.Decide(Request{
+			Transport: TransportEncrypted, Device: dev,
+			Body: engineBody("aaaa"), UsedKey: dev.XAuthkey,
+			Now: time.Unix(now, 0),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	// The boot race: the first post-boot table shows the applied SSID not
+	// yet running — one miss, no fire.
+	dev := fixture(factoryTable)
+	out := decide(dev, 1000)
+	if out.Kind != KindNoop || out.SetCfgVersion {
+		t.Fatalf("boot-race miss = %+v, want plain connected noop (a single miss must not fire)", out)
+	}
+	if n, ok := missCounter(out.Extra); !ok || n != 1 {
+		t.Fatalf("boot-race miss not recorded: counter = %v/%v, want 1", n, ok)
+	}
+
+	// The race resolves: the next table proves the applied SSID RUN. No
+	// fire ever happened and the RUN proof resets the window.
+	applyDeltas(&dev, out)
+	dev.Extra["vap_table"] = runningTable
+	out = decide(dev, 1010)
+	if out.Kind != KindNoop || out.SetCfgVersion {
+		t.Fatalf("post-race RUN = %+v, want plain connected noop (boot race: no fire)", out)
+	}
+	if _, ok := missCounter(out.Extra); ok {
+		t.Fatalf("RUN proof did not reset the window: %v", out.Extra["wlan_cfg_not_running_misses"])
+	}
+
+	// The reset window re-arms fresh: the next single miss still does not
+	// fire...
+	applyDeltas(&dev, out)
+	dev.Extra["vap_table"] = factoryTable
+	out = decide(dev, 1020)
+	if out.Kind != KindNoop || out.SetCfgVersion {
+		t.Fatalf("post-race miss#1 = %+v, want plain connected noop (window re-armed, no fire)", out)
+	}
+	// ...and the second consecutive miss does.
+	applyDeltas(&dev, out)
+	dev.Extra["vap_table"] = factoryTable
+	out = decide(dev, 1030)
+	if out.Kind != KindNoop || !out.SetCfgVersion || out.CfgVersion == "aaaa" {
+		t.Fatalf("post-race miss#2 = %+v, want minting noop (re-armed window fires)", out)
+	}
+}
+
+// Sparse heartbeats (absent or empty vap_table) are UNKNOWN: they never
+// increment and never reset the window. A sparse inform between two
+// not-running proofs leaves the miss chain intact — the second consecutive
+// proof still fires — and sparse informs after a single miss leave the
+// counter armed.
+func TestNotRunningSparseHeartbeatNeutral(t *testing.T) {
+	e, fixture, factoryTable, _ := notRunningHarness(t)
+	decide := func(dev store.Device, now int64) Outcome {
+		t.Helper()
+		out, err := e.Decide(Request{
+			Transport: TransportEncrypted, Device: dev,
+			Body: engineBody("aaaa"), UsedKey: dev.XAuthkey,
+			Now: time.Unix(now, 0),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	// Miss#1 arms the window.
+	dev := fixture(factoryTable)
+	out := decide(dev, 1000)
+	if out.Kind != KindNoop || out.SetCfgVersion {
+		t.Fatalf("miss#1 = %+v, want plain connected noop", out)
+	}
+	if n, ok := missCounter(out.Extra); !ok || n != 1 {
+		t.Fatalf("miss#1 counter = %v/%v, want 1", n, ok)
+	}
+
+	// Sparse heartbeat (no vap_table in the body): unknown — no increment,
+	// no reset, no fire.
+	applyDeltas(&dev, out)
+	delete(dev.Extra, "vap_table")
+	out = decide(dev, 1010)
+	if out.Kind != KindNoop || out.SetCfgVersion {
+		t.Fatalf("sparse-absent outcome = %+v, want plain connected noop (sparse must never re-arm)", out)
+	}
+	if n, ok := missCounter(out.Extra); !ok || n != 1 {
+		t.Fatalf("sparse-absent counter = %v/%v, want kept 1 (no change)", n, ok)
+	}
+
+	// Empty table (present but zero rows): same neutrality.
+	applyDeltas(&dev, out)
+	dev.Extra["vap_table"] = []any{}
+	out = decide(dev, 1020)
+	if out.Kind != KindNoop || out.SetCfgVersion {
+		t.Fatalf("sparse-empty outcome = %+v, want plain connected noop (sparse must never re-arm)", out)
+	}
+	if n, ok := missCounter(out.Extra); !ok || n != 1 {
+		t.Fatalf("sparse-empty counter = %v/%v, want kept 1 (no change)", n, ok)
+	}
+
+	// The unknowns did not break the chain: the next full factory proof is
+	// the SECOND consecutive miss → fire.
+	applyDeltas(&dev, out)
+	dev.Extra["vap_table"] = factoryTable
+	out = decide(dev, 1030)
+	if out.Kind != KindNoop || !out.SetCfgVersion || out.CfgVersion == "aaaa" {
+		t.Fatalf("post-sparse miss#2 = %+v, want minting noop (unknowns must not break the miss chain)", out)
+	}
+}
+
+// appliedNotRunning's proof semantics are the watchdog's evidence bar and
+// MUST NOT change (the two-consecutive-miss lane changes only the arming
+// policy around them): SSID presence is the proof bar (not per-radio
+// placement), absent/empty tables and absent/no-enabled/unparsable applied
+// snapshots are unknown, and the snapshot is re-read from extra verbatim.
+// notRunningEvidence carries the same bar as a three-way classification
+// (the policy's increment/reset/neutral inputs).
+func TestAppliedNotRunningProofSemantics(t *testing.T) {
+	enabled := []wireless.Wlan{{Name: "corp", SSID: "corpnet", Security: "open", Enabled: true}}
+	disabled := []wireless.Wlan{{Name: "corp", SSID: "corpnet", Security: "open", Enabled: false}}
+	snap := func(w []wireless.Wlan) string {
+		b, err := json.Marshal(w)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	factory := []any{map[string]any{"essid": "factory-default", "state": "RUN", "radio_name": "ra0"}}
+	runEssid := []any{map[string]any{"essid": "corpnet", "state": "RUN", "radio_name": "ra0"}}
+	runLegacy := []any{map[string]any{"ssid": "corpnet", "status": "RUN"}}                          // legacy fixture spellings
+	runOtherRadio := []any{map[string]any{"essid": "corpnet", "state": "RUN", "radio_name": "ra9"}} // placement is NOT the bar
+	appliedNotRun := []any{map[string]any{"essid": "corpnet", "state": "INIT", "radio_name": "ra0"}}
+
+	tests := []struct {
+		name  string
+		extra store.JSONMap
+		class notRunningClass
+	}{
+		{"absent table is unknown", store.JSONMap{"wlan_cfg_applied_wlans": snap(enabled)}, nrUnknown},
+		{"empty table is unknown", store.JSONMap{"wlan_cfg_applied_wlans": snap(enabled), "vap_table": []any{}}, nrUnknown},
+		{"no applied snapshot is unknown", store.JSONMap{"vap_table": factory}, nrUnknown},
+		{"unparsable snapshot is unknown", store.JSONMap{"wlan_cfg_applied_wlans": "{bad", "vap_table": factory}, nrUnknown},
+		{"nothing enabled is unknown", store.JSONMap{"wlan_cfg_applied_wlans": snap(disabled), "vap_table": factory}, nrUnknown},
+		{"factory table is a miss", store.JSONMap{"wlan_cfg_applied_wlans": snap(enabled), "vap_table": factory}, nrMiss},
+		{"applied ssid not RUN is a miss", store.JSONMap{"wlan_cfg_applied_wlans": snap(enabled), "vap_table": appliedNotRun}, nrMiss},
+		{"run essid proves running", store.JSONMap{"wlan_cfg_applied_wlans": snap(enabled), "vap_table": runEssid}, nrRun},
+		{"legacy run spellings prove running", store.JSONMap{"wlan_cfg_applied_wlans": snap(enabled), "vap_table": runLegacy}, nrRun},
+		{"run on any radio proves running", store.JSONMap{"wlan_cfg_applied_wlans": snap(enabled), "vap_table": runOtherRadio}, nrRun},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := loadWlanCfgState(tt.extra)
+			if got := st.notRunningEvidence(); got != tt.class {
+				t.Fatalf("notRunningEvidence = %v, want %v", got, tt.class)
+			}
+			if got, want := st.appliedNotRunning(), tt.class == nrMiss; got != want {
+				t.Fatalf("appliedNotRunning = %v, want %v (miss class only)", got, want)
+			}
+		})
+	}
+
+	// The counter loads from both the engine's int write and the JSON
+	// round-trip float64 shape (persisted-store reload).
+	if got := loadWlanCfgState(store.JSONMap{"wlan_cfg_not_running_misses": 1}).notRunningMisses; got != 1 {
+		t.Fatalf("int counter load = %d, want 1", got)
+	}
+	if got := loadWlanCfgState(store.JSONMap{"wlan_cfg_not_running_misses": float64(2)}).notRunningMisses; got != 2 {
+		t.Fatalf("float64 counter load = %d, want 2", got)
 	}
 }
 

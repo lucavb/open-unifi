@@ -420,7 +420,25 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, d *store.Devi
 		// and flows through full provisioning, re-entering drift
 		// settle. Absent/empty tables are unknown, not regression —
 		// sparse heartbeats must never re-arm delivery.
-		if st.appliedNotRunning() {
+		//
+		// Two-consecutive-miss arming (2026-09-19 boot-race finding,
+		// WLAN-ACCEPTANCE 6.8.2.15592 A2 re-run): the first post-boot
+		// inform can carry a present, non-empty table whose radios are
+		// still in bring-up — one not-running proof is the boot race,
+		// not genuine factory regression, so a single miss no longer
+		// fires. The controller-owned counter (wlan_cfg_not_running_misses)
+		// records the first miss; the SECOND consecutive miss fires with
+		// the same mechanics as before (mint → the next inform full
+		// provisions) and resets the window so it can re-arm; a RUN
+		// proof resets it; unknown informs (absent/empty table) leave it
+		// untouched in both directions.
+		switch st.notRunningEvidence() {
+		case nrMiss:
+			if misses := st.recordNotRunningMiss(); misses < 2 {
+				e.lg.Debug("inform: applied WLANs not running (miss 1 of 2, boot-race grace)", "mac", d.MAC)
+				break
+			}
+			st.clearNotRunningMisses()
 			nv, kerr := e.keyChars(16)
 			if kerr != nil {
 				return Outcome{}, kerr
@@ -428,6 +446,8 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, d *store.Devi
 			d.CfgVersion = nv
 			e.lg.Debug("inform: applied WLANs not running, forcing re-provisioning", "mac", d.MAC)
 			return e.noopFor(d, now, req.PrevNoopTarget, KindNoop), nil
+		case nrRun:
+			st.clearNotRunningMisses()
 		}
 		d.State = store.StateAdopted
 		e.lg.Debug("inform: connected noop", "mac", d.MAC, "cfg", d.CfgVersion)
