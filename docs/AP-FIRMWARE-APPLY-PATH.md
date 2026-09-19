@@ -232,12 +232,19 @@ emits the row (no mgmt writer in config_String/int; `is_default` exists only
 in device-state classes), so real deployments never trip the guard.
 **Fix 2026-09-19:** render.go no longer emits `mgmt.is_default` in any value
 (the zz_minimaldiff gates allow exactly that row-key as intended, all other
-mgmt.* deltas stay violations). **A2 re-run expectation:** provision →
-wait ≥15 s (flag consume + pack) → raw reboot → boot restores the applied
-text (guard silent) → sorted applied system.cfg, vaps running,
-cfgversion-match noop, no watchdog re-provision. The not-running watchdog
-stays as the safety net for genuinely-lost configs (power-cut inside the
-pack window, blob corruption).
+mgmt.* deltas stay violations). **A2 re-run CONFIRMED 2026-09-19 (live
+bench):** drift push applied at sha `3da7ce3e…` (row absent on the wire),
+blob == applied pre-reboot, raw reboot → first re-inform +67 s with the
+RETAINED key and the APPLIED cfgversion echo, post-boot
+`/tmp/system.cfg` byte-identical to the push (the renderer emits sorted
+rows, so the preinit `sort` is a no-op), vaps RUN, 6.5 h steady state —
+A2 PROVEN (WLAN-ACCEPTANCE round record). One deviation from the clean
+expectation: the not-running watchdog fired on the first post-boot
+inform (vap_table present, applied SSID not yet RUN — boot bring-up
+race) and re-provisioned byte-identically; a boot-grace /
+two-consecutive-miss counter in wlanstate.go is the indicated follow-up.
+The not-running watchdog stays as the safety net for genuinely-lost
+configs (power-cut inside the pack window, blob corruption).
 
 ## 7. Related applets (same ubntbox binary)
 
@@ -330,8 +337,10 @@ pack window, blob corruption).
 
 ## 10. AP fetch list
 
-**A2-persist lane (RESOLVED 2026-09-18/19 — fetched to
-`tmpwork/harness-20260917/ap-persist/`, root cause in §6.5):**
+**A2-persist lane (RESOLVED 2026-09-18/19 — root cause in §6.5, retention
+live-PROVEN 2026-09-19: raw reboot → retained key + applied cfgversion
+echo + post-boot `/tmp/system.cfg` == pushed bytes `3da7ce3e…`, 6.5 h
+steady; fetched to `tmpwork/harness-20260917/ap-persist/`):**
 
 1. `/usr/etc/syswrapper.sh` — READ. `save-config` = flag only (:2887),
    `apply-config` = apply then flag (:2831/:2844), `cfg_save_check` = the pack

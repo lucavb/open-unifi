@@ -136,7 +136,7 @@ SSID and each intended radio where the row says `2.4 GHz` or `5 GHz`.
 | ID | Required case and pass criteria | Status | Evidence refs |
 | --- | --- | --- | --- |
 | A1 | **Factory adoption:** factory AP is discovered/adopted; AP reports adopted/connected; controller records the expected model and firmware; post-adoption inform is received. | `PROVEN` | §2026-09-18 F-row live round — adoption chain 07:32:47–07:34:09Z (adoption-seed engine finding recorded there); §2026-09-18 verify round — re-proven under the fixed engine, adoption delivers the envelope automatically 11:21:45–11:23:13Z |
-| A2 | **Restart with retained key:** adopted AP is restarted without deleting controller state; it re-informs using the retained key, returns to connected, and receives/retains the expected configuration. | `FAILED` | §2026-09-18 F-row live round — 74 s gap + retained-key re-inform + cfg echo unchanged proven 08:09–08:12Z; applied config did NOT survive the reboot (recovery via the tested self-heal remedy); §2026-09-18 verify round — retention failure re-confirmed (factory vap + matching cfg echo on the first re-inform) and automatic watchdog recovery live-proven 11:29:59–11:30:48Z, unattended; §2026-09-19 root cause resolved — the renderer's `mgmt.is_default=true` factory-echo row tripped the AP preinit boot guard (`/lib/preinit/99_21_ubnt_ubntconf` replaces the MTD-restored text containing it with the factory template; docs/AP-FIRMWARE-APPLY-PATH.md §6.5); fix in render.go, re-run pending |
+| A2 | **Restart with retained key:** adopted AP is restarted without deleting controller state; it re-informs using the retained key, returns to connected, and receives/retains the expected configuration. | `PROVEN` | §2026-09-18 F-row live round — 74 s gap + retained-key re-inform + cfg echo unchanged proven 08:09–08:12Z; applied config did NOT survive the reboot (recovery via the tested self-heal remedy); §2026-09-18 verify round — retention failure re-confirmed and automatic watchdog recovery live-proven 11:29:59–11:30:48Z; §2026-09-19 root cause resolved — the renderer's `mgmt.is_default=true` factory-echo row tripped the AP preinit boot guard (`/lib/preinit/99_21_ubnt_ubntconf` replaces the MTD-restored text containing it with the factory template; docs/AP-FIRMWARE-APPLY-PATH.md §6.5); fix in render.go; §2026-09-19 A2 re-run — retention PROVEN live: retained-key first re-inform (+67 s) with unchanged cfgversion echo, post-boot `/tmp/system.cfg` byte-identical to the push (`3da7ce3e…`), vaps RUN, 6.5 h steady state; one benign not-running-watchdog boot-race re-provision recorded (two-consecutive-miss guard now live-indicated — see the 2026-09-19 round record) |
 | B1 | **WPA-Personal association:** WPA-Personal test client associates to the intended SSID on 2.4 GHz and 5 GHz as applicable; client receives DHCP lease and can pass the defined allowed traffic test. | `NOT RUN` | `________________` |
 | B2 | **Open association:** open test client associates; client receives DHCP lease and can pass the defined allowed traffic test. | `NOT RUN` | `________________` |
 | B3 | **Tagged VLAN:** WPA-Personal and/or open test WLAN configured with a tagged VLAN; client associates and receives DHCP on the intended subnet; traffic passes; capture on the AP uplink visibly records 802.1Q with the expected VID (or records the exact reason the observation point cannot see the tag). | `NOT RUN` | `________________` |
@@ -633,13 +633,55 @@ never returns; `zz_minimaldiff_scratch_test.go` permits exactly the
 pre-fix applied captures — every other mgmt.* delta stays a violation.
 Full `go test ./...` green.
 
-**A2 re-run protocol (pending — live bench):** deploy the fixed
-controller → let drift or the watchdog land the corrected push → wait
-≥15 s (flag consume + pack) → raw reboot → expect the first re-inform
-RETAINED key, UNCHANGED cfgversion, RUNNING vaps, no watchdog
-re-provision; post-boot `/tmp/system.cfg` = the applied text ROW-SORTED
-(compare row-sets, not sha — the boot `sort` reorders rows). Row A2
-flips to `PROVEN` only on that round.
+**A2 re-run protocol (executed 2026-09-19 00:29–00:33 CEST; AP-side
+verified ~07:07 CEST) — A2 flips to `PROVEN`:**
+
+- Fixed controller deployed (`./deploy-bench.sh`, binary `217a608644ae`);
+  AP settled at cfg `5d16465c6fb7a64b`, flags `0x000b`. Verbatim envelope
+  PUT: correctly no drift. Passphrase-change PUT (`…20260918` →
+  `…20260919`) → drift 00:29:12 → setparam carrying the FIXED render
+  (system_cfg diagnostic sha256 `3da7ce3e13bcd67b5035eb18f6ff63288fac431
+  6d5d3af0aa410f5d64c9b2df6a`; key list jumps `mgmt.flavor` →
+  `dhcpd.status` — no `mgmt.is_default` on the wire). Settle 00:29:59
+  (new mint `bf4daa59…`, ~47 s).
+- AP-side pre-reboot (key lane): `/tmp/system.cfg` `mgmt.is_default`
+  row count **0**, sha == `3da7ce3e…` byte-exact (the renderer emits
+  sorted rows, so the boot `sort` later proves a no-op); blob probe
+  (`cfgmtd -r`) extracted text == applied text (`3da7ce3e…`) — the MTD
+  blob held the corrected text before the reboot.
+- Raw reboot 00:31:00 (BusyBox `reboot` over the uid-0 `ubnt` lane).
+  Boot confirmed by uptime arithmetic (23839 s at ~07:07 → boot
+  ~00:31), fresh `mcad` PID 1391, and exactly one post-boot discovery
+  announce 00:32:06.648. First re-inform 00:32:07 (+67 s): flags
+  `0x000b` — **retained key**; cfg echo `bf4daa59…` — **the applied
+  cfgversion, not factory**. Retention proven.
+- **Watchdog boot-race finding (new, recorded for follow-up):** that
+  first inform's vap_table was present, non-empty, and showed the
+  applied SSID not yet RUN (radios still in boot bring-up), so
+  `appliedNotRunning()` fired per its documented contract → fresh mint
+  `59d7b3e1` → byte-identical re-push 00:32:11 → settle 00:32:29 (18 s),
+  steady connected noops since. The re-provision was benign and
+  unattended, but the false-fire means the not-running watchdog needs a
+  boot-grace (the two-consecutive-miss counter in `wlanstate.go`,
+  previously "not indicated by live evidence", is now live-indicated).
+- Post-boot + 6.5 h AP-side verification (password lane — the
+  users-apply wipes `/etc/dropbear/authorized_keys`, the file this
+  dropbear build reads; `/etc/persistent` copies don't survive, the
+  blob skips dot-dirs — operator key re-deployed per bench practice):
+  `/tmp/system.cfg` sha `3da7ce3e…` (row-for-row the pushed bytes),
+  `mgmt.is_default` count 0, blob == applied, ath0 (11ng) + ath1 (11ac)
+  both Master broadcasting `openunifi-gate-check`.
+- Gates re-seeded to the round's device-verified state:
+  `live-applied-sys.txt` (3da7ce3e…), `live-devices.json`,
+  `live-wireless.json` from the running controller;
+  `render-fixed-sys.txt` regenerated post-fix (sha256 `48dbb631…`,
+  synthetic night reference); `TestZZLiveWpaCandidateVsApplied` skip
+  updated (both wpa-p rounds complete). All ZZ gates green; full
+  `go test ./...` green (11 packages).
+- **Verdict: A2 `PROVEN`** — retained key, retained cfg echo, returned
+  to connected, expected configuration retained across a raw reboot.
+  The boot-race watchdog false-fire is an engine follow-up, not a
+  retention failure.
 
 ### Per-case capture minimum
 

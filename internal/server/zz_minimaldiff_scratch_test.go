@@ -30,10 +30,14 @@ package server
 //	must be IDENTICAL to the factory tree, or the push restarts (or
 //	deletes state from) a section we do not manage.
 //
-// Part 2 — successive-push gates (night extension). The live AP now
-// runs the accepted fixed render (render-fixed-sys.txt, sha256
-// b25a2c80007f564c3331d98ce8b020e96321701785740e824fc4f29d0ca8235e —
-// the APPLIED baseline). Each next-push candidate — both-band open
+// Part 2 — successive-push gates (night extension). render-fixed-sys.txt
+// is the SYNTHETIC night reference (sha256
+// 48dbb631f05d9ff4… — the zzHarnessRecord + gate-check open-WLAN render,
+// regenerated 2026-09-19 with the post-is_default-fix generator); the
+// live AP's device-verified running bytes live separately in
+// live-applied-sys.txt (sha256 3da7ce3e…, re-seeded from the 2026-09-19
+// A2 reboot round that proved them retained across a raw reboot). Each
+// next-push candidate — both-band open
 // (control), 2g-only open, both-band wpa-p — is diffed against the
 // APPLIED bytes, because the live question is exactly "which on-device
 // plugins would this next push restart": managed prefixes may differ,
@@ -325,8 +329,9 @@ func TestZZMinimalDiffGateLiveRecord(t *testing.T) {
 // wireless envelope as fetched from the RUNNING controller
 // (live-devices.json + live-wireless.json), rendered and diffed against
 // the DEVICE-VERIFIED running bytes (live-applied-sys.txt — seeded by a
-// confirmed round: the 2026-09-18 C1 push, whose candidate the AP's
-// /tmp/system.cfg reproduced at sha256 9891d9ff… byte-for-byte) and against
+// confirmed round: the 2026-09-19 post-is_default-fix push, whose bytes
+// the AP's /tmp/system.cfg reproduced at sha256 3da7ce3e… and, after a
+// raw reboot, the boot-restored text preserved row-for-row) and against
 // the factory baseline. This is the steady-state drift check: in steady
 // state the render must be byte-identical to what the device runs (zero
 // intended, zero violations); ANY delta is real drift or record change to
@@ -447,8 +452,8 @@ func TestZZLiveWpaCandidateVsApplied(t *testing.T) {
 		t.Fatalf("expected exactly the one live gate-check WLAN, got %d", len(envFile.Wlans))
 	}
 	cand := envFile.Wlans[0]
-	if cand.Security == "wpa-p" && cand.Passphrase == zzLiveWpaPSK {
-		t.Skipf("the 2026-09-18 C1 round is complete: the live envelope already carries this round's wpa-p candidate (device-verified at sha256 9891d9ff…); the steady-state check lives in TestZZLiveIntentVsApplied")
+	if cand.Security == "wpa-p" {
+		t.Skipf("a wpa-p round is complete and device-verified (2026-09-18 C1, superseded by the 2026-09-19 A2 passphrase round, device-verified at sha256 3da7ce3e… and proven retained across a raw reboot); the steady-state check lives in TestZZLiveIntentVsApplied")
 	}
 	if cand.Security != "open" {
 		t.Fatalf("live envelope security = %q, expected the open baseline before the C1 mutation", cand.Security)
