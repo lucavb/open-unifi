@@ -69,6 +69,8 @@
   td input.num { width: 90px; }
   td.radius-cell { min-width: 170px; }
   td.radius-cell input, td.radius-cell select { display: block; margin: 2px 0; }
+  td.led-cell { min-width: 130px; }
+  td.led-cell input, td.led-cell button { display: block; margin: 2px 0; width: 110px; }
   .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
   .badge {
     display: inline-block; padding: 2px 9px; border-radius: 999px;
@@ -117,9 +119,9 @@
 
   <section class="card" id="devSection">
     <h2>Devices</h2>
-    <p class="hint">Polled every 5&nbsp;s. State: pending &rarr; adopting &rarr; adopted (green &ldquo;live&rdquo; badge) &rarr; lost. &ldquo;Clients&rdquo; expands a device's client sessions (connected state and last seen, from full informs).</p>
+    <p class="hint">Polled every 5&nbsp;s. State: pending &rarr; adopting &rarr; adopted (green &ldquo;live&rdquo; badge) &rarr; lost. &ldquo;Clients&rdquo; expands a device's client sessions (connected state and last seen, from full informs). LED bar (adopted only): brightness 0&ndash;100 (empty&nbsp;=&nbsp;keep), color verbatim, e.g. #ff8c00 (empty&nbsp;=&nbsp;default blue).</p>
     <table aria-label="Devices">
-      <thead><tr><th>MAC</th><th>Name</th><th>Model</th><th>IP</th><th>State</th><th>Power</th><th></th></tr></thead>
+      <thead><tr><th>MAC</th><th>Name</th><th>Model</th><th>IP</th><th>State</th><th>Power</th><th>LED bar</th><th></th></tr></thead>
       <tbody id="devRows"></tbody>
     </table>
     <span class="pill" id="devError" hidden></span>
@@ -262,7 +264,7 @@
     lastDevices = devices;
     var tbody = document.getElementById("devRows");
     if (!devices.length) {
-      tbody.innerHTML = '<tr><td colspan="7" class="empty">no devices registered</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="8" class="empty">no devices registered</td></tr>';
       return;
     }
     var rows = [];
@@ -270,6 +272,21 @@
       var power = d.state === 3
         ? '<span class="badge live">live</span>'
         : '<span class="sub">&ndash;</span>';
+      // LED bar cell — adopted devices only (the ledbar block reaches the
+      // AP via system_cfg provisioning). Brightness input round-trips the
+      // record value; empty = the jar default (leave unchanged on save).
+      // Color input round-trips verbatim; empty = the jar default #0000ff
+      // (sending the empty string is the explicit clear).
+      var led;
+      if (d.state === 3) {
+        led = '<td class="led-cell">' +
+          '<input name="led_bright" type="number" min="0" max="100" placeholder="100" value="' +
+            esc(d.led_override_color_brightness != null ? String(d.led_override_color_brightness) : "") + '">' +
+          '<input name="led_color" placeholder="#0000ff" value="' + esc(d.led_override_color || "") + '">' +
+          '<button type="button" class="btn-ghost btn-small" data-led="' + esc(d.mac) + '">Save</button></td>';
+      } else {
+        led = '<td class="sub">&ndash;</td>';
+      }
       rows.push(
         '<tr data-devrow="' + esc(d.mac) + '">' +
         '<td class="mono">' + esc(d.mac) + "</td>" +
@@ -278,6 +295,7 @@
         '<td class="mono">' + esc(d.ip || "") + "</td>" +
         "<td>" + badgeFor(d.state) + "</td>" +
         "<td>" + power + "</td>" +
+        led +
         '<td class="actions-cell">' +
         '<button type="button" class="btn-ghost btn-small" data-clients="' + esc(d.mac) + '">' +
         (openClients[d.mac] ? "Hide clients" : "Clients") + "</button>&nbsp; " +
@@ -314,7 +332,7 @@
   // vocabulary (live = connected, state-unknown = disconnected).
   function clientsSubRow(clients) {
     if (!clients.length) {
-      return '<tr class="clients-row"><td colspan="7"><div class="empty">no client sessions recorded</div></td></tr>';
+      return '<tr class="clients-row"><td colspan="8"><div class="empty">no client sessions recorded</div></td></tr>';
     }
     var rows = ['<table class="clients-table"><thead><tr><th>Client</th><th>State</th><th>Last seen</th></tr></thead><tbody>'];
     clients.forEach(function (c) {
@@ -328,7 +346,7 @@
       );
     });
     rows.push("</tbody></table>");
-    return '<tr class="clients-row"><td colspan="7">' + rows.join("") + "</td></tr>";
+    return '<tr class="clients-row"><td colspan="8">' + rows.join("") + "</td></tr>";
   }
 
   // updateOpenClients refreshes the expansion rows: every open device
@@ -353,6 +371,34 @@
           setError("devError", "clients: " + e.message);
           renderDevices(lastDevices);
         });
+    });
+    tbody.querySelectorAll("button[data-led]").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        setError("devError", "");
+        var tr = btn.closest("tr");
+        var bright = tr.querySelector("[name=led_bright]").value.trim();
+        var color = tr.querySelector("[name=led_color]").value.trim();
+        // Brightness: only an explicit non-empty 0..100 number is sent —
+        // an empty input means "leave unchanged" (the server's pointer
+        // semantics). Color is always sent (trimmed); the input
+        // round-trips the stored value, so this is a no-op unless edited.
+        var body = {};
+        if (bright !== "") {
+          if (!/^\d+$/.test(bright) || +bright > 100) {
+            setError("devError", "LED brightness must be 0..100");
+            return;
+          }
+          body.led_override_color_brightness = +bright;
+        }
+        body.led_override_color = color;
+        api("/api/v1/devices/" + encodeURIComponent(btn.getAttribute("data-led")), {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body)
+        })
+          .then(refreshAll)
+          .catch(function (e) { setError("devError", "LED bar save failed: " + e.message); });
+      });
     });
   }
 

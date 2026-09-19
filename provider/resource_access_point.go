@@ -116,7 +116,13 @@ type apDevice struct {
 	WLANLastAttempt    int64  `json:"wlan_last_attempt,omitempty"`
 	SiteID             string `json:"site_id,omitempty"`
 	LEDOverride        string `json:"led_override,omitempty"`
-	PendingCommand     string `json:"pending_command,omitempty"`
+	// LEDOverrideColorBrightness mirrors the admin API's view field
+	// (nil = the jar default 100; explicit 0 valid). Wire-decode only:
+	// the provider schema has no led_override attribute, so parity with
+	// the server structs is the only contract (TestDeviceStructParity).
+	LEDOverrideColorBrightness *int   `json:"led_override_color_brightness,omitempty"`
+	LEDOverrideColor           string `json:"led_override_color,omitempty"`
+	PendingCommand             string `json:"pending_command,omitempty"`
 }
 
 func (r *accessPointResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {

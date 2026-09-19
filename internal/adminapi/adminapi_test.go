@@ -90,6 +90,17 @@ func (f *fakeBackend) PatchDevice(_ context.Context, mac string, p DevicePatch) 
 			d.LEDOverride = *p.LEDOverride
 		}
 	}
+	if p.LEDOverrideColorBrightness != nil {
+		if *p.LEDOverrideColorBrightness == 100 {
+			d.LEDOverrideColorBrightness = nil // the explicit clear, mirroring the real adapter
+		} else {
+			v := *p.LEDOverrideColorBrightness
+			d.LEDOverrideColorBrightness = &v
+		}
+	}
+	if p.LEDOverrideColor != nil {
+		d.LEDOverrideColor = *p.LEDOverrideColor // verbatim, "" clears — mirroring the real adapter
+	}
 	f.byMAC[mac] = d
 	return d, nil
 }
@@ -1290,6 +1301,80 @@ func TestPatchDeviceLEDOverrideRoute(t *testing.T) {
 	// empty string is not one of the three states -> 400 too
 	if rec := patch(`{"led_override":""}`); rec.Code != http.StatusBadRequest {
 		t.Fatalf("empty override: %d, want 400", rec.Code)
+	}
+}
+
+// TestPatchDeviceLEDBarKnobsRoute covers the two §12 ledbar knobs on
+// PATCH /api/v1/devices/{mac}: the brightness knob's 0..100 domain
+// (explicit 0 is valid and must round-trip — the pointer semantics; 100
+// is the explicit clear back to the jar default, omitted from the view;
+// out-of-domain is a 400), and the color knob's verbatim storage (no
+// format validation — the §12 render owns the Color.decode fallback per
+// the packet, so even a "garbage" value is accepted and stored; "" is
+// the explicit clear). Pointer semantics: an omitted field leaves the
+// record untouched.
+func TestPatchDeviceLEDBarKnobsRoute(t *testing.T) {
+	be := newFakeBackend()
+	h := New(Config{}, be)
+
+	patch := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("PATCH", "/api/v1/devices/f0:9f:c2:84:8f:2a", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Brightness: explicit 0 is VALID and must round-trip (not omitted).
+	rec := patch(`{"led_override_color_brightness":0}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("set explicit 0: %d %q", rec.Code, rec.Body.String())
+	}
+	var dv DeviceView
+	if err := json.Unmarshal(rec.Body.Bytes(), &dv); err != nil ||
+		dv.LEDOverrideColorBrightness == nil || *dv.LEDOverrideColorBrightness != 0 {
+		t.Fatalf("explicit 0 round-trip: %+v err=%v", dv, err)
+	}
+	// Mid-domain value round-trips.
+	if err := json.Unmarshal(patch(`{"led_override_color_brightness":50}`).Body.Bytes(), &dv); err != nil ||
+		dv.LEDOverrideColorBrightness == nil || *dv.LEDOverrideColorBrightness != 50 {
+		t.Fatalf("set 50 round-trip: %+v err=%v", dv, err)
+	}
+	// 100 is the explicit clear back to the jar default: omitted from view.
+	clearRec := patch(`{"led_override_color_brightness":100}`)
+	if clearRec.Code != http.StatusOK {
+		t.Fatalf("clear brightness: %d %q", clearRec.Code, clearRec.Body.String())
+	}
+	if strings.Contains(clearRec.Body.String(), "led_override_color_brightness") {
+		t.Fatalf("cleared brightness must be omitted from the view: %q", clearRec.Body.String())
+	}
+	// Out-of-domain: 400 with the validator message.
+	for _, bad := range []string{`{"led_override_color_brightness":101}`, `{"led_override_color_brightness":-1}`} {
+		if rec := patch(bad); rec.Code != http.StatusBadRequest ||
+			!strings.Contains(rec.Body.String(), "led_override_color_brightness must be 0..100") {
+			t.Fatalf("out-of-domain %q: %d %q, want 400", bad, rec.Code, rec.Body.String())
+		}
+	}
+
+	// Color: verbatim storage — a well-formed hex, and a "garbage" value
+	// the jar itself would fall back on, both round-trip unchanged (the
+	// §12 render owns the fallback; the API does not second-guess it).
+	for _, c := range []string{"#ff8c00", "garbage", "  "} {
+		if err := json.Unmarshal(patch(`{"led_override_color":"`+c+`"}`).Body.Bytes(), &dv); err != nil ||
+			dv.LEDOverrideColor != c {
+			t.Fatalf("verbatim color %q round-trip: %+v err=%v", c, dv, err)
+		}
+	}
+	// "" is the explicit clear: omitted from the view.
+	clearColor := patch(`{"led_override_color":""}`)
+	if clearColor.Code != http.StatusOK || strings.Contains(clearColor.Body.String(), "led_override_color") {
+		t.Fatalf("clear color: %d %q, want 200 with the field omitted", clearColor.Code, clearColor.Body.String())
+	}
+	// A JSON string into the int knob (and a fractional number) is a
+	// body-decode 400, not a stored value.
+	for _, bad := range []string{`{"led_override_color_brightness":"42"}`, `{"led_override_color_brightness":42.5}`} {
+		if rec := patch(bad); rec.Code != http.StatusBadRequest {
+			t.Fatalf("type-confused %q: %d %q, want 400", bad, rec.Code, rec.Body.String())
+		}
 	}
 }
 

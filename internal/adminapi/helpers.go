@@ -213,6 +213,22 @@ func ValidateLEDOverride(v string) string {
 	return "led_override must be one of default, on, off"
 }
 
+// ValidateLEDOverrideColorBrightness enforces the ledbar brightness
+// knob's 0..100 domain. The classic controller's §12 render reads
+// device.getInt("led_override_color_brightness", 100) and scales it by
+// the truncating (255*b)/100 (config_String.txt:2627-2640); the admin API
+// keeps the knob's contract explicit instead of letting out-of-domain
+// values ride to a render that was never cited for them. 0 is a VALID
+// explicit choice (LED bar dark); 100 is the jar default (and the
+// record's explicit-clear value). Returns "" when valid, else a short
+// human message for the 400 body.
+func ValidateLEDOverrideColorBrightness(v int) string {
+	if v < 0 || v > 100 {
+		return "led_override_color_brightness must be 0..100"
+	}
+	return ""
+}
+
 // ValidateRadioName enforces the path radio name for the per-radio intent
 // routes: 1..64 characters, no control characters. The name is a LOOKUP
 // KEY against the device-reported radio_table names (never emitted into

@@ -69,6 +69,21 @@ type DeviceView struct {
 	// led_override, docs/PROTOCOL-mgmt.md §2): "" (omitted) = the jar's
 	// "default" (follow the site default), "on", "off". Read-only here.
 	LEDOverride string `json:"led_override,omitempty"`
+	// LEDOverrideColorBrightness is the admin-set ledbar brightness knob
+	// (record field led_override_color_brightness — the §12 block's
+	// device.getInt read, config_String.txt:2627-2640): nil (omitted) =
+	// the jar default 100; 0..100 the admin's explicit pick, where
+	// explicit 0 is VALID (LED bar dark — the reason the field is a
+	// pointer). Read-only here.
+	LEDOverrideColorBrightness *int `json:"led_override_color_brightness,omitempty"`
+	// LEDOverrideColor is the admin-set ledbar color knob (record field
+	// led_override_color — the §12 block's device.getString read,
+	// config_String.txt:2661-2678): "" (omitted) = the jar default
+	// "#0000ff". Stored verbatim with NO format validation: the §12
+	// render owns the fallback (Color.decode — unparseable values land
+	// on #0000ff, per the packet), so the API does not second-guess it.
+	// Read-only here.
+	LEDOverrideColor string `json:"led_override_color,omitempty"`
 	// PendingCommand is the read-only armed remote-command state: "reboot"
 	// when the armed §6.5 reboot flag is set, "factory-reset" when the
 	// armed §6.6 setdefault flag is set (outranking reboot, matching the
@@ -91,6 +106,19 @@ type DevicePatch struct {
 	// / "off" = the two override states (values validated by
 	// ValidateLEDOverride).
 	LEDOverride *string `json:"led_override,omitempty"`
+	// LEDOverrideColorBrightness sets/clears the ledbar brightness knob
+	// (0..100, validated by ValidateLEDOverrideColorBrightness). nil =
+	// leave unchanged; 100 = the explicit clear back to the jar default
+	// (the record stores nil); any other value in domain — including 0 —
+	// is the admin's explicit pick.
+	LEDOverrideColorBrightness *int `json:"led_override_color_brightness,omitempty"`
+	// LEDOverrideColor sets/clears the ledbar color knob, stored VERBATIM
+	// with no format validation — the §12 render owns the fallback
+	// (Color.decode; unparseable values land on #0000ff,
+	// config_String.txt:2669-2678), and the packet proves the jar accepts
+	// any string here. nil = leave unchanged; "" = the explicit clear
+	// back to the jar default.
+	LEDOverrideColor *string `json:"led_override_color,omitempty"`
 }
 
 // DeviceUpsert is the request body for manual device registration ("adopt
@@ -471,6 +499,12 @@ func New(cfg Config, be Backend) http.Handler {
 		}
 		if patch.LEDOverride != nil {
 			if msg := ValidateLEDOverride(*patch.LEDOverride); msg != "" {
+				writeErr(w, http.StatusBadRequest, msg)
+				return
+			}
+		}
+		if patch.LEDOverrideColorBrightness != nil {
+			if msg := ValidateLEDOverrideColorBrightness(*patch.LEDOverrideColorBrightness); msg != "" {
 				writeErr(w, http.StatusBadRequest, msg)
 				return
 			}
