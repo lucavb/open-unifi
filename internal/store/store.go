@@ -66,6 +66,31 @@ type Device struct {
 	// it so the §2 semantics are complete the day one lands. ADMIN-OWNED:
 	// a device body can neither write nor introduce it.
 	Disabled bool `json:"disabled,omitempty"`
+
+	// LEDOverrideColorBrightness is the admin-set per-device ledbar
+	// brightness percent — the classic controller's device record field
+	// "led_override_color_brightness" (the system_cfg ledbar emitter reads
+	// device.getInt("led_override_color_brightness", 100),
+	// config_String.txt:2627-2630). nil = unset (≡ the jar default 100).
+	// It is a POINTER because 0 is a valid explicit value: a plain int
+	// could not tell an explicit 0 from unset, and setting 100 ≡ clearing
+	// (the renders are byte-identical). The admin API validates 0..100.
+	// ADMIN-OWNED (CONTEXT.md trust policy): the device can neither write
+	// nor introduce it — absorbInform never touches typed fields, and the
+	// server drops device-supplied Extra["led_override_color_brightness"]
+	// copies (server.extraAdminOwned).
+	LEDOverrideColorBrightness *int `json:"led_override_color_brightness,omitempty"`
+
+	// LEDOverrideColor is the admin-set per-device ledbar color — the
+	// classic controller's device record field "led_override_color" (the
+	// ledbar emitter reads device.getString("led_override_color",
+	// "#0000ff"), config_String.txt:2661-2663). "" ≡ unset (the jar
+	// default "#0000ff"): blank or unparseable values fall back to
+	// #0000ff at render time (config_String.txt:2666-2678) — stored
+	// VERBATIM, not validated at the admin API, mirroring the jar's
+	// record semantics. ADMIN-OWNED (CONTEXT.md trust policy): the
+	// device can neither write nor introduce it.
+	LEDOverrideColor string `json:"led_override_color,omitempty"`
 }
 
 // JSONMap is a loosely-typed JSON object (statistics passthrough etc.).
@@ -258,6 +283,14 @@ func cloneValue(v any) any {
 // JSONMap and slice that aliasing bugs could otherwise reach through.
 func cloneDevice(d Device) Device {
 	out := d
+	// The brightness knob is a pointer so explicit 0 survives the JSON
+	// round-trip; the clone re-points it so the copy's aliasing matches
+	// the map/slice deep-copy discipline below (no caller can mutate the
+	// stored record through a returned pointer).
+	if d.LEDOverrideColorBrightness != nil {
+		v := *d.LEDOverrideColorBrightness
+		out.LEDOverrideColorBrightness = &v
+	}
 	out.Authkeys = nil
 	if d.Authkeys != nil {
 		out.Authkeys = make([]string, len(d.Authkeys))

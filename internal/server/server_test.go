@@ -2103,24 +2103,32 @@ func TestNewlineInjectionGuarded(t *testing.T) {
 	}
 }
 
-// TestAbsorbAdminOwnedLEDFieldsProtected pins the trust policy for the two
+// TestAbsorbAdminOwnedLEDFieldsProtected pins the trust policy for the
 // admin-owned LED record inputs (CONTEXT.md): a device inform body carrying
-// led_override / disabled can neither overwrite the typed admin fields nor
-// introduce a shadowing Extra copy — the classic controller reads both from
-// its own DB record (§2: device.getString("led_override"), device.is
-// ("disabled")), never from the wire, and the §2 led_enabled computation
-// must only ever see admin-controlled values.
+// led_override / disabled / led_override_color_brightness /
+// led_override_color can neither overwrite the typed admin fields nor
+// introduce a shadowing Extra copy — the classic controller reads all four
+// from its own DB record (§2: device.getString("led_override"), device.is
+// ("disabled"); §12: device.getInt/getString for the ledbar knobs —
+// config_String.txt:2627-2678), never from the wire, and the §2/§12 LED
+// computations must only ever see admin-controlled values.
 func TestAbsorbAdminOwnedLEDFieldsProtected(t *testing.T) {
 	s := New(Config{}, store.NewMemStore(), testLogger())
 	rec := u7pg2Record()
 	rec.LEDOverride = "on"
 	rec.Disabled = false
+	bright := 0 // explicit zero: the pointer edge that must survive intact
+	rec.LEDOverrideColorBrightness = &bright
+	rec.LEDOverrideColor = "#ff8c00"
 	body := map[string]any{
 		"mac":          store.ColonMAC(testMAC),
 		"model":        "U7PG2",
 		"version":      "6.8.2.15592",
 		"led_override": "off", // forged device-side claim — must be dropped
 		"disabled":     true,  // forged device-side claim — must be dropped
+		// Forged ledbar knobs (§12 reads) — must be dropped the same way.
+		"led_override_color_brightness": 42.0,
+		"led_override_color":            "#ff0000",
 	}
 	s.absorbInform(testMAC, &rec, body, time.Now(), false)
 	if rec.LEDOverride != "on" {
@@ -2129,11 +2137,65 @@ func TestAbsorbAdminOwnedLEDFieldsProtected(t *testing.T) {
 	if rec.Disabled {
 		t.Fatal("device body introduced the admin disabled flag")
 	}
-	if v, ok := rec.Extra["led_override"]; ok {
-		t.Fatalf("device-introduced Extra[led_override] survived absorb: %v", v)
+	if rec.LEDOverrideColorBrightness == nil || *rec.LEDOverrideColorBrightness != 0 {
+		t.Fatalf("device body overwrote admin ledbar brightness: %v", rec.LEDOverrideColorBrightness)
 	}
-	if v, ok := rec.Extra["disabled"]; ok {
-		t.Fatalf("device-introduced Extra[disabled] survived absorb: %v", v)
+	if rec.LEDOverrideColor != "#ff8c00" {
+		t.Fatalf("device body overwrote admin ledbar color: %q", rec.LEDOverrideColor)
+	}
+	for _, k := range []string{"led_override", "disabled",
+		"led_override_color_brightness", "led_override_color"} {
+		if v, ok := rec.Extra[k]; ok {
+			t.Fatalf("device-introduced Extra[%s] survived absorb: %v", k, v)
+		}
+	}
+}
+
+// TestLEDStateMgmtCfgLedBarConsistency pins the brief's ledbar consistency
+// gate: for every LED state, the mgmt_cfg led_enabled row (adoption's §2
+// writer) and the system_cfg ledbar block (the §12 emitter) must tell the
+// device the SAME story — led_enabled=true ⟺ ledbar.status=enabled ⟺ the
+// block carries its brightness row. The jar computes the state
+// independently in both emitters (B.cfr ledOn vs config_String.Ò00000);
+// adoption must never import systemcfg, so this adapter-layer test is the
+// only place both renders are callable — that is why it lives in package
+// server (WORKER-BRIEF-ledbar.md, ledbar gates).
+func TestLEDStateMgmtCfgLedBarConsistency(t *testing.T) {
+	s := New(Config{}, store.NewMemStore(), testLogger())
+	cases := []struct {
+		override string
+		disabled bool
+		ledOn    bool
+	}{
+		{"", false, true}, // "" ≡ jar default "default", site default on
+		{"on", false, true},
+		{"off", false, false},
+		{"default", true, false}, // admin disable flag wins over default
+		{"on", true, false},      // ...and over an explicit "on"
+	}
+	for _, tc := range cases {
+		rec := u7pg2Record()
+		rec.LEDOverride = tc.override
+		rec.Disabled = tc.disabled
+		mgmt := s.engine.BuildMgmtCfg(rec, inform.DefaultKeyHex)
+		sys := mustBuildSys(t, s, rec)
+		want := "false"
+		status := "disabled"
+		if tc.ledOn {
+			want, status = "true", "enabled"
+		}
+		if !strings.Contains(mgmt, "led_enabled="+want+"\n") {
+			t.Fatalf("override=%q disabled=%v: mgmt_cfg led_enabled row is not %q:\n%s",
+				tc.override, tc.disabled, want, mgmt)
+		}
+		if !strings.Contains(sys, "ledbar.status="+status+"\n") {
+			t.Fatalf("override=%q disabled=%v: system_cfg ledbar.status is not %q:\n%s",
+				tc.override, tc.disabled, status, sys)
+		}
+		if strings.Contains(sys, "ledbar.brightness=") != tc.ledOn {
+			t.Fatalf("override=%q disabled=%v: ledbar.brightness presence (%v) disagrees with led_enabled=%q",
+				tc.override, tc.disabled, strings.Contains(sys, "ledbar.brightness="), want)
+		}
 	}
 }
 

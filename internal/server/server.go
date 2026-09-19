@@ -864,6 +864,11 @@ var (
 	// dropped here: the admin value lives in the typed field and a body
 	// echo can neither shadow nor introduce it (CONTEXT.md trust policy:
 	// admin-owned).
+	// led_override_color_brightness and led_override_color are the same
+	// again for the ledbar block's two knobs (store.Device typed fields;
+	// the §12 emitter reads device.getInt/getString for them —
+	// config_String.txt:2627-2678): a device body can neither overwrite
+	// the typed value nor introduce a shadowing Extra copy.
 	// radio_intent (wireless.RadioIntentExtraKey) is the per-radio
 	// channel/txpower intent the admin API writes — admin-owned rows in
 	// the CONTEXT.md sense: the device can neither write nor introduce
@@ -876,7 +881,8 @@ var (
 		"anonymous_controller_id", "anonymous_site_id",
 		adoption.FlagRebootOnConnect, adoption.FlagSetdefaultArmed,
 		"blocked_sta", "blocked_sta_sha",
-		"led_override", "disabled", wireless.RadioIntentExtraKey,
+		"led_override", "disabled", "led_override_color_brightness",
+		"led_override_color", wireless.RadioIntentExtraKey,
 		store.CmdTaskKey}
 )
 
