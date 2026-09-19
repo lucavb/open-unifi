@@ -135,6 +135,20 @@ const (
 	// default key runs the ordinary adoption path unchanged. NO
 	// cfgversion is minted.
 	KindSetdefault Kind = "setdefault"
+
+	// KindCmd is the §6.3 stored-task replay, docs/PROTOCOL-mgmt.md §6.3
+	// (voidsuper `o00000(Device, Task)`: `new Object("cmd")` +
+	// `object.mergeFrom((X)task)` — the stored task's Mongo fields become
+	// response keys VERBATIM, then task cleanup `\u00d300000`). Fired once
+	// on the device's next decoded inform after an admin enqueues a cmd
+	// for it (inform hook `task != null`, §1353-1359); the engine consumes
+	// the stored task in the same decision (one-shot), and the outcome
+	// carries the row for the adapter to serialize verbatim. NO
+	// cfgversion is minted: the §6.2 mint-site list (§501, §676, §826,
+	// §1117/1122, §1269, §3068) has no cmd-replay site — same reasoning
+	// as the §6.5/§6.6 emissions, and the follow-on inform re-enters the
+	// ordinary decisions (drift full provisioning, §6.1 noop) unchanged.
+	KindCmd Kind = "cmd"
 )
 
 // Admin-armed lifecycle command flags (the trust-policy "admin-owned rows"
@@ -212,6 +226,13 @@ type Outcome struct {
 	SetAuthkeys   bool
 	Authkeys      []string
 	Extra         store.JSONMap
+
+	// CmdTask is the stored-task row replayed VERBATIM as the §6.3 cmd
+	// response's payload keys (`mergeFrom((X)task)`): non-nil only for
+	// KindCmd. The ADAPTER assembles the response JSON from it and the
+	// inform codec seals the already-built bytes (CONTEXT.md seam) — the
+	// engine never touches framing or crypto.
+	CmdTask store.JSONMap
 }
 
 // Deps are the engine's injected dependencies (no store, no HTTP, no crypto,
@@ -345,30 +366,42 @@ func (e *Engine) Decide(req Request) (Outcome, error) {
 }
 
 // armedLifecycle is the admin-armed remote-command lane (§6.5 reboot /
-// §6.6 setdefault): the admin API sets an admin-owned Extra flag; the
-// NEXT decoded inform for that device answers with the corresponding
-// lifecycle response instead of entering the key/drift machinery, and the
-// engine clears the flag in the same decision (one-shot). Both transports
-// run it, after their gentle-noop gate (the flag rides the main status
-// inform, exactly the empty-_type informs real firmware sends).
+// §6.6 setdefault / §6.3 stored cmd task): the admin API sets
+// admin-owned record rows; the NEXT decoded inform for that device
+// answers with the corresponding response instead of entering the
+// key/drift machinery, and the engine consumes the arming in the same
+// decision (one-shot). All transports run it, after their gentle-noop
+// gate (the armed commands ride the main status inform, exactly the
+// empty-_type informs real firmware sends).
 //
 // Precedence: setdefault outranks reboot (a factory reset subsumes a
 // pending reboot, and clearing the reboot flag keeps the post-reset
 // default-key re-adoption from being preempted by a stale command), and
-// both fire BEFORE the key/state gate — mirroring the classic dispatcher,
-// where the state-8 setdefault check (voidsuper line 1018) precedes every
-// §6.2 setparam site (§1117+) and the default-key state gate. The jar's
-// reboot emission site itself is not line-pinned in
-// docs/PROTOCOL-mgmt.md §6.5 (byte shape only); placing it in the same
-// early arm keeps the "next inform carries the response" contract —
-// recorded as a live-proof obligation in the lane docs.
+// both fire BEFORE the key/state gate — mirroring the classic
+// dispatcher, where the state-8 setdefault check (voidsuper line 1018)
+// precedes every §6.2 setparam site (§1117+), the §6.3 task hook
+// (§1353-1359) and the default-key state gate. The jar's reboot emission
+// site itself is not line-pinned in docs/PROTOCOL-mgmt.md §6.5 (byte
+// shape only); placing it in the same early arm keeps the
+// "next inform carries the response" contract — recorded as a
+// live-proof obligation in the lane docs. The §6.3 cmd task slots AFTER
+// both: §6.3 is silent on the task's ordering against the other armed
+// commands — chosen: last, so the line-pinned setdefault check keeps
+// winning and a one-shot reboot merely defers the task by exactly one
+// inform without losing it (the post-reboot inform replays it). An armed
+// task OUTRANKS the drift machinery: the §6.3 hook runs before the
+// wireless/blocked drift arms below, so a drifted device with an armed
+// task gets the task response, and after it delivers the SAME device
+// falls back to the drift outcome on its next inform (the replay is not
+// lost — §6.3's task cleanup is consumption, and the deferred
+// provisioning re-fires exactly like the §6.5 deferred delivery).
 //
 // cfgversion-mint semantics — §6.2 catalog entries matched: NONE for the
-// emissions themselves. Neither §6.5 reboot nor §6.6 setdefault is a
-// §6.2 setparam emission site, and the §6.2 mint-site list (§501, §676,
-// §826, §1117/1122, §1269, §3068) contains no reboot/setdefault site, so
-// arming and emitting mint NO cfgversion. The follow-on decisions reuse
-// existing catalog entries unchanged:
+// emissions themselves. Neither §6.5 reboot nor §6.6 setdefault nor the
+// §6.3 replay is a §6.2 setparam emission site, and the §6.2 mint-site
+// list (§501, §676, §826, §1117/1122, §1269, §3068) contains no
+// reboot/setdefault/cmd site, so arming and emitting mint NO cfgversion.
+// The follow-on decisions reuse existing catalog entries unchanged:
 //   - after a reboot, the device's retained-key re-inform re-enters the
 //     ordinary dispatcher (§6.1 noop on cfgversion match; §6.2 d full
 //     provisioning on mismatch — the appliedNotRunning re-arm covers the
@@ -377,7 +410,10 @@ func (e *Engine) Decide(req Request) (Outcome, error) {
 //     §8 default-key rotation path (the §6.2 a/c/f mgmt_cfg-only
 //     family), which mints the fresh 16-hex cfgversion exactly as every
 //     adoption does (rotateKeys — the §6.2 c "+ fresh 16-hex cfgversion
-//     stored" semantics).
+//     stored" semantics);
+//   - after a cmd replay, the next inform re-enters the ordinary
+//     dispatcher wherever the record stood (a drifted record full
+//     provisions; a settled record noops).
 func (e *Engine) armedLifecycle(d *store.Device) (Outcome, bool) {
 	if truthy(d.Extra[FlagSetdefaultArmed]) {
 		e.lg.Debug("inform: armed setdefault (factory reset)", "mac", d.MAC)
@@ -409,6 +445,13 @@ func (e *Engine) armedLifecycle(d *store.Device) (Outcome, bool) {
 		delete(d.Extra, FlagSetdefaultArmed)
 		// A pending reboot is moot once the device factory-resets.
 		delete(d.Extra, FlagRebootOnConnect)
+		// A queued §6.3 cmd task is moot too: the post-reset re-inform
+		// arrives on the factory default key as a pending candidate, and
+		// a replayed task would preempt the re-adoption push that record
+		// must answer with. §6.3 is silent on task-vs-setdefault
+		// interplay — chosen: the reset discards the queued task (the
+		// same moot-clearing as the pending reboot).
+		delete(d.Extra, store.CmdTaskKey)
 		return Outcome{Kind: KindSetdefault}, true
 	}
 	if truthy(d.Extra[FlagRebootOnConnect]) {
@@ -426,7 +469,31 @@ func (e *Engine) armedLifecycle(d *store.Device) (Outcome, bool) {
 		delete(d.Extra, "wlan_cfg_not_running_misses")
 		return Outcome{Kind: KindReboot}, true
 	}
+	// §6.3 stored cmd task (last in the armed chain — see the precedence
+	// note above): replay the stored row VERBATIM and consume the arming
+	// in the same decision, exactly the jar's `o00000(device, task)`
+	// build-then-cleanup order. The task is opaque passthrough — whether
+	// the cmd reboots the device (e.g. "restart") is the DEVICE's
+	// business, so unlike the reboot branch this deliberately touches no
+	// other record rows; a restart's boot window re-opens through the
+	// ordinary two-consecutive-miss grace on the next inform.
+	if task := store.ArmedCmdTask(*d); task != nil {
+		e.lg.Debug("inform: armed cmd task", "mac", d.MAC, "cmd", CmdTaskString(task))
+		delete(d.Extra, store.CmdTaskKey)
+		return Outcome{Kind: KindCmd, CmdTask: task}, true
+	}
 	return Outcome{}, false
+}
+
+// CmdTaskString renders an armed task row's cmd for logs — the one §6.3
+// field with operator meaning. Never logs the whole row: future task
+// fields may carry more than the admin typed.
+func CmdTaskString(task store.JSONMap) string {
+	if task == nil {
+		return ""
+	}
+	cmd, _ := task["cmd"].(string)
+	return cmd
 }
 
 // decideEncrypted ports the former Server.advance for ENCRYPTED informs.
@@ -440,7 +507,7 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, d *store.Devi
 		return e.noopFor(d, now, req.PrevNoopTarget, KindNoop), nil
 	}
 
-	// Admin-armed lifecycle commands (§6.5/§6.6) preempt the drift and
+	// Admin-armed remote commands (§6.3/§6.5/§6.6) preempt the drift and
 	// key machinery: the armed response is what this inform must carry,
 	// and the post-lifecycle inform re-enters the ordinary decisions
 	// below (deferred provisioning is not lost — see armedLifecycle).
@@ -713,7 +780,7 @@ func (e *Engine) decidePlain(req Request, wls []wireless.Wlan, d *store.Device) 
 		return e.noopFor(d, now, req.PrevNoopTarget, KindNoop), nil
 	}
 
-	// Admin-armed lifecycle commands fire on this lane too (same record,
+	// Admin-armed remote commands fire on this lane too (same record,
 	// same admin intent; the outcome serialization is shared).
 	if out, armed := e.armedLifecycle(d); armed {
 		return out, nil
