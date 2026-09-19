@@ -178,7 +178,9 @@ type Outcome struct {
 
 	// setparam payloads. The adoption push (§6.2 a/b/c/f) carries ONLY
 	// MgmtCfg; full provisioning additionally carries CfgVersion, SystemCfg
-	// and BlockedSta. CfgVersion is also the record delta target value.
+	// and BlockedSta (the §4 wire string rendered from the admin-owned
+	// blocked-client set; "" when none). CfgVersion is also the record
+	// delta target value.
 	FullProvision bool
 	SystemCfg     string
 	BlockedSta    string
@@ -473,11 +475,40 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, d *store.Devi
 			e.lg.Debug("inform: wireless envelope drift", "mac", d.MAC)
 		}
 	}
+	blockedDrift := false
+	// blocked_sta drift (§6.2(d), engine.go's §4 writer): the admin-owned
+	// blocked-client set is provisioned CONTENT, delivered only inside full
+	// provisioning — the jar has no standalone blocked push short of the
+	// reconnect-only variant §6.2(e) records as a named open-unifi
+	// follow-up. So a set change rides exactly the WLAN envelope change
+	// machinery: mint a fresh cfgversion here (a blocked edit is a content
+	// change, so the echoed cfgversion must never enter the equality/noop
+	// branch), and the switch below forces assignedKeyFlow in THIS inform.
+	// The baseline semantics differ from wlan_cfg_sha in one way: absent
+	// baseline + EMPTY set is steady state, not drift — that combination is
+	// what a freshly adopted device presents (2026-09-16 live round: the
+	// equal path answers connected noops after adoption), and baseline
+	// capture happens at EMISSION (blocked content has no vap_table to
+	// observe; the cfgversion echo the equality path already tracks is the
+	// only confirmation there is).
+	if _, blockedChanged := blockedStaDrift(*d); blockedChanged {
+		blockedDrift = true
+		nv, kerr := e.keyChars(16)
+		if kerr != nil {
+			return Outcome{}, kerr
+		}
+		d.CfgVersion = nv
+		e.lg.Debug("inform: blocked_sta drift", "mac", d.MAC)
+	}
 	if st.pendingSHAPresent && st.pendingSHA != "" {
 		// A changed envelope is a new delivery operation. For the unchanged
 		// operation, rate-limit retries before the switch below; importantly,
 		// this does not clear pending or treat cfgversion equality as success.
-		if st.pendingSHA == wireless.WlanListHash(wls) && !st.retryDue(now) {
+		// A blocked_sta change must bypass the rate limit: an exhausted WLAN
+		// delivery retry would otherwise hold the blocked set hostage — the
+		// pending operation is re-offered alongside the new content anyway,
+		// since assignedKeyFlow emits system_cfg unconditionally.
+		if !blockedDrift && st.pendingSHA == wireless.WlanListHash(wls) && !st.retryDue(now) {
 			return e.noopFor(d, now, req.PrevNoopTarget, KindNoopPendingWLAN), nil
 		}
 		wlanDrift = true
@@ -525,13 +556,15 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, d *store.Devi
 	// particular, U7 firmware commonly echoes the cfgversion from the previous
 	// mgmt_cfg on the first inform after an admin WLAN save.  Do not let that
 	// echoed value enter the equality/noop branch: the response must contain the
-	// newly rendered system_cfg in this inform.
-	case wlanDrift:
+	// newly rendered system_cfg in this inform.  A blocked_sta edit is the same
+	// kind of content change (§6.2(d) delivers it only inside full
+	// provisioning), so the arm is shared.
+	case wlanDrift || blockedDrift:
 		out, err := e.assignedKeyFlow(d, now, wls)
 		if err != nil {
 			return Outcome{}, err
 		}
-		e.lg.Debug("inform: wireless envelope drift, forcing full provisioning", "mac", d.MAC)
+		e.lg.Debug("inform: content drift (wireless/blocked_sta), forcing full provisioning", "mac", d.MAC)
 		return out, nil
 
 	// Authenticated with our per-device key and the config applied → noop.
@@ -731,12 +764,23 @@ func (e *Engine) assignedKeyFlow(d *store.Device, now time.Time, wls []wireless.
 	placements := wlanPlacements(*d, wls)
 	st := loadWlanCfgState(d.Extra)
 	st.applyProvisioning(cur, now.Unix(), wls, placements)
+	// blocked_sta rides every full provisioning (§6.2(d)): render the §4
+	// wire string from the admin-owned set, carry it in the outcome, and
+	// stamp the delivery baseline so the next inform can tell confirmed
+	// content from drift. Baseline capture at EMISSION (not apply) is
+	// correct here: blocked content has no observable on-device state to
+	// settle against — the cfgversion echo the equality path already
+	// tracks is the only confirmation there is — and stamping keeps an
+	// unconfirmed-but-unchanged set from re-MINTING on every inform while
+	// the plain cfgversion mismatch keeps re-OFFERING it until applied.
+	blocked := blockedStaWire(*d)
+	stampBlockedSta(d, blocked)
 	return Outcome{
 		Kind:             KindSetparam,
 		FullProvision:    true,
 		CfgVersion:       d.CfgVersion,
 		SystemCfg:        sys,
-		BlockedSta:       "",
+		BlockedSta:       blocked,
 		MgmtCfg:          e.BuildMgmtCfg(*d, d.XAuthkey),
 		CredentialDeltas: deltas,
 	}, nil

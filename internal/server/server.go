@@ -783,9 +783,16 @@ func (s *Server) applyOutcome(mac string, rec *store.Device, out adoption.Outcom
 var (
 	extraPrevWins     = append(append([]string{}, adoption.ControllerOwnedKeys...), "ssh_sha512passwd")
 	extraFillIfAbsent = []string{"radio_table", "wifi_caps", "fw_caps", "if_table", "ethernet_table", "uplink", "has_eth1"}
-	extraAdminOwned   = []string{"system_cfg_extra_lines", "mgmt_dev",
+	// blocked_sta (the admin-owned blocked-client set) and blocked_sta_sha
+	// (the engine's delivery baseline, internal/server/adoption) are BOTH
+	// admin-owned here: prev-WINS alone would let a device-supplied body
+	// INTRODUCE the baseline — a forged baseline matching a forged set
+	// would suppress delivery — so the baseline uses prev-or-delete too
+	// (only the engine's own emission ever writes it).
+	extraAdminOwned = []string{"system_cfg_extra_lines", "mgmt_dev",
 		"anonymous_controller_id", "anonymous_site_id",
-		adoption.FlagRebootOnConnect, adoption.FlagSetdefaultArmed}
+		adoption.FlagRebootOnConnect, adoption.FlagSetdefaultArmed,
+		"blocked_sta", "blocked_sta_sha"}
 )
 
 // absorbInform copies interesting fields from the inform body into the record.

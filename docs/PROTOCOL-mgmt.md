@@ -338,6 +338,19 @@ Full-provisioning body example:
 `cfr_renamed_1(device,"cfgversion", C.o00000("0123456789abcdef",16))` at §501, §676,
 §826, §1117/1122, §1269, §3068).
 
+> **open-unifi note (blocked_sta):** rows (d) and (e) are implemented ONLY as
+> (d): a change to the blocked-client set rides full provisioning through the
+> same mint-then-emit machinery as a WLAN envelope change, and the set lives
+> in the device record as an admin-owned row a device body can neither write
+> nor introduce. Variant (e) — the reconnect-only `blocked_sta` push — is a
+> NAMED follow-up, `blocked_sta-reconnect-push`: open-unifi has no
+> connected/disconnected session tracking yet, so there is no
+> `!consideredConnected` event to hang it on. Deviation: the list is emitted
+> in sorted order (the record stores a canonical sorted set); the real
+> controller's order comes from Mongo natural order, which is unrecoverable
+> from the jar — treat exact order as a live-proof obligation, not a
+> byte-exactness claim.
+
 ### 6.3 `cmd` (task passthrough)
 
 ```java
