@@ -136,7 +136,7 @@ SSID and each intended radio where the row says `2.4 GHz` or `5 GHz`.
 | ID | Required case and pass criteria | Status | Evidence refs |
 | --- | --- | --- | --- |
 | A1 | **Factory adoption:** factory AP is discovered/adopted; AP reports adopted/connected; controller records the expected model and firmware; post-adoption inform is received. | `PROVEN` | §2026-09-18 F-row live round — adoption chain 07:32:47–07:34:09Z (adoption-seed engine finding recorded there); §2026-09-18 verify round — re-proven under the fixed engine, adoption delivers the envelope automatically 11:21:45–11:23:13Z |
-| A2 | **Restart with retained key:** adopted AP is restarted without deleting controller state; it re-informs using the retained key, returns to connected, and receives/retains the expected configuration. | `PROVEN` | §2026-09-18 F-row live round — 74 s gap + retained-key re-inform + cfg echo unchanged proven 08:09–08:12Z; applied config did NOT survive the reboot (recovery via the tested self-heal remedy); §2026-09-18 verify round — retention failure re-confirmed and automatic watchdog recovery live-proven 11:29:59–11:30:48Z; §2026-09-19 root cause resolved — the renderer's `mgmt.is_default=true` factory-echo row tripped the AP preinit boot guard (`/lib/preinit/99_21_ubnt_ubntconf` replaces the MTD-restored text containing it with the factory template; docs/AP-FIRMWARE-APPLY-PATH.md §6.5); fix in render.go; §2026-09-19 A2 re-run — retention PROVEN live: retained-key first re-inform (+67 s) with unchanged cfgversion echo, post-boot `/tmp/system.cfg` byte-identical to the push (`3da7ce3e…`), vaps RUN, 6.5 h steady state; one benign not-running-watchdog boot-race re-provision recorded (two-consecutive-miss guard now live-indicated — see the 2026-09-19 round record) |
+| A2 | **Restart with retained key:** adopted AP is restarted without deleting controller state; it re-informs using the retained key, returns to connected, and receives/retains the expected configuration. | `PROVEN` | §2026-09-18 F-row live round — 74 s gap + retained-key re-inform + cfg echo unchanged proven 08:09–08:12Z; applied config did NOT survive the reboot (recovery via the tested self-heal remedy); §2026-09-18 verify round — retention failure re-confirmed and automatic watchdog recovery live-proven 11:29:59–11:30:48Z; §2026-09-19 root cause resolved — the renderer's `mgmt.is_default=true` factory-echo row tripped the AP preinit boot guard (`/lib/preinit/99_21_ubnt_ubntconf` replaces the MTD-restored text containing it with the factory template; docs/AP-FIRMWARE-APPLY-PATH.md §6.5); fix in render.go; §2026-09-19 A2 re-run — retention PROVEN live: retained-key first re-inform (+67 s) with unchanged cfgversion echo, post-boot `/tmp/system.cfg` byte-identical to the push (`3da7ce3e…`), vaps RUN, 6.5 h steady state; one benign not-running-watchdog boot-race re-provision recorded (two-consecutive-miss guard now live-indicated — see the 2026-09-19 round record); §2026-09-19 full-chain round — controller-armed §6.5 reboot: `kind=reboot` on the retained key, echo unchanged, NO boot-race miss (device came up RUN); post-boot `/tmp/system.cfg` is the fw-sorted re-emission, row set byte-identical to the push |
 | B1 | **WPA-Personal association:** WPA-Personal test client associates to the intended SSID on 2.4 GHz and 5 GHz as applicable; client receives DHCP lease and can pass the defined allowed traffic test. | `NOT RUN` | `________________` |
 | B2 | **Open association:** open test client associates; client receives DHCP lease and can pass the defined allowed traffic test. | `NOT RUN` | `________________` |
 | B3 | **Tagged VLAN:** WPA-Personal and/or open test WLAN configured with a tagged VLAN; client associates and receives DHCP on the intended subnet; traffic passes; capture on the AP uplink visibly records 802.1Q with the expected VID (or records the exact reason the observation point cannot see the tag). | `NOT RUN` | `________________` |
@@ -146,7 +146,7 @@ SSID and each intended radio where the row says `2.4 GHz` or `5 GHz`.
 | D1 | **Multiple WLANs on both radios:** configure at least two WLANs, with intended 2.4 GHz and 5 GHz coverage; each expected VAP is present, clients associate to each, receive the correct DHCP/VLAN result, and pass the defined traffic test. | `NOT RUN` | `________________` |
 | E1 | **AP lost/recovery:** isolate or power off the AP; controller marks it lost within the documented window; restore connectivity/power; AP re-informs, returns connected, and WLAN client service recovers. | `NOT RUN` | `________________` |
 | F1 | **Controller-side deletion:** delete the adopted AP/controller device record using the approved procedure; record resulting AP state and confirm the expected re-adoption path without claiming success unless completed. | `PROVEN` | §2026-09-18 F-row live round — deletion 07:25:55Z; decrypt-failure informs at escalated cadence; pending sourced from discovery announces; re-adoption completed under F2; §2026-09-18 verify round — re-proven under the fixed engine 11:14:39Z |
-| F2 | **Factory reset, deletion, and re-adoption:** after approved backup, factory-reset the AP, verify it returns to factory state, remove/clean its old controller record as required, adopt it again, and repeat the minimum WLAN association/DHCP check. | `BLOCKED` | §2026-09-18 F-row live round — backup/reset/factory verify/re-adopt all proven 07:27–07:34Z; final association/DHCP check NOT RUN: no test client at the bench (same environment condition as the C1-shape round); §2026-09-18 verify round — full chain re-proven automatically under the fixed engine 11:17–11:23Z (mint → provisioning → byte-exact settle, no store surgery); client-side sub-criterion unchanged |
+| F2 | **Factory reset, deletion, and re-adoption:** after approved backup, factory-reset the AP, verify it returns to factory state, remove/clean its old controller record as required, adopt it again, and repeat the minimum WLAN association/DHCP check. | `BLOCKED` | §2026-09-18 F-row live round — backup/reset/factory verify/re-adopt all proven 07:27–07:34Z; final association/DHCP check NOT RUN: no test client at the bench (same environment condition as the C1-shape round); §2026-09-18 verify round — full chain re-proven automatically under the fixed engine 11:17–11:23Z (mint → provisioning → byte-exact settle, no store surgery); client-side sub-criterion unchanged; §2026-09-19 full-chain round — armed `setdefault` on the retained key; demotion swept the per-device key and the whole `wlan_cfg_*` family; factory recovery via `set-inform`; inform-time adoption push from the demoted pending record (no admin adopt call); settle on the FIRST provisioning attempt; boot-guard (`mgmt.is_default=false`), fresh rotated key, and byte-exact `3da7ce3e…` re-proven on the factory-recovered device; client-side sub-criterion still not run |
 
 ### Bridge-apply verdict (2026-09-17 night pass — offline plugin forensics; no live run)
 
@@ -700,8 +700,13 @@ verified ~07:07 CEST) — A2 flips to `PROVEN`:**
 Per-radio channel/txpower intent (admin-owned `Extra["radio_intent"]`,
 admin API `GET/PUT/DELETE /api/v1/devices/{mac}/radios[/{radio}]`,
 renderer overlay on `radio.<n>.channel`/`txpower`) is implemented,
-renderer- and trust-policy-tested offline. No live radio-intent push has
-happened. **Live-proof obligations before the first production
+renderer- and trust-policy-tested offline. Originally recorded with no
+live radio-intent push; **live-evidenced 2026-09-19 in the full-chain
+round below**: the gated channel-36 candidate applied byte-exact on the
+AP and the `{radio}` restart set survived live; obligations 1–2 closed,
+obligation 3 partially (echo-matches-intent observed live; the
+adversarial old-echo render precedence remains offline-covered).
+**Live-proof obligations before the first production
 channel-intent push:**
 1. Run `TestZZSuccessivePushChannelIntentVsApplied` on the postmortem
    workstation main checkout (tmpwork/harness-20260917 present) and
@@ -717,6 +722,117 @@ channel-intent push:**
    (DFS) remain unrecovered from the jar — deliberately not implemented
    (PROTOCOL-systemcfg-wireless.md §3.2/§9). Do not mint either from a
    bench observation without a jar citation first.
+
+### 2026-09-19 full-chain round — EAP push, delivery-storm fix, §6.5 reboot, §6.6 factory reset (controller `1e4c14f4a226` → `95bfc84fe3b2b6a5`)
+
+**Scope:** the full approved destructive chain on bench AP-1
+(`aabbccddee02`, U7PG2, 6.8.2.15592), 07:16–08:40 UTC (09:16–10:40
+CEST): deploy + regression, LED off/default, blocked_sta block/unblock,
+radio-intent channel 36/clear (closing the radio-lane obligations
+above), wpa-eap push + revert (which live-found and fixed a
+delivery-retry defect), §6.5 armed reboot, §6.6 armed factory reset +
+re-adoption. Pre-round backups: remote
+`data/devices.json.bak-20260919T071637Z` +
+`data/wireless.json.bak-20260919T071637Z`; local preround copies
+(devices sha256 `688b28b6…`, wireless `5620a15d…`).
+
+**Deploy + regression:** binary `1e4c14f4a226` (rollback
+`openunifi.rollback-20260919T071704Z`); post-swap retained-key GCM
+noops with cfg echo `59d7b3e1…` steady — the swap invisible to the
+device.
+
+**LED (off/default):** mint `75af095d…` → full provisioning carrying
+the byte-identical baseline system_cfg (`3da7ce3e…`); AP-side
+`/etc/persistent/cfg/mgmt` gained `mgmt.led_enabled=false` with
+`mgmt.cfgversion=75af095d…` and `mgmt.is_default=false`; default
+revert mint `ed8e3890…`, `mgmt.led_enabled=true`. Both settled.
+
+**blocked_sta (§4 writer, §6.2(d) delivery):** block POST → inform-time
+content drift (no admin-time mint) → setparam → mint `61b46516…` →
+settle; the device persisted the wire string verbatim
+(`/etc/persistent/cfg/blocked_sta`, 17 bytes, the test MAC). Idempotent
+re-block: no drift. Unblock DELETE → drift → mint `9e461fa3…` →
+settle; DELETE of an absent MAC → 404. **FW quirk recorded:** fw 6.8.2
+does NOT clear `/etc/persistent/cfg/blocked_sta` when pushed the empty
+set — the stale MAC stays in the file after unblock; the
+controller-side set remains the source of truth (the classic
+controller's empty push hits the same firmware behavior).
+
+**Radio intent:** PUT wifi1 channel 36 → mint `6284f648…` → AP
+`/tmp/system.cfg` == gated candidate sha256
+`278882152b6f0ea8…becfea` byte-exact (`radio.2.channel=36`, ath1 Master
+at 5.18 GHz — the `{radio}` restart set survived live); DELETE → mint
+`3d5487c3…` → baseline restored (`3da7ce3e…`, `radio.2.channel=0`, ath1
+auto-picked ch157). Obligation 3 is evidenced live only in the
+echo-matches-intent direction (post-apply radio_table echoed 36; no
+revert churn between push and delete); the adversarial old-echo render
+precedence remains offline-covered.
+
+**wpa-eap push — delivery storm found (controller `1e4c14f4a226`):**
+the gated EAP envelope (inline RADIUS `10.10.10.10:1812`, test-only
+secret, `dynamic_vlan=0`) applied byte-exact — AP `/tmp/system.cfg` ==
+candidate `15e48396…`, `aaa.1/2.wpa.key.1.mgmt=WPA-EAP`, radius rows,
+`wireless.1.authmode=1` unchanged — but the delivery never settled: the
+device emitted ONLY sparse informs (741–745 B, no `vap_table`; 60+ in
+3.5 min, zero full) at its ~5 s post-apply quick cadence, and the
+engine re-minted the cfgversion on every drifted inform, which kept the
+pending gate's operatorMint escape permanently true: re-provisioning
+every ~5 s, `wlan_cfg_attempts` 37 with `WlanMaxAttempts` never
+engaging, the device echo chasing fresh mints (`in_sync` unreachable).
+Root cause: `engine.go`'s envelope-drift mint fired per INFORM for a
+still-PENDING envelope instead of once per content change; the
+exhausted-retry unit tests only ever modeled seeded sha==envelope
+states (unreachable via the real settle flow), so the storm was
+live-only.
+
+**Fix + live re-validation (controller `95bfc84fe3b2b6a5`):** the mint
+is now conditional on the drifted envelope differing from the pending
+sha — one mint per delivery operation; re-offers carry the stable
+version, `WlanRetryDue`'s bounded budget governs them, and an echoed
+offer reaches the equality branch's `noop-pending-wlan` instead of
+minting the equality away. Regression
+`TestEnvelopeDriftDeliveryIsBounded` models the exact live storm
+(settled record + admin envelope change + sparse-only informs) and
+asserts ≤ `WlanMaxAttempts` offers, one stable cfgversion across all
+offers, the exhausted cap holding, echo-catch noops, full-inform
+settle, and a fresh-envelope fresh mint. Re-push of the SAME EAP
+envelope live: 4 offers total, one cfgversion (`e7b1f8ee…`) on every
+offer, echo caught ≤ 10 s, `noop-pending-wlan` during backoff, settle
+**confirmed in 53 s** end-to-end; AP bytes `15e48396…` byte-exact.
+Revert to the wpa-p baseline: 2 offers, settle 32 s, AP bytes back to
+`3da7ce3e…`.
+
+**§6.5 armed reboot:** POST `/reboot` armed `pending_command: reboot`;
+the next inform answered `kind=reboot` (gcm, retained key); ~2:07 dark;
+post-boot retained-key noops with echo `d7e0342b…` unchanged, no mint,
+no not-running miss (the device came up RUN — the two-miss watchdog
+stayed idle), status confirmed. **Finding:** post-boot
+`/tmp/system.cfg` is the firmware's alphabetically sorted re-emission
+(sha `28ea7f9f…`); its row set is byte-identical to the pushed
+document (`3da7ce3e…`) — byte gates apply to pushed document order;
+post-boot AP-side evidence is the sorted re-emission.
+
+**§6.6 armed factory reset + re-adoption:** POST `/factory-reset` →
+`kind=setdefault` on the retained key → record demoted (state 1,
+cfg/applied cleared, per-device key swept, the whole `wlan_cfg_*`
+family wiped) → AP dark ~6 min in factory state. Recovery over the
+default-password SSH lane: `mca-cli-op set-inform` → factory inform
+(flags `0x0003`, reply gcm=false) → engine adoption push from the
+demoted pending record (prevState=1; inform-time — no admin adopt call
+needed) → re-keyed echo +3 s (gcm=true) → no-baseline self-heal mint →
+full provisioning (ours `8977bcd2…` vs adoption echo `980ddd95…`) →
+**settle on the first attempt** → steady connected noops. AP-side:
+`mgmt.is_default=false` (boot-guard fix holding on a factory-recovered
+device), fresh rotated per-device key (≠ pre-reset), `mgmt.cfgversion`
+== controller's, `mgmt.use_aes_gcm=true`, `/tmp/system.cfg` byte-exact
+`3da7ce3e…`, blocked_sta re-pushed empty (file absent).
+
+**Gates:** fixtures re-seeded from the post-round controller (devices:
+state 3, cfg `8977bcd2…`, rotated key; wireless: the wpa-p baseline);
+`live-applied-sys.txt` re-verified `3da7ce3e…` against the AP; all ZZ
+gates green (BlockedSta/RadioIntent/EAP/Intent PASS, Wpa SKIP by
+design); `go vet` + full `go test ./...` green including the new
+regression.
 
 ### Per-case capture minimum
 
