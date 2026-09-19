@@ -187,6 +187,147 @@ func TestGetDeleteUnknownMACErrors(t *testing.T) {
 	}
 }
 
+// ---- remote lifecycle arming (§6.5 reboot / §6.6 setdefault) -----------------
+
+// TestLifecycleArmingArmsOnlyTheFlag pins the arming contract: an armed
+// command changes ONLY the admin-owned flag — state, per-device key,
+// cfgversion and applied cfgversion are untouched (no §6.2 mint site
+// exists for either response), the record stays where it is, and the
+// second arm is idempotent (flag already true).
+func TestLifecycleArmingArmsOnlyTheFlag(t *testing.T) {
+	a, st, _ := testApp(t)
+	ctx := context.Background()
+
+	seeded := store.Device{
+		MAC: "f09fc2848f2a", State: store.StateAdopted, Model: "U7PG2",
+		XAuthkey: "0123456789abcdef", CfgVersion: "aaaabbbbccccdddd", AppliedCfg: "aaaabbbbccccdddd",
+	}
+	if err := st.Put(seeded); err != nil {
+		t.Fatal(err)
+	}
+
+	// Before arming: no pending command — the view's steady state.
+	if get, gerr := a.GetDevice(ctx, "f0:9f:c2:84:8f:2a"); gerr != nil || get.PendingCommand != "" {
+		t.Fatalf("pre-arm GET pending_command = %q (err=%v), want \"\"", get.PendingCommand, gerr)
+	}
+
+	dv, err := a.RebootDevice(ctx, "F0:9F:C2:84:8F:2A") // normalized on the way in
+	if err != nil {
+		t.Fatalf("reboot arm: %v", err)
+	}
+	if dv.MAC != "f0:9f:c2:84:8f:2a" || dv.State != store.StateAdopted {
+		t.Fatalf("reboot view: %+v", dv)
+	}
+	if dv.PendingCommand != "reboot" {
+		t.Fatalf("reboot-arm view pending_command = %q, want reboot", dv.PendingCommand)
+	}
+	if get, gerr := a.GetDevice(ctx, "f0:9f:c2:84:8f:2a"); gerr != nil || get.PendingCommand != "reboot" {
+		t.Fatalf("post-arm GET pending_command = %q (err=%v), want reboot", get.PendingCommand, gerr)
+	}
+	d, err := st.Get("f09fc2848f2a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !truthyFlag(d.Extra["reboot_on_connect"]) {
+		t.Fatalf("reboot flag not armed: %+v", d.Extra)
+	}
+	if d.State != store.StateAdopted || d.XAuthkey != seeded.XAuthkey ||
+		d.CfgVersion != seeded.CfgVersion || d.AppliedCfg != seeded.AppliedCfg {
+		t.Fatalf("arming mutated the record: %+v", d)
+	}
+
+	// re-arm is idempotent; the setdefault arm coexists until the engine
+	// fires (setdefault outranks reboot at emission).
+	if _, err := a.RebootDevice(ctx, "f0:9f:c2:84:8f:2a"); err != nil {
+		t.Fatalf("re-arm: %v", err)
+	}
+	dv, err = a.FactoryResetDevice(ctx, "f0:9f:c2:84:8f:2a")
+	if err != nil {
+		t.Fatalf("factory-reset arm: %v", err)
+	}
+	// Both flags armed: factory-reset wins the view exactly as it wins
+	// the engine's emission order.
+	if dv.PendingCommand != "factory-reset" {
+		t.Fatalf("both-armed view pending_command = %q, want factory-reset", dv.PendingCommand)
+	}
+	if get, gerr := a.GetDevice(ctx, "f0:9f:c2:84:8f:2a"); gerr != nil || get.PendingCommand != "factory-reset" {
+		t.Fatalf("both-armed GET pending_command = %q (err=%v), want factory-reset", get.PendingCommand, gerr)
+	}
+	d, err = st.Get("f09fc2848f2a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !truthyFlag(d.Extra["reboot_on_connect"]) || !truthyFlag(d.Extra["setdefault_armed"]) {
+		t.Fatalf("both flags must be armed: %+v", d.Extra)
+	}
+	if d.State != store.StateAdopted || d.XAuthkey != seeded.XAuthkey ||
+		d.CfgVersion != seeded.CfgVersion || d.AppliedCfg != seeded.AppliedCfg {
+		t.Fatalf("arming mutated the record: %+v", d)
+	}
+}
+
+// TestLifecycleArmingWorksOnNilExtra pins the nil-map arm path (a record
+// created without Extra): UpdateExisting allocates the map, the flag
+// lands, and nothing else changes.
+func TestLifecycleArmingWorksOnNilExtra(t *testing.T) {
+	a, st, _ := testApp(t)
+	if err := st.Put(store.Device{MAC: "a040a0aabbcc", State: store.StatePending}); err != nil {
+		t.Fatal(err)
+	}
+	dv, err := a.FactoryResetDevice(context.Background(), "a0:40:a0:aa:bb:cc")
+	if err != nil {
+		t.Fatalf("arm on nil Extra: %v", err)
+	}
+	// Factory-reset armed ALONE (no reboot flag on this record): the view
+	// must show it, so an operator can tell armed/pending from consumed.
+	if dv.PendingCommand != "factory-reset" {
+		t.Fatalf("nil-Extra arm view pending_command = %q, want factory-reset", dv.PendingCommand)
+	}
+	d, err := st.Get("a040a0aabbcc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !truthyFlag(d.Extra["setdefault_armed"]) {
+		t.Fatalf("flag not armed: %+v", d.Extra)
+	}
+	if d.State != store.StatePending {
+		t.Fatalf("arming changed state: %+v", d)
+	}
+}
+
+func TestLifecycleArmingUnknownMACIsWrappedNotFound(t *testing.T) {
+	a, _, _ := testApp(t)
+	ctx := context.Background()
+	if _, err := a.RebootDevice(ctx, "ff:ff:ff:ff:ff:ff"); !errors.Is(err, adminapi.ErrNotFound) {
+		t.Fatalf("reboot unknown: want adminapi.ErrNotFound wrapped, got %v", err)
+	}
+	if _, err := a.FactoryResetDevice(ctx, "ff:ff:ff:ff:ff:ff"); !errors.Is(err, adminapi.ErrNotFound) {
+		t.Fatalf("factory-reset unknown: want adminapi.ErrNotFound wrapped, got %v", err)
+	}
+	if _, err := a.RebootDevice(ctx, "not-a-mac"); !errors.Is(err, adminapi.ErrNotFound) {
+		t.Fatalf("reboot invalid mac: want adminapi.ErrNotFound wrapped, got %v", err)
+	}
+	if _, err := a.FactoryResetDevice(ctx, "not-a-mac"); !errors.Is(err, adminapi.ErrNotFound) {
+		t.Fatalf("factory-reset invalid mac: want adminapi.ErrNotFound wrapped, got %v", err)
+	}
+}
+
+// truthyFlag mirrors the adoption engine's truthy() for the JSON map
+// values an armed flag can carry (stored as bool true).
+func truthyFlag(v any) bool {
+	switch t := v.(type) {
+	case bool:
+		return t
+	case string:
+		return t != "" && t != "0" && t != "false"
+	case float64:
+		return t != 0
+	case nil:
+		return false
+	}
+	return v != nil
+}
+
 // ---- end-to-end wiring: real adapter behind the real adminapi handler ----
 
 // TestHTTPNotFoundThroughRealAdapter composes App (real Backend) with a real

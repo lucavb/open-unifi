@@ -24,6 +24,7 @@ import (
 
 	"github.com/lucavb/open-unifi/internal/adminapi"
 	"github.com/lucavb/open-unifi/internal/metrics"
+	"github.com/lucavb/open-unifi/internal/server/adoption"
 	"github.com/lucavb/open-unifi/internal/store"
 )
 
@@ -115,7 +116,42 @@ func (a *App) view(d store.Device) adminapi.DeviceView {
 		WLANDeliveryCount:  intExtra(d.Extra, "wlan_cfg_attempts"),
 		WLANLastAttempt:    int64Extra(d.Extra, "wlan_cfg_last_attempt"),
 		SiteID:             d.SiteID,
+		PendingCommand:     armedCommand(d.Extra),
 		Actions:            []string{"delete"},
+	}
+}
+
+// armedCommand reads the admin-armed remote-command flags (§6.5 reboot /
+// §6.6 setdefault) into the view's PendingCommand: "reboot" when the
+// reboot flag is armed, "factory-reset" when the setdefault arm is set,
+// "" when neither. Setdefault outranks reboot exactly like the engine's
+// emission precedence (armedLifecycle: a factory reset subsumes a pending
+// reboot).
+func armedCommand(m store.JSONMap) string {
+	if flagArmed(m, adoption.FlagSetdefaultArmed) {
+		return "factory-reset"
+	}
+	if flagArmed(m, adoption.FlagRebootOnConnect) {
+		return "reboot"
+	}
+	return ""
+}
+
+// flagArmed reports whether an armed flag holds a truthy value. It applies
+// the same acceptance as the adoption engine's truthy() (bool, or a
+// non-empty string other than "false"/"0", or a non-zero number), so the
+// view can never hide a command the engine would fire — the operator's
+// armed/pending signal stays consistent with the emission path.
+func flagArmed(m store.JSONMap, key string) bool {
+	switch v := m[key].(type) {
+	case bool:
+		return v
+	case string:
+		return v != "" && v != "false" && v != "0"
+	case float64:
+		return v != 0
+	default:
+		return v != nil
 	}
 }
 
@@ -393,6 +429,61 @@ func (a *App) AdoptPending(_ context.Context, mac string) (adminapi.DeviceView, 
 	}
 	a.lg.Debug("device promoted to pending", "mac", store.ColonMAC(mac))
 	return a.view(rec), nil
+}
+
+// ---- remote lifecycle commands (§6.5 reboot / §6.6 setdefault) -----------
+
+// RebootDevice arms the remote reboot: sets the admin-owned
+// reboot_on_connect flag (the jar-verbatim §6.5 record field name), so
+// the device's NEXT decoded inform answers
+// {"_type":"reboot","reboot_type":"soft"} and the flag is consumed. The
+// record's state, per-device key and cfgversion are untouched at arming
+// time — the §6.2 mint-site list has no reboot entry.
+func (a *App) RebootDevice(_ context.Context, mac string) (adminapi.DeviceView, error) {
+	return a.armLifecycle(mac, adoption.FlagRebootOnConnect)
+}
+
+// FactoryResetDevice arms the factory reset: sets the admin-owned
+// setdefault flag, so the device's NEXT decoded inform answers
+// {"_type":"setdefault"} and the record then returns to the
+// pending-candidate shape the existing default-key adoption path
+// re-adopts (the demotion happens at emission, not at arming).
+func (a *App) FactoryResetDevice(_ context.Context, mac string) (adminapi.DeviceView, error) {
+	return a.armLifecycle(mac, adoption.FlagSetdefaultArmed)
+}
+
+// armLifecycle is the shared arming path for the admin remote-lifecycle
+// commands: one admin-owned Extra flag set to true inside the store's
+// per-MAC RMW cycle (a concurrent inform for the same device cannot
+// interleave), everything else on the record untouched. The flag survives
+// controller restarts (it is a persisted record row) and, being
+// admin-owned, no inform body can introduce, forge or clear it — only
+// the adoption engine consumes it (one-shot, on the next inform).
+// Unknown MACs map to the wrapped ErrNotFound sentinel (HTTP 404).
+func (a *App) armLifecycle(mac, flag string) (adminapi.DeviceView, error) {
+	canon, cerr := store.CanonicalMAC(mac)
+	if cerr != nil {
+		return adminapi.DeviceView{}, fmt.Errorf("%w: %s (%v)", adminapi.ErrNotFound, mac, cerr)
+	}
+	if err := a.st.UpdateExisting(canon, func(d *store.Device) error {
+		if d.Extra == nil {
+			d.Extra = store.JSONMap{}
+		}
+		d.Extra[flag] = true
+		return nil
+	}); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return adminapi.DeviceView{}, unknownDevice(canon)
+		}
+		return adminapi.DeviceView{}, fmt.Errorf("device store: %w", err)
+	}
+	// Post-cycle read for the returned view: a detached deep copy, so the
+	// response cannot alias store internals even transiently.
+	d, err := a.st.Get(canon)
+	if err != nil {
+		return adminapi.DeviceView{}, fmt.Errorf("device store: %w", err)
+	}
+	return a.view(d), nil
 }
 
 // ---- wireless config file -------------------------------------------------

@@ -86,6 +86,10 @@ Grafana Alloy example wiring OTLP into Tempo and the controller log into Loki). 
 ```
 GET/POST      /api/v1/devices          list / register (adopt whitelist)
 GET/DELETE    /api/v1/devices/{mac}
+POST          /api/v1/devices/{mac}/reboot          arm remote reboot
+                                          (fires on the device's next inform)
+POST          /api/v1/devices/{mac}/factory-reset   arm remote factory reset
+                                          (fires on the device's next inform)
 GET           /api/v1/pending           unadopted devices heard so far
 POST          /api/v1/pending/{mac}/adopt
 GET/PUT       /api/v1/wireless          whole-doc WLAN config ({"wlans":[…]})

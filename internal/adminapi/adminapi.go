@@ -59,11 +59,18 @@ type DeviceView struct {
 	InSync *bool `json:"in_sync,omitempty"`
 	// WLAN delivery is controller-side bookkeeping. It is independent of
 	// cfgversion, which is not proof that the AP applied system_cfg.
-	WLANDeliveryStatus string   `json:"wlan_delivery_status,omitempty"`
-	WLANDeliveryCount  int      `json:"wlan_delivery_count,omitempty"`
-	WLANLastAttempt    int64    `json:"wlan_last_attempt,omitempty"`
-	SiteID             string   `json:"site_id,omitempty"`
-	Actions            []string `json:"actions,omitempty"`
+	WLANDeliveryStatus string `json:"wlan_delivery_status,omitempty"`
+	WLANDeliveryCount  int    `json:"wlan_delivery_count,omitempty"`
+	WLANLastAttempt    int64  `json:"wlan_last_attempt,omitempty"`
+	SiteID             string `json:"site_id,omitempty"`
+	// PendingCommand is the read-only armed remote-command state: "reboot"
+	// when the armed §6.5 reboot flag is set, "factory-reset" when the armed
+	// §6.6 setdefault flag is set (outranking reboot, matching the engine's
+	// emission precedence), "" (omitted) when no command is armed. The
+	// engine consumes the flag one-shot on the device's next inform; the
+	// value returning to "" is the operator's consumed/done signal.
+	PendingCommand string   `json:"pending_command,omitempty"`
+	Actions        []string `json:"actions,omitempty"`
 }
 
 // DevicePatch contains the mutable administrative device fields. Pointers
@@ -122,6 +129,20 @@ type Backend interface {
 	// adopt whitelist; the native PENDING state is what the device record
 	// holds until the inform handshake completes.
 	AdoptPending(ctx context.Context, mac string) (DeviceView, error)
+	// RebootDevice arms the remote reboot (docs/PROTOCOL-mgmt.md §6.5):
+	// the device's NEXT decoded inform answers
+	// {"_type":"reboot","reboot_type":"soft"} and the arming is consumed.
+	// Arming is idempotent and one-shot; it leaves the record's state,
+	// per-device key and cfgversion untouched (no §6.2 mint site exists
+	// for the reboot response). Unknown MACs are a wrapped ErrNotFound.
+	RebootDevice(ctx context.Context, mac string) (DeviceView, error)
+	// FactoryResetDevice arms the factory reset
+	// (docs/PROTOCOL-mgmt.md §6.6): the device's NEXT decoded inform
+	// answers {"_type":"setdefault"}, then the record returns to a
+	// pending-candidate shape — the device factory-resets, re-informs on
+	// the factory default key, and is re-adopted by the existing
+	// adoption flow. Like RebootDevice, arming changes only the flag.
+	FactoryResetDevice(ctx context.Context, mac string) (DeviceView, error)
 	// GetWireless returns the whole wireless config document.
 	GetWireless(ctx context.Context) WlansEnvelope
 	// PutWireless replaces the whole wireless config document.
@@ -138,14 +159,16 @@ const version = "0.1.0-dev"
 // ---- Low-cardinality metrics route labels ------------------------------
 
 const (
-	routeDevicesList  = "/api/v1/devices"
-	routeDeviceItem   = "/api/v1/devices/{mac}"
-	routePendingList  = "/api/v1/pending"
-	routePendingAdopt = "/api/v1/pending/{mac}/adopt"
-	routeWireless     = "/api/v1/wireless"
-	routeWhoAmI       = "/api/v1/whoami"
-	routeOther        = "/api/other"
-	apiPrefix         = "/api/"
+	routeDevicesList        = "/api/v1/devices"
+	routeDeviceItem         = "/api/v1/devices/{mac}"
+	routeDeviceReboot       = "/api/v1/devices/{mac}/reboot"
+	routeDeviceFactoryReset = "/api/v1/devices/{mac}/factory-reset"
+	routePendingList        = "/api/v1/pending"
+	routePendingAdopt       = "/api/v1/pending/{mac}/adopt"
+	routeWireless           = "/api/v1/wireless"
+	routeWhoAmI             = "/api/v1/whoami"
+	routeOther              = "/api/other"
+	apiPrefix               = "/api/"
 )
 
 // classifyRoute turns the ServeMux pattern into a bounded-cardinality
@@ -254,6 +277,35 @@ func New(cfg Config, be Backend) http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "mac": mac})
+	}))
+	// Remote lifecycle commands (§6.5/§6.6): both only ARM the record —
+	// the response the device sees rides its next inform, not this HTTP
+	// reply. The 200 body is the (unchanged) device view.
+	mux.HandleFunc("POST /api/v1/devices/{mac}/reboot", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+		mac, err := normalizeMAC(r.PathValue("mac"))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid mac: "+err.Error())
+			return
+		}
+		dv, err := be.RebootDevice(r.Context(), mac)
+		if err != nil {
+			handleBackendErr(w, lg, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, dv)
+	}))
+	mux.HandleFunc("POST /api/v1/devices/{mac}/factory-reset", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+		mac, err := normalizeMAC(r.PathValue("mac"))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid mac: "+err.Error())
+			return
+		}
+		dv, err := be.FactoryResetDevice(r.Context(), mac)
+		if err != nil {
+			handleBackendErr(w, lg, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, dv)
 	}))
 	mux.HandleFunc("GET /api/v1/pending", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, pendingEnvelope{be.ListPending(r.Context())})

@@ -25,11 +25,13 @@ type fakeBackend struct {
 	pending  []PendingView
 	wireless WlansEnvelope
 
-	lastPut WlansEnvelope
-	created []DeviceUpsert
-	adopted []string
-	deleted []string
-	byMAC   map[string]DeviceView
+	lastPut           WlansEnvelope
+	created           []DeviceUpsert
+	adopted           []string
+	deleted           []string
+	rebootArmed       []string
+	factoryResetArmed []string
+	byMAC             map[string]DeviceView
 }
 
 func newFakeBackend() *fakeBackend {
@@ -96,6 +98,22 @@ func (f *fakeBackend) DeleteDevice(_ context.Context, mac string) error {
 }
 
 func (f *fakeBackend) ListPending(context.Context) []PendingView { return f.pending }
+
+func (f *fakeBackend) RebootDevice(_ context.Context, mac string) (DeviceView, error) {
+	f.rebootArmed = append(f.rebootArmed, mac)
+	if dv, ok := f.byMAC[mac]; ok {
+		return dv, nil
+	}
+	return DeviceView{}, fmt.Errorf("%w: %s", ErrNotFound, mac)
+}
+
+func (f *fakeBackend) FactoryResetDevice(_ context.Context, mac string) (DeviceView, error) {
+	f.factoryResetArmed = append(f.factoryResetArmed, mac)
+	if dv, ok := f.byMAC[mac]; ok {
+		return dv, nil
+	}
+	return DeviceView{}, fmt.Errorf("%w: %s", ErrNotFound, mac)
+}
 
 func (f *fakeBackend) AdoptPending(_ context.Context, mac string) (DeviceView, error) {
 	f.adopted = append(f.adopted, mac)
@@ -168,6 +186,8 @@ func TestUnauthorizedPostWhenTokenSet(t *testing.T) {
 	}{
 		{"POST", "/api/v1/devices"},
 		{"DELETE", "/api/v1/devices/f0:9f:c2:84:8f:2a"},
+		{"POST", "/api/v1/devices/f0:9f:c2:84:8f:2a/reboot"},
+		{"POST", "/api/v1/devices/f0:9f:c2:84:8f:2a/factory-reset"},
 		{"POST", "/api/v1/pending/a0:40:a0:aa:bb:cc/adopt"},
 		{"PUT", "/api/v1/wireless"},
 		// GETs require the token too when auth is on:
@@ -358,6 +378,132 @@ func TestWrappedErrNotFoundMapsTo404(t *testing.T) {
 		if !strings.Contains(m["error"].(string), "device not found") {
 			t.Fatalf("%s: error text %q does not carry the sentinel message", tc.name, m["error"])
 		}
+	}
+}
+
+// TestLifecycleRoutes pins the §6.5/§6.6 admin arming surface: route in,
+// backend method called with the normalized MAC, 200 carries the backend
+// DeviceView, unknown MAC is the wrapped-404 shape, malformed MAC is 400,
+// and neither route is reachable under a foreign method (Go 1.22 mux: no
+// registered POST under GET falls through to 405).
+func TestLifecycleRoutes(t *testing.T) {
+	const known = "f0:9f:c2:84:8f:2a"
+	for _, tc := range []testCase{
+		{
+			name: "reboot arms via RebootDevice", method: "POST",
+			path: "/api/v1/devices/" + known + "/reboot", want: http.StatusOK,
+			checks: func(t *testing.T, be *fakeBackend, rec *httptest.ResponseRecorder) {
+				t.Helper()
+				if len(be.rebootArmed) != 1 || be.rebootArmed[0] != known {
+					t.Fatalf("RebootDevice calls: %v", be.rebootArmed)
+				}
+				if len(be.factoryResetArmed) != 0 {
+					t.Fatalf("factory reset armed by reboot route: %v", be.factoryResetArmed)
+				}
+				var dv DeviceView
+				if err := json.Unmarshal(rec.Body.Bytes(), &dv); err != nil || dv.Name != "office-ceiling" {
+					t.Fatalf("200 body should be the DeviceView: %+v err=%v", dv, err)
+				}
+			},
+		},
+		{
+			name: "reboot MAC is normalized (upper-case in, lower-case out)", method: "POST",
+			path: "/api/v1/devices/F0:9F:C2:84:8F:2A/reboot", want: http.StatusOK,
+			checks: func(t *testing.T, be *fakeBackend, _ *httptest.ResponseRecorder) {
+				t.Helper()
+				if len(be.rebootArmed) != 1 || be.rebootArmed[0] != known {
+					t.Fatalf("RebootDevice calls: %v", be.rebootArmed)
+				}
+			},
+		},
+		{
+			name: "factory-reset arms via FactoryResetDevice", method: "POST",
+			path: "/api/v1/devices/" + known + "/factory-reset", want: http.StatusOK,
+			checks: func(t *testing.T, be *fakeBackend, rec *httptest.ResponseRecorder) {
+				t.Helper()
+				if len(be.factoryResetArmed) != 1 || be.factoryResetArmed[0] != known {
+					t.Fatalf("FactoryResetDevice calls: %v", be.factoryResetArmed)
+				}
+				if len(be.rebootArmed) != 0 {
+					t.Fatalf("reboot armed by factory-reset route: %v", be.rebootArmed)
+				}
+				var dv DeviceView
+				if err := json.Unmarshal(rec.Body.Bytes(), &dv); err != nil || dv.Name != "office-ceiling" {
+					t.Fatalf("200 body should be the DeviceView: %+v err=%v", dv, err)
+				}
+			},
+		},
+		{
+			name: "reboot unknown MAC is 404", method: "POST",
+			path: "/api/v1/devices/aa:bb:cc:dd:ee:66/reboot", want: http.StatusNotFound,
+			checks: func(t *testing.T, be *fakeBackend, rec *httptest.ResponseRecorder) {
+				t.Helper()
+				if !strings.Contains(rec.Body.String(), "device not found") {
+					t.Fatalf("404 shape: %q", rec.Body.String())
+				}
+			},
+		},
+		{
+			name: "factory-reset unknown MAC is 404", method: "POST",
+			path: "/api/v1/devices/aa:bb:cc:dd:ee:66/factory-reset", want: http.StatusNotFound,
+			checks: func(t *testing.T, be *fakeBackend, rec *httptest.ResponseRecorder) {
+				t.Helper()
+				if !strings.Contains(rec.Body.String(), "device not found") {
+					t.Fatalf("404 shape: %q", rec.Body.String())
+				}
+			},
+		},
+		{
+			name: "reboot malformed MAC is 400", method: "POST",
+			path: "/api/v1/devices/not-a-mac/reboot", want: http.StatusBadRequest,
+			checks: func(t *testing.T, be *fakeBackend, rec *httptest.ResponseRecorder) {
+				t.Helper()
+				if !strings.Contains(rec.Body.String(), "invalid mac") {
+					t.Fatalf("400 shape: %q", rec.Body.String())
+				}
+				if len(be.rebootArmed) != 0 {
+					t.Fatalf("backend called with malformed MAC: %v", be.rebootArmed)
+				}
+			},
+		},
+		{
+			name: "factory-reset malformed MAC is 400", method: "POST",
+			path: "/api/v1/devices/not-a-mac/factory-reset", want: http.StatusBadRequest,
+			checks: func(t *testing.T, be *fakeBackend, rec *httptest.ResponseRecorder) {
+				t.Helper()
+				if !strings.Contains(rec.Body.String(), "invalid mac") {
+					t.Fatalf("400 shape: %q", rec.Body.String())
+				}
+				if len(be.factoryResetArmed) != 0 {
+					t.Fatalf("backend called with malformed MAC: %v", be.factoryResetArmed)
+				}
+			},
+		},
+		{
+			// Only POST is registered; the project's unmatched-route
+			// wrapper answers with the JSON 404 (Go 1.22 mux 405 never
+			// surfaces through it). Either way the backend must NOT run.
+			name: "GET reboot does not arm (only POST registered)", method: "GET",
+			path: "/api/v1/devices/" + known + "/reboot", want: http.StatusNotFound,
+			checks: func(t *testing.T, be *fakeBackend, _ *httptest.ResponseRecorder) {
+				t.Helper()
+				if len(be.rebootArmed) != 0 {
+					t.Fatalf("backend reached via GET: %v", be.rebootArmed)
+				}
+			},
+		},
+		{
+			name: "GET factory-reset does not arm (only POST registered)", method: "GET",
+			path: "/api/v1/devices/" + known + "/factory-reset", want: http.StatusNotFound,
+			checks: func(t *testing.T, be *fakeBackend, _ *httptest.ResponseRecorder) {
+				t.Helper()
+				if len(be.factoryResetArmed) != 0 {
+					t.Fatalf("backend reached via GET: %v", be.factoryResetArmed)
+				}
+			},
+		},
+	} {
+		run(t, tc)
 	}
 }
 
