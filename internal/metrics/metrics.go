@@ -44,6 +44,19 @@ var apiRequestsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Help: "Total admin API requests by status code and route pattern.",
 }, []string{"code", "path"})
 
+// clientSessionEvents counts client session transitions (connect /
+// disconnect) observed on the inform path: the session refresh computed
+// inside the inform RMW cycle derives them from decoded station data, and
+// the transport adapter bumps this counter AFTER the store cycle commits
+// (exactly-once per persisted transition — the same discipline as the
+// adopt counters). Labels: mac is the DEVICE's colon-hex MAC (per-client
+// identity is deliberately NOT a label — client cardinality is unbounded);
+// event is "connect" or "disconnect". Series are pruned by ForgetDevice.
+var clientSessionEvents = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "openunifi_client_session_events_total",
+	Help: "Client session connect/disconnect transitions observed on committed informs.",
+}, []string{"mac", "event"})
+
 // deviceState reports the current state of each tracked device as an integer
 // matching the store state enum (1=pending, 2=adopting, 3=adopted, 4=lost;
 // -1 = unknown). MACs are canonical lowercase colon-hex.
@@ -111,6 +124,7 @@ func init() {
 		adoptTotal,
 		adoptFailTotal,
 		apiRequestsTotal,
+		clientSessionEvents,
 		deviceState,
 		lastInformTimestamp,
 		uptimeSeconds,
@@ -144,6 +158,19 @@ func IncAdoptFail() { adoptFailTotal.Inc() }
 // low-cardinality constant — never a raw user-supplied path with MACs in it.
 func ObserveAPIRequest(code int, route string) {
 	apiRequestsTotal.WithLabelValues(strconv.Itoa(code), route).Inc()
+}
+
+// IncClientSessionEvents records client session transitions observed on a
+// committed inform: connects/disconnects are the event counts the session
+// refresh computed for this device (both 0 — e.g. a sparse heartbeat —
+// records nothing). mac is the device's colon-hex MAC.
+func IncClientSessionEvents(mac string, connects, disconnects int) {
+	if connects > 0 {
+		clientSessionEvents.WithLabelValues(mac, "connect").Add(float64(connects))
+	}
+	if disconnects > 0 {
+		clientSessionEvents.WithLabelValues(mac, "disconnect").Add(float64(disconnects))
+	}
 }
 
 // SetDeviceState records a device's lifecycle state. Pass -1 for unknown.
@@ -214,6 +241,7 @@ func ForgetDevice(mac string) {
 	staCount.DeleteLabelValues(mac)
 	userTxBytes.DeleteLabelValues(mac)
 	userRxBytes.DeleteLabelValues(mac)
+	clientSessionEvents.DeletePartialMatch(prometheus.Labels{"mac": mac})
 }
 
 // Handler returns the Prometheus HTTP handler (metrics endpoint).

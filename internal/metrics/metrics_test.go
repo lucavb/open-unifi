@@ -137,6 +137,38 @@ func TestUnknownValuesAreHonest(t *testing.T) {
 	}
 }
 
+// IncClientSessionEvents is the INFORM-path transition counter (bumped by
+// the transport hook after each committed store cycle); zero counts record
+// nothing — a sparse heartbeat must not touch the counter.
+func TestClientSessionEventsCounter(t *testing.T) {
+	const mac = "ce:ff:ee:00:00:99"
+	bC := testutil.ToFloat64(clientSessionEvents.WithLabelValues(mac, "connect"))
+	bD := testutil.ToFloat64(clientSessionEvents.WithLabelValues(mac, "disconnect"))
+
+	IncClientSessionEvents(mac, 2, 1)
+	if got := testutil.ToFloat64(clientSessionEvents.WithLabelValues(mac, "connect")); got != bC+2 {
+		t.Fatalf("connect events = %v, want %v", got, bC+2)
+	}
+	if got := testutil.ToFloat64(clientSessionEvents.WithLabelValues(mac, "disconnect")); got != bD+1 {
+		t.Fatalf("disconnect events = %v, want %v", got, bD+1)
+	}
+
+	// Zero counts (eventless/sparse cycles) record nothing.
+	IncClientSessionEvents(mac, 0, 0)
+	if got := testutil.ToFloat64(clientSessionEvents.WithLabelValues(mac, "connect")); got != bC+2 {
+		t.Fatalf("zero-count call must not touch the connect series: %v", got)
+	}
+	if got := testutil.ToFloat64(clientSessionEvents.WithLabelValues(mac, "disconnect")); got != bD+1 {
+		t.Fatalf("zero-count call must not touch the disconnect series: %v", got)
+	}
+
+	// Client identity is NOT a label: only the device's series move.
+	if got := seriesForMAC(t, "aa:bb:cc:dd:ee:ff", "openunifi_client_session_events_total"); got != 0 {
+		t.Fatalf("unexpected series for an unrelated MAC: %d", got)
+	}
+	ForgetDevice(mac) // clean up
+}
+
 // ForgetDevice must remove EVERY per-device series for the MAC — including
 // the (mac, model) pairs of deviceState — and leave other devices untouched.
 func TestForgetDevicePrunesAllSeries(t *testing.T) {
@@ -146,10 +178,12 @@ func TestForgetDevicePrunesAllSeries(t *testing.T) {
 	UpdateFromDevice(mac, "U7PG2", 3, 1700000001, 1, 2, 3, 4)
 	UpdateFromDevice(mac, "U6Lite", 3, 1700000001, 1, 2, 3, 4) // churned repair pair
 	UpdateFromDevice(other, "U7PG2", 1, 1700000002, 5, 6, 7, 8)
+	IncClientSessionEvents(mac, 1, 1)
 
-	// 2 (mac, model) pairs on deviceState + 5 single-label gauges = 7 series.
-	if got := seriesForMAC(t, mac, ""); got != 7 {
-		t.Fatalf("series for %s = %d, want 7", mac, got)
+	// 2 (mac, model) pairs on deviceState + 5 single-label gauges
+	// + 2 session-event series = 9 series.
+	if got := seriesForMAC(t, mac, ""); got != 9 {
+		t.Fatalf("series for %s = %d, want 9", mac, got)
 	}
 
 	ForgetDevice(mac)
