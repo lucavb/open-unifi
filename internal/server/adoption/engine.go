@@ -467,11 +467,27 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, d *store.Devi
 	if st.sha != "" {
 		if cur := wireless.WlanListHash(wls); cur != st.sha {
 			wlanDrift = true
-			nv, kerr := e.keyChars(16)
-			if kerr != nil {
-				return Outcome{}, kerr
+			// Mint ONLY for a genuinely NEW envelope. Live finding
+			// (2026-09-19 EAP round, WLAN-ACCEPTANCE 6.8.2.15592): a
+			// drifted-but-still-pending envelope re-minted on EVERY
+			// inform — 37 offers in 3.5 minutes against a device that
+			// only sent sparse informs (no vap_table, so settle could
+			// never confirm) — and each fresh mint kept operatorMint
+			// true in the pending gate below, so WlanRetryDue never
+			// bounded the re-offers and the device's echo could never
+			// land on ours. While cur == the pending hash the delivery
+			// operation is UNCHANGED: keep the offered cfgversion
+			// stable (assignedKeyFlow re-offers it verbatim), let the
+			// pending gate's bounded budget govern re-offers, and let
+			// an echoed offer reach the equality branch's
+			// noop-pending-wlan instead of minting the equality away.
+			if !st.pendingSHAPresent || st.pendingSHA != cur {
+				nv, kerr := e.keyChars(16)
+				if kerr != nil {
+					return Outcome{}, kerr
+				}
+				d.CfgVersion = nv
 			}
-			d.CfgVersion = nv
 			e.lg.Debug("inform: wireless envelope drift", "mac", d.MAC)
 		}
 	}

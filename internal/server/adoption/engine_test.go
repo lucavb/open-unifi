@@ -1368,3 +1368,145 @@ func TestOperatorMintEscapesExhaustedDeliveryGate(t *testing.T) {
 		t.Fatalf("LED re-offer missing led_enabled=false:\n%s", out.MgmtCfg)
 	}
 }
+
+// TestEnvelopeDriftDeliveryIsBounded reproduces the 2026-09-19 EAP live
+// storm (WLAN-ACCEPTANCE 6.8.2.15592, the wpa-eap push): a SETTLED record
+// whose envelope is admin-changed underneath it, against a device that
+// only ever sends SPARSE informs — no vap_table, so settle can never
+// confirm the delivery. The pre-fix engine re-minted the cfgversion on
+// EVERY drifted inform, which kept the pending gate's operatorMint
+// escape permanently true: WlanRetryDue never engaged and the re-offers
+// were unbounded (37 pushes in 3.5 live minutes), each carrying a fresh
+// version the device echo could never land on. The fixed contract, in
+// order: ONE mint for the genuinely new envelope; re-offers carry the
+// SAME version; the bounded budget caps them (exhausted at
+// WlanMaxAttempts); an echoed offer answers noop-pending-wlan without
+// re-offering; a later full inform settles the pending; and a NEW
+// envelope after settle mints fresh again.
+func TestEnvelopeDriftDeliveryIsBounded(t *testing.T) {
+	base := []wireless.Wlan{{Name: "gate-check", SSID: "openunifi-gate-check", Security: "wpa-p", Passphrase: "pw", VLAN: 1, Enabled: true}}
+	eap := []wireless.Wlan{{
+		Name: "gate-check", SSID: "openunifi-gate-check", Security: "wpa-eap", VLAN: 1, Enabled: true,
+		RadiusServers: []wireless.RadiusServer{{IP: "10.10.10.10", Port: 1812}}, RadiusSecret: "eap-secret",
+	}}
+	e := newTestEngine(t)
+	e.wireless = func() []wireless.Wlan { return base }
+	snap, err := json.Marshal(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const xkey = "11112222333344445555666677778888"
+	dev := store.Device{
+		MAC: engineMAC, State: store.StateAdopted,
+		CfgVersion: "aaaa", AppliedCfg: "aaaa",
+		XAuthkey: xkey, Authkeys: []string{xkey}, Model: "U7PG2",
+		Extra: store.JSONMap{
+			"wlan_cfg_sha":           wireless.WlanListHash(base),
+			"wlan_cfg_applied_wlans": string(snap),
+		},
+	}
+	inform := func(now int64) Outcome {
+		t.Helper()
+		out, derr := e.Decide(Request{Transport: TransportEncrypted, Device: dev, Body: engineBody(dev.AppliedCfg), UsedKey: xkey, Now: time.Unix(now, 0)})
+		if derr != nil {
+			t.Fatal(derr)
+		}
+		return out
+	}
+
+	// (a) Settled sanity: connected noop, no mint.
+	if out := inform(1000); out.Kind != KindNoop || out.SetCfgVersion {
+		t.Fatalf("settled inform = %+v, want connected noop without mint", out)
+	}
+
+	// (b) Admin WLAN save: the EAP envelope drifts a SETTLED record. The
+	// first drifted inform mints ONCE and offers full provisioning.
+	e.wireless = func() []wireless.Wlan { return eap }
+	out := inform(1005)
+	if out.Kind != KindSetparam || !out.FullProvision {
+		t.Fatalf("first drifted inform = %+v, want setparam full provisioning", out)
+	}
+	minted := out.CfgVersion
+	if minted == "" || minted == "aaaa" {
+		t.Fatalf("drift mint = %q, want a fresh cfgversion", minted)
+	}
+	applyDeltas(&dev, out)
+	if dev.CfgVersion != minted {
+		t.Fatalf("mint not persisted: record %q vs outcome %q", dev.CfgVersion, minted)
+	}
+	if attempts, _ := dev.Extra["wlan_cfg_attempts"].(int); attempts != 1 {
+		t.Fatalf("first offer attempts = %v, want 1", dev.Extra["wlan_cfg_attempts"])
+	}
+	if offered, _ := dev.Extra["wlan_cfg_offered_cfgversion"].(string); offered != minted {
+		t.Fatalf("offered-cfgversion = %q, want the minted %q", offered, minted)
+	}
+
+	// (c) The storm window at the live cadence — sparse informs every
+	// ~5s (the device's post-apply quick-inform loop), never a vap_table,
+	// the echo never catching up. Re-offers must stay on the SAME
+	// version, respect the backoff windows, and stop at the budget.
+	pushes := 1
+	for now := int64(1010); now <= 1235; now += 5 {
+		out = inform(now)
+		switch out.Kind {
+		case KindSetparam:
+			pushes++
+			if out.CfgVersion != minted {
+				t.Fatalf("re-offer @%d re-minted: %q, want the stable %q", now, out.CfgVersion, minted)
+			}
+		case KindNoopPendingWLAN:
+		default:
+			t.Fatalf("inform @%d = %+v, want re-offer or noop-pending-wlan", now, out)
+		}
+		applyDeltas(&dev, out)
+		if pushes > WlanMaxAttempts {
+			t.Fatalf("push storm: %d offers, want the budget of %d", pushes, WlanMaxAttempts)
+		}
+	}
+	if pushes != WlanMaxAttempts {
+		t.Fatalf("pushes = %d, want the full budget %d", pushes, WlanMaxAttempts)
+	}
+	if status, _ := dev.Extra["wlan_cfg_delivery_status"].(string); status != "exhausted" {
+		t.Fatalf("delivery status = %q, want exhausted at the cap", status)
+	}
+
+	// (d) Echo catch-up under exhaustion: the device applies the offered
+	// version. The gate must hold — noop-pending-wlan, not a re-offer,
+	// and no mint to push the echo off the equality branch.
+	dev.AppliedCfg = dev.CfgVersion
+	if out = inform(1240); out.Kind != KindNoopPendingWLAN {
+		t.Fatalf("echoed offer under exhaustion = %+v, want noop-pending-wlan", out)
+	}
+	applyDeltas(&dev, out)
+
+	// (e) Recovery: a full inform with RUN VAPs proves the pending
+	// envelope and settles — connected noop, confirmed, baseline moved.
+	dev.Extra["vap_table"] = []any{
+		map[string]any{"essid": "openunifi-gate-check", "state": "RUN", "radio_name": "wifi0", "name": "ath0"},
+		map[string]any{"essid": "openunifi-gate-check", "state": "RUN", "radio_name": "wifi1", "name": "ath1"},
+	}
+	if out = inform(1245); out.Kind != KindNoop {
+		t.Fatalf("settling full inform = %+v, want connected noop", out)
+	}
+	applyDeltas(&dev, out)
+	if status, _ := dev.Extra["wlan_cfg_delivery_status"].(string); status != "confirmed" {
+		t.Fatalf("delivery status after settle = %q, want confirmed", status)
+	}
+	if sha, _ := dev.Extra["wlan_cfg_sha"].(string); sha != wireless.WlanListHash(eap) {
+		t.Fatalf("settled baseline = %q, want the EAP envelope hash", sha)
+	}
+	if _, still := dev.Extra["wlan_cfg_pending_sha"]; still {
+		t.Fatal("settle did not clear the pending hash")
+	}
+
+	// (f) A NEW envelope after settle is a new delivery operation: fresh
+	// mint, fresh budget.
+	e.wireless = func() []wireless.Wlan { return base }
+	if out = inform(1250); out.Kind != KindSetparam || out.CfgVersion == minted {
+		t.Fatalf("post-settle new envelope = %+v (cfg %q), want a fresh-minted re-provision", out, out.CfgVersion)
+	}
+	applyDeltas(&dev, out)
+	if attempts, _ := dev.Extra["wlan_cfg_attempts"].(int); attempts != 1 {
+		t.Fatalf("new delivery attempts = %v, want a fresh budget of 1", dev.Extra["wlan_cfg_attempts"])
+	}
+}
