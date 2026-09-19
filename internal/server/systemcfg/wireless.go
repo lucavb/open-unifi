@@ -216,15 +216,27 @@ func (rd *render) emitAaaRows(b *strings.Builder, n int, v wireless.VapPlan, ope
 		line("id", v.ID)
 		// no wpa.* rows in the open branch (§4.2).
 	default:
-		if v.Wlan.Security == "wpa-eap" {
-			// Our admin API carries no RADIUS servers/profile yet; the real
-			// controller would append radius.auth.<i>.* rows from the
-			// RADIUS profile (int §791-840) right after the auth_cache row,
-			// before dynamic_vlan.
-			// TODO(wireless): radius rows once the API has RADIUS fields.
+		if v.Wlan.Security == "wpa-eap" && !wlanHasRadiusProfile(v.Wlan) {
+			// The jar's requireRadiusProfile() invalid-profile path still
+			// emits the vap (int §13492+ warn shape): a WPA-EAP vap with
+			// no resolvable RADIUS servers is DEAD on the device. The
+			// admin API now enforces a profile (adminapi.validateWlanEap),
+			// so this fires only for envelopes built outside it.
 			rd.alerts = append(rd.alerts, Alert{
 				Msg: "provisioning WPA-EAP wlan without RADIUS servers; " +
 					"emitting mgmt=WPA-EAP with auth_cache enabled, no radius.* rows",
+			})
+		} else if v.Wlan.Security == "wpa-eap" && v.Wlan.RadiusSecret == "" {
+			// Sibling out-of-API guard: usable servers are configured (auth
+			// rows emit below) but the profile-level secret is empty, so
+			// every row would carry `secret=` with an empty value — a vap
+			// that cannot authenticate against RADIUS. validateWlanEap
+			// rejects this shape at the admin API; the alert covers
+			// envelopes built outside it, exactly like the profile-less
+			// case above.
+			rd.alerts = append(rd.alerts, Alert{
+				Msg: "provisioning WPA-EAP wlan without a radius secret; " +
+					"emitting radius.auth rows with an empty secret= value",
 			})
 		}
 		line("status", "enabled") // only is_wds_uplink → disabled; we have none
@@ -262,9 +274,34 @@ func (rd *render) emitAaaRows(b *strings.Builder, n int, v wireless.VapPlan, ope
 		if v.Wlan.Security == "wpa-eap" {
 			// always "enabled" at WlanConf's auth_cache is(..., true) default
 			line("auth_cache", "enabled")
-			// vlan_wlan_mode disabled → dynamic_vlan=0 (default §8); the
-			// RADIUS-driven 1|2 variants need the missing RADIUS fields.
-			line("dynamic_vlan", "0")
+			// radius.auth.<i>.* rows (int §791-840): the inline RADIUS
+			// profile's auth servers, copied onto the wlanConf by the
+			// controller (copyAttrsIfPresent, int §1401-1405). Row index =
+			// ARRAY POSITION in radius_servers (slots 1..4): the jar never
+			// backfills an empty-IP slot and never emits a 5th server.
+			// The admin API rejects empty IPs and >4 entries, so both
+			// guards below are renderer defense mirroring the jar shape.
+			// Port 0 is the jar default 1812; the secret is the
+			// profile-level x_secret value, verbatim on every server row.
+			for idx, srv := range v.Wlan.RadiusServers {
+				if idx >= maxRadiusAuthSlots {
+					break
+				}
+				if srv.IP == "" {
+					continue // jar shape: empty ip ⇒ no rows for the slot
+				}
+				rp := fmt.Sprintf("radius.auth.%d.", idx+1)
+				line(rp+"ip", srv.IP)
+				if srv.Port == 0 {
+					line(rp+"port", "1812")
+				} else {
+					line(rp+"port", strconv.Itoa(srv.Port))
+				}
+				line(rp+"secret", v.Wlan.RadiusSecret)
+			}
+			// dynamic_vlan (int §613-624; vlan_wlan_mode knob): ""/disabled
+			// → 0, optional → 1, required → 2.
+			line("dynamic_vlan", dynamicVlanOf(v.Wlan.RadiusVLANMode))
 		}
 		line("wpa.1.pairwise", "CCMP") // wpa_enc auto → CCMP (§8)
 		line("pmf.cipher", "AES-128-CMAC")
@@ -273,6 +310,42 @@ func (rd *render) emitAaaRows(b *strings.Builder, n int, v wireless.VapPlan, ope
 	// §4.3/§613-624 common tail (macacl off, not hidden).
 	line("radius.macacl.status", "disabled")
 	line("hide_ssid", "false")
+}
+
+// maxRadiusAuthSlots is the system_cfg writer's fixed auth row count
+// (radius.auth.1..4, int §791-840); a 5th server has no slot to land in.
+const maxRadiusAuthSlots = 4
+
+// dynamicVlanOf maps the admin API's vlan_wlan_mode knob to the
+// dynamic_vlan row (int §613-624): ""/disabled → 0, optional → 1,
+// required → 2. Unknown values collapse to the conservative 0 — the admin
+// API rejects anything but the four accepted spellings, so the default is
+// renderer defense.
+func dynamicVlanOf(mode string) string {
+	switch mode {
+	case "optional":
+		return "1"
+	case "required":
+		return "2"
+	default:
+		return "0"
+	}
+}
+
+// wlanHasRadiusProfile reports whether the inline RADIUS profile yields at
+// least one emitted auth row — the emission-side equivalent of the jar's
+// requireRadiusProfile() gate: an EAP vap with zero resolvable servers is
+// dead on the device and is flagged with an Alert instead.
+func wlanHasRadiusProfile(w wireless.Wlan) bool {
+	for idx, srv := range w.RadiusServers {
+		if idx >= maxRadiusAuthSlots {
+			break
+		}
+		if srv.IP != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // aaaBridge resolves the bridge hosting this vap's athdev (doc §6/§555-561).

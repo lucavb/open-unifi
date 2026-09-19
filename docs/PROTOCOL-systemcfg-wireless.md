@@ -328,13 +328,17 @@ Open+WPA3 transitional adds the `wpa3.support/transition` writer call
 (`this.\u00d8\u00f40000.o00000(sb, wlanConf, "aaa."+n, legacyEnabled)` §589-591).
 No `wpa.*` lines in this branch.
 
-### 4.3 WPA-PSK branch (int §595-612)
+### 4.3 WPA branch: PSK + EAP (int §595-612)
 
-The WPA-EAP/RADIUS material below is retained as a forensic record of the
-classic controller's writer, not as an open-unifi capability. WPA-EAP/RADIUS
-is unsupported and explicitly out of scope for this release: the current
-control plane does not expose or emit it.
-Fixed block (§597, one `C.o00000` call with pairs → each pair becomes one row):
+WPA-EAP is a supported open-unifi security: the Wlan carries an inline
+RADIUS profile (admin API `radius_servers` = auth servers, `radius_secret`
+= the profile-level `x_secret`, `radius_vlan_mode` = `vlan_wlan_mode`),
+accepted ONLY with ≥1 auth server and a shared secret
+(adminapi.validateWlanEap — the jar's `requireRadiusProfile()` gate,
+int §13492+; a profile-less EAP row is rejected at the API, and a
+profile-less envelope built outside it still renders with a renderer
+Alert, mirroring the jar's invalid-profile warn path that ships a dead
+vap). Fixed block (§597, one `C.o00000` call with pairs → each pair becomes one row):
 ```
 aaa.<n>.br.devname=…        aaa.<n>.devname=ath<X>       aaa.<n>.driver=madwifi
 aaa.<n>.ssid=<name>         aaa.<n>.status=enabled        (only is_wds_uplink → "disabled")
@@ -369,21 +373,26 @@ WPA3/SAE variant adds: `wpa.key.1.mgmt=SAE`, `wpa3.support/transition` rows and
 per-PSK entries via `config/B/O0OO` (`sae.sync`, `sae.groups.<i>.group`,
 `sae.psk.<i>.psk/.mac/.vlan/.id`) — cited, not part of the MVP contract.
 
-**Historical classic-controller WPA-Enterprise (`wpaeap` / `osen`)** — int
-§775-789, RADIUS helper §791-840. This is not a supported open-unifi option:
+**WPA-Enterprise (`wpaeap` / `osen`)** — int §775-789, RADIUS helper
+§791-840. Emitted by open-unifi for `security=wpa-eap` (OSEN is not an
+admin-API option). Row status per line:
 ```
-aaa.<n>.wpa.key.1.mgmt=WPA-EAP               (OSEN → "OSEN")
-aaa.<n>.wpa.psk=<x_passphrase>               (same fallback "letmeinnow"!) + auth_cache=enabled|disabled
-aaa.<n>.radius.auth.<i>.ip/.port=1812/.secret=<x_secret>     i=1..4, skip empty ip (servers from wlanConf auth_servers, via radiusprofile copyAttrsIfPresent int §1401-1405)
-aaa.<n>.radius.acct.<i>.ip/.port=1813/.secret=<x_secret>     only if accounting_enabled
-aaa.<n>.radius.das.status=enabled/.das.port=<3800+n>/radius.dad.status=enabled   (radius_das_enabled + accounting)
-aaa.<n>.radius.dad.client.<i>.cidr=<ip>/32 + .secret=<x_secret>
-aaa.<n>.radius.das.client=<ip> / .das.secret=<x_secret>
-aaa.<n>.interim_update.status=enabled / .interval=<3600>     (interim_update_enabled)
-aaa.<n>.dynamic_vlan=0|1|2                    vlan_wlan_mode disabled/optional/required → 0/1/2 (default 0)
-aaa.<n>.radius_acct_send_keyid.status=enabled  (Uid IoT + psk-radius non-disabled)
-aaa.<n>.filter_id=UID_WIFI                    (Uid wifi + radius_filter_id_enabled + supportsRadiusFilter)
+aaa.<n>.wpa.key.1.mgmt=WPA-EAP               (OSEN → "OSEN"; not modelled) — EMITTED
+aaa.<n>.wpa.psk=<x_passphrase>               (same fallback "letmeinnow"; admin API passphrase is OPTIONAL on wpa-eap, ≥8 chars when set) + auth_cache=enabled — EMITTED (auth_cache literal "enabled", the is(..., true) default)
+aaa.<n>.radius.auth.<i>.ip/.port=1812/.secret=<x_secret>     EMITTED: i=1..4, row index = position in radius_servers, empty-ip slot skipped with NO backfill, entries past slot 4 never emit; port 0 → 1812; secret = radius_secret (profile-level x_secret) on every row (servers from wlanConf auth_servers, via radiusprofile copyAttrsIfPresent int §1401-1405)
+aaa.<n>.radius.acct.<i>.ip/.port=1813/.secret=<x_secret>     OMITTED (accounting_enabled not modelled — §12)
+aaa.<n>.radius.das.status=enabled/.das.port=<3800+n>/radius.dad.status=enabled   OMITTED (radius_das_enabled + accounting not modelled — §12)
+aaa.<n>.radius.dad.client.<i>.cidr=<ip>/32 + .secret=<x_secret>   OMITTED (§12)
+aaa.<n>.radius.das.client=<ip> / .das.secret=<x_secret>       OMITTED (§12)
+aaa.<n>.interim_update.status=enabled / .interval=<3600>     OMITTED (interim_update_enabled not modelled — §12)
+aaa.<n>.dynamic_vlan=0|1|2                    EMITTED: radius_vlan_mode ""/disabled→0, optional→1, required→2 (jar default 0)
+aaa.<n>.radius_acct_send_keyid.status=enabled  OMITTED (Uid IoT + psk-radius gates not modelled — §12)
+aaa.<n>.filter_id=UID_WIFI                    OMITTED (Uid wifi + radius_filter_id_enabled + supportsRadiusFilter gates not modelled — §12)
 ```
+Static VLAN wiring note: under `radius_vlan_mode` optional/required the
+vap KEEPS its static `vlan` wiring (§6 rows unchanged) — per-sta dynamic
+assignment is device-side RADIUS behavior; the controller-side DAS/DAD
+rows that complement it stay omitted (§12).
 Common tail for both wpa kinds (int §613-624), then:
 ```
 aaa.<n>.radius.macacl.status=enabled|disabled             (radius_mac_auth_enabled)
@@ -676,9 +685,12 @@ dhcpc.1.devname=<getMgmtDev() of the device>
 | `name` | `name` (same value used for `ssid`) | `wireless.<n>.name`/`ssid`, `aaa.<n>.ssid` |
 | `security=open` | `security=open` | NO `aaa.<n>.wpa.*`; `wireless.<n>.authmode=0`, `security=none`; `aaa.<n>.status` = enabled iff device `wifi_caps` bit `0x2000` (`supportOpenHostapd`, Device.java §1275 & §1247) — **device-record dependent; check per adopter** |
 | `security=wpa-p` | `security=wpapsk` (wpa_mode AUTO→3, wpa_enc AUTO→CCMP) | `aaa.<n>.wpa=3` (AUTO; jar truth — WPA1=1/WPA2=2/AUTO=3, WpaMode static-init `WpaMode.txt:197-211`), `.eapol_version=2`, `.wpa.key.1.mgmt=WPA-PSK`, `.wpa.psk=<passphrase>` (plaintext), `.wpa.1.pairwise=CCMP`, `.pmf.cipher=AES-128-CMAC`, `.wpa.group_rekey=3600`, `wireless.<n>.authmode=1`, `security=none` |
-| `security=wpa-eap` | — | **Unsupported/non-goal for this release.** WPA-EAP/RADIUS is not part of the open-unifi API or control-plane contract. The classic-controller mapping is retained only in §4.3 as forensic history. |
+| `security=wpa-eap` | `security=wpaeap` + a valid radiusprofile (requireRadiusProfile, int §13492+) | `.wpa.key.1.mgmt=WPA-EAP`, `.psk=<passphrase or the "letmeinnow" fallback — passphrase optional, ≥8 when set>`, `auth_cache=enabled`, `radius.auth.<i>.*` per `radius_servers` (i=1..4, port 0→1812, secret=`radius_secret`), `dynamic_vlan` per `radius_vlan_mode`, `wireless.<n>.authmode=1`, `security=none`. Without a profile the API rejects the row; the renderer flags an envelope built outside the API with a dead-vap Alert. acct/das/dad/interim_update/keyid/filter_id rows omitted (§12) |
+| `radius_servers` (wpa-eap only; 1..4 entries) | radiusprofile `auth_servers` (copied onto the wlanConf, int §1401-1405) | `aaa.<n>.radius.auth.<i>.ip` + `.port` (0→1812); row index = ARRAY POSITION (empty-ip slot skipped, no backfill, no 5th slot — the API rejects both, renderer defense mirrors the jar) |
+| `radius_secret` (wpa-eap only) | radiusprofile `x_secret` | `aaa.<n>.radius.auth.<i>.secret` verbatim on EVERY server row — never hashed/obfuscated (the radius writers follow the psk-writer rule) |
+| `radius_vlan_mode` (wpa-eap only) | `vlan_wlan_mode` (""/disabled/optional/required) | `aaa.<n>.dynamic_vlan` = 0/1/2; static `vlan` wiring (§6) unchanged under optional/required — per-sta assignment is device-side |
 | `passphrase` | `x_passphrase` (fallback literal `"letmeinnow"`) | `aaa.<n>.wpa.psk` verbatim — **never hashed/obfuscated on this writer** |
-| `vlan=<vid>` | `vlan` (or bound `networkconf_id`) | new `br0.<vid>`: `# vlan` row(s), `# bridge` row + `port.*.devname=ath…`, `# netconf` row, `aaa.<n>.br.devname=br0.<vid>`; guard `vid != 1` (else br-trunk). The historical EAP dynamic-VLAN/DAS/DAD behavior is not supported by the current control plane. |
+| `vlan=<vid>` | `vlan` (or bound `networkconf_id`) | new `br0.<vid>`: `# vlan` row(s), `# bridge` row + `port.*.devname=ath…`, `# netconf` row, `aaa.<n>.br.devname=br0.<vid>`; guard `vid != 1` (else br-trunk). Applies unchanged to wpa-eap WLANs — the `radius_vlan_mode` dynamic-VLAN row only labels the vap; per-sta assignment is device-side RADIUS behavior, and the controller-side DAS/DAD rows stay omitted (§12). |
 | `vlan` absent/0 | – | `aaa.<n>.br.devname=br0`; no `# vlan`/bridge additions; (device mgmt-network overridden → joins br-trunk, §6) |
 | `enabled=false` | `enabled` | **entire WLAN omitted** (F.super return null ⇒ no vap, no bridge membership, no dhcpc row) |
 | `enabled=true` | `enabled` | vap + all rows above with `wireless.<n>.status=enabled` (literal) |
@@ -924,6 +936,9 @@ String.txt:1851-1930, int.txt:16600-16630). Remaining accepted deviations:
 | hidden mesh/vwire/vport synthetic vaps | per-radio synth in the collector (int.txt:L12629, §2.1): `vport-<serial>` uplink vap when create_vport (⇒ `ath<N>`, `radio.<n>.mode=managed`); per-radio **mesh vap** when `supportVwire() && site connectivity enabled && radio vwire_enabled && supportMeshv3()` (⇒ `vwire<N>`, `usage=downlink`); `vwire-<serial>` peer vap only when the device `vwire_table` has rows for the band with non-empty `wds_peers` | never — planVaps emits vaps only for site WLANs (internal/wireless/plan.go:159-198); a radio with no WLAN emits no vap rows | deliberate — open-unifi has no mesh/wireless-uplink feature; our renders are byte-faithful to the real builder's vwire-disabled site shape (connectivity `enabled=false` ⇒ zero synthetics on the real path too). Consequence: WLAN-count changes alter the real builder's bridge ports just as they alter ours — see §2.1 and WLAN-ACCEPTANCE-6.8.2.15592.md §Bridge-apply verdict |
 | `mgmt.is_default` | never emitted (no mgmt writer in config_String/int; `is_default` exists only in device-state classes) | **removed 2026-09-19** — the pre-fix factory-echo block emitted `mgmt.is_default=true` | live-proven hazard: the fw 6.8.2 preinit boot guard (`/lib/preinit/99_21_ubnt_ubntconf` `do_ubntconf`) replaces the MTD-restored blob text with the factory template when it contains `mgmt.is_default=true` ⇒ every reboot of a provisioned AP factory-reset the WLAN text while mgmt/authkey survived via the tar part (WLAN-ACCEPTANCE A2; AP-FIRMWARE-APPLY-PATH.md §6.5). Absence is the real shape |
 | `mgmt.discovery.status`/`mgmt.flavor`/`dhcpd.*`/`httpd.status`/`ebtables.*` factory-echo rows | never emitted | echoed verbatim from the factory baseline (2026-09-16 zero-parsed-diff choice) | deleting unmanaged rows on full-config replacement had unknown plugin effects; the rows are inert at boot (the preinit guard consumes only `mgmt.is_default`); kept deliberately — see render.go |
+| `aaa.<n>.radius.acct.<i>.ip/.port/.secret` rows | emitted per radiusprofile accounting server (port 1813) when `accounting_enabled` | omitted (2026-09-19 radius lane) | open-unifi's inline RADIUS profile models auth servers only; accounting rows would reference servers the admin API cannot configure. Add together with an accounting feature |
+| `aaa.<n>.radius.das.*`/`radius.dad.*`/`interim_update.*` rows | gated on `radius_das_enabled` (+ accounting) and `interim_update_enabled` | omitted (2026-09-19 radius lane) | no DAS/DAD/interim knobs in the inline profile; the jar's own gates make them unreachable without accounting_enabled anyway |
+| `aaa.<n>.radius_acct_send_keyid.status`/`aaa.<n>.filter_id` | gated on Uid device classes (IoT/wifi) + `radius_filter_id_enabled` + `supportsRadiusFilter` | omitted (2026-09-19 radius lane) | no Uid/IoT device classes in the model set; not reachable for U7PG2 |
 
 (End; see PROTOCOL-mgmt.md §3 for the surrounding `system_cfg` order and §6/§7 of
 PROTOCOL-mgmt.md for how system_cfg reaches the device.)

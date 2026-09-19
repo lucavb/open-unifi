@@ -67,6 +67,8 @@
   tr:last-child > td { border-bottom: none; }
   td input, td select { width: 100%; min-width: 90px; }
   td input.num { width: 90px; }
+  td.radius-cell { min-width: 170px; }
+  td.radius-cell input, td.radius-cell select { display: block; margin: 2px 0; }
   .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
   .badge {
     display: inline-block; padding: 2px 9px; border-radius: 999px;
@@ -142,12 +144,14 @@
     <p class="hint">
       Whole-document editor: <span class="mono">Save</span> PUTs all rows to
       <span class="mono">/api/v1/wireless</span>. Passphrase &ge; 8 chars unless security is
-      &ldquo;open&rdquo;; VLAN 1&ndash;4094.
+      &ldquo;open&rdquo; (wpa-eap: optional, &ge; 8 when set); VLAN 1&ndash;4094. wpa-eap needs a
+      RADIUS profile: up to 4 auth servers (&ldquo;ip&rdquo; or &ldquo;ip:port&rdquo;), a shared secret,
+      and a dynamic-VLAN mode.
     </p>
     <table aria-label="Wireless networks">
-      <thead><tr><th>SSID</th><th>Name</th><th>Security</th><th>Passphrase</th><th>VLAN</th><th>On</th><th></th></tr></thead>
+      <thead><tr><th>SSID</th><th>Name</th><th>Security</th><th>Passphrase</th><th>VLAN</th><th>RADIUS</th><th>On</th><th></th></tr></thead>
       <tbody id="wlRows"></tbody>
-      <tfoot><tr><td colspan="7"><button type="button" class="btn-ghost btn-small" id="wlAddRow">+ Row</button>&nbsp; <button type="button" class="btn btn-small" id="wlSave">Save</button></td></tr></tfoot>
+      <tfoot><tr><td colspan="8"><button type="button" class="btn-ghost btn-small" id="wlAddRow">+ Row</button>&nbsp; <button type="button" class="btn btn-small" id="wlSave">Save</button></td></tr></tfoot>
     </table>
     <span class="pill" id="wlError" hidden></span>
   </section>
@@ -301,17 +305,75 @@
     });
   }
 
+  // radiusServersText renders the inline RADIUS profile's auth servers back
+  // into the console's compact text form ("ip" or "ip:port", comma-
+  // separated). A host that itself contains colons (an IPv6 literal) is
+  // bracketed when it carries an explicit port — the same "[host]:port"
+  // form parseRadiusServers reads — so a saved IPv6 server with a port
+  // round-trips instead of collapsing into an ambiguous bare host.
+  function radiusServersText(w) {
+    return (w.radius_servers || []).map(function (s) {
+      if (!s.port) { return s.ip; }
+      return s.ip.indexOf(":") === -1 ? s.ip + ":" + s.port : "[" + s.ip + "]:" + s.port;
+    }).join(", ");
+  }
+
+  // parseRadiusServers is the inverse: "host:port" applies only to a
+  // SINGLE-colon token with an all-digit tail (an IPv6 literal like fd00::5
+  // keeps its colons and parses whole), "[host]:port" (and bare "[host]")
+  // brackets an IPv6 literal that carries an explicit port; anything else
+  // is a bare host with the 1812 default port.
+  function parseRadiusServers(text) {
+    return text.split(",").map(function (part) {
+      part = part.trim();
+      if (!part) { return null; }
+      if (part.charAt(0) === "[") {
+        var close = part.indexOf("]");
+        if (close > 1) {
+          var tail = part.slice(close + 1);
+          if (tail === "") { return { ip: part.slice(1, close), port: 0 }; }
+          if (tail.charAt(0) === ":" && /^\d{1,5}$/.test(tail.slice(1))) {
+            return { ip: part.slice(1, close), port: parseInt(tail.slice(1), 10) };
+          }
+        }
+      }
+      var cut = part.lastIndexOf(":");
+      if (cut > 0 && part.indexOf(":") === cut && /^\d{1,5}$/.test(part.slice(cut + 1))) {
+        return { ip: part.slice(0, cut), port: parseInt(part.slice(cut + 1), 10) };
+      }
+      return { ip: part, port: 0 };
+    }).filter(function (s) { return s && s.ip; });
+  }
+
+  // setRadiusInputsEnabled toggles the three profile inputs for one row.
+  // The column itself stays rendered (hiding the td would misalign the
+  // grid); disabled inputs mark it not-applicable for non-EAP rows.
+  function setRadiusInputsEnabled(tr, enabled) {
+    ["radius_servers", "radius_secret", "radius_vlan_mode"].forEach(function (n) {
+      tr.querySelector("[name=" + n + "]").disabled = !enabled;
+    });
+  }
+
   function wlanRowInputs(w) {
-    var sec = w.security === "open" ? "open" : "wpa-p";
+    var sec = w.security === "open" || w.security === "wpa-eap" ? w.security : "wpa-p";
+    var eap = sec === "wpa-eap";
     return '<td><input name="ssid" value="' + esc(w.ssid || "") + '"></td>' +
       '<td><input name="name" value="' + esc(w.name || "") + '"></td>' +
       '<td><select name="security">' +
-      ["open", "wpa-p"].map(function (s) {
+      ["open", "wpa-p", "wpa-eap"].map(function (s) {
         return '<option value="' + s + '"' + (s === sec ? " selected" : "") + ">" + s + "</option>";
       }).join("") +
       "</select></td>" +
       '<td><input name="passphrase" type="password" value="' + esc(w.passphrase || "") + '"></td>' +
       '<td><input name="vlan" class="num" type="number" min="1" max="4094" value="' + esc(w.vlan || 1) + '"></td>' +
+      '<td class="radius-cell">' +
+      '<input name="radius_servers" placeholder="10.0.0.5:1812, 10.0.0.6" value="' + esc(radiusServersText(w)) + '"' + (eap ? "" : " disabled") + '>' +
+      '<input name="radius_secret" type="password" placeholder="shared secret" value="' + esc(w.radius_secret || "") + '"' + (eap ? "" : " disabled") + '>' +
+      '<select name="radius_vlan_mode"' + (eap ? "" : " disabled") + '>' +
+      ["", "disabled", "optional", "required"].map(function (m) {
+        return '<option value="' + m + '"' + (m === (w.radius_vlan_mode || "") ? " selected" : "") + ">" + (m === "" ? "dynamic vlan: off" : m) + "</option>";
+      }).join("") +
+      "</select></td>" +
       '<td><input name="enabled" type="checkbox"' + (w.enabled ? " checked" : "") + "></td>" +
       '<td class="actions-cell"><button type="button" class="btn-ghost btn-small" data-rm>&times;</button></td>';
   }
@@ -320,6 +382,9 @@
     var tr = document.createElement("tr");
     tr.innerHTML = wlanRowInputs(w || { security: "wpa-p", vlan: 1 });
     tr.querySelector("[data-rm]").addEventListener("click", function () { tr.remove(); });
+    tr.querySelector("[name=security]").addEventListener("change", function () {
+      setRadiusInputsEnabled(tr, this.value === "wpa-eap");
+    });
     document.getElementById("wlRows").appendChild(tr);
   }
 
@@ -331,11 +396,23 @@
   }
 
   function validateWlan(w) {
-    if (["open", "wpa-p"].indexOf(w.security) < 0) { return "bad security"; }
+    if (["open", "wpa-p", "wpa-eap"].indexOf(w.security) < 0) { return "bad security"; }
     if (!w.ssid || w.ssid.length > 32) { return "ssid must be 1..32 characters"; }
     if (w.vlan < 1 || w.vlan > 4094) { return "vlan must be 1..4094"; }
     if (w.security === "open") {
       if (w.passphrase) { return "passphrase must be empty when security is open"; }
+      return "";
+    }
+    if (w.security === "wpa-eap") {
+      if (!w.radius_servers || !w.radius_servers.length) { return "wpa-eap requires at least one RADIUS server (" + w.ssid + ")"; }
+      if (w.radius_servers.length > 4) { return "radius_servers supports at most 4 entries (" + w.ssid + ")"; }
+      for (var i = 0; i < w.radius_servers.length; i++) {
+        var srv = w.radius_servers[i];
+        if (!srv.ip) { return "radius_servers[" + i + "].ip must not be empty (" + w.ssid + ")"; }
+        if (srv.port && (srv.port < 1 || srv.port > 65535)) { return "radius_servers[" + i + "].port must be 1..65535 (" + w.ssid + ")"; }
+      }
+      if (!w.radius_secret) { return "wpa-eap requires a RADIUS shared secret (" + w.ssid + ")"; }
+      if (w.passphrase && w.passphrase.length < 8) { return "passphrase must be at least 8 characters (" + w.ssid + ")"; }
       return "";
     }
     if (w.passphrase.length < 8) { return "passphrase must be at least 8 characters (" + w.ssid + ")"; }
@@ -355,6 +432,11 @@
         vlan: parseInt(g("vlan").value, 10) || 0,
         enabled: g("enabled").checked
       };
+      if (w.security === "wpa-eap") {
+        w.radius_servers = parseRadiusServers(g("radius_servers").value);
+        w.radius_secret = g("radius_secret").value;
+        w.radius_vlan_mode = g("radius_vlan_mode").value;
+      }
       if (!err) {
         err = validateWlan(w);
         if (err) { err = "row " + (i + 1) + ": " + err; }

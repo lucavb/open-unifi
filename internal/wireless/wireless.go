@@ -20,4 +20,21 @@ type Wlan struct {
 	Enabled    bool   // false ⇒ ENTIRE WLAN omitted (doc §2)
 	ID         string // stable WlanConf._id; empty ⇒ sha256(nameSSID)[:24]
 	Band       string // 2g, 5g, both; empty is legacy both
+
+	// Inline RADIUS profile (wpa-eap only; the classic controller's
+	// radiusprofile auth_servers/x_secret copied onto the wlanConf via
+	// copyAttrsIfPresent, int §1401-1405). Zero on non-EAP WLANs; the
+	// admin API enforces that invariant.
+	RadiusServers  []RadiusServer // auth rows, 1..4 usable entries
+	RadiusSecret   string         // profile-level x_secret, one value for every auth row
+	RadiusVLANMode string         // vlan_wlan_mode: ""/"disabled"→dynamic_vlan=0, "optional"→1, "required"→2
+}
+
+// RadiusServer is one auth server of a WLAN's inline RADIUS profile. Port 0
+// means "unset" and renders as the jar's 1812 default (radius profile int
+// §791-840); an empty IP renders no rows (the jar skips empty ip entries —
+// the admin API rejects them, so that skip is renderer defense only).
+type RadiusServer struct {
+	IP   string // emitted verbatim into aaa.<n>.radius.auth.<i>.ip
+	Port int    // 0 ⇒ 1812 at emission
 }

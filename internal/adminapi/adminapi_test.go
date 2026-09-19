@@ -713,17 +713,81 @@ func TestWirelessValidation(t *testing.T) {
 	}
 }
 
-func TestWPAEAPRejected(t *testing.T) {
+func TestWPAEAPRadiusValidation(t *testing.T) {
 	// Bytecode rationale in validateWlan: the reference controller only
-	// emits functional EAP vaps with a valid radiusprofile; without RADIUS
-	// support we must never accept wpa-eap.
+	// emits functional EAP vaps with a valid radiusprofile
+	// (requireRadiusProfile, int §13492+). wpa-eap is now ACCEPTED with an
+	// inline RADIUS profile (radius_servers + radius_secret) and stays
+	// rejected without one.
 	h := New(Config{}, newFakeBackend())
+
+	// Without a profile: still rejected, new wording.
 	rec := putWireless(t, h, `{"wlans":[{"ssid":"corp","security":"wpa-eap","vlan":1}]}`)
 	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("wpa-eap: %d, want 400", rec.Code)
+		t.Fatalf("profile-less wpa-eap: %d, want 400", rec.Code)
 	}
-	if m := decodeJSON(t, rec); !strings.Contains(m["error"].(string), "wpa-eap requires RADIUS profiles, which open-unifi does not support") {
-		t.Fatalf("wpa-eap error text: %v", m["error"])
+	if m := decodeJSON(t, rec); !strings.Contains(m["error"].(string), "wpa-eap requires at least one RADIUS server") {
+		t.Fatalf("profile-less wpa-eap error text: %v", m["error"])
+	}
+
+	// With a minimal profile: accepted.
+	rec = putWireless(t, h, `{"wlans":[{"ssid":"corp","security":"wpa-eap","vlan":1,`+
+		`"radius_servers":[{"ip":"10.1.0.5"}],"radius_secret":"s3cr3t!"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("wpa-eap with profile: %d %q, want 200", rec.Code, rec.Body.String())
+	}
+
+	// Profile shape failures, each with its precise wording.
+	for _, tc := range []struct {
+		name, extra, wantErr string
+	}{
+		{"empty ip",
+			`"security":"wpa-eap","radius_servers":[{"ip":""}],"radius_secret":"s"`,
+			"radius_servers[0].ip must not be empty"},
+		{"five servers",
+			`"security":"wpa-eap","radius_servers":[` + strings.Repeat(`{"ip":"10.0.0.1"},`, 4) + `{"ip":"10.0.0.5"}],"radius_secret":"s"`,
+			"radius_servers supports at most 4 entries"},
+		{"port out of range",
+			`"security":"wpa-eap","radius_servers":[{"ip":"10.0.0.1","port":65536}],"radius_secret":"s"`,
+			"radius_servers[0].port must be 1..65535"},
+		{"missing secret",
+			`"security":"wpa-eap","radius_servers":[{"ip":"10.1.0.5"}]`,
+			"wpa-eap requires a RADIUS shared secret"},
+		{"control char secret",
+			`"security":"wpa-eap","radius_servers":[{"ip":"10.1.0.5"}],"radius_secret":"s\nevil=1"`,
+			"radius_secret must not contain control characters"},
+		{"bad vlan mode",
+			`"security":"wpa-eap","radius_servers":[{"ip":"10.1.0.5"}],"radius_secret":"s","radius_vlan_mode":"sometimes"`,
+			"radius_vlan_mode must be one of disabled, optional, required"},
+		{"short passphrase",
+			`"security":"wpa-eap","radius_servers":[{"ip":"10.1.0.5"}],"radius_secret":"s","passphrase":"short"`,
+			"passphrase must be at least 8 characters"},
+		{"radius on wpa-p",
+			`"security":"wpa-p","passphrase":"correcthorse","radius_secret":"s"`,
+			"require security wpa-eap"},
+		{"radius on open",
+			`"security":"open","radius_servers":[{"ip":"10.1.0.5"}]`,
+			"require security wpa-eap"},
+	} {
+		rec := putWireless(t, h, `{"wlans":[{"ssid":"corp","name":"corp","vlan":1,`+tc.extra+`}]}`)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: %d %q, want 400", tc.name, rec.Code, rec.Body.String())
+		}
+		if m := decodeJSON(t, rec); !strings.Contains(m["error"].(string), tc.wantErr) {
+			t.Fatalf("%s: error %q, want it to contain %q", tc.name, m["error"], tc.wantErr)
+		}
+	}
+
+	// The full accepted shape round-trips through the 200 echo body,
+	// including the optional port and vlan mode.
+	rec = putWireless(t, h, `{"wlans":[{"ssid":"corp","security":"wpa-eap","vlan":1,`+
+		`"radius_servers":[{"ip":"10.1.0.5","port":1812},{"ip":"10.1.0.6"}],`+
+		`"radius_secret":"s3cr3t!","radius_vlan_mode":"required"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("full profile wpa-eap: %d %q, want 200", rec.Code, rec.Body.String())
+	}
+	if body := rec.Body.String(); !strings.Contains(body, `"radius_vlan_mode":"required"`) {
+		t.Fatalf("radius_vlan_mode missing from the echo: %s", body)
 	}
 }
 
@@ -1268,7 +1332,40 @@ func TestEmbeddedConsoleHasQuoteEscapingAndCSP(t *testing.T) {
 // ANY new field must be added to BOTH structs, the converter, AND
 // wlanListHash's map — or provisioning silently drops it. This reflect test
 // catches STRUCT drift (field name+type sets); converter/hash drift needs
-// review attention — its test lives with the server lane.
+// review attention — its test lives with the server lane. Nested mirror
+// types (adminapi.RadiusServer vs wireless.RadiusServer) compare by
+// STRUCTURAL shape, not nominal identity — the packages are deliberately
+// decoupled.
+
+// sameShape reports structural type identity: builtin kinds must match
+// exactly; slices/pointers recurse into their elements; struct types
+// (the two packages' mirrored RadiusServer) match when their field
+// compositions match.
+func sameShape(a, b reflect.Type) bool {
+	if a == b {
+		return true
+	}
+	if a.Kind() != b.Kind() {
+		return false
+	}
+	switch a.Kind() {
+	case reflect.Slice, reflect.Pointer, reflect.Array:
+		return sameShape(a.Elem(), b.Elem())
+	case reflect.Struct:
+		if a.NumField() != b.NumField() {
+			return false
+		}
+		for i := 0; i < a.NumField(); i++ {
+			af, bf := a.Field(i), b.Field(i)
+			if af.Name != bf.Name || !sameShape(af.Type, bf.Type) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
 
 func TestWlanStructParityWithServer(t *testing.T) {
 	a := reflect.TypeOf(Wlan{})
@@ -1288,7 +1385,7 @@ func TestWlanStructParityWithServer(t *testing.T) {
 		if !ok {
 			t.Fatalf("server.Wlan field %q missing in adminapi.Wlan — add to BOTH structs, the cmd/openunifi converter AND server's wlanListHash", sf.Name)
 		}
-		if at != sf.Type {
+		if !sameShape(at, sf.Type) {
 			t.Fatalf("field %q type drift: adminapi %v vs server %v", sf.Name, at, sf.Type)
 		}
 		delete(afields, sf.Name)

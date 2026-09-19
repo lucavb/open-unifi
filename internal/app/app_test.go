@@ -570,6 +570,33 @@ func TestNewWithMissingWirelessFileIsEmptyDefault(t *testing.T) {
 	}
 }
 
+// TestNewLoadsEapWirelessDocument: a wpa-eap WLAN with a valid inline
+// RADIUS profile passes the load-time ValidateWlan pass and serves intact.
+func TestNewLoadsEapWirelessDocument(t *testing.T) {
+	dir := t.TempDir()
+	wpath := filepath.Join(dir, "wireless.json")
+	body := `{"wlans":[{"name":"corp","ssid":"corp","security":"wpa-eap","vlan":10,"enabled":true,` +
+		`"radius_servers":[{"ip":"10.1.0.5"},{"ip":"10.1.0.6","port":18120}],"radius_secret":"s3cr3t!",` +
+		`"radius_vlan_mode":"required"}]}`
+	if err := os.WriteFile(wpath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := New(store.NewMemStore(), wpath, quietLogger())
+	if _, err := a.CurrentWireless(); err != nil {
+		t.Fatalf("valid EAP document must load, got %v", err)
+	}
+	env := a.GetWireless(context.Background())
+	if len(env.Wlans) != 1 || env.Wlans[0].Security != "wpa-eap" {
+		t.Fatalf("EAP wlan lost in load: %+v", env)
+	}
+	w := env.Wlans[0]
+	if w.RadiusSecret != "s3cr3t!" || w.RadiusVLANMode != "required" || len(w.RadiusServers) != 2 ||
+		w.RadiusServers[0].IP != "10.1.0.5" || w.RadiusServers[0].Port != 0 ||
+		w.RadiusServers[1].IP != "10.1.0.6" || w.RadiusServers[1].Port != 18120 {
+		t.Fatalf("inline RADIUS profile lost in load: %+v", w)
+	}
+}
+
 // The load path runs the SAME validation as PUT /api/v1/wireless
 // (adminapi.ValidateWlan): a document that only DECODES but violates the
 // rules must fail startup, and the error must name the offending wlan
@@ -578,9 +605,12 @@ func TestNewRejectsInvalidWirelessDocument(t *testing.T) {
 	for _, tc := range []struct {
 		name, body, wantText string
 	}{
-		{"wpa-eap without RADIUS support", `{"wlans":[{"name":"corp","ssid":"corp","security":"wpa-eap","vlan":1}]}`, "wpa-eap requires RADIUS profiles"},
+		{"wpa-eap without RADIUS support", `{"wlans":[{"name":"corp","ssid":"corp","security":"wpa-eap","vlan":1}]}`, "wpa-eap requires at least one RADIUS server"},
+		{"wpa-eap with empty server ip", `{"wlans":[{"name":"corp","ssid":"corp","security":"wpa-eap","vlan":1,"radius_servers":[{"ip":""}],"radius_secret":"s"}]}`, "radius_servers[0].ip must not be empty"},
+		{"wpa-eap without secret", `{"wlans":[{"name":"corp","ssid":"corp","security":"wpa-eap","vlan":1,"radius_servers":[{"ip":"10.1.0.5"}]}]}`, "wpa-eap requires a RADIUS shared secret"},
+		{"radius on wpa-p", `{"wlans":[{"ssid":"x","security":"wpa-p","passphrase":"longenough","vlan":1,"radius_secret":"s"}]}`, "require security wpa-eap"},
 		{"vlan out of range", `{"wlans":[{"ssid":"x","security":"wpa-p","passphrase":"longenough","vlan":5000}]}`, "vlan must be 1..4094"},
-		{"bad security enum", `{"wlans":[{"ssid":"x","security":"wpa2","passphrase":"longenough","vlan":1}]}`, "security must be one of open, wpa-p"},
+		{"bad security enum", `{"wlans":[{"ssid":"x","security":"wpa2","passphrase":"longenough","vlan":1}]}`, "security must be one of open, wpa-p, wpa-eap"},
 		{"control char ssid", `{"wlans":[{"ssid":"a\nb","security":"open","vlan":1}]}`, "control characters"},
 		{"name too long", `{"wlans":[{"name":"` + strings.Repeat("n", 65) + `","ssid":"x","security":"open","vlan":1}]}`, "name must be at most 64 characters"},
 	} {

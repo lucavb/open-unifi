@@ -126,11 +126,11 @@ func hexDigit(v byte) byte {
 
 // ---- wireless config validation -----------------------------------------
 
-// validSecurities is the allowed Security enum for a Wlan. wpa-eap is
-// deliberately ABSENT: see ValidateWlan.
+// validSecurities is the allowed Security enum for a Wlan.
 var validSecurities = map[string]bool{
-	"open":  true,
-	"wpa-p": true,
+	"open":    true,
+	"wpa-p":   true,
+	"wpa-eap": true,
 }
 
 // ValidateWlan is the exported form of validateWlan: the SAME server-side
@@ -196,23 +196,21 @@ func ValidateSiteID(id string) string {
 // time even if a client bypasses the console. Returns "" when valid, or a
 // short human message for the 400 body.
 //
-// Bytecode evidence for the wpa-eap rejection (decompiled ace.jar, ground
-// truth): com/ubnt/service/config/int only emits FUNCTIONAL EAP vaps when
+// WPA-EAP acceptance (decompiled ace.jar, ground truth): the reference
+// controller emits FUNCTIONAL EAP vaps only when
 // WlanConf.requireRadiusProfile() is backed by a valid radiusprofile_id
-// lookup (tmpwork/javap/com__ubnt__service__config__int.txt:13492+) — and
-// its invalid-profile warn path still emits the same non-functional config
-// we would have been emitting (no radius servers → dead vaps on devices).
-// open-unifi has no RADIUS support, so any wpa-eap we accept would ship a
-// dead vap configuration to hardware. Fail loud instead.
+// lookup (tmpwork/javap/com__ubnt__service__config__int.txt:13492+); its
+// invalid-profile warn path still emits a non-functional config (no radius
+// servers → dead vaps on devices). open-unifi now models the profile
+// inline on the Wlan (radius_servers/radius_secret, doc §4.3): wpa-eap is
+// accepted ONLY with a usable profile (≥1 auth server + shared secret),
+// which the renderer emits as the aaa.<n>.radius.auth.<i>.* rows.
 func validateWlan(wl *Wlan) string {
 	if wl.Band != "" && wl.Band != "2g" && wl.Band != "5g" && wl.Band != "both" {
 		return "band must be one of 2g, 5g, both"
 	}
-	if wl.Security == "wpa-eap" {
-		return "wpa-eap requires RADIUS profiles, which open-unifi does not support"
-	}
 	if !validSecurities[wl.Security] {
-		return "security must be one of open, wpa-p"
+		return "security must be one of open, wpa-p, wpa-eap"
 	}
 	if hasControlChar(wl.SSID) {
 		return "ssid must not contain control characters"
@@ -241,12 +239,72 @@ func validateWlan(wl *Wlan) string {
 		return "vlan must be 1..4094"
 	}
 	if wl.Security == "open" {
+		if wl.hasRadiusFields() {
+			return "radius_servers/radius_secret/radius_vlan_mode require security wpa-eap"
+		}
 		if wl.Passphrase != "" {
 			return "passphrase must be empty when security is open"
 		}
 		return ""
 	}
+	if wl.Security == "wpa-eap" {
+		return validateWlanEap(wl)
+	}
+	// wpa-p: radius fields are EAP-only; a non-EAP row carrying them is a
+	// client bug the renderer would silently drop — fail loud instead.
+	if wl.hasRadiusFields() {
+		return "radius_servers/radius_secret/radius_vlan_mode require security wpa-eap"
+	}
 	if len(wl.Passphrase) < 8 {
+		return "passphrase must be at least 8 characters when security is " + wl.Security
+	}
+	return ""
+}
+
+// hasRadiusFields reports whether any inline RADIUS profile field is set.
+func (wl *Wlan) hasRadiusFields() bool {
+	return len(wl.RadiusServers) > 0 || wl.RadiusSecret != "" || wl.RadiusVLANMode != ""
+}
+
+// validateWlanEap enforces the wpa-eap-only rules: a usable inline RADIUS
+// profile (the requireRadiusProfile gate) and the optional-passphrase
+// relaxation (the jar still emits wpa.psk on the EAP branch via the same
+// getWpaPreSharedKey() fallback, so an explicitly supplied passphrase keeps
+// the wpa-p >= 8 rule; an absent one falls back at emission).
+func validateWlanEap(wl *Wlan) string {
+	if len(wl.RadiusServers) == 0 {
+		return "wpa-eap requires at least one RADIUS server (radius_servers)"
+	}
+	if len(wl.RadiusServers) > 4 {
+		// The system_cfg writer has exactly four auth slots (radius.auth.1..4,
+		// int §791-840); a 5th server could never reach the device.
+		return "radius_servers supports at most 4 entries"
+	}
+	for i, srv := range wl.RadiusServers {
+		if srv.IP == "" {
+			return fmt.Sprintf("radius_servers[%d].ip must not be empty", i)
+		}
+		if hasControlChar(srv.IP) {
+			return fmt.Sprintf("radius_servers[%d].ip must not contain control characters", i)
+		}
+		if srv.Port < 0 || srv.Port > 65535 {
+			return fmt.Sprintf("radius_servers[%d].port must be 1..65535 (0 = the 1812 default)", i)
+		}
+	}
+	if wl.RadiusSecret == "" {
+		return "wpa-eap requires a RADIUS shared secret (radius_secret)"
+	}
+	if hasControlChar(wl.RadiusSecret) {
+		return "radius_secret must not contain control characters"
+	}
+	switch wl.RadiusVLANMode {
+	case "", "disabled", "optional", "required":
+		// "" and "disabled" are the same knob (vlan_wlan_mode jar default);
+		// both emit dynamic_vlan=0.
+	default:
+		return "radius_vlan_mode must be one of disabled, optional, required"
+	}
+	if wl.Passphrase != "" && len(wl.Passphrase) < 8 {
 		return "passphrase must be at least 8 characters when security is " + wl.Security
 	}
 	return ""

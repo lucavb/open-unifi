@@ -306,9 +306,10 @@ only `/` (web console) and `/healthz` stay open. Terraform provider uses this.
 Web UI (lane D): static page at `/`:
 - list of devices & pending adopters,
 - `Adopt` button → POST /pending/{mac}/adopt,
-- textarea/dropdowns for: SSID name, passphrase, security (open/wpa-p). WPA-EAP/
-  RADIUS is unsupported and a non-goal for this release; it is not part of the
-  open-unifi control-plane contract.
+- textarea/dropdowns for: SSID name, passphrase, security (open/wpa-p/
+  wpa-eap). wpa-eap needs an inline RADIUS profile (up to 4 auth servers
+  "ip"/"ip:port", shared secret, dynamic-VLAN mode); passphrase is
+  optional there (≥8 when set).
   VLAN id; save → PUT /api/v1/wireless (whole-document envelope, adminapi shape).
 
 Package `provider` (lane E, at provider/ dir + cmd/tfprovider):

@@ -104,6 +104,20 @@ type Wlan struct {
 	VLAN       int    `json:"vlan"`
 	Enabled    bool   `json:"enabled"`
 	Band       string `json:"band,omitempty"`
+	// Inline RADIUS profile, wpa-eap only (mirrors wireless.Wlan): auth
+	// servers (1..4), the shared secret, and the dynamic-VLAN mode. The
+	// admin API rejects radius fields on any other security.
+	RadiusServers  []RadiusServer `json:"radius_servers,omitempty"`
+	RadiusSecret   string         `json:"radius_secret,omitempty"`
+	RadiusVLANMode string         `json:"radius_vlan_mode,omitempty"`
+}
+
+// RadiusServer is one auth server of a WLAN's inline RADIUS profile
+// (mirrors wireless.RadiusServer): ip plus an optional port (0 = the
+// system_cfg 1812 default).
+type RadiusServer struct {
+	IP   string `json:"ip"`
+	Port int    `json:"port,omitempty"`
 }
 
 // WlansEnvelope is the whole-document wireless config. PUT replaces it

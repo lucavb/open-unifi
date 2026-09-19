@@ -27,6 +27,7 @@ import (
 	"github.com/lucavb/open-unifi/internal/server"
 	"github.com/lucavb/open-unifi/internal/store"
 	"github.com/lucavb/open-unifi/internal/telemetry"
+	"github.com/lucavb/open-unifi/internal/wireless"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
@@ -153,7 +154,7 @@ func run() error {
 		}
 		out := make([]server.Wlan, 0, len(env.Wlans))
 		for _, w := range env.Wlans {
-			out = append(out, server.Wlan{
+			wl := server.Wlan{
 				Name:       w.Name,
 				SSID:       w.SSID,
 				Security:   w.Security,
@@ -162,7 +163,16 @@ func run() error {
 				Enabled:    w.Enabled,
 				ID:         w.ID,
 				Band:       w.Band,
-			})
+				// Inline RADIUS profile (wpa-eap): the slice must be
+				// rebuilt, not aliased — env.Wlans belongs to App's
+				// cached envelope and out outlives this call.
+				RadiusSecret:   w.RadiusSecret,
+				RadiusVLANMode: w.RadiusVLANMode,
+			}
+			for _, s := range w.RadiusServers {
+				wl.RadiusServers = append(wl.RadiusServers, wireless.RadiusServer{IP: s.IP, Port: s.Port})
+			}
+			out = append(out, wl)
 		}
 		return out
 	}

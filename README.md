@@ -107,9 +107,14 @@ delivers the blocked list inside the same `setparam` that carries
 fresh `cfgversion` is minted and the AP confirms it by echoing the new
 version back.
 
-Wireless fields per WLAN: `name`, `ssid`, `security` (`open` | `wpa-p`),
-`passphrase` (≥8, required for `wpa-p`, rejected for `open`), `vlan` (1–4094),
-`enabled`. WPA-EAP/RADIUS is unsupported and a non-goal for this release.
+Wireless fields per WLAN: `name`, `ssid`, `security` (`open` | `wpa-p` |
+`wpa-eap`), `passphrase` (≥8, required for `wpa-p`, rejected for `open`,
+optional for `wpa-eap`), `vlan` (1–4094),
+`enabled`. `wpa-eap` requires an inline RADIUS profile:
+`radius_servers` (1–4 `{ip, port}` auth servers, port default 1812),
+`radius_secret` (shared secret, emitted verbatim), and
+`radius_vlan_mode` (`disabled`/`optional`/`required` → system_cfg
+`dynamic_vlan` 0/1/2). Radius fields on non-EAP WLANs are rejected.
 Control characters are rejected in all
 fields (they would inject `system_cfg` rows). Disabling a WLAN removes it
 from the pushed config entirely.
@@ -223,8 +228,13 @@ Still open (classic behavior vs open-unifi):
   classic replies when discoverable (`docs/PROTOCOL.md` §4); open-unifi is
   announce-only. Live note (2026-09-16): replies are not required for adoption
   — the U7PG2 adopted via set-inform with zero server-side UDP/10001 traffic.
-- WPA-EAP/RADIUS is unsupported and is a non-goal for this release; it is not
-  part of the open-unifi API or control-plane contract.
+- WPA-EAP/RADIUS (2026-09-19): supported via the admin API + web console
+  with an inline RADIUS profile per WLAN (auth servers, shared secret,
+  dynamic-VLAN mode); accounting (radius.acct), DAS/DAD, interim-update,
+  keyid and filter_id rows are omitted (docs/PROTOCOL-systemcfg-wireless.md
+  §12). The Terraform provider still pins security to open|wpa-p — radius
+  fields there are a follow-up. Live EAP association against a bench
+  RADIUS server is not yet proven (see acceptance docs).
 - No firmware upgrade / `upgrade` responses; no hotspot2/WPA3/SAE emission.
 - `system.analytics.status` is not emitted (see Limitations).
 - Real-device **protocol/control-plane evidence** was captured on 2026-09-16

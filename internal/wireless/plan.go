@@ -216,10 +216,19 @@ func UnknownBandRadios(d store.Device) int {
 // WlanListHash serializes the wireless envelope stably (sorted-key JSON per
 // item) and hashes it with sha256; the value is only compared against
 // itself, so any stable canonicalization works.
+//
+// The inline RADIUS profile fields join the hash ONLY when set: a WLAN with
+// no radius fields hashes byte-identically to the pre-radius format, so
+// existing stored baselines (Extra["wlan_cfg_sha"]) do not spuriously drift
+// across the upgrade. Server ports hash at their EFFECTIVE value (0 → the
+// 1812 emission default), so a stored 0 and a stored 1812 — which render
+// the same rows — also hash the same. The vlan mode hashes at its effective
+// spelling too: "" normalizes to "disabled" (both render dynamic_vlan=0),
+// so a spelling-only flip cannot mint a new hash.
 func WlanListHash(wls []Wlan) string {
 	m := make([]map[string]any, 0, len(wls))
 	for _, w := range wls {
-		m = append(m, map[string]any{
+		e := map[string]any{
 			"name":       w.Name,
 			"ssid":       w.SSID,
 			"security":   w.Security,
@@ -228,7 +237,29 @@ func WlanListHash(wls []Wlan) string {
 			"enabled":    w.Enabled,
 			"id":         w.ID,
 			"band":       w.Band,
-		})
+		}
+		if len(w.RadiusServers) > 0 || w.RadiusSecret != "" || w.RadiusVLANMode != "" {
+			e["radius_secret"] = w.RadiusSecret
+			// Effective spelling, like the port normalization below: the
+			// renderer maps "" and "disabled" to the same dynamic_vlan=0
+			// row, so hashing the mode verbatim let a ""↔"disabled" flip
+			// mint a spurious drift push over byte-identical system_cfg.
+			mode := w.RadiusVLANMode
+			if mode == "" {
+				mode = "disabled"
+			}
+			e["radius_vlan_mode"] = mode
+			servers := make([]map[string]any, 0, len(w.RadiusServers))
+			for _, s := range w.RadiusServers {
+				port := s.Port
+				if port == 0 {
+					port = 1812
+				}
+				servers = append(servers, map[string]any{"ip": s.IP, "port": port})
+			}
+			e["radius_servers"] = servers
+		}
+		m = append(m, e)
 	}
 	blob, err := json.Marshal(m) // map keys marshal in sorted order
 	if err != nil {
