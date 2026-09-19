@@ -92,6 +92,10 @@
   footer a { color: var(--accent); text-decoration: none; }
   footer a:hover { text-decoration: underline; }
   .empty { color: var(--muted); font-style: italic; padding: 10px 0; }
+  tr.clients-row > td { background: var(--bg); padding: 0 10px 12px; }
+  table.clients-table { font-size: 13px; }
+  table.clients-table th { font-size: 11px; }
+  table.clients-table td, table.clients-table th { padding: 5px 10px; }
   noscript p { color: #b45309; background: #fef3c7; padding: 10px 14px; border-radius: 8px; }
 </style>
 </head>
@@ -113,7 +117,7 @@
 
   <section class="card" id="devSection">
     <h2>Devices</h2>
-    <p class="hint">Polled every 5&nbsp;s. State: pending &rarr; adopting &rarr; adopted (green &ldquo;live&rdquo; badge) &rarr; lost.</p>
+    <p class="hint">Polled every 5&nbsp;s. State: pending &rarr; adopting &rarr; adopted (green &ldquo;live&rdquo; badge) &rarr; lost. &ldquo;Clients&rdquo; expands a device's client sessions (connected state and last seen, from full informs).</p>
     <table aria-label="Devices">
       <thead><tr><th>MAC</th><th>Name</th><th>Model</th><th>IP</th><th>State</th><th>Power</th><th></th></tr></thead>
       <tbody id="devRows"></tbody>
@@ -175,6 +179,13 @@
     3: ["adopted", "state-3"],
     4: ["lost", "state-4"]
   };
+
+  // Client-session expansion state: openClients maps the device MACs whose
+  // sub-row is expanded; lastDevices caches the last listing so a toggle
+  // can re-render without a refetch. renderDevices rebuilds the tbody on
+  // every 5 s poll and re-expands the open rows (updateOpenClients).
+  var openClients = {};
+  var lastDevices = [];
 
   var tokenInput = document.getElementById("token");
   var tokenBox = document.getElementById("tokenbox");
@@ -248,6 +259,7 @@
   }
 
   function renderDevices(devices) {
+    lastDevices = devices;
     var tbody = document.getElementById("devRows");
     if (!devices.length) {
       tbody.innerHTML = '<tr><td colspan="7" class="empty">no devices registered</td></tr>';
@@ -259,13 +271,17 @@
         ? '<span class="badge live">live</span>'
         : '<span class="sub">&ndash;</span>';
       rows.push(
-        "<tr><td class=\"mono\">" + esc(d.mac) + "</td>" +
+        '<tr data-devrow="' + esc(d.mac) + '">' +
+        '<td class="mono">' + esc(d.mac) + "</td>" +
         "<td>" + esc(d.name || "") + "</td>" +
         "<td>" + esc(d.model || "") + "</td>" +
-        "<td class=\"mono\">" + esc(d.ip || "") + "</td>" +
+        '<td class="mono">' + esc(d.ip || "") + "</td>" +
         "<td>" + badgeFor(d.state) + "</td>" +
         "<td>" + power + "</td>" +
-        '<td class="actions-cell"><button type="button" class="btn-ghost btn-small" data-del="' + esc(d.mac) + '">Forget</button></td></tr>'
+        '<td class="actions-cell">' +
+        '<button type="button" class="btn-ghost btn-small" data-clients="' + esc(d.mac) + '">' +
+        (openClients[d.mac] ? "Hide clients" : "Clients") + "</button>&nbsp; " +
+        '<button type="button" class="btn-ghost btn-small" data-del="' + esc(d.mac) + '">Forget</button></td></tr>'
       );
     });
     tbody.innerHTML = rows.join("");
@@ -276,6 +292,67 @@
           .then(refreshAll)
           .catch(function (e) { setError("devError", "forget failed: " + e.message); });
       });
+    });
+    tbody.querySelectorAll("button[data-clients]").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var mac = btn.getAttribute("data-clients");
+        if (openClients[mac]) { delete openClients[mac]; } else { openClients[mac] = true; }
+        renderDevices(lastDevices);
+      });
+    });
+    updateOpenClients();
+  }
+
+  // lastSeenText renders a unix-seconds timestamp as a local time of day
+  // (the console's own clock face); zero means never seen.
+  function lastSeenText(unix) {
+    return unix ? new Date(unix * 1000).toLocaleTimeString() : "\u2014";
+  }
+
+  // clientsSubRow builds the expansion row under a device: the client
+  // sessions with connected-state badges, reusing the console's badge
+  // vocabulary (live = connected, state-unknown = disconnected).
+  function clientsSubRow(clients) {
+    if (!clients.length) {
+      return '<tr class="clients-row"><td colspan="7"><div class="empty">no client sessions recorded</div></td></tr>';
+    }
+    var rows = ['<table class="clients-table"><thead><tr><th>Client</th><th>State</th><th>Last seen</th></tr></thead><tbody>'];
+    clients.forEach(function (c) {
+      var state = c.connected
+        ? '<span class="badge live">connected</span>'
+        : '<span class="badge state-unknown">disconnected</span>';
+      rows.push(
+        '<tr><td class="mono">' + esc(c.mac) + "</td>" +
+        "<td>" + state + "</td>" +
+        '<td class="mono">' + esc(lastSeenText(c.last_seen)) + "</td></tr>"
+      );
+    });
+    rows.push("</tbody></table>");
+    return '<tr class="clients-row"><td colspan="7">' + rows.join("") + "</td></tr>";
+  }
+
+  // updateOpenClients refreshes the expansion rows: every open device
+  // fetches its client sessions and re-inserts the sub-row after its
+  // table row (renderDevices rebuilds the tbody on every poll, so the
+  // sub-rows must be rebuilt with it). A failed fetch (e.g. the device
+  // was forgotten) closes the row and surfaces the error once instead
+  // of failing on every poll.
+  function updateOpenClients() {
+    Object.keys(openClients).forEach(function (mac) {
+      api("/api/v1/devices/" + encodeURIComponent(mac) + "/clients")
+        .then(getJSON)
+        .then(function (env) {
+          var tr = document.querySelector('#devRows tr[data-devrow="' + mac.replace(/["\\]/g, "\\$&") + '"]');
+          if (!tr) { return; }
+          var existing = tr.nextElementSibling;
+          if (existing && existing.classList.contains("clients-row")) { existing.remove(); }
+          tr.insertAdjacentHTML("afterend", clientsSubRow(env.clients || []));
+        })
+        .catch(function (e) {
+          delete openClients[mac];
+          setError("devError", "clients: " + e.message);
+          renderDevices(lastDevices);
+        });
     });
   }
 
