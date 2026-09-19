@@ -692,6 +692,9 @@ func (s *Server) applyOutcome(mac string, rec *store.Device, out adoption.Outcom
 	if out.SetCfgVersion {
 		rec.CfgVersion = out.CfgVersion
 	}
+	if out.SetAppliedCfg {
+		rec.AppliedCfg = out.AppliedCfg
+	}
 	if out.SetAuthkeys {
 		rec.Authkeys = out.Authkeys
 	}
@@ -725,6 +728,27 @@ func (s *Server) applyOutcome(mac string, rec *store.Device, out adoption.Outcom
 			"server_time_in_utc": nowMS(),
 			"mgmt_cfg":           out.MgmtCfg,
 		}
+	case adoption.KindReboot:
+		// §6.5 (voidsuper): `new Object("reboot")` +
+		// `put("reboot_type", "soft")` — the only reboot form the jar
+		// emits, from the reboot_on_connect flag. server_time_in_utc
+		// rides EVERY response (§5 servlet). encoding/json sorts map
+		// keys, so the wire bytes are exactly
+		// {"_type":"reboot","reboot_type":"soft","server_time_in_utc":"…"}.
+		return map[string]any{
+			"_type":              "reboot",
+			"reboot_type":        "soft",
+			"server_time_in_utc": nowMS(),
+		}
+	case adoption.KindSetdefault:
+		// §6.6 (voidsuper line 1018, device state 8): `return new
+		// Object("setdefault")` — a bare _type with NO payload keys
+		// (nothing else in the §6 catalog rides this shape);
+		// server_time_in_utc per §5, as on every response.
+		return map[string]any{
+			"_type":              "setdefault",
+			"server_time_in_utc": nowMS(),
+		}
 	default:
 		return map[string]any{
 			"_type":              "noop",
@@ -745,7 +769,12 @@ func (s *Server) applyOutcome(mac string, rec *store.Device, out adoption.Outcom
 //	               reselection forever);
 //	adminOwned   — never sourced from a device body: value comes from the
 //	               previous record if present, otherwise the key is DELETED
-//	               (the device can never introduce them).
+//	               (the device can never introduce them). The two
+//	               admin-armed lifecycle flags (reboot_on_connect,
+//	               setdefault_armed — §6.5/§6.6) live here: an armed
+//	               command survives every device inform until the
+//	               adoption engine fires it, and no inform body can
+//	               introduce, forge or clear an arming.
 //
 // extraPrevWins is built from the engine's single-source controller-owned
 // key list (adoption.ControllerOwnedKeys) plus the server-side ssh hash
@@ -755,7 +784,8 @@ var (
 	extraPrevWins     = append(append([]string{}, adoption.ControllerOwnedKeys...), "ssh_sha512passwd")
 	extraFillIfAbsent = []string{"radio_table", "wifi_caps", "fw_caps", "if_table", "ethernet_table", "uplink", "has_eth1"}
 	extraAdminOwned   = []string{"system_cfg_extra_lines", "mgmt_dev",
-		"anonymous_controller_id", "anonymous_site_id"}
+		"anonymous_controller_id", "anonymous_site_id",
+		adoption.FlagRebootOnConnect, adoption.FlagSetdefaultArmed}
 )
 
 // absorbInform copies interesting fields from the inform body into the record.

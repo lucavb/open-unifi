@@ -379,6 +379,33 @@ string11 = new Object("reboot");
 string11.put("reboot_type", "soft");                  // only from reboot_on_connect flag
 ```
 
+**open-unifi (2026-09-19 lifecycle lane).** Implemented. Arming rides the
+jar-verbatim record flag `reboot_on_connect`, set only by the admin route
+`POST /api/v1/devices/{mac}/reboot` (an admin-owned Extra row — no inform
+body can introduce, forge or clear it). The device's NEXT decoded inform
+answers exactly `{"_type":"reboot","reboot_type":"soft","server_time_in_utc":"<ms>"}`
+on both the CBC and GCM lanes, sealed in the request's own key, and the
+flag is consumed in the same decision (one-shot). No cfgversion is minted
+at arming or emission: the §6.2 mint-site list (§501, §676, §826,
+§1117/1122, §1269, §3068) has no reboot site. The post-reboot re-inform
+on the retained key re-enters the ordinary decisions (§6.1 noop /
+§6.2 d full provisioning), which is the flow the 2026-09-18 A2 live
+reboot round already proved on hardware.
+Unrecoverable from the decompile (live-proof obligations): the emission
+SITE of the reboot branch inside the dispatcher is not line-pinned (the
+byte shape is), so its ordering against the §11006+ default-key state
+gate and the drift machinery is our placement, chosen to keep the
+armed-command-outranks-everything contract; and whether the real
+controller persists the armed flag across controller restarts or re-sends
+it (e.g. from a DB with the row always present until a successful
+emission) is unproven. Closely related and equally unproven: the
+dropped-response case — the flag is consumed in the same decision that
+emits, so if the sealed response cannot be written (a sealing failure
+falls back to a plain-JSON noop; the socket can drop), the armed command
+is silently lost; whether the real controller re-sends an armed command
+until the device acks, or loses it the same way, is exactly the re-send
+question above.
+
 ### 6.6 `setdefault`
 Factory reset path (device state 8): `return new Object("setdefault");` (line 1018).
 Two-phase adoption (`o00000(string, device, x, …)` §902-924) stages:
@@ -387,6 +414,36 @@ Two-phase adoption (`o00000(string, device, x, …)` §902-924) stages:
 2. `o00000(...)` — mgmt refresh before upgrade: `new Object("setparam"){mgmt_cfg}`;
    if device ready: `o00000(device, fwState, ...)` → `upgrade {version,url,…}`.
 3. EOL path: `\u300000000(device)` — removes device from DB (no body write).
+
+**open-unifi (2026-09-19 lifecycle lane).** Implemented. DEVIATION from the
+jar's arming shape: the classic controller arms factory reset as device
+STATE 8, a controller-side enum member this store deliberately lacks
+(adding one would redesign the pending-candidate lifecycle this lane
+reuses), so arming rides the admin-owned Extra flag `setdefault_armed`,
+set only by `POST /api/v1/devices/{mac}/factory-reset`. The device's NEXT
+decoded inform answers exactly
+`{"_type":"setdefault","server_time_in_utc":"<ms>"}` (the bare §6.6 shape
+plus the §5 universal timestamp), and at emission the record returns to
+the pending-candidate shape: state → pending, per-device key dropped,
+cfgversion + applied cfgversion cleared, authkey history cleared, and the
+controller-owned WLAN bookkeeping (`wlan_cfg_sha` & co., §6.2's drift
+baseline) deleted — a stale baseline would let the re-adopted device
+settle into connected noops while running factory config. The factory-reset
+device re-informs on the factory default key and is re-adopted by the
+existing §8 rotation path (§6.2 a/c/f mgmt_cfg-only family) unchanged.
+No cfgversion is minted at arming or emission (no §6.2 setdefault site).
+Precedence mirrors the dispatcher's layout: the state-8 check (§1018)
+precedes every §6.2 setparam site (§1117+) and the §11006+ key gate, so an
+armed setdefault outranks a simultaneously armed reboot and fires even on
+a default-key inform.
+Unrecoverable from the decompile (live-proof obligations): whether the real
+controller clears `x_authkey` at emission or keeps state 8 until the
+re-inform (our demotion happens at emission, one decision earlier); the
+jar's post-setdefault record mutation beyond the response itself; the
+armed-flag retention semantics across controller restarts; and the §6.5
+dropped-response case — the flag is consumed in the emission decision, so
+a failed seal or a dropped socket silently loses the factory reset (same
+open questions as §6.5).
 
 ### 6.7 HTTP-status-only answers
 404 unknown MAC, 400 decrypt/parse/"Bad packet magic"/"Data version %d is not

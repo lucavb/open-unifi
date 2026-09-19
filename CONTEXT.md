@@ -95,7 +95,9 @@ dispatcher.
 
 **Inform codec**: the module that turns an inform body into a decoded
 inform and an outcome into response bytes — framing, crypto, and
-compression live behind it.
+compression live behind it. The JSON payload (noop, setparam, reboot,
+setdefault) is assembled by the transport adapter; the codec seals
+already-built bytes.
 _Avoid_: crypto layer (that names a byte-exactness scope, not the module),
 packet parser.
 
