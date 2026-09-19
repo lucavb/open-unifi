@@ -798,6 +798,24 @@ func (s *Server) applyOutcome(mac string, rec *store.Device, out adoption.Outcom
 			"_type":              "setdefault",
 			"server_time_in_utc": nowMS(),
 		}
+	case adoption.KindCmd:
+		// §6.3 (voidsuper o00000): `new Object("cmd")` +
+		// `object.mergeFrom((X)task)` — the stored task's Mongo fields
+		// become response keys VERBATIM. The engine stages the row as
+		// out.CmdTask (the exact admin-armed {"cmd","mac"} object), so
+		// seeding the response map from it reproduces mergeFrom field-for-
+		// field; _type is overwritten to "cmd" and server_time_in_utc
+		// rides every response (§5 servlet). encoding/json sorts map
+		// keys, so for cmd="restart" the wire bytes are exactly
+		// {"_type":"cmd","cmd":"restart","mac":"…","server_time_in_utc":"…"}.
+		m := map[string]any{
+			"_type":              "cmd",
+			"server_time_in_utc": nowMS(),
+		}
+		for k, v := range out.CmdTask {
+			m[k] = v
+		}
+		return m
 	default:
 		return map[string]any{
 			"_type":              "noop",
@@ -850,11 +868,16 @@ var (
 	// channel/txpower intent the admin API writes — admin-owned rows in
 	// the CONTEXT.md sense: the device can neither write nor introduce
 	// them, exactly like the other entries here.
+	// cmd_task (store.CmdTaskKey) is the §6.3 stored-task row: admin-owned
+	// like the two armed lifecycle flags — an armed task survives every
+	// device inform until the adoption engine fires it, and no inform
+	// body can introduce, forge, or clear the arming (prev-or-delete).
 	extraAdminOwned = []string{"system_cfg_extra_lines", "mgmt_dev",
 		"anonymous_controller_id", "anonymous_site_id",
 		adoption.FlagRebootOnConnect, adoption.FlagSetdefaultArmed,
 		"blocked_sta", "blocked_sta_sha",
-		"led_override", "disabled", wireless.RadioIntentExtraKey}
+		"led_override", "disabled", wireless.RadioIntentExtraKey,
+		store.CmdTaskKey}
 )
 
 // absorbInform copies interesting fields from the inform body into the record.
