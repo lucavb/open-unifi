@@ -231,6 +231,39 @@ func ValidateRadioName(name string) string {
 	return ""
 }
 
+// maxCmdRunes caps the §6.3 stored-task cmd string. The jar's real cmds
+// are short identifiers ("restart", "clear-all-dpi-counters", …); 64 runes
+// bounds the replayed response payload while leaving generous headroom.
+const maxCmdRunes = 64
+
+// ValidateCmdString enforces the cmd string of a §6.3 stored-task
+// enqueue (docs/PROTOCOL-mgmt.md §6.3): non-empty, at most 64 runes, no
+// control characters, and no leading/trailing whitespace. §6.3 is silent
+// on cmd validation (the classic UI only queued fixed cmd values, and the
+// passthrough replays the stored row verbatim), so this is the boundary
+// shape open-unifi chose: the shortest gate that keeps the replayed
+// payload well-formed. It deliberately does NOT whitelist cmd names —
+// the §6.3 built-in list is explicitly "implemented NOT as tasks", so no
+// task-queue membership can be cited, and an invented whitelist would be
+// drift. Rejected values 400 at the route; the stored value is replayed
+// EXACTLY as validated (no silent trimming). Returns "" when valid, else
+// a short human message for the 400 body.
+func ValidateCmdString(cmd string) string {
+	if cmd == "" {
+		return "cmd is required"
+	}
+	if len([]rune(cmd)) > maxCmdRunes {
+		return "cmd must be at most 64 characters"
+	}
+	if cmd != strings.TrimSpace(cmd) {
+		return "cmd must not begin or end with whitespace"
+	}
+	if hasControlChar(cmd) {
+		return "cmd must not contain control characters"
+	}
+	return ""
+}
+
 // validateWlan enforces server-side rules. The web console mirrors the
 // length/security rules client-side (see static/index.html validateWlan);
 // the control-character and ID-charset checks are deliberately

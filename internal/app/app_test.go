@@ -398,6 +398,137 @@ func TestLifecycleArmingUnknownMACIsWrappedNotFound(t *testing.T) {
 	}
 }
 
+// TestEnqueueCmdTaskArmsOnlyTheRow pins the §6.3 enqueue contract: the
+// stored-task row lands as the ONLY record change (state, per-device key,
+// cfgversion, applied cfgversion untouched — no §6.2 mint site exists for
+// the replay), the view's PendingCommand reports "cmd" exactly while the
+// task is armed, and a second enqueue REPLACES the armed task (at most
+// one; §6.3 silent on enqueue, chosen: overwrite).
+func TestEnqueueCmdTaskArmsOnlyTheRow(t *testing.T) {
+	a, st, _ := testApp(t)
+	ctx := context.Background()
+
+	seeded := store.Device{
+		MAC: "f09fc2848f2a", State: store.StateAdopted, Model: "U7PG2",
+		XAuthkey: "0123456789abcdef", CfgVersion: "aaaabbbbccccdddd", AppliedCfg: "aaaabbbbccccdddd",
+	}
+	if err := st.Put(seeded); err != nil {
+		t.Fatal(err)
+	}
+
+	// Before enqueue: no pending command.
+	if get, gerr := a.GetDevice(ctx, "f0:9f:c2:84:8f:2a"); gerr != nil || get.PendingCommand != "" {
+		t.Fatalf("pre-enqueue GET pending_command = %q (err=%v), want \"\"", get.PendingCommand, gerr)
+	}
+
+	dv, err := a.EnqueueDeviceCmd(ctx, "F0:9F:C2:84:8F:2A", "restart") // normalized on the way in
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if dv.PendingCommand != "cmd" {
+		t.Fatalf("enqueue view pending_command = %q, want cmd", dv.PendingCommand)
+	}
+	d, err := st.Get("f09fc2848f2a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := store.CmdTaskCmd(d); got != "restart" {
+		t.Fatalf("stored cmd = %q, want restart (row: %+v)", got, d.Extra[store.CmdTaskKey])
+	}
+	if row := store.ArmedCmdTask(d); row == nil || row["mac"] != "f09fc2848f2a" {
+		t.Fatalf("stored row mac = %+v, want the canonical identity", row)
+	}
+	if d.State != store.StateAdopted || d.XAuthkey != seeded.XAuthkey ||
+		d.CfgVersion != seeded.CfgVersion || d.AppliedCfg != seeded.AppliedCfg {
+		t.Fatalf("enqueue mutated the record: %+v", d)
+	}
+
+	// Second enqueue REPLACES the armed task; the queue holds one slot.
+	if _, err := a.EnqueueDeviceCmd(ctx, "f0:9f:c2:84:8f:2a", "spectrum-scan"); err != nil {
+		t.Fatalf("re-enqueue: %v", err)
+	}
+	d, err = st.Get("f09fc2848f2a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := store.CmdTaskCmd(d); got != "spectrum-scan" {
+		t.Fatalf("re-enqueue did not replace the task: cmd = %q", got)
+	}
+	if get, gerr := a.GetDevice(ctx, "f0:9f:c2:84:8f:2a"); gerr != nil || get.PendingCommand != "cmd" {
+		t.Fatalf("post-re-enqueue GET pending_command = %q (err=%v), want cmd", get.PendingCommand, gerr)
+	}
+}
+
+// TestEnqueueCmdTaskWorksOnNilExtra pins the nil-map enqueue path (a
+// record created without Extra): UpdateExisting allocates the map, the
+// row lands, nothing else changes.
+func TestEnqueueCmdTaskWorksOnNilExtra(t *testing.T) {
+	a, st, _ := testApp(t)
+	if err := st.Put(store.Device{MAC: "a040a0aabbcc", State: store.StatePending}); err != nil {
+		t.Fatal(err)
+	}
+	dv, err := a.EnqueueDeviceCmd(context.Background(), "a0:40:a0:aa:bb:cc", "restart")
+	if err != nil {
+		t.Fatalf("enqueue on nil Extra: %v", err)
+	}
+	if dv.PendingCommand != "cmd" {
+		t.Fatalf("nil-Extra enqueue view pending_command = %q, want cmd", dv.PendingCommand)
+	}
+	d, err := st.Get("a040a0aabbcc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := store.CmdTaskCmd(d); got != "restart" {
+		t.Fatalf("stored cmd = %q, want restart", got)
+	}
+	if d.State != store.StatePending {
+		t.Fatalf("enqueue changed state: %+v", d)
+	}
+}
+
+// TestEnqueueCmdTaskUnknownMACIsWrappedNotFound: the enqueue seam maps
+// unknown and unparseable MACs onto the wrapped ErrNotFound sentinel,
+// like the arming routes.
+func TestEnqueueCmdTaskUnknownMACIsWrappedNotFound(t *testing.T) {
+	a, _, _ := testApp(t)
+	ctx := context.Background()
+	if _, err := a.EnqueueDeviceCmd(ctx, "ff:ff:ff:ff:ff:ff", "restart"); !errors.Is(err, adminapi.ErrNotFound) {
+		t.Fatalf("enqueue unknown: want adminapi.ErrNotFound wrapped, got %v", err)
+	}
+	if _, err := a.EnqueueDeviceCmd(ctx, "not-a-mac", "restart"); !errors.Is(err, adminapi.ErrNotFound) {
+		t.Fatalf("enqueue invalid mac: want adminapi.ErrNotFound wrapped, got %v", err)
+	}
+}
+
+// TestEnqueueCmdTaskViewPrecedence: the view names the response _type the
+// engine will actually fire — factory-reset and reboot outrank the queued
+// task exactly like armedLifecycle's emission order.
+func TestEnqueueCmdTaskViewPrecedence(t *testing.T) {
+	a, _, _ := testApp(t)
+	ctx := context.Background()
+	if err := a.st.Put(store.Device{MAC: "f09fc2848f2a", State: store.StateAdopted}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.EnqueueDeviceCmd(ctx, "f0:9f:c2:84:8f:2a", "restart"); err != nil {
+		t.Fatal(err)
+	}
+	if get, gerr := a.GetDevice(ctx, "f0:9f:c2:84:8f:2a"); gerr != nil || get.PendingCommand != "cmd" {
+		t.Fatalf("task-only view pending_command = %q (err=%v), want cmd", get.PendingCommand, gerr)
+	}
+	if _, err := a.RebootDevice(ctx, "f0:9f:c2:84:8f:2a"); err != nil {
+		t.Fatal(err)
+	}
+	if get, gerr := a.GetDevice(ctx, "f0:9f:c2:84:8f:2a"); gerr != nil || get.PendingCommand != "reboot" {
+		t.Fatalf("reboot-outranks view pending_command = %q (err=%v), want reboot", get.PendingCommand, gerr)
+	}
+	if _, err := a.FactoryResetDevice(ctx, "f0:9f:c2:84:8f:2a"); err != nil {
+		t.Fatal(err)
+	}
+	if get, gerr := a.GetDevice(ctx, "f0:9f:c2:84:8f:2a"); gerr != nil || get.PendingCommand != "factory-reset" {
+		t.Fatalf("setdefault-outranks view pending_command = %q (err=%v), want factory-reset", get.PendingCommand, gerr)
+	}
+}
+
 // truthyFlag mirrors the adoption engine's truthy() for the JSON map
 // values an armed flag can carry (stored as bool true).
 func truthyFlag(v any) bool {

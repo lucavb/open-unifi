@@ -120,23 +120,28 @@ func (a *App) view(d store.Device) adminapi.DeviceView {
 		WLANLastAttempt:    int64Extra(d.Extra, "wlan_cfg_last_attempt"),
 		SiteID:             d.SiteID,
 		LEDOverride:        d.LEDOverride,
-		PendingCommand:     armedCommand(d.Extra),
+		PendingCommand:     armedCommand(d),
 		Actions:            []string{"delete"},
 	}
 }
 
-// armedCommand reads the admin-armed remote-command flags (§6.5 reboot /
-// §6.6 setdefault) into the view's PendingCommand: "reboot" when the
-// reboot flag is armed, "factory-reset" when the setdefault arm is set,
-// "" when neither. Setdefault outranks reboot exactly like the engine's
-// emission precedence (armedLifecycle: a factory reset subsumes a pending
-// reboot).
-func armedCommand(m store.JSONMap) string {
-	if flagArmed(m, adoption.FlagSetdefaultArmed) {
+// armedCommand reads the admin-armed remote-command rows (§6.5 reboot /
+// §6.6 setdefault / §6.3 stored cmd task) into the view's
+// PendingCommand: the value names the _type the device's NEXT inform
+// will carry. "reboot" when the reboot flag is armed, "factory-reset"
+// when the setdefault arm is set (outranking reboot), "cmd" when a
+// stored task is armed (last in the chain), "" when none. The order
+// mirrors the engine's armedLifecycle emission precedence exactly, so
+// the view can never name a response the engine would not fire.
+func armedCommand(d store.Device) string {
+	if flagArmed(d.Extra, adoption.FlagSetdefaultArmed) {
 		return "factory-reset"
 	}
-	if flagArmed(m, adoption.FlagRebootOnConnect) {
+	if flagArmed(d.Extra, adoption.FlagRebootOnConnect) {
 		return "reboot"
+	}
+	if store.ArmedCmdTask(d) != nil {
+		return "cmd"
 	}
 	return ""
 }
@@ -845,7 +850,7 @@ func (a *App) AdoptPending(_ context.Context, mac string) (adminapi.DeviceView, 
 	return a.view(rec), nil
 }
 
-// ---- remote lifecycle commands (§6.5 reboot / §6.6 setdefault) -----------
+// ---- remote lifecycle commands (§6.5 reboot / §6.6 setdefault / §6.3 cmd) --
 
 // RebootDevice arms the remote reboot: sets the admin-owned
 // reboot_on_connect flag (the jar-verbatim §6.5 record field name), so
@@ -864,6 +869,40 @@ func (a *App) RebootDevice(_ context.Context, mac string) (adminapi.DeviceView, 
 // re-adopts (the demotion happens at emission, not at arming).
 func (a *App) FactoryResetDevice(_ context.Context, mac string) (adminapi.DeviceView, error) {
 	return a.armLifecycle(mac, adoption.FlagSetdefaultArmed)
+}
+
+// EnqueueDeviceCmd stores a §6.3 cmd task for the device
+// (docs/PROTOCOL-mgmt.md §6.3): the record gains the admin-owned
+// stored-task row (store.ArmCmdTask — at most one armed task, second
+// enqueue REPLACES), and the device's NEXT decoded inform answers
+// {"_type":"cmd", <stored task fields verbatim>} with the arming consumed
+// one-shot by the adoption engine. Arming touches nothing else on the
+// record — no §6.2 mint site exists for the replay. The cmd string is
+// validated at the admin API boundary (ValidateCmdString) and stored
+// verbatim; this Backend seam trusts the admin lane exactly like the
+// blocked-client row helpers. Unknown MACs map to the wrapped ErrNotFound
+// sentinel (HTTP 404).
+func (a *App) EnqueueDeviceCmd(_ context.Context, mac, cmd string) (adminapi.DeviceView, error) {
+	canon, cerr := store.CanonicalMAC(mac)
+	if cerr != nil {
+		return adminapi.DeviceView{}, fmt.Errorf("%w: %s (%v)", adminapi.ErrNotFound, mac, cerr)
+	}
+	if err := a.st.UpdateExisting(canon, func(d *store.Device) error {
+		store.ArmCmdTask(d, cmd)
+		return nil
+	}); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return adminapi.DeviceView{}, unknownDevice(canon)
+		}
+		return adminapi.DeviceView{}, fmt.Errorf("device store: %w", err)
+	}
+	// Post-cycle read for the returned view: a detached deep copy, so the
+	// response cannot alias store internals even transiently.
+	d, err := a.st.Get(canon)
+	if err != nil {
+		return adminapi.DeviceView{}, fmt.Errorf("device store: %w", err)
+	}
+	return a.view(d), nil
 }
 
 // armLifecycle is the shared arming path for the admin remote-lifecycle

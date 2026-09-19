@@ -70,10 +70,12 @@ type DeviceView struct {
 	// "default" (follow the site default), "on", "off". Read-only here.
 	LEDOverride string `json:"led_override,omitempty"`
 	// PendingCommand is the read-only armed remote-command state: "reboot"
-	// when the armed §6.5 reboot flag is set, "factory-reset" when the armed
-	// §6.6 setdefault flag is set (outranking reboot, matching the engine's
-	// emission precedence), "" (omitted) when no command is armed. The
-	// engine consumes the flag one-shot on the device's next inform; the
+	// when the armed §6.5 reboot flag is set, "factory-reset" when the
+	// armed §6.6 setdefault flag is set (outranking reboot, matching the
+	// engine's emission precedence), "cmd" when a §6.3 stored task is
+	// armed (last in the armed chain), "" (omitted) when no command is
+	// armed. The value names the _type the device's NEXT inform will
+	// carry. The engine consumes the arming one-shot on that inform; the
 	// value returning to "" is the operator's consumed/done signal.
 	PendingCommand string   `json:"pending_command,omitempty"`
 	Actions        []string `json:"actions,omitempty"`
@@ -167,6 +169,13 @@ type ClientView struct {
 // any common spelling (normalized at the boundary).
 type blockClientRequest struct {
 	MAC string `json:"mac"`
+}
+
+// cmdTaskRequest is the POST body of the §6.3 stored-task enqueue route:
+// the cmd string to queue for the device (validated by ValidateCmdString,
+// stored verbatim — the replay copies it byte-for-byte).
+type cmdTaskRequest struct {
+	Cmd string `json:"cmd"`
 }
 
 // RadioTxPower is the admin txpower intent value: the literal "auto" or
@@ -293,6 +302,17 @@ type Backend interface {
 	// the factory default key, and is re-adopted by the existing
 	// adoption flow. Like RebootDevice, arming changes only the flag.
 	FactoryResetDevice(ctx context.Context, mac string) (DeviceView, error)
+	// EnqueueDeviceCmd stores a §6.3 cmd task for the device
+	// (docs/PROTOCOL-mgmt.md §6.3): the device's NEXT decoded inform
+	// answers {"_type":"cmd", <stored task fields verbatim>} — the row's
+	// cmd and mac keys exactly as stored — and the arming is consumed
+	// one-shot. At most one task is armed per device; a second enqueue
+	// REPLACES the armed task (§6.3 silent on enqueue, chosen: overwrite).
+	// Like the arming routes, enqueue touches nothing else on the record
+	// (no §6.2 mint site exists for the replay). The cmd string must pass
+	// ValidateCmdString (the route 400s before the backend runs). Unknown
+	// MACs are a wrapped ErrNotFound.
+	EnqueueDeviceCmd(ctx context.Context, mac, cmd string) (DeviceView, error)
 	// GetWireless returns the whole wireless config document.
 	GetWireless(ctx context.Context) WlansEnvelope
 	// PutWireless replaces the whole wireless config document.
@@ -329,6 +349,7 @@ const (
 	routeDeviceClients      = "/api/v1/devices/{mac}/clients"
 	routeDeviceReboot       = "/api/v1/devices/{mac}/reboot"
 	routeDeviceFactoryReset = "/api/v1/devices/{mac}/factory-reset"
+	routeDeviceCmd          = "/api/v1/devices/{mac}/cmd"
 	routeRadiosList         = "/api/v1/devices/{mac}/radios"
 	routeRadioIntent        = "/api/v1/devices/{mac}/radios/{radio}"
 	routePendingList        = "/api/v1/pending"
@@ -475,6 +496,32 @@ func New(cfg Config, be Backend) http.Handler {
 			return
 		}
 		dv, err := be.FactoryResetDevice(r.Context(), mac)
+		if err != nil {
+			handleBackendErr(w, lg, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, dv)
+	}))
+	// §6.3 stored-task enqueue: like the arming routes, the HTTP reply only
+	// records the admin intent — the device sees the replayed task as its
+	// NEXT inform response, not on this request. The 200 body is the
+	// (otherwise unchanged) device view.
+	mux.HandleFunc("POST /api/v1/devices/{mac}/cmd", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+		mac, err := normalizeMAC(r.PathValue("mac"))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid mac: "+err.Error())
+			return
+		}
+		var req cmdTaskRequest
+		if err := readJSON(r, &req); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		if msg := ValidateCmdString(req.Cmd); msg != "" {
+			writeErr(w, http.StatusBadRequest, "invalid cmd: "+msg)
+			return
+		}
+		dv, err := be.EnqueueDeviceCmd(r.Context(), mac, req.Cmd)
 		if err != nil {
 			handleBackendErr(w, lg, err)
 			return

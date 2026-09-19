@@ -33,6 +33,7 @@ type fakeBackend struct {
 	deleted           []string
 	rebootArmed       []string
 	factoryResetArmed []string
+	cmdEnqueued       []cmdEnqueue
 	byMAC             map[string]DeviceView
 	// Blocked-set state (device MAC -> clients in the boundary-normalized
 	// colon-hex spelling) plus call recording for routing assertions.
@@ -201,6 +202,20 @@ func (f *fakeBackend) RebootDevice(_ context.Context, mac string) (DeviceView, e
 
 func (f *fakeBackend) FactoryResetDevice(_ context.Context, mac string) (DeviceView, error) {
 	f.factoryResetArmed = append(f.factoryResetArmed, mac)
+	if dv, ok := f.byMAC[mac]; ok {
+		return dv, nil
+	}
+	return DeviceView{}, fmt.Errorf("%w: %s", ErrNotFound, mac)
+}
+
+// cmdEnqueue records one §6.3 EnqueueDeviceCmd call.
+type cmdEnqueue struct {
+	mac string
+	cmd string
+}
+
+func (f *fakeBackend) EnqueueDeviceCmd(_ context.Context, mac, cmd string) (DeviceView, error) {
+	f.cmdEnqueued = append(f.cmdEnqueued, cmdEnqueue{mac: mac, cmd: cmd})
 	if dv, ok := f.byMAC[mac]; ok {
 		return dv, nil
 	}
@@ -639,6 +654,153 @@ func TestLifecycleRoutes(t *testing.T) {
 				t.Helper()
 				if len(be.factoryResetArmed) != 0 {
 					t.Fatalf("backend reached via GET: %v", be.factoryResetArmed)
+				}
+			},
+		},
+	} {
+		run(t, tc)
+	}
+}
+
+// TestCmdTaskRoutes pins the §6.3 stored-task enqueue surface: route in,
+// EnqueueDeviceCmd called with the normalized MAC and the VALIDATED cmd
+// string, 200 carries the backend DeviceView, unknown MAC is the
+// wrapped-404 shape, malformed MAC is 400, cmd-string violations are 400
+// before the backend runs, and the route is not reachable under a
+// foreign method.
+func TestCmdTaskRoutes(t *testing.T) {
+	const known = "f0:9f:c2:84:8f:2a"
+	for _, tc := range []testCase{
+		{
+			name: "cmd enqueues via EnqueueDeviceCmd", method: "POST",
+			path: "/api/v1/devices/" + known + "/cmd", body: `{"cmd":"restart"}`, want: http.StatusOK,
+			checks: func(t *testing.T, be *fakeBackend, rec *httptest.ResponseRecorder) {
+				t.Helper()
+				if len(be.cmdEnqueued) != 1 || be.cmdEnqueued[0].mac != known || be.cmdEnqueued[0].cmd != "restart" {
+					t.Fatalf("EnqueueDeviceCmd calls: %+v", be.cmdEnqueued)
+				}
+				var dv DeviceView
+				if err := json.Unmarshal(rec.Body.Bytes(), &dv); err != nil || dv.Name != "office-ceiling" {
+					t.Fatalf("200 body should be the DeviceView: %+v err=%v", dv, err)
+				}
+			},
+		},
+		{
+			name: "cmd MAC is normalized (upper-case in, lower-case out)", method: "POST",
+			path: "/api/v1/devices/F0:9F:C2:84:8F:2A/cmd", body: `{"cmd":"restart"}`, want: http.StatusOK,
+			checks: func(t *testing.T, be *fakeBackend, _ *httptest.ResponseRecorder) {
+				t.Helper()
+				if len(be.cmdEnqueued) != 1 || be.cmdEnqueued[0].mac != known {
+					t.Fatalf("EnqueueDeviceCmd calls: %+v", be.cmdEnqueued)
+				}
+			},
+		},
+		{
+			name: "cmd task replaces enqueue (no error path)", method: "POST",
+			path: "/api/v1/devices/" + known + "/cmd", body: `{"cmd":"spectrum-scan"}`, want: http.StatusOK,
+			checks: func(t *testing.T, be *fakeBackend, _ *httptest.ResponseRecorder) {
+				t.Helper()
+				if len(be.cmdEnqueued) != 1 || be.cmdEnqueued[0].cmd != "spectrum-scan" {
+					t.Fatalf("EnqueueDeviceCmd calls: %+v", be.cmdEnqueued)
+				}
+			},
+		},
+		{
+			name: "unknown MAC is 404", method: "POST",
+			path: "/api/v1/devices/aa:bb:cc:dd:ee:66/cmd", body: `{"cmd":"restart"}`, want: http.StatusNotFound,
+			checks: func(t *testing.T, be *fakeBackend, rec *httptest.ResponseRecorder) {
+				t.Helper()
+				if !strings.Contains(rec.Body.String(), "device not found") {
+					t.Fatalf("404 shape: %q", rec.Body.String())
+				}
+			},
+		},
+		{
+			name: "malformed MAC is 400", method: "POST",
+			path: "/api/v1/devices/not-a-mac/cmd", body: `{"cmd":"restart"}`, want: http.StatusBadRequest,
+			checks: func(t *testing.T, be *fakeBackend, rec *httptest.ResponseRecorder) {
+				t.Helper()
+				if !strings.Contains(rec.Body.String(), "invalid mac") {
+					t.Fatalf("400 shape: %q", rec.Body.String())
+				}
+				if len(be.cmdEnqueued) != 0 {
+					t.Fatalf("backend called with malformed MAC: %+v", be.cmdEnqueued)
+				}
+			},
+		},
+		{
+			name: "invalid JSON body is 400", method: "POST",
+			path: "/api/v1/devices/" + known + "/cmd", body: `{"cmd":`, want: http.StatusBadRequest,
+			checks: func(t *testing.T, be *fakeBackend, _ *httptest.ResponseRecorder) {
+				t.Helper()
+				if len(be.cmdEnqueued) != 0 {
+					t.Fatalf("backend called on invalid JSON: %+v", be.cmdEnqueued)
+				}
+			},
+		},
+		{
+			name: "empty cmd is 400", method: "POST",
+			path: "/api/v1/devices/" + known + "/cmd", body: `{"cmd":""}`, want: http.StatusBadRequest,
+			checks: func(t *testing.T, be *fakeBackend, rec *httptest.ResponseRecorder) {
+				t.Helper()
+				if !strings.Contains(rec.Body.String(), "invalid cmd") {
+					t.Fatalf("400 shape: %q", rec.Body.String())
+				}
+				if len(be.cmdEnqueued) != 0 {
+					t.Fatalf("backend called with empty cmd: %+v", be.cmdEnqueued)
+				}
+			},
+		},
+		{
+			name: "missing cmd key is 400", method: "POST",
+			path: "/api/v1/devices/" + known + "/cmd", body: `{}`, want: http.StatusBadRequest,
+			checks: func(t *testing.T, be *fakeBackend, _ *httptest.ResponseRecorder) {
+				t.Helper()
+				if len(be.cmdEnqueued) != 0 {
+					t.Fatalf("backend called with missing cmd: %+v", be.cmdEnqueued)
+				}
+			},
+		},
+		{
+			name: "cmd over 64 characters is 400", method: "POST",
+			path: "/api/v1/devices/" + known + "/cmd", body: `{"cmd":"` + strings.Repeat("x", 65) + `"}`, want: http.StatusBadRequest,
+			checks: func(t *testing.T, be *fakeBackend, _ *httptest.ResponseRecorder) {
+				t.Helper()
+				if len(be.cmdEnqueued) != 0 {
+					t.Fatalf("backend called with oversized cmd: %+v", be.cmdEnqueued)
+				}
+			},
+		},
+		{
+			name: "cmd with control character is 400", method: "POST",
+			path: "/api/v1/devices/" + known + "/cmd", body: "{\"cmd\":\"re\nstart\"}", want: http.StatusBadRequest,
+			checks: func(t *testing.T, be *fakeBackend, _ *httptest.ResponseRecorder) {
+				t.Helper()
+				if len(be.cmdEnqueued) != 0 {
+					t.Fatalf("backend called with control-char cmd: %+v", be.cmdEnqueued)
+				}
+			},
+		},
+		{
+			name: "cmd with leading whitespace is 400 (no silent trim — verbatim replay)", method: "POST",
+			path: "/api/v1/devices/" + known + "/cmd", body: `{"cmd":" restart"}`, want: http.StatusBadRequest,
+			checks: func(t *testing.T, be *fakeBackend, _ *httptest.ResponseRecorder) {
+				t.Helper()
+				if len(be.cmdEnqueued) != 0 {
+					t.Fatalf("backend called with padded cmd: %+v", be.cmdEnqueued)
+				}
+			},
+		},
+		{
+			// Only POST is registered; the project's unmatched-route
+			// wrapper answers with the JSON 404. Either way the backend
+			// must NOT run.
+			name: "GET cmd does not enqueue (only POST registered)", method: "GET",
+			path: "/api/v1/devices/" + known + "/cmd", want: http.StatusNotFound,
+			checks: func(t *testing.T, be *fakeBackend, _ *httptest.ResponseRecorder) {
+				t.Helper()
+				if len(be.cmdEnqueued) != 0 {
+					t.Fatalf("backend reached via GET: %+v", be.cmdEnqueued)
 				}
 			},
 		},
