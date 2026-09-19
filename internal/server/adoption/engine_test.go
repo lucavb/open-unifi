@@ -73,6 +73,9 @@ func applyDeltas(dev *store.Device, out Outcome) {
 	if out.SetCfgVersion {
 		dev.CfgVersion = out.CfgVersion
 	}
+	if out.SetAppliedCfg {
+		dev.AppliedCfg = out.AppliedCfg
+	}
 	if out.SetAuthkeys {
 		dev.Authkeys = out.Authkeys
 	}
@@ -494,6 +497,72 @@ func TestNotRunningBootRaceGrace(t *testing.T) {
 	out = decide(dev, 1030)
 	if out.Kind != KindNoop || !out.SetCfgVersion || out.CfgVersion == "aaaa" {
 		t.Fatalf("post-race miss#2 = %+v, want minting noop (re-armed window fires)", out)
+	}
+}
+
+// Reboot is a lifecycle boundary for the not-running window: a miss
+// recorded BEFORE an admin-armed reboot must not fire on the first
+// post-boot bring-up table — the KindReboot emission clears the
+// consecutive-miss counter with the flag, so the post-reboot boot race
+// gets its full two-miss grace again (the review's cross-cycle carry).
+func TestRebootEmissionClearsNotRunningWindow(t *testing.T) {
+	e, fixture, factoryTable, runningTable := notRunningHarness(t)
+	decide := func(dev store.Device, now int64) Outcome {
+		t.Helper()
+		out, err := e.Decide(Request{
+			Transport: TransportEncrypted, Device: dev,
+			Body: engineBody("aaaa"), UsedKey: dev.XAuthkey,
+			Now: time.Unix(now, 0),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	// Pre-reboot miss#1: recorded, no fire (the boot-race grace shape).
+	dev := fixture(factoryTable)
+	out := decide(dev, 1000)
+	if out.Kind != KindNoop || out.SetCfgVersion {
+		t.Fatalf("pre-reboot miss#1 = %+v, want plain connected noop", out)
+	}
+	if n, ok := missCounter(out.Extra); !ok || n != 1 {
+		t.Fatalf("pre-reboot miss#1 counter = %v/%v, want 1", n, ok)
+	}
+
+	// Admin arms the reboot; the next inform emits it and must clear the
+	// window with the flag (the next table is a fresh boot window).
+	applyDeltas(&dev, out)
+	dev.Extra[FlagRebootOnConnect] = true
+	out = decide(dev, 1010)
+	if out.Kind != KindReboot {
+		t.Fatalf("armed inform = %+v, want reboot", out)
+	}
+	applyDeltas(&dev, out)
+	if _, ok := dev.Extra["wlan_cfg_not_running_misses"]; ok {
+		t.Fatalf("reboot emission left the miss window armed: %v", dev.Extra["wlan_cfg_not_running_misses"])
+	}
+
+	// First post-reboot table is the bring-up race (a miss): plain
+	// connected noop — the window re-armed from zero, not a fire.
+	dev.Extra["vap_table"] = factoryTable
+	out = decide(dev, 1020)
+	if out.Kind != KindNoop || out.SetCfgVersion {
+		t.Fatalf("post-reboot boot-race miss = %+v, want plain connected noop (window cleared at emission)", out)
+	}
+	if n, ok := missCounter(out.Extra); !ok || n != 1 {
+		t.Fatalf("post-reboot miss counter = %v/%v, want the window re-armed at 1", n, ok)
+	}
+
+	// The race resolves: RUN proof, steady state, window reset.
+	applyDeltas(&dev, out)
+	dev.Extra["vap_table"] = runningTable
+	out = decide(dev, 1030)
+	if out.Kind != KindNoop || out.SetCfgVersion {
+		t.Fatalf("post-race RUN = %+v, want plain connected noop", out)
+	}
+	if _, ok := missCounter(out.Extra); ok {
+		t.Fatalf("RUN proof must reset the window: %v", out.Extra["wlan_cfg_not_running_misses"])
 	}
 }
 

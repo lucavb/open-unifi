@@ -116,6 +116,50 @@ const (
 	KindNoop            Kind = "noop"
 	KindNoopPendingWLAN Kind = "noop-pending-wlan"
 	KindSetparam        Kind = "setparam"
+
+	// KindReboot is the remote-reboot response, docs/PROTOCOL-mgmt.md §6.5
+	// (voidsuper: `new Object("reboot")` + `put("reboot_type", "soft")` —
+	// the only reboot form the jar emits, from the reboot_on_connect
+	// record flag). Fired once on the device's next decoded inform after
+	// an admin arms that flag; the engine clears the flag in the same
+	// decision. NO cfgversion is minted (see armedLifecycle for the §6.2
+	// catalog match).
+	KindReboot Kind = "reboot"
+
+	// KindSetdefault is the factory-reset response, docs/PROTOCOL-mgmt.md
+	// §6.6 (voidsuper line 1018, device state 8: `return new
+	// Object("setdefault")` — a bare _type with no payload keys). Fired
+	// once on the device's next decoded inform after an admin arms the
+	// flag; at emission the record returns to the pending-candidate shape
+	// (see armedLifecycle) so the post-reset re-inform on the factory
+	// default key runs the ordinary adoption path unchanged. NO
+	// cfgversion is minted.
+	KindSetdefault Kind = "setdefault"
+)
+
+// Admin-armed lifecycle command flags (the trust-policy "admin-owned rows"
+// class, CONTEXT.md: only an admin can set or change them — a device can
+// neither write nor introduce them via an inform body; the adapter's
+// absorbInform preserves them from the previous record through the
+// admin-owned key list). Both are one-shot: the engine fires the
+// corresponding response on the device's next decoded inform and clears
+// the flag in the same decision.
+const (
+	// FlagRebootOnConnect is the jar-verbatim record flag name the §6.5
+	// reboot response is emitted from (voidsuper comment: "only from
+	// reboot_on_connect flag"). Arming rides POST
+	// /api/v1/devices/{mac}/reboot.
+	FlagRebootOnConnect = "reboot_on_connect"
+
+	// FlagSetdefaultArmed is open-unifi's arming flag for the §6.6
+	// setdefault response (POST /api/v1/devices/{mac}/factory-reset).
+	// The jar arms factory reset as device STATE 8, a controller-side
+	// enum member this store deliberately lacks (adding one would
+	// redesign the pending-candidate lifecycle this lane must reuse), so
+	// the arming rides an admin-owned Extra key instead. DEVIATION from
+	// the jar's state-8 arming shape — recorded with the unrecoverable
+	// jar facts in docs/PROTOCOL-mgmt.md §6.6.
+	FlagSetdefaultArmed = "setdefault_armed"
 )
 
 // Outcome carries the response payload plus the record deltas the adapter
@@ -155,6 +199,12 @@ type Outcome struct {
 	XAuthkey      string
 	SetCfgVersion bool
 	CfgVersion    string // also the full-provision payload top-level cfgversion
+	// SetAppliedCfg clears the record's last-reported applied cfgversion.
+	// Carried only by the setdefault demotion to the pending-candidate
+	// shape (every other outcome leaves AppliedCfg to the adapter's
+	// absorbInform).
+	SetAppliedCfg bool
+	AppliedCfg    string
 	SetAuthkeys   bool
 	Authkeys      []string
 	Extra         store.JSONMap
@@ -285,6 +335,91 @@ func (e *Engine) Decide(req Request) (Outcome, error) {
 	return out, nil
 }
 
+// armedLifecycle is the admin-armed remote-command lane (§6.5 reboot /
+// §6.6 setdefault): the admin API sets an admin-owned Extra flag; the
+// NEXT decoded inform for that device answers with the corresponding
+// lifecycle response instead of entering the key/drift machinery, and the
+// engine clears the flag in the same decision (one-shot). Both transports
+// run it, after their gentle-noop gate (the flag rides the main status
+// inform, exactly the empty-_type informs real firmware sends).
+//
+// Precedence: setdefault outranks reboot (a factory reset subsumes a
+// pending reboot, and clearing the reboot flag keeps the post-reset
+// default-key re-adoption from being preempted by a stale command), and
+// both fire BEFORE the key/state gate — mirroring the classic dispatcher,
+// where the state-8 setdefault check (voidsuper line 1018) precedes every
+// §6.2 setparam site (§1117+) and the default-key state gate. The jar's
+// reboot emission site itself is not line-pinned in
+// docs/PROTOCOL-mgmt.md §6.5 (byte shape only); placing it in the same
+// early arm keeps the "next inform carries the response" contract —
+// recorded as a live-proof obligation in the lane docs.
+//
+// cfgversion-mint semantics — §6.2 catalog entries matched: NONE for the
+// emissions themselves. Neither §6.5 reboot nor §6.6 setdefault is a
+// §6.2 setparam emission site, and the §6.2 mint-site list (§501, §676,
+// §826, §1117/1122, §1269, §3068) contains no reboot/setdefault site, so
+// arming and emitting mint NO cfgversion. The follow-on decisions reuse
+// existing catalog entries unchanged:
+//   - after a reboot, the device's retained-key re-inform re-enters the
+//     ordinary dispatcher (§6.1 noop on cfgversion match; §6.2 d full
+//     provisioning on mismatch — the appliedNotRunning re-arm covers the
+//     reboot regression the 2026-09-18 F-row round captured);
+//   - after a setdefault, the post-reset default-key re-inform runs the
+//     §8 default-key rotation path (the §6.2 a/c/f mgmt_cfg-only
+//     family), which mints the fresh 16-hex cfgversion exactly as every
+//     adoption does (rotateKeys — the §6.2 c "+ fresh 16-hex cfgversion
+//     stored" semantics).
+func (e *Engine) armedLifecycle(d *store.Device) (Outcome, bool) {
+	if truthy(d.Extra[FlagSetdefaultArmed]) {
+		e.lg.Debug("inform: armed setdefault (factory reset)", "mac", d.MAC)
+		// §6.6 emission plus the pending-candidate demotion: after the
+		// device applies the factory reset it re-informs on the factory
+		// default key, and the record must be the shape the existing
+		// default-key adoption path accepts. Clearing the per-device key
+		// assignment means a pre-reset inform on the old key can no
+		// longer be decrypted (keyCandidates holds only Authkeys entries
+		// plus the factory key) — the same 400 a genuinely unknown
+		// record's non-default-key payload gets; the jar's own
+		// post-emission record mutation (whether it clears x_authkey at
+		// emission or keeps state 8 until the re-inform) was not
+		// recoverable from the decompile and is recorded in §6.6.
+		d.State = store.StatePending
+		d.XAuthkey = ""
+		d.CfgVersion = ""
+		d.AppliedCfg = ""
+		d.Authkeys = nil
+		// Drop the controller-owned WLAN bookkeeping (single-source
+		// list): a stale wlan_cfg_sha would let the re-adopted device
+		// settle into connected noops while running factory config. The
+		// baseline is re-captured by the post-adoption self-heal + drift
+		// settle, exactly like a fresh adoption (which deliberately
+		// seeds no baseline).
+		for _, k := range ControllerOwnedKeys {
+			delete(d.Extra, k)
+		}
+		delete(d.Extra, FlagSetdefaultArmed)
+		// A pending reboot is moot once the device factory-resets.
+		delete(d.Extra, FlagRebootOnConnect)
+		return Outcome{Kind: KindSetdefault}, true
+	}
+	if truthy(d.Extra[FlagRebootOnConnect]) {
+		e.lg.Debug("inform: armed reboot", "mac", d.MAC)
+		delete(d.Extra, FlagRebootOnConnect)
+		// A reboot is a lifecycle boundary for the not-running window: the
+		// next vap_table opens a fresh boot window (the 2026-09-19 A2
+		// record: every raw reboot starts with a bring-up miss), so the
+		// consecutive-miss counter must not straddle the reboot — a miss
+		// recorded before it would otherwise fire a byte-identical
+		// re-provision on the first post-boot table, re-opening exactly the
+		// boot-race false fire the two-consecutive-miss arming closes.
+		// The setdefault demotion already sweeps the whole
+		// controller-owned family, so only the reboot path needs this.
+		delete(d.Extra, "wlan_cfg_not_running_misses")
+		return Outcome{Kind: KindReboot}, true
+	}
+	return Outcome{}, false
+}
+
 // decideEncrypted ports the former Server.advance for ENCRYPTED informs.
 // usedKey is the lowercase hex key that authenticated the inform.
 func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, d *store.Device) (Outcome, error) {
@@ -294,6 +429,14 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, d *store.Devi
 	if informTypeGentleNoop(rtype) {
 		e.lg.Debug("inform: gentle noop for _type", "mac", d.MAC, "type", rtype)
 		return e.noopFor(d, now, req.PrevNoopTarget, KindNoop), nil
+	}
+
+	// Admin-armed lifecycle commands (§6.5/§6.6) preempt the drift and
+	// key machinery: the armed response is what this inform must carry,
+	// and the post-lifecycle inform re-enters the ordinary decisions
+	// below (deferred provisioning is not lost — see armedLifecycle).
+	if out, armed := e.armedLifecycle(d); armed {
+		return out, nil
 	}
 
 	// Wireless envelope drift (FSM hash bump): BEFORE the cfgversion drift
@@ -487,6 +630,12 @@ func (e *Engine) decidePlain(req Request, wls []wireless.Wlan, d *store.Device) 
 	if informTypeGentleNoop(rtype) {
 		e.lg.Debug("inform-plain: gentle noop for _type", "mac", d.MAC, "type", rtype)
 		return e.noopFor(d, now, req.PrevNoopTarget, KindNoop), nil
+	}
+
+	// Admin-armed lifecycle commands fire on this lane too (same record,
+	// same admin intent; the outcome serialization is shared).
+	if out, armed := e.armedLifecycle(d); armed {
+		return out, nil
 	}
 
 	switch {
@@ -776,6 +925,9 @@ func (out *Outcome) deltas(snapshot, work *store.Device) {
 	}
 	if work.CfgVersion != snapshot.CfgVersion {
 		out.SetCfgVersion, out.CfgVersion = true, work.CfgVersion
+	}
+	if work.AppliedCfg != snapshot.AppliedCfg {
+		out.SetAppliedCfg, out.AppliedCfg = true, work.AppliedCfg
 	}
 	if !equalStrings(work.Authkeys, snapshot.Authkeys) {
 		out.SetAuthkeys, out.Authkeys = true, work.Authkeys
