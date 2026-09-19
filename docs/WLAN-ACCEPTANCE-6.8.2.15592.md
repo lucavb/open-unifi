@@ -899,6 +899,25 @@ live-proven (observation may not mint admin semantics — obligation 4
 above). Full lane reports: scratch
 `/tmp/3fe1d3752fe0b1c6/opencode/fleet-20260919/reports/`.
 
+**Post-round flip (same day):** the acct lane's jar-recovery obligation
+is closed offline from the main-checkout javap dump
+(tmpwork/javap/com__ubnt__service__config__int.txt): the DAS/DAD client
+rows' `<ip>` is the acct server beans' own admin-configured field
+(X.getString(srv,"ip",""), int offsets 564-736), gated on
+`accounting_enabled` && `radius_das_enabled` && the device fw_caps
+0x100000 bit (hasCapability(1048576), int 1500-1539). The knob is now
+accepted behind a requires-accounting gate, the rows are emitted
+byte-exact (the dad block dad.status/dad.port=3799 once per device
+render, das.status + das.port=3800+n + dad.status per emitted index —
+the jar's duplicate dad.status preserved — and das.client/das.secret
+once per index, dad.client.<i>.cidr=`<ip>`/32 per server),
+WlanListHash joins the knob under the accounting gate (the
+envelope-external capability arm recorded as a bounded residual), and
+§12 row 1014 / §4.3 / §8 are flipped implemented. The bench AP's
+fw_caps (0xE7FD3F3F) carries the bit. Obligation 3's live half stands:
+live accounting push with das on, Interim-Update session proof,
+accounting-off revert, console round-trip.
+
 ## Release gate summary
 
 | Gate | Result |

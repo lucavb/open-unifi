@@ -156,8 +156,9 @@ type Wlan struct {
 	// wireless.Wlan; §12 rows 1013-1014): the accounting toggle, the
 	// accounting servers (0..4 entries, port 0 = the 1813 emission
 	// default), and the interim-update toggle. radius_das_enabled is
-	// modeled for profile parity but REJECTED while set — the DAS/DAD
-	// client rows are blocked pending a jar citation (§12 row 1014).
+	// accepted behind its requires-accounting gate — the das/dad rows
+	// emit under the jar's accounting_enabled gate (§12 row 1014
+	// implemented).
 	AccountingEnabled    bool               `json:"accounting_enabled,omitempty"`
 	AcctServers          []RadiusAcctServer `json:"acct_servers,omitempty"`
 	InterimUpdateEnabled bool               `json:"interim_update_enabled,omitempty"`

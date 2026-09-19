@@ -437,16 +437,14 @@ func validateWlanEap(wl *Wlan) string {
 	if wl.InterimUpdateEnabled && !wl.AccountingEnabled {
 		return "interim_update_enabled requires accounting_enabled"
 	}
-	// radius_das_enabled is REJECTED while set: the DAS/DAD client rows
-	// (dad.client.<i>.cidr/das.client/das.secret) are blocked pending a
-	// jar citation for their client <ip> source — the status/port rows
-	// cannot ship without them (a client-less DAS block is not a jar
-	// shape), and no candidate value is invented (§12 row 1014). The
-	// field stays in the model for radiusprofile parity; flip this
-	// rejection together with the renderer block when the citation
-	// lands.
-	if wl.RadiusDASEnabled {
-		return "radius_das_enabled is not supported yet: the DAS/DAD client rows are blocked pending a jar citation (PROTOCOL-systemcfg-wireless.md §12 row 1014)"
+	// radius_das_enabled needs accounting_enabled: every das/dad row
+	// lives under the jar's accounting_enabled gate (int offsets 176-184),
+	// so a stored das toggle without accounting would be admin intent the
+	// renderer can never honor. The client rows' <ip> source is recovered
+	// (the acct server beans' ip fields — §12 row 1014 implemented), so
+	// the knob is accepted behind this gate.
+	if wl.RadiusDASEnabled && !wl.AccountingEnabled {
+		return "radius_das_enabled requires accounting_enabled"
 	}
 	if wl.Passphrase != "" && len(wl.Passphrase) < 8 {
 		return "passphrase must be at least 8 characters when security is " + wl.Security

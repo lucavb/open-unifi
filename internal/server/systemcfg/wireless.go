@@ -167,8 +167,9 @@ func (rd *render) emitWirelessCfg(b *strings.Builder, d store.Device, wls []wire
 	wifiCapsKnown, wifiCaps := wireless.NumFromExtra(d.Extra, "wifi_caps")
 	openHostapd := wifiCapsKnown && wifiCaps&0x2000 != 0 // supportOpenHostapd() = bit 0x2000 (Device §7696-7704)
 	bgaFilterCap := wifiCapsKnown && wifiCaps&0x40 != 0  // hasWifiCapability(64) (FID-51)
+	dasCap := supportsDasDad(d)                          // dasCap: hasCapability(0x100000) — the DAS/DAD device gate (int 1500-1539)
 	for n, v := range vaps {                             // 0-based over emissions → row index n+1
-		rd.emitAaaRows(b, n+1, v, openHostapd)
+		rd.emitAaaRows(b, n+1, v, openHostapd, dasCap)
 		rd.emitWirelessRows(b, n+1, v, bgaFilterCap)
 	}
 
@@ -206,7 +207,7 @@ func antennaGain(raw map[string]any) string {
 // emitAaaRows writes the aaa.<n> block for one vap per doc §4:
 // always-first block, then the security branch (§4.2 open, §4.3 WPA),
 // then the common tail.
-func (rd *render) emitAaaRows(b *strings.Builder, n int, v wireless.VapPlan, openHostapd bool) {
+func (rd *render) emitAaaRows(b *strings.Builder, n int, v wireless.VapPlan, openHostapd, dasCap bool) {
 	p := fmt.Sprintf("aaa.%d.", n)
 	prefix := rd.lineWriter(b, "aaa-rows")
 	line := func(k, vv string) { prefix(p+k, vv) }
@@ -336,6 +337,33 @@ func (rd *render) emitAaaRows(b *strings.Builder, n int, v wireless.VapPlan, ope
 			// `<x_secret>` symbol is the same profile-level secret the auth
 			// rows use).
 			if v.Wlan.AccountingEnabled {
+				// radius.das.*/radius.dad.* rows (int offsets 176-299, 527-736):
+				// gated on accounting_enabled && hasCapability(0x100000) &&
+				// radius_das_enabled (the jar also ORs hotspot2conf_enabled —
+				// unmodeled in our inline profile). The dad block (dad.status,
+				// dad.port=3799) emits once per DEVICE RENDER (rd.dasDadStatusDone =
+				// jar local 19); the das block re-emits dad.status alongside
+				// das.status/das.port on EVERY emitted index — the duplicate is the
+				// jar's own byte shape. das.port = 3800 + the aaa index. Client rows
+				// ride the acct-server loop below: the <ip> is the server bean's own
+				// ip field (X.getString(srv,"ip",""), offsets 570-580/670-692) —
+				// admin-configured data, the reason §12 row 1014 flips implemented.
+				dasGate := v.Wlan.RadiusDASEnabled && dasCap
+				if dasGate {
+					if !rd.dasDadStatusDone {
+						line("radius.dad.status", "enabled")
+						line("radius.dad.port", "3799")
+						rd.dasDadStatusDone = true
+					}
+					line("radius.das.status", "enabled")
+					line("radius.das.port", strconv.Itoa(3800+n))
+					line("radius.dad.status", "enabled")
+				}
+				// dasClientDone is the jar's once-per-aaa-index das.client flag
+				// (jar local 8, int offsets 302-303): reset per emitAaaRows call,
+				// advancing only when the das.client/das.secret pair emits (the
+				// first non-empty-IP acct server of this index).
+				dasClientDone := false
 				for idx, srv := range v.Wlan.AcctServers {
 					if idx >= maxRadiusAuthSlots {
 						break
@@ -351,27 +379,16 @@ func (rd *render) emitAaaRows(b *strings.Builder, n int, v wireless.VapPlan, ope
 						line(rp+"port", strconv.Itoa(srv.Port))
 					}
 					line(rp+"secret", v.Wlan.RadiusSecret)
+					if dasGate {
+						if !dasClientDone {
+							line("radius.das.client", srv.IP)
+							line("radius.das.secret", v.Wlan.RadiusSecret)
+							dasClientDone = true
+						}
+						line(fmt.Sprintf("radius.dad.client.%d.cidr", idx+1), srv.IP+"/32")
+						line(fmt.Sprintf("radius.dad.client.%d.secret", idx+1), v.Wlan.RadiusSecret)
+					}
 				}
-			}
-			// radius.das.*/radius.dad.* rows (§12 row 1014, doc §4.3
-			// lines 417-419): BLOCKED — the dad/das client rows' `<ip>`
-			// source is unrecovered from the jar and is not invented
-			// (this worktree has no javap access; §12 rows 1013-1015 are
-			// the citation of record). The status/port rows cannot ship
-			// without the client rows: a client-less DAS block is not a
-			// jar shape (the jar gates das.status/das.port/dad.status on
-			// radius_das_enabled AND emits its client rows from jar-side
-			// data this lane cannot cite), so the whole subfamily stays
-			// omitted. radius_das_enabled is REJECTED at the admin API
-			// (adminapi.validateWlanEap); this Alert covers envelopes
-			// built outside it, mirroring the profile-less dead-vap
-			// guard above.
-			if v.Wlan.RadiusDASEnabled {
-				rd.alerts = append(rd.alerts, Alert{
-					Msg: "provisioning WPA-EAP wlan with radius_das_enabled; " +
-						"radius.das/radius.dad rows are not emitted — the DAS/DAD client row source " +
-						"is unrecovered from the jar (PROTOCOL-systemcfg-wireless.md §12 row 1014)",
-				})
 			}
 			// interim_update.* rows (§12 row 1014, doc §4.3 line 420):
 			// gated on interim_update_enabled AND accounting_enabled (the

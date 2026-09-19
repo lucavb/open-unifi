@@ -46,8 +46,8 @@ func TestWlanListHashRadiusVLANModeEquivalence(t *testing.T) {
 // follow: flipping accounting on, or the interim toggle under it, mints
 // a fresh wlan_cfg_sha. Acct ports hash at their effective value
 // (0 → 1813), mirroring the auth-port rule. radius_das_enabled never
-// joins: its rows are blocked pending a jar citation (§12 row 1014),
-// so no emission changes with it.
+// joins the hash here (accounting off ⇒ no das/dad rows either — its
+// emission gate is accounting_enabled, §12 row 1014 implemented).
 func TestWlanListHashAcctFieldsDrift(t *testing.T) {
 	base := Wlan{
 		ID: "eapcorp", Name: "corp", SSID: "corp",
@@ -61,7 +61,8 @@ func TestWlanListHashAcctFieldsDrift(t *testing.T) {
 	// to no accounting fields at all.
 	inert := base
 	inert.AcctServers = acct
-	// Defense-shape variant: das set changes nothing either (blocked rows).
+	// Defense-shape variant: das set with accounting off changes nothing
+	// either (the das gate is accounting_enabled — no das/dad rows).
 	dasInert := inert
 	dasInert.RadiusDASEnabled = true
 	hNone := WlanListHash([]Wlan{base})
@@ -71,7 +72,7 @@ func TestWlanListHashAcctFieldsDrift(t *testing.T) {
 		t.Fatalf("inert acct_servers must hash identically to none: %q vs %q", hInert, hNone)
 	}
 	if hDas != hNone {
-		t.Fatalf("radius_das_enabled must not join the hash (rows blocked): %q vs %q", hDas, hNone)
+		t.Fatalf("das without accounting must not join the hash (no das/dad rows emit): %q vs %q", hDas, hNone)
 	}
 
 	// Accounting ON: rows change, the hash must change.
@@ -93,5 +94,13 @@ func TestWlanListHashAcctFieldsDrift(t *testing.T) {
 	onInterim.InterimUpdateEnabled = true
 	if WlanListHash([]Wlan{onInterim}) == WlanListHash([]Wlan{on}) {
 		t.Fatal("interim_update_enabled under accounting must mint a fresh hash (interim rows join the render)")
+	}
+	// The das toggle under accounting changes rows ⇒ changes the hash
+	// (the das/dad rows join the render; the fw_caps residual is
+	// documented on WlanListHash).
+	onDas := on
+	onDas.RadiusDASEnabled = true
+	if WlanListHash([]Wlan{onDas}) == WlanListHash([]Wlan{on}) {
+		t.Fatal("radius_das_enabled under accounting must mint a fresh hash (das/dad rows join the render)")
 	}
 }

@@ -319,8 +319,14 @@ func WlanListHash(wls []Wlan) string {
 		// value (0 → the 1813 emission default), and empty-IP slots DO
 		// hash (unlike a skipped auth slot they still shift later row
 		// indexes, so they are not render-inert). radius_das_enabled
-		// never joins: its rows are blocked pending a jar citation (§12
-		// row 1014) and no emission changes with it.
+		// joins under the same gate (§12 row 1014 implemented): with
+		// accounting on, a das flip changes the emitted das/dad rows and
+		// must mint a fresh sha. Residual: the das gate's device arm
+		// (fw_caps 0x100000, render.go supportsDasDad) is outside the
+		// envelope, so on a record without the bit a das flip mints a
+		// fresh sha over a byte-identical render — bounded to one
+		// idempotent full provisioning; the model set {U7PG2} carries
+		// the bit (bench AP fw_caps 0xE7FD3F3F).
 		if w.AccountingEnabled {
 			e["accounting_enabled"] = true
 			acct := make([]map[string]any, 0, len(w.AcctServers))
@@ -333,6 +339,7 @@ func WlanListHash(wls []Wlan) string {
 			}
 			e["acct_servers"] = acct
 			e["interim_update_enabled"] = w.InterimUpdateEnabled
+			e["radius_das_enabled"] = w.RadiusDASEnabled
 		}
 		m = append(m, e)
 	}

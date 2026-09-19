@@ -1023,9 +1023,9 @@ func TestWPAEAPRadiusValidation(t *testing.T) {
 		{"interim without accounting",
 			`"security":"wpa-eap","radius_servers":[{"ip":"10.1.0.5"}],"radius_secret":"s","interim_update_enabled":true`,
 			"interim_update_enabled requires accounting_enabled"},
-		{"das knob rejected",
+		{"das without accounting",
 			`"security":"wpa-eap","radius_servers":[{"ip":"10.1.0.5"}],"radius_secret":"s","radius_das_enabled":true`,
-			"radius_das_enabled is not supported yet"},
+			"radius_das_enabled requires accounting_enabled"},
 		{"acct on wpa-p",
 			`"security":"wpa-p","passphrase":"correcthorse","accounting_enabled":true`,
 			"require security wpa-eap"},
@@ -1067,8 +1067,8 @@ func TestWPAEAPRadiusValidation(t *testing.T) {
 // through the 200 echo body, stored acct_servers stay acceptable with
 // accounting OFF (radiusprofile shape: server list and toggle are
 // independent; the inert list renders byte-identically to none), and
-// radius_das_enabled stays the one rejected knob (blocked pending the
-// §12 row 1014 jar citation).
+// radius_das_enabled is accepted under the requires-accounting gate
+// (§12 row 1014 implemented — the renderer emits its das/dad rows).
 func TestWPAEAPAccountingAcceptance(t *testing.T) {
 	h := New(Config{}, newFakeBackend())
 	profile := `"radius_servers":[{"ip":"10.1.0.5"}],"radius_secret":"s3cr3t!"`
@@ -1090,6 +1090,19 @@ func TestWPAEAPAccountingAcceptance(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("accounting echo missing %q: %s", want, body)
 		}
+	}
+
+	// radius_das_enabled with accounting and a valid acct server:
+	// accepted and echoed (the judge's acct_servers precheck applies —
+	// das adds only the requires-accounting rule).
+	rec = putWireless(t, h, `{"wlans":[{"ssid":"corp","security":"wpa-eap","vlan":1,`+profile+`,`+
+		`"accounting_enabled":true,"acct_servers":[{"ip":"10.2.0.1"}],`+
+		`"radius_das_enabled":true}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("das wpa-eap: %d %q, want 200", rec.Code, rec.Body.String())
+	}
+	if body := rec.Body.String(); !strings.Contains(body, `"radius_das_enabled":true`) {
+		t.Fatalf("das echo missing the toggle: %s", body)
 	}
 
 	// Stored acct servers with accounting off: accepted (inert list —

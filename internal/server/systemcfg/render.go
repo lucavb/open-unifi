@@ -101,6 +101,11 @@ type render struct {
 	warnings []string // debug-level diagnostics (Result.Warnings)
 	alerts   []Alert  // warn-level diagnostics (Result.Alerts)
 	deltas   map[string]string
+	// dasDadStatusDone is the jar's cross-wlan once-flag for the
+	// radius.dad.status/dad.port block: initialized once per device render
+	// (zero value), advancing only when the dad block emits (jar local 19,
+	// int offsets 1435-1439 / 231-232 / 2901).
+	dasDadStatusDone bool
 }
 
 // lineWriter returns the injection-guarded writer; newline-injected rows are
@@ -415,4 +420,14 @@ func (rd *render) usersPasswordHash(d store.Device) (string, error) {
 func supportsSha512Password(d store.Device) bool {
 	ok, caps := wireless.NumFromExtra(d.Extra, "fw_caps")
 	return ok && caps&0x400 == 0x400
+}
+
+// supportsDasDad mirrors the DAS/DAD gate's device capability arm:
+// hasCapability(1048576) — the fw_caps 0x100000 bit (main-writer
+// offsets 1500-1539; accessor semantics per supportsSha512Password
+// above). A record that does not report fw_caps evaluates to
+// capability 0: the jar then skips every das/dad row, silently.
+func supportsDasDad(d store.Device) bool {
+	ok, caps := wireless.NumFromExtra(d.Extra, "fw_caps")
+	return ok && caps&0x100000 == 0x100000
 }

@@ -37,7 +37,7 @@ type Wlan struct {
 	AccountingEnabled    bool               // radiusprofile accounting_enabled: gates the acct rows AND the interim_update rows
 	AcctServers          []RadiusAcctServer // acct rows, 0..4 entries; inert while AccountingEnabled is false (profile-shaped: the radiusprofile stores servers independent of the toggle)
 	InterimUpdateEnabled bool               // radiusprofile interim_update_enabled: needs AccountingEnabled (the jar's own gate, §12 row 1014 rationale)
-	RadiusDASEnabled     bool               // radiusprofile radius_das_enabled: BLOCKED — no emission; the admin API rejects it, the renderer flags out-of-API carriers with an Alert (§12 row 1014)
+	RadiusDASEnabled     bool               // radiusprofile radius_das_enabled: the das/dad rows under accounting_enabled && hasCapability(0x100000) (§12 row 1014 implemented; the admin API requires accounting_enabled for it)
 }
 
 // RadiusAcctServer is one accounting server of a WLAN's inline RADIUS
