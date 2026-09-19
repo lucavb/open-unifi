@@ -19,7 +19,7 @@ var ControllerOwnedKeys = []string{
 	"wlan_cfg_pending_old_wlans", "wlan_cfg_applied_wlans",
 	"wlan_cfg_pending_placements", "wlan_cfg_attempt_sha", "wlan_cfg_attempts",
 	"wlan_cfg_last_attempt", "wlan_cfg_delivery_status",
-	"wlan_cfg_not_running_misses",
+	"wlan_cfg_not_running_misses", "wlan_cfg_offered_cfgversion",
 }
 
 // wlanCfgState is the typed view over the controller-owned wlan_cfg_* Extra
@@ -34,7 +34,7 @@ var ControllerOwnedKeys = []string{
 //	wlan_cfg_pending_old_wlans, wlan_cfg_applied_wlans,
 //	wlan_cfg_pending_placements, wlan_cfg_attempt_sha, wlan_cfg_attempts,
 //	wlan_cfg_last_attempt, wlan_cfg_delivery_status,
-//	wlan_cfg_not_running_misses.
+//	wlan_cfg_not_running_misses, wlan_cfg_offered_cfgversion.
 type wlanCfgState struct {
 	// extra is the map the state was loaded from (apply functions write here).
 	extra store.JSONMap
@@ -80,6 +80,21 @@ type wlanCfgState struct {
 	// survives sparse heartbeats and device bodies cannot clobber it
 	// (extraPrevWins). Absent = 0 = window unarmed.
 	notRunningMisses int
+
+	// offeredCfgversion is wlan_cfg_offered_cfgversion: the cfgversion the
+	// pending delivery operation was last OFFERED with (written by
+	// applyProvisioning at emission, cleared by settle with the rest of the
+	// pending bookkeeping). The engine's pending gate compares it with the
+	// record's current cfgversion so an operator mint since the last offer
+	// (radio-intent / LED-override saves — the same escape blocked-set
+	// changes have) cannot be held hostage by an exhausted
+	// unchanged-envelope retry. Controller-owned: a device body can
+	// neither write nor clear it (extraPrevWins), and the setdefault
+	// demotion sweeps it with the rest of the family. Absent = the pending
+	// predates this bookkeeping (the gate keeps its hold-at-gate behavior
+	// for those records).
+	offeredPresent    bool
+	offeredCfgversion string
 }
 
 // loadWlanCfgState reads the controller-owned keys from extra with exactly
@@ -137,6 +152,10 @@ func loadWlanCfgState(extra store.JSONMap) wlanCfgState {
 		st.notRunningMisses = v
 	case float64:
 		st.notRunningMisses = int(v)
+	}
+	if v, ok := extra["wlan_cfg_offered_cfgversion"].(string); ok {
+		st.offeredPresent = true
+		st.offeredCfgversion = v
 	}
 	return st
 }
@@ -218,6 +237,7 @@ func (st *wlanCfgState) settle() {
 	delete(st.extra, "wlan_cfg_pending_sha")
 	delete(st.extra, "wlan_cfg_pending_wlans")
 	delete(st.extra, "wlan_cfg_pending_placements")
+	delete(st.extra, "wlan_cfg_offered_cfgversion")
 	// Mirror the promotion in the typed view so the post-settle drift and
 	// pending checks read the same values the former direct Extra reads did.
 	st.sha = st.pendingSHA
@@ -226,6 +246,8 @@ func (st *wlanCfgState) settle() {
 	st.pendingSHA = ""
 	st.pendingWlans = nil
 	st.placements = nil
+	st.offeredPresent = false
+	st.offeredCfgversion = ""
 }
 
 // notRunningClass is the settled-state watchdog's three-valued reading of
@@ -355,8 +377,12 @@ func WlanRetryDue(extra store.JSONMap, now time.Time) bool {
 
 // applyProvisioning records one system_cfg delivery attempt (the assignedKey
 // bookkeeping): replacing the pending hash starts a fresh budget; retrying
-// the same hash increments it. EXACT key names and value formats preserved.
-func (st wlanCfgState) applyProvisioning(cur string, nowUnix int64, wls []wireless.Wlan, placements map[string]int) {
+// the same hash increments it. offeredCfg is the cfgversion THIS offer
+// carries — the pending gate reads it back (wlan_cfg_offered_cfgversion) to
+// tell an operator mint from a genuinely unchanged record, so an exhausted
+// unchanged-envelope retry cannot hold operator content hostage. EXACT key
+// names and value formats preserved.
+func (st wlanCfgState) applyProvisioning(cur string, nowUnix int64, wls []wireless.Wlan, placements map[string]int, offeredCfg string) {
 	st.extra["wlan_cfg_pending_sha"] = cur
 	// Each emitted system_cfg is one bounded delivery attempt. Replacing the
 	// pending hash starts a fresh budget; retrying the same hash increments it.
@@ -368,6 +394,7 @@ func (st wlanCfgState) applyProvisioning(cur string, nowUnix int64, wls []wirele
 	}
 	st.extra["wlan_cfg_last_attempt"] = nowUnix
 	st.extra["wlan_cfg_delivery_status"] = "pending"
+	st.extra["wlan_cfg_offered_cfgversion"] = offeredCfg
 	// Keep the previously applied snapshot for the settle check (verbatim
 	// value copy, whatever type it carries).
 	if st.appliedPresent {

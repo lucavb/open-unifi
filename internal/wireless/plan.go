@@ -99,6 +99,53 @@ func JSONStr(m map[string]any, key, def string) string {
 	}
 }
 
+// ---- admin-owned per-radio intent (CONTEXT.md trust policy) ----------------
+
+// RadioIntentExtraKey is the record Extra key holding the admin-owned
+// per-radio intent map, keyed by radio_table `name` (the same key the
+// renderer and StoredRadios use). server.absorbInform lists it under
+// extraAdminOwned: a device inform can neither write nor introduce it.
+const RadioIntentExtraKey = "radio_intent"
+
+// RadioIntent is the admin-owned provisioning intent for one radio's
+// channel/txpower rows. Channel/Txpower hold the FORMATTED row value
+// ("36", "0", "auto", … — the same normalization JSONStr applies to the
+// device echo); "" means "no intent for this row — the device's
+// radio_table echo survives verbatim" (CONTEXT.md: admin-owned rows sit
+// on top, device-refreshable caps stay refreshable underneath).
+type RadioIntent struct {
+	Channel string
+	Txpower string
+}
+
+// RadioIntents extracts the intent map from the record. Absent or empty
+// yields nil (byte-identical render to a record without the layer);
+// malformed shapes are skipped row-wise, never panic.
+func RadioIntents(d store.Device) map[string]RadioIntent {
+	raw, ok := d.Extra[RadioIntentExtraKey].(map[string]any)
+	if !ok {
+		return nil
+	}
+	out := make(map[string]RadioIntent, len(raw))
+	for name, v := range raw {
+		m, ok := v.(map[string]any)
+		if !ok || name == "" {
+			continue
+		}
+		it := RadioIntent{
+			Channel: JSONStr(m, "channel", ""),
+			Txpower: JSONStr(m, "txpower", ""),
+		}
+		if it.Channel != "" || it.Txpower != "" {
+			out[name] = it
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // JSONBool fetches a boolean field (defaults false when absent).
 func JSONBool(m map[string]any, key string) bool {
 	v, _ := m[key].(bool)

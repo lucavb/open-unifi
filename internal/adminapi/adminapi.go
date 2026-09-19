@@ -9,8 +9,10 @@ package adminapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -151,6 +153,82 @@ type blockClientRequest struct {
 	MAC string `json:"mac"`
 }
 
+// RadioTxPower is the admin txpower intent value: the literal "auto" or
+// a whole number of dBm. Decoding accepts exactly those two shapes
+// (everything else is a decode error → HTTP 400); the backend
+// range-checks the dBm value against the device-reported
+// [min_txpower, max_txpower].
+type RadioTxPower struct {
+	Auto bool
+	DBm  int
+}
+
+// String returns the emitted row value ("auto" or the dBm integer).
+func (t RadioTxPower) String() string {
+	if t.Auto {
+		return "auto"
+	}
+	return strconv.Itoa(t.DBm)
+}
+
+func (t RadioTxPower) MarshalJSON() ([]byte, error) {
+	if t.Auto {
+		return []byte(`"auto"`), nil
+	}
+	return []byte(strconv.Itoa(t.DBm)), nil
+}
+
+func (t *RadioTxPower) UnmarshalJSON(b []byte) error {
+	if string(b) == `"auto"` {
+		t.Auto, t.DBm = true, 0
+		return nil
+	}
+	var n float64
+	if err := json.Unmarshal(b, &n); err != nil || n != math.Trunc(n) || math.Abs(n) > 1e6 {
+		return errors.New(`txpower must be "auto" or a whole number of dBm`)
+	}
+	t.Auto, t.DBm = false, int(n)
+	return nil
+}
+
+// RadioIntentUpsert is the request body for PUT
+// /api/v1/devices/{mac}/radios/{radio}. PUT replaces that radio's admin
+// intent WHOLESALE (the same doctrine as the wireless envelope): every
+// absent field is cleared and the device's radio_table echo takes over
+// that row again. `null` equals absent — wholesale semantics make the
+// distinction moot.
+type RadioIntentUpsert struct {
+	// Channel: nil = clear; 0 = explicit auto; otherwise the channel
+	// number. Band legality is checked by the backend against the
+	// device's radio_table band token (HTTP 409 on violation).
+	Channel *int `json:"channel,omitempty"`
+	// Txpower: nil = clear; "auto" or a whole dBm number bounded by the
+	// device-reported min/max_txpower (HTTP 409 on violation).
+	Txpower *RadioTxPower `json:"txpower,omitempty"`
+}
+
+// RadioView is the read model for one device radio: the
+// device-refreshable echo (radio_table passthrough, formatted exactly as
+// the renderer emits it) plus the admin-owned intent layer that overrides
+// it at emission time. Nil intent fields mean "no intent — the echo is
+// what a push carries".
+type RadioView struct {
+	Name string `json:"name"`
+	Band string `json:"band"`
+	// Echo*: the values the radio_table currently reports, formatted as
+	// the renderer emits them (defaults "0"/"auto" when the device
+	// reports none).
+	EchoChannel string `json:"echo_channel"`
+	EchoTxPower string `json:"echo_tx_power"`
+	// EchoTxPowerMode is context for the documented omission: intent
+	// never touches the txpower_mode row (admin-side semantics
+	// unrecovered from the jar), so a fixed dBm intent can coexist with
+	// mode "auto" — docs/PROTOCOL-systemcfg-wireless.md §8.
+	EchoTxPowerMode string  `json:"echo_tx_power_mode"`
+	Channel         *string `json:"channel,omitempty"`
+	Txpower         *string `json:"txpower,omitempty"`
+}
+
 // Backend is the storage/service contract implemented by the server lane.
 type Backend interface {
 	ListDevices(ctx context.Context) []DeviceView
@@ -201,6 +279,21 @@ type Backend interface {
 	GetWlan(ctx context.Context, name string) (Wlan, error)
 	UpdateWlan(ctx context.Context, name string, wlan Wlan) (Wlan, error)
 	DeleteWlan(ctx context.Context, name string) error
+	// ListDeviceRadios returns the per-radio view (device echo + admin
+	// intent) in radio_table name order. Unknown MACs are ErrNotFound.
+	ListDeviceRadios(ctx context.Context, mac string) ([]RadioView, error)
+	// PutDeviceRadioIntent replaces the radio's admin channel/txpower
+	// intent wholesale (RadioIntentUpsert semantics) and returns the
+	// updated view. An EFFECTIVE change bumps the device's cfgversion —
+	// the jar's operator-save trigger — so the next inform
+	// full-provisions the intent; idempotent writes do not bump. Unknown
+	// MACs/radio names are ErrNotFound; band/bounds violations are
+	// ErrConflict.
+	PutDeviceRadioIntent(ctx context.Context, mac, radio string, up RadioIntentUpsert) (RadioView, error)
+	// DeleteDeviceRadioIntent clears the radio's admin intent (the
+	// device's radio_table echo takes over again). An effective change
+	// bumps the device's cfgversion like PutDeviceRadioIntent.
+	DeleteDeviceRadioIntent(ctx context.Context, mac, radio string) (RadioView, error)
 }
 
 // version reports the module version for /api/v1/whoami.
@@ -213,6 +306,8 @@ const (
 	routeDeviceItem         = "/api/v1/devices/{mac}"
 	routeDeviceReboot       = "/api/v1/devices/{mac}/reboot"
 	routeDeviceFactoryReset = "/api/v1/devices/{mac}/factory-reset"
+	routeRadiosList         = "/api/v1/devices/{mac}/radios"
+	routeRadioIntent        = "/api/v1/devices/{mac}/radios/{radio}"
 	routePendingList        = "/api/v1/pending"
 	routePendingAdopt       = "/api/v1/pending/{mac}/adopt"
 	routeWireless           = "/api/v1/wireless"
@@ -422,6 +517,63 @@ func New(cfg Config, be Backend) http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, v)
+	}))
+	// Per-radio admin intent (channel/txpower): the admin-owned layer over
+	// the device's radio_table echo (CONTEXT.md trust policy). PUT is
+	// wholesale-replace for that radio; DELETE clears it entirely.
+	mux.HandleFunc("GET /api/v1/devices/{mac}/radios", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+		mac, err := normalizeMAC(r.PathValue("mac"))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid mac: "+err.Error())
+			return
+		}
+		radios, err := be.ListDeviceRadios(r.Context(), mac)
+		if err != nil {
+			handleBackendErr(w, lg, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, radiosEnvelope{radios})
+	}))
+	mux.HandleFunc("PUT /api/v1/devices/{mac}/radios/{radio}", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+		mac, err := normalizeMAC(r.PathValue("mac"))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid mac: "+err.Error())
+			return
+		}
+		radio := r.PathValue("radio")
+		if msg := ValidateRadioName(radio); msg != "" {
+			writeErr(w, http.StatusBadRequest, "invalid radio: "+msg)
+			return
+		}
+		var up RadioIntentUpsert
+		if err := readJSON(r, &up); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+			return
+		}
+		view, err := be.PutDeviceRadioIntent(r.Context(), mac, radio, up)
+		if err != nil {
+			handleBackendErr(w, lg, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, view)
+	}))
+	mux.HandleFunc("DELETE /api/v1/devices/{mac}/radios/{radio}", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+		mac, err := normalizeMAC(r.PathValue("mac"))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid mac: "+err.Error())
+			return
+		}
+		radio := r.PathValue("radio")
+		if msg := ValidateRadioName(radio); msg != "" {
+			writeErr(w, http.StatusBadRequest, "invalid radio: "+msg)
+			return
+		}
+		view, err := be.DeleteDeviceRadioIntent(r.Context(), mac, radio)
+		if err != nil {
+			handleBackendErr(w, lg, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, view)
 	}))
 	mux.HandleFunc("GET /api/v1/pending", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, pendingEnvelope{be.ListPending(r.Context())})

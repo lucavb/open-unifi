@@ -271,7 +271,8 @@ record is absent); `Get` returns a deep copy. `Device` fields as implemented: MA
 LastSeen, FirstSeen, CfgVersion, AppliedCfg, Authkeys (assigned-key history, newest
 last, capped at 2 — the factory default key is NEVER stored here), XAuthkey, AESGCM,
 LastUps, Extra (inform-body passthrough; controller-owned `wlan_cfg_sha`/
-`ssh_sha512passwd` and admin-owned keys are preserved/protected across informs).
+`ssh_sha512passwd` and admin-owned keys — `wlan_cfg_*`, `radio_intent` — are
+preserved/protected across informs).
 
 Trust-policy asymmetries (mirror the classic controller's observed behavior;
 recorded so they read as fidelity, not oversight):
@@ -284,6 +285,10 @@ recorded so they read as fidelity, not oversight):
 - `has_eth1` is fill-if-absent but never read: the eth inventory derives from
   if_table/ethernet_table (system_cfg renderer), so the key is a vestige the
   classic controller also carries.
+- `Extra["radio_intent"]` is admin-owned (2026-09-19): the per-radio
+  channel/txpower intent the renderer overlays on the radio_table echo
+  (PROTOCOL-systemcfg-wireless.md §3.2). An inform can neither overwrite nor
+  introduce it; a forged `radio_intent` in an inform body is discarded.
 
 Package `internal/adminapi`: REST over JSON at the `--listen-admin` addr:
 ```
@@ -295,6 +300,9 @@ GET    /api/v1/pending            (discovery-found candidates)
 POST   /api/v1/pending/{mac}/adopt
 GET    /api/v1/wireless           (whole-document WLAN envelope)
 PUT    /api/v1/wireless           (replaces the whole document)
+GET    /api/v1/devices/{mac}/radios    (per-radio views: echo fields + intent overlay)
+PUT    /api/v1/devices/{mac}/radios/{radio}    {"channel"?: int, "txpower"?: int|"auto"}  -> wholesale replace
+DELETE /api/v1/devices/{mac}/radios/{radio}     (clear the radio's intent; echo-only again)
 GET    /api/v1/whoami
 GET    /healthz                   -> 200 ok
 GET    /metrics                   (promhttp; requires the token when one is set)

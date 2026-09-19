@@ -558,6 +558,50 @@ func TestZZSuccessivePush2gOnlyVsApplied(t *testing.T) {
 	}
 }
 
+// TestZZSuccessivePushChannelIntentVsApplied — the per-radio admin
+// channel-intent candidate (radio lane): zzHarnessRecord + the
+// admin-owned Extra["radio_intent"] layer (wifi1 = the na radio, channel
+// 36) with the SAME gate-check both-band open WLAN, diffed against the
+// APPLIED bytes. The channel-intent push is exactly the kind the
+// minimal-diff invariant exists for: the intended delta must be the ONE
+// row radio.2.channel "0"→"36" (radio 2 = wifi1 na; runtime channels
+// live in vap_table, WLAN-ACCEPTANCE 2026-09-17 §channel rows), with
+// every unmanaged section byte-identical — the restart set stays
+// {radio}, which is NOT live-evidenced (the {radio} plugin restart has
+// no live round yet; see the radio-lane obligations in
+// WLAN-ACCEPTANCE-6.8.2.15592.md). Post-merge activation evidence: run
+// on the postmortem workstation main checkout (tmpwork/harness-20260917
+// present) and record the gate listing + candidate sha256 in the
+// acceptance doc before the first live channel-intent push.
+func TestZZSuccessivePushChannelIntentVsApplied(t *testing.T) {
+	appliedRaw, err := os.ReadFile(zzAppliedCfg)
+	if err != nil {
+		t.Skipf("applied baseline not present (%v); successive-push gates run only on the postmortem workstation", err)
+	}
+	env := []Wlan{{
+		ID: "7a5326f64be2c3c13c18eb4f", Name: "gate-check",
+		SSID: "openunifi-gate-check", Security: "open",
+		VLAN: 1, Enabled: true, Band: "both",
+	}}
+	rec := zzHarnessRecord()
+	rec.Extra["radio_intent"] = map[string]any{
+		"wifi1": map[string]any{"channel": 36.0},
+	}
+	s := New(Config{WirelessSource: func() []Wlan { return env }}, store.NewMemStore(), testLogger())
+	sys := mustBuildSys(t, s, rec)
+	if err := os.WriteFile(zzHarnessDir+"/night-cand-channel-intent-sys.txt", []byte(sys), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	intended, violations := zzRunGate(t, "successive-push CHANNEL-INTENT vs APPLIED", appliedRaw, sys, zzManagedAllow)
+	if len(violations) > 0 {
+		t.Fatalf("minimal-diff invariant broken: %d unmanaged row(s) differ from the APPLIED baseline — the push would restart/delete unmanaged plugins: %v", len(violations), violations)
+	}
+	intended = zzExemptIsDefaultMigration(intended)
+	if len(intended) != 1 || !strings.HasPrefix(intended[0], `radio.2.channel: "0" -> "36"`) {
+		t.Fatalf("channel-intent candidate must change exactly one row (radio.2.channel 0->36); got %v", intended)
+	}
+}
+
 // TestZZSuccessivePushWpaPskVsApplied — the wpa-p candidate (gate-check
 // WLAN re-secured to wpa-p) against the APPLIED bytes. The vap shape is
 // unchanged (both-band, same WLAN id/ssid, VLAN 1 untagged), so no

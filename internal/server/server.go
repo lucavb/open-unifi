@@ -797,11 +797,15 @@ var (
 	// dropped here: the admin value lives in the typed field and a body
 	// echo can neither shadow nor introduce it (CONTEXT.md trust policy:
 	// admin-owned).
+	// radio_intent (wireless.RadioIntentExtraKey) is the per-radio
+	// channel/txpower intent the admin API writes — admin-owned rows in
+	// the CONTEXT.md sense: the device can neither write nor introduce
+	// them, exactly like the other entries here.
 	extraAdminOwned = []string{"system_cfg_extra_lines", "mgmt_dev",
 		"anonymous_controller_id", "anonymous_site_id",
 		adoption.FlagRebootOnConnect, adoption.FlagSetdefaultArmed,
 		"blocked_sta", "blocked_sta_sha",
-		"led_override", "disabled"}
+		"led_override", "disabled", wireless.RadioIntentExtraKey}
 )
 
 // absorbInform copies interesting fields from the inform body into the record.

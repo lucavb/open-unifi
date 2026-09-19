@@ -56,6 +56,10 @@ type devicesEnvelope struct {
 	Devices []DeviceView `json:"devices"`
 }
 
+type radiosEnvelope struct {
+	Radios []RadioView `json:"radios"`
+}
+
 type pendingEnvelope struct {
 	Pending []PendingView `json:"pending"`
 }
@@ -201,6 +205,24 @@ func ValidateLEDOverride(v string) string {
 		return ""
 	}
 	return "led_override must be one of default, on, off"
+}
+
+// ValidateRadioName enforces the path radio name for the per-radio intent
+// routes: 1..64 characters, no control characters. The name is a LOOKUP
+// KEY against the device-reported radio_table names (never emitted into
+// system_cfg), so the injection surface is nil — the bounds are hygiene.
+// The backend's not-found mapping answers unknown names with 404.
+func ValidateRadioName(name string) string {
+	if name == "" {
+		return "empty"
+	}
+	if len(name) > 64 {
+		return "must be at most 64 characters"
+	}
+	if hasControlChar(name) {
+		return "must not contain control characters"
+	}
+	return ""
 }
 
 // validateWlan enforces server-side rules. The web console mirrors the

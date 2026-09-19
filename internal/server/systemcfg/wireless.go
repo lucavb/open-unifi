@@ -80,6 +80,16 @@ func (rd *render) emitWirelessCfg(b *strings.Builder, d store.Device, wls []wire
 
 	line := rd.lineWriter(b, "wireless-radio")
 
+	// Admin-owned radio intent (CONTEXT.md trust policy): per-radio
+	// channel/txpower values the admin set, overriding the device echo at
+	// emission time. The rows themselves are the byte-verified §3 rows —
+	// intent only picks the VALUE, never the row shape or order; where a
+	// row has no intent the radio_table echo survives verbatim. The
+	// txpower_mode row is deliberately NEVER intent-driven (its admin-side
+	// semantics are unrecovered from the jar; documented omission,
+	// docs/PROTOCOL-systemcfg-wireless.md §8).
+	intent := wireless.RadioIntents(d)
+
 	// Header block (int §488-497 / doc §1) — country is explicitly configured,
 	// with the compatibility default applied by ValidateConfig.
 	// override from site settings we do not carry yet → "disabled".
@@ -104,7 +114,10 @@ func (rd *render) emitWirelessCfg(b *strings.Builder, d store.Device, wls []wire
 		line(prefix+"cwm.enable", "0")
 		line(prefix+"cwm.mode", "0")
 		line(prefix+"forbiasauto", "0")
-		line(prefix+"channel", wireless.JSONStr(r.Raw, "channel", "0"))
+		// channel/txpower: admin intent wins where set, else the §3 echo
+		// (radio_table `channel` default "0" = auto, `tx_power` default
+		// "auto"). Both values flow through the same newline guard.
+		line(prefix+"channel", intentOr(intent[r.Name].Channel, wireless.JSONStr(r.Raw, "channel", "0")))
 		line(prefix+"backup_channel", wireless.JSONStr(r.Raw, "backup_channel", "0"))
 		// chanWidth resolver (devmgr c javap 1242-1298): width =
 		// min(countryLimit, ht cap (ng→20 / na→40), device caps). All three
@@ -125,7 +138,7 @@ func (rd *render) emitWirelessCfg(b *strings.Builder, d store.Device, wls []wire
 		line(prefix+"antenna.gain", antennaGain(r.Raw))
 		line(prefix+"antenna", wireless.JSONStr(r.Raw, "antenna_id", "-1"))
 		line(prefix+"txpower_mode", wireless.JSONStr(r.Raw, "tx_power_mode", "auto"))
-		line(prefix+"txpower", wireless.JSONStr(r.Raw, "tx_power", "auto"))
+		line(prefix+"txpower", intentOr(intent[r.Name].Txpower, wireless.JSONStr(r.Raw, "tx_power", "auto")))
 		line(prefix+"hard_noisefloor.status", "disabled")
 		// per-vap devname/status rows (int offsets 1141-1432): emitted for
 		// EVERY vap walking this radio — plain `radio.<n>` prefix for
@@ -169,6 +182,16 @@ func boolStr(v bool) string {
 		return "enabled"
 	}
 	return "disabled"
+}
+
+// intentOr returns the admin intent value when set, else the device's
+// radio_table echo (CONTEXT.md: admin-owned rows win, device-refreshable
+// caps stay verbatim where no intent exists).
+func intentOr(intent, echo string) string {
+	if intent != "" {
+		return intent
+	}
+	return echo
 }
 
 // antennaGain: builtin_antenna → builtin_ant_gain (default 0), else

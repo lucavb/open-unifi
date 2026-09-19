@@ -1111,3 +1111,231 @@ func TestInvalidMACIsRejectedOrNotFound(t *testing.T) {
 		t.Fatalf("dot-separated mac must normalize: %v", err)
 	}
 }
+
+// ---- per-radio admin intent (admin-owned record state) ---------------------
+
+// seedRadioDevice seeds an adopted device whose radio_table mirrors the
+// live U7PG2 shape: ra0 (ng) + rai0 (na), device-reported txpower bounds
+// 6..22 dBm, echo channel defaults.
+func seedRadioDevice(t *testing.T, st store.DeviceStore) {
+	t.Helper()
+	if err := st.Put(store.Device{
+		MAC: "aabbccddeeff", Model: "U7PG2", State: store.StateAdopted,
+		CfgVersion: "aaaa", AppliedCfg: "aaaa",
+		Extra: store.JSONMap{"radio_table": []any{
+			map[string]any{"name": "ra0", "radio": "ng", "channel": "6",
+				"min_txpower": 6.0, "max_txpower": 22.0},
+			map[string]any{"name": "rai0", "radio": "na", "channel": 0.0,
+				"min_txpower": 6.0, "max_txpower": 22.0},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func chPtr(n int) *int { return &n }
+func txPtr(auto bool, dbm int) *adminapi.RadioTxPower {
+	return &adminapi.RadioTxPower{Auto: auto, DBm: dbm}
+}
+
+// TestRadioIntentPutBumpsCfgVersionOncePerChange pins the operator-save
+// trigger: an EFFECTIVE intent change bumps the device's cfgversion
+// (fresh 16-hex, the engine's operator-save shape); idempotent writes
+// do not bump; wholesale replaces/clears behave the same.
+func TestRadioIntentPutBumpsCfgVersionOncePerChange(t *testing.T) {
+	a, st, _ := testApp(t)
+	ctx := context.Background()
+	seedRadioDevice(t, st)
+
+	v, err := a.PutDeviceRadioIntent(ctx, "aabbccddeeff", "rai0",
+		adminapi.RadioIntentUpsert{Channel: chPtr(36)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Channel == nil || *v.Channel != "36" || v.Txpower != nil {
+		t.Fatalf("put view: %+v", v)
+	}
+	rec, err := st.Get("aabbccddeeff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.CfgVersion == "aaaa" || len(rec.CfgVersion) != 16 {
+		t.Fatalf("effective change must bump cfgversion (16 hex), got %q", rec.CfgVersion)
+	}
+	per, ok := rec.Extra["radio_intent"].(map[string]any)["rai0"].(map[string]any)
+	if !ok || per["channel"] != 36.0 {
+		t.Fatalf("stored intent: %v", rec.Extra["radio_intent"])
+	}
+
+	// Idempotent re-put of the same value: no further bump.
+	bumped := rec.CfgVersion
+	if _, err := a.PutDeviceRadioIntent(ctx, "aabbccddeeff", "rai0",
+		adminapi.RadioIntentUpsert{Channel: chPtr(36)}); err != nil {
+		t.Fatal(err)
+	}
+	if rec, err = st.Get("aabbccddeeff"); err != nil {
+		t.Fatal(err)
+	}
+	if rec.CfgVersion != bumped {
+		t.Fatalf("idempotent write bumped cfgversion: %q -> %q", bumped, rec.CfgVersion)
+	}
+
+	// Wholesale replace: txpower only — the channel intent is cleared.
+	v, err = a.PutDeviceRadioIntent(ctx, "aabbccddeeff", "rai0",
+		adminapi.RadioIntentUpsert{Txpower: txPtr(false, 10)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Channel != nil || v.Txpower == nil || *v.Txpower != "10" {
+		t.Fatalf("wholesale replace view: %+v", v)
+	}
+	if rec, err = st.Get("aabbccddeeff"); err != nil {
+		t.Fatal(err)
+	}
+	if rec.CfgVersion == bumped {
+		t.Fatal("effective change (channel cleared) must bump cfgversion")
+	}
+	per = rec.Extra["radio_intent"].(map[string]any)["rai0"].(map[string]any)
+	if _, has := per["channel"]; has {
+		t.Fatalf("wholesale replace must clear the channel field: %v", per)
+	}
+	if per["txpower"] != 10.0 {
+		t.Fatalf("stored txpower: %v", per)
+	}
+
+	// DELETE clears the radio's layer entirely; the empty layer key is
+	// dropped from Extra (absent == empty on disk).
+	v, err = a.DeleteDeviceRadioIntent(ctx, "aabbccddeeff", "rai0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Channel != nil || v.Txpower != nil {
+		t.Fatalf("delete view must show echo-only: %+v", v)
+	}
+	if rec, err = st.Get("aabbccddeeff"); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := rec.Extra["radio_intent"]; exists {
+		t.Fatalf("empty intent layer must be dropped from Extra: %v", rec.Extra["radio_intent"])
+	}
+	if rec.CfgVersion == bumped {
+		t.Fatal("effective clear must bump cfgversion")
+	}
+}
+
+// TestRadioIntentValidation pins the band/bounds contract: ng/na channel
+// ranges, device-reported txpower bounds, the "auto" forms, unknown-band
+// rejection, missing-bounds rejection, and unknown MAC/radio 404s.
+func TestRadioIntentValidation(t *testing.T) {
+	a, st, _ := testApp(t)
+	ctx := context.Background()
+	seedRadioDevice(t, st)
+	// An unknown-band radio and a bounds-less radio join the fixture.
+	if err := st.Update("aabbccddeeff", func(d *store.Device) error {
+		d.Extra["radio_table"] = append(d.Extra["radio_table"].([]any),
+			map[string]any{"name": "rae0", "radio": "6e"},
+			map[string]any{"name": "rax0", "radio": "ng"})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ok := func(radio string, up adminapi.RadioIntentUpsert) error {
+		_, err := a.PutDeviceRadioIntent(ctx, "aabbccddeeff", radio, up)
+		return err
+	}
+	conflict := func(err error) bool { return errors.Is(err, adminapi.ErrConflict) }
+	notFound := func(err error) bool { return errors.Is(err, adminapi.ErrNotFound) }
+
+	// Channel ranges per band.
+	if err := ok("ra0", adminapi.RadioIntentUpsert{Channel: chPtr(15)}); !conflict(err) {
+		t.Fatalf("ng channel 15 must conflict: %v", err)
+	}
+	if err := ok("ra0", adminapi.RadioIntentUpsert{Channel: chPtr(-1)}); !conflict(err) {
+		t.Fatalf("ng channel -1 must conflict: %v", err)
+	}
+	if err := ok("ra0", adminapi.RadioIntentUpsert{Channel: chPtr(0)}); err != nil {
+		t.Fatalf("ng channel 0 (explicit auto) must pass: %v", err)
+	}
+	if err := ok("rai0", adminapi.RadioIntentUpsert{Channel: chPtr(200)}); !conflict(err) {
+		t.Fatalf("na channel 200 must conflict: %v", err)
+	}
+	if err := ok("rai0", adminapi.RadioIntentUpsert{Channel: chPtr(35)}); !conflict(err) {
+		t.Fatalf("na channel 35 must conflict: %v", err)
+	}
+	if err := ok("rai0", adminapi.RadioIntentUpsert{Channel: chPtr(36)}); err != nil {
+		t.Fatalf("na channel 36 must pass: %v", err)
+	}
+	// txpower bounds: device-reported [6, 22].
+	if err := ok("ra0", adminapi.RadioIntentUpsert{Txpower: txPtr(false, 23)}); !conflict(err) {
+		t.Fatalf("txpower 23 over max must conflict: %v", err)
+	}
+	if err := ok("ra0", adminapi.RadioIntentUpsert{Txpower: txPtr(false, 5)}); !conflict(err) {
+		t.Fatalf("txpower 5 under min must conflict: %v", err)
+	}
+	if err := ok("ra0", adminapi.RadioIntentUpsert{Txpower: txPtr(false, 22)}); err != nil {
+		t.Fatalf("txpower 22 at max must pass: %v", err)
+	}
+	if err := ok("ra0", adminapi.RadioIntentUpsert{Txpower: txPtr(true, 0)}); err != nil {
+		t.Fatalf("txpower auto must pass: %v", err)
+	}
+	// Unknown band: any intent (even auto) is rejected — semantics for
+	// non-na/ng tokens are unrecovered; never ship unvalidated rows.
+	if err := ok("rae0", adminapi.RadioIntentUpsert{Channel: chPtr(36)}); !conflict(err) {
+		t.Fatalf("unknown-band channel intent must conflict: %v", err)
+	}
+	if err := ok("rae0", adminapi.RadioIntentUpsert{Txpower: txPtr(true, 0)}); !conflict(err) {
+		t.Fatalf("unknown-band txpower intent must conflict: %v", err)
+	}
+	// Bounds-less radio: fixed txpower rejected ("byte-exact or absent"),
+	// auto passes.
+	if err := ok("rax0", adminapi.RadioIntentUpsert{Txpower: txPtr(false, 10)}); !conflict(err) {
+		t.Fatalf("txpower without device bounds must conflict: %v", err)
+	}
+	if err := ok("rax0", adminapi.RadioIntentUpsert{Txpower: txPtr(true, 0)}); err != nil {
+		t.Fatalf("txpower auto without bounds must pass: %v", err)
+	}
+	// Unknown radio name and unknown MAC: not-found (404).
+	if err := ok("nosuch", adminapi.RadioIntentUpsert{Channel: chPtr(36)}); !notFound(err) {
+		t.Fatalf("unknown radio must be not-found: %v", err)
+	}
+	if _, err := a.PutDeviceRadioIntent(ctx, "deadbeef0000", "ra0",
+		adminapi.RadioIntentUpsert{Channel: chPtr(36)}); !notFound(err) {
+		t.Fatalf("unknown mac must be not-found: %v", err)
+	}
+	if _, err := a.ListDeviceRadios(ctx, "deadbeef0000"); !notFound(err) {
+		t.Fatalf("list unknown mac must be not-found: %v", err)
+	}
+}
+
+// TestRadioIntentListView pins the list read model: name order, the echo
+// fields formatted exactly as the renderer emits them, and intent
+// overlaying the echo.
+func TestRadioIntentListView(t *testing.T) {
+	a, st, _ := testApp(t)
+	ctx := context.Background()
+	seedRadioDevice(t, st)
+	if _, err := a.PutDeviceRadioIntent(ctx, "aa:bb:cc:dd:ee:ff", "rai0",
+		adminapi.RadioIntentUpsert{Channel: chPtr(36), Txpower: txPtr(false, 8)}); err != nil {
+		t.Fatal(err)
+	}
+	radios, err := a.ListDeviceRadios(ctx, "AA-BB-CC-DD-EE-FF")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(radios) != 2 {
+		t.Fatalf("want 2 radios, got %+v", radios)
+	}
+	if radios[0].Name != "ra0" || radios[1].Name != "rai0" {
+		t.Fatalf("radios must be in name order: %+v", radios)
+	}
+	ra0, rai0 := radios[0], radios[1]
+	if ra0.Channel != nil || ra0.Txpower != nil ||
+		ra0.EchoChannel != "6" || ra0.EchoTxPower != "auto" || ra0.EchoTxPowerMode != "auto" {
+		t.Fatalf("ra0 view (echo only): %+v", ra0)
+	}
+	if rai0.Channel == nil || *rai0.Channel != "36" || rai0.Txpower == nil || *rai0.Txpower != "8" ||
+		rai0.EchoChannel != "0" || rai0.EchoTxPower != "auto" {
+		t.Fatalf("rai0 view (intent over echo): %+v", rai0)
+	}
+}

@@ -1271,3 +1271,100 @@ func TestMgmtCfgLEDOverride(t *testing.T) {
 		})
 	}
 }
+
+// TestOperatorMintEscapesExhaustedDeliveryGate: at the WLAN delivery retry
+// cap with the envelope UNCHANGED, the exhausted gate answers
+// noop-pending-wlan indefinitely — but an operator cfgversion mint (the
+// putRadioIntent / LED-override save shape: Extra write + fresh CfgVersion,
+// envelope unchanged) must still deliver in the same inform, exactly like a
+// blocked-set change: the mint bypasses the exhausted early return and the
+// re-offer carries the minted cfgversion. The escape is one-shot per mint —
+// the follow-up inform holds at the gate again (rate-limit semantics for the
+// unchanged record). The device never proves its VAPs (no vap_table), so
+// settle cannot clear the pending bookkeeping.
+func TestOperatorMintEscapesExhaustedDeliveryGate(t *testing.T) {
+	e := newTestEngine(t)
+	// The render stub records whether the operator intent reached it, so
+	// the escape offer is proven to render the minted record, not just to
+	// answer setparam.
+	sawIntent := false
+	e.systemCfg = func(d store.Device, wls []wireless.Wlan) (string, map[string]string, error) {
+		if _, ok := d.Extra["radio_intent"]; ok {
+			sawIntent = true
+		}
+		return "# unifi\n", nil, nil
+	}
+	dev := driveToProvisioned(t, e) // attempts=1, lastAttempt=1010, pending outstanding
+	xkey := dev.XAuthkey
+	inform := func(now int64) Outcome {
+		t.Helper()
+		out, err := e.Decide(Request{Transport: TransportEncrypted, Device: dev, Body: engineBody(dev.AppliedCfg), UsedKey: xkey, Now: time.Unix(now, 0)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	// Burn the whole bounded retry budget on the unchanged envelope: five
+	// re-offers (2s,4s,8s,16s,32s backoff), each a full provisioning.
+	for _, tt := range []int64{1012, 1016, 1024, 1040, 1072} {
+		out := inform(tt)
+		if out.Kind != KindSetparam || !out.FullProvision {
+			t.Fatalf("re-offer @%d = %+v, want full provisioning", tt, out)
+		}
+		applyDeltas(&dev, out)
+	}
+
+	// Cap reached: the delivery status flips to exhausted and the gate
+	// holds (noop-pending-wlan, not re-offer).
+	out := inform(1080)
+	if out.Kind != KindNoopPendingWLAN {
+		t.Fatalf("exhausted inform = %+v, want noop-pending-wlan", out)
+	}
+	applyDeltas(&dev, out)
+	if status, _ := dev.Extra["wlan_cfg_delivery_status"].(string); status != "exhausted" {
+		t.Fatalf("delivery status = %q, want exhausted", status)
+	}
+
+	// Operator radio-intent save: the app layer's mint shape (Extra write +
+	// fresh cfgversion, envelope unchanged). Same inform: full provisioning
+	// despite the exhausted budget — the mint cannot be held hostage.
+	const radioMint = "cccccccccccccccc"
+	dev.Extra["radio_intent"] = map[string]any{"rai0": map[string]any{"channel": 36.0}}
+	dev.CfgVersion = radioMint
+	out = inform(1090)
+	if out.Kind != KindSetparam || !out.FullProvision {
+		t.Fatalf("radio-intent mint under exhausted retry = %+v, want full provisioning", out)
+	}
+	if out.CfgVersion != radioMint {
+		t.Fatalf("the escape offer must carry the minted cfgversion: %q", out.CfgVersion)
+	}
+	if !sawIntent {
+		t.Fatal("the escape offer rendered without the radio intent")
+	}
+	applyDeltas(&dev, out)
+	if offered, _ := dev.Extra["wlan_cfg_offered_cfgversion"].(string); offered != radioMint {
+		t.Fatalf("offered-cfgversion bookkeeping not stamped at emission: %v", dev.Extra["wlan_cfg_offered_cfgversion"])
+	}
+
+	// The escape is one-shot per mint: the follow-up inform (record
+	// unchanged since the re-offer) holds at the gate again.
+	out = inform(1100)
+	if out.Kind != KindNoopPendingWLAN {
+		t.Fatalf("post-escape inform = %+v, want the exhausted gate to hold again", out)
+	}
+	applyDeltas(&dev, out)
+
+	// Same escape for the LED-override mint: the LED row rides the full
+	// provisioning's mgmt_cfg (BuildMgmtCfg led_enabled).
+	const ledMint = "dddddddddddddddd"
+	dev.LEDOverride = "off"
+	dev.CfgVersion = ledMint
+	out = inform(1110)
+	if out.Kind != KindSetparam || !out.FullProvision {
+		t.Fatalf("LED-override mint under exhausted retry = %+v, want full provisioning", out)
+	}
+	if !strings.Contains(out.MgmtCfg, "led_enabled=false\n") {
+		t.Fatalf("LED re-offer missing led_enabled=false:\n%s", out.MgmtCfg)
+	}
+}

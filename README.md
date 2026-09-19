@@ -96,6 +96,8 @@ POST          /api/v1/devices/{mac}/factory-reset   arm remote factory reset
 GET           /api/v1/pending           unadopted devices heard so far
 POST          /api/v1/pending/{mac}/adopt
 GET/PUT       /api/v1/wireless          whole-doc WLAN config ({"wlans":[…]})
+GET           /api/v1/devices/{mac}/radios          per-radio echo + admin intent
+PUT/DELETE    /api/v1/devices/{mac}/radios/{radio} set / clear per-radio intent
 GET           /api/v1/whoami
 GET           /metrics                  Prometheus (requires the token when one is set)
 GET           /healthz
@@ -125,6 +127,14 @@ optional for `wpa-eap`), `vlan` (1–4094),
 Control characters are rejected in all
 fields (they would inject `system_cfg` rows). Disabling a WLAN removes it
 from the pushed config entirely.
+
+Per-radio intent: `PUT /api/v1/devices/{mac}/radios/{radio}` with
+`{"channel": 36}` and/or `{"txpower": 8 | "auto"}` (wholesale replace —
+absent fields clear). Intent survives inform echoes, rides full
+provisioning after a one-per-change cfgversion bump, and overlays the
+device's radio_table echo in the rendered `radio.<n>.channel`/`txpower`
+rows. Validation: channel `ng` 0–14 / `na` 0 or 36–165; fixed txpower
+must fit the device-reported bounds; unknown bands are rejected.
 
 ## Terraform
 

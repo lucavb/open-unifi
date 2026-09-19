@@ -508,7 +508,17 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, d *store.Devi
 		// delivery retry would otherwise hold the blocked set hostage — the
 		// pending operation is re-offered alongside the new content anyway,
 		// since assignedKeyFlow emits system_cfg unconditionally.
-		if !blockedDrift && st.pendingSHA == wireless.WlanListHash(wls) && !st.retryDue(now) {
+		// An operator cfgversion mint (radio-intent / LED-override saves —
+		// the §6.2 "CONFIG changed" operator-save trigger) gets the SAME
+		// escape: applyProvisioning records the cfgversion the pending
+		// operation was last offered with (wlan_cfg_offered_cfgversion), and
+		// a record whose cfgversion has moved past that offer carries
+		// operator content this gate must not hold hostage while the
+		// envelope is unchanged. The rate limit still holds the UNCHANGED
+		// case (no mint since the last offer), and records whose pending
+		// predates the offered bookkeeping keep the hold-at-gate behavior.
+		operatorMint := st.offeredPresent && d.CfgVersion != st.offeredCfgversion
+		if !blockedDrift && !operatorMint && st.pendingSHA == wireless.WlanListHash(wls) && !st.retryDue(now) {
 			return e.noopFor(d, now, req.PrevNoopTarget, KindNoopPendingWLAN), nil
 		}
 		wlanDrift = true
@@ -763,7 +773,7 @@ func (e *Engine) assignedKeyFlow(d *store.Device, now time.Time, wls []wireless.
 	// inform (including deletions, where absence must be observed).
 	placements := wlanPlacements(*d, wls)
 	st := loadWlanCfgState(d.Extra)
-	st.applyProvisioning(cur, now.Unix(), wls, placements)
+	st.applyProvisioning(cur, now.Unix(), wls, placements, d.CfgVersion)
 	// blocked_sta rides every full provisioning (§6.2(d)): render the §4
 	// wire string from the admin-owned set, carry it in the outcome, and
 	// stamp the delivery baseline so the next inform can tell confirmed

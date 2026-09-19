@@ -2789,6 +2789,157 @@ func TestRadioTablePreserveAndRefresh(t *testing.T) {
 	}
 }
 
+// ---- radio intent: admin-owned trust policy + delivery (§8i) ----------------
+
+// radio_intent is ADMIN-OWNED (CONTEXT.md trust policy: the device can
+// neither write nor introduce admin-owned rows): an inform body carrying
+// a forged radio_intent must not overwrite the stored one, a body that
+// omits it must not wipe it, and a refreshed radio_table
+// (device-refreshable) must coexist with the surviving intent layer.
+func TestRadioIntentAdminOwnedSurvivesInforms(t *testing.T) {
+	h, st := newServerWith(Config{AllowPlainText: true})
+	registerAdopted(t, st, "aaaa", "11112222333344445555666677778888")
+	xk := "11112222333344445555666677778888"
+	// Seed the admin intent the way the admin API stores it (float64 for
+	// numeric scalars, string for "auto").
+	if err := st.Update(testMAC, func(d *store.Device) error {
+		if d.Extra == nil {
+			d.Extra = store.JSONMap{}
+		}
+		d.Extra["radio_intent"] = map[string]any{
+			"rai0": map[string]any{"channel": 36.0},
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Full inform WITHOUT radio_intent in the body: preserved.
+	full := infoBody("aaaa")
+	full["_authkey"] = xk
+	full["radio_table"] = u7pg2Record().Extra["radio_table"]
+	resp := post(t, h, mustJSON(t, full))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("full inform: %d %q", resp.Code, resp.Body.String())
+	}
+	// Full inform WITH a forged radio_intent (device trying to overwrite
+	// the admin layer): the admin value must survive verbatim.
+	forged := infoBody("aaaa")
+	forged["_authkey"] = xk
+	forged["radio_table"] = u7pg2Record().Extra["radio_table"]
+	forged["radio_intent"] = map[string]any{
+		"rai0": map[string]any{"channel": 999.0},
+	}
+	resp = post(t, h, mustJSON(t, forged))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("forged inform: %d %q", resp.Code, resp.Body.String())
+	}
+	rec, err := st.Get(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ri, ok := rec.Extra["radio_intent"].(map[string]any)
+	if !ok {
+		t.Fatalf("radio_intent wiped by inform: %v", rec.Extra["radio_intent"])
+	}
+	per, ok := ri["rai0"].(map[string]any)
+	if !ok || per["channel"] != 36.0 {
+		t.Fatalf("admin radio_intent not preserved verbatim (forged overwrite): %v", ri)
+	}
+
+	// A record WITHOUT the layer stays without it: a device introducing
+	// radio_intent in its body cannot seed the admin key.
+	st2 := store.NewMemStore()
+	h2 := New(Config{AllowPlainText: true}, st2, testLogger()).InformHandler()
+	registerAdopted(t, st2, "aaaa", xk)
+	intro := infoBody("aaaa")
+	intro["_authkey"] = xk
+	intro["radio_table"] = u7pg2Record().Extra["radio_table"]
+	intro["radio_intent"] = map[string]any{"ra0": map[string]any{"channel": 1.0}}
+	resp = post(t, h2, mustJSON(t, intro))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("introduce inform: %d", resp.Code)
+	}
+	rec2, err := st2.Get(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := rec2.Extra["radio_intent"]; exists {
+		t.Fatalf("device inform introduced the admin-owned radio_intent key: %v", rec2.Extra["radio_intent"])
+	}
+
+	// Refreshed radio_table + surviving intent coexist (device-refreshable
+	// caps refresh; admin-owned rows persist) — and the rendered config
+	// for the CURRENT record carries intent over the fresh echo.
+	updated := infoBody("aaaa")
+	updated["_authkey"] = xk
+	updated["radio_table"] = []any{
+		map[string]any{"name": "ra0", "radio": "ng", "channel": 6.0},
+		map[string]any{"name": "rai0", "radio": "na", "channel": 149.0},
+	}
+	resp = post(t, h, mustJSON(t, updated))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("refresh inform: %d", resp.Code)
+	}
+	rec, err = st.Get(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt, _ := rec.Extra["radio_table"].([]any)
+	if len(rt) != 2 {
+		t.Fatalf("radio_table not refreshed: %v", rec.Extra["radio_table"])
+	}
+	second, _ := rt[1].(map[string]any)
+	if second["channel"] != 149.0 {
+		t.Fatalf("radio_table echo not refreshed (want device echo 149): %v", second)
+	}
+	s := New(Config{}, store.NewMemStore(), testLogger())
+	sys := mustBuildSys(t, s, rec)
+	if !strings.Contains(sys, "radio.2.channel=36\n") {
+		t.Fatalf("intent must beat the refreshed 149 echo in the render:\n%s", sys)
+	}
+}
+
+// Intent delivery: an admin radio-intent save bumps cfgversion (the jar's
+// operator-save trigger, engine.go decideEncrypted) — the device's next
+// inform still echoes the OLD applied version, so the default arm
+// full-provisions and the pushed system_cfg carries the intent row.
+func TestRadioIntentRidesFullProvisioning(t *testing.T) {
+	st := store.NewMemStore()
+	xk := "11112222333344445555666677778888"
+	rec := u7pg2Record()
+	rec.XAuthkey, rec.Authkeys = xk, []string{xk}
+	rec.CfgVersion = "bbbb" // the admin save bumped it
+	rec.AppliedCfg = "aaaa" // the device still runs/echoes the old version
+	rec.Extra["radio_intent"] = map[string]any{
+		"rai0": map[string]any{"channel": 36.0, "txpower": 8.0},
+	}
+	if err := st.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	env := []Wlan{{Name: "net", SSID: "net", Security: "open", Enabled: true}}
+	s := New(Config{WirelessSource: func() []Wlan { return env }}, st, testLogger())
+	h := s.InformHandler()
+
+	body := infoBody("aaaa") // device echoes the applied, not the bumped, version
+	body["_authkey"] = xk
+	resp := post(t, h, encryptCBC(t, mustJSON(t, body), hexKey(t, xk), testIV))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("inform: %d", resp.Code)
+	}
+	_, jm := decryptResponse(t, resp.Body.Bytes(), hexKey(t, xk))
+	if jm["_type"] != "setparam" || jm["cfgversion"] != "bbbb" {
+		t.Fatalf("admin-bumped cfgversion must drive full provisioning, got %v (cfg %v)",
+			jm["_type"], jm["cfgversion"])
+	}
+	sys, _ := jm["system_cfg"].(string)
+	for _, want := range []string{"radio.2.channel=36\n", "radio.2.txpower=8\n"} {
+		if !strings.Contains(sys, want) {
+			t.Fatalf("full provisioning missing intent row %q:\n%s", want, sys)
+		}
+	}
+}
+
 // LED override delivery: an effective LEDOverride save mints a cfgversion
 // (the same operator-save trigger as the radio intent above); the device's
 // next inform still echoes the OLD applied version, so full provisioning

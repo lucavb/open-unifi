@@ -375,6 +375,106 @@ func TestRenderStaleMD5CacheIgnored(t *testing.T) {
 	}
 }
 
+// Radio intent (admin-owned layer over the §3 echo rows): intent wins
+// where set, the device radio_table echo survives verbatim where unset,
+// and the txpower_mode row is never intent-driven (documented omission).
+// The row shape/order is pinned elsewhere (golden + worked-example
+// tests); these assertions only pin WHICH value each row carries.
+func TestRadioIntentWinsOverEcho(t *testing.T) {
+	rec := renderRecord()
+	// Non-default echoes so "intent wins" is provable per row: ra0 (ng)
+	// echoes channel 6 / tx_power 14; rai0 (na) echoes channel 149.
+	rec.Extra["radio_table"] = []any{
+		map[string]any{"name": "ra0", "radio": "ng", "channel": "6",
+			"tx_power_mode": "auto", "tx_power": "14",
+			"builtin_antenna": true, "builtin_ant_gain": 0.0},
+		map[string]any{"name": "rai0", "radio": "na", "channel": 149.0,
+			"tx_power_mode": "auto", "tx_power": "auto",
+			"builtin_antenna": true, "builtin_ant_gain": 0.0},
+	}
+	// Intent: ra0 txpower fixed 10 dBm (float64 — the admin API stores
+	// numbers as JSON scalars); rai0 channel fixed 36.
+	rec.Extra["radio_intent"] = map[string]any{
+		"ra0":  map[string]any{"txpower": 10.0},
+		"rai0": map[string]any{"channel": 36.0},
+	}
+	wls := []wireless.Wlan{{Name: "w", SSID: "w", Security: "open", Enabled: true}}
+	res, err := Render(rec, SiteFacts{WLANs: wls})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"radio.1.channel=6\n",         // no channel intent → echo survives
+		"radio.1.txpower=10\n",        // txpower intent beats echo "14"
+		"radio.2.channel=36\n",        // channel intent beats echo "149"
+		"radio.2.txpower=auto\n",      // no txpower intent → echo default
+		"radio.1.txpower_mode=auto\n", // mode row NEVER intent-driven
+	} {
+		if !strings.Contains(res.Text, want) {
+			t.Fatalf("radio intent resolution wrong, missing %q:\n%s", want, res.Text)
+		}
+	}
+
+	// Intent "0" (explicit auto) must also WIN over a non-default echo —
+	// "0" is a set value, not an unset sentinel.
+	recAuto := renderRecord()
+	recAuto.Extra["radio_table"] = rec.Extra["radio_table"]
+	recAuto.Extra["radio_intent"] = map[string]any{
+		"rai0": map[string]any{"channel": 0.0},
+	}
+	resAuto, err := Render(recAuto, SiteFacts{WLANs: wls})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(resAuto.Text, "radio.2.channel=0\n") {
+		t.Fatalf("explicit-auto channel intent must beat the 149 echo:\n%s", resAuto.Text)
+	}
+
+	// Byte-identity contract: an EMPTY intent map renders byte-identical
+	// to a record with no intent layer at all (nil and {} are the same
+	// state; existing golden pins cover the no-layer shape). The ssh
+	// cache is seeded from the first render so the random salt cannot
+	// masquerade as a layer diff.
+	recNone := renderRecord()
+	recNone.Extra["radio_table"] = rec.Extra["radio_table"]
+	resNone, err := Render(recNone, SiteFacts{WLANs: wls})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recEmpty := renderRecord()
+	recEmpty.Extra["radio_table"] = rec.Extra["radio_table"]
+	recEmpty.Extra["radio_intent"] = map[string]any{}
+	for _, seed := range []*store.Device{&recNone, &recEmpty} {
+		for k, v := range resNone.CredentialDeltas {
+			seed.Extra[k] = v
+		}
+	}
+	resNone, err = Render(recNone, SiteFacts{WLANs: wls})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resEmpty, err := Render(recEmpty, SiteFacts{WLANs: wls})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resNone.Text != resEmpty.Text {
+		t.Fatal("empty radio_intent map must render byte-identical to no intent layer")
+	}
+	// Malformed intent shapes are skipped row-wise, never panic, and
+	// never leak into rows (echo still wins).
+	recBad := renderRecord()
+	recBad.Extra["radio_table"] = rec.Extra["radio_table"]
+	recBad.Extra["ssh_sha512passwd"] = recNone.Extra["ssh_sha512passwd"]
+	recBad.Extra["radio_intent"] = map[string]any{"ra0": "garbage", "": map[string]any{"channel": 1.0}}
+	resBad, err := Render(recBad, SiteFacts{WLANs: wls})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resBad.Text != resNone.Text {
+		t.Fatal("malformed radio_intent must be inert (echo-only render)")
+	}
+}
+
 // Golden-style full render: the canonical evidence-derived input (the
 // worked-example device, no WLANs) pins the twelve section heads in STRICT
 // FIRST-OCCURRENCE ORDER (the only full-order pin in the repo), the exact

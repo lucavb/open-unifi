@@ -39,6 +39,8 @@ type fakeBackend struct {
 	blocked        map[string][]string
 	blockedAdded   []string
 	blockedRemoved []string
+	radios         []RadioView
+	radioPuts      []radioPutCall
 }
 
 func newFakeBackend() *fakeBackend {
@@ -212,6 +214,54 @@ func (f *fakeBackend) PutWireless(_ context.Context, env WlansEnvelope) error {
 	f.lastPut = env
 	f.wireless = env
 	return nil
+}
+
+// radioPutCall records one per-radio intent mutation for assertions.
+type radioPutCall struct {
+	mac, radio string
+	up         RadioIntentUpsert
+	clear      bool // DELETE route
+}
+
+func (f *fakeBackend) ListDeviceRadios(_ context.Context, mac string) ([]RadioView, error) {
+	if _, ok := f.byMAC[mac]; !ok {
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, mac)
+	}
+	if len(f.radios) == 0 {
+		return []RadioView{}, nil
+	}
+	return f.radios, nil
+}
+
+func (f *fakeBackend) PutDeviceRadioIntent(_ context.Context, mac, radio string, up RadioIntentUpsert) (RadioView, error) {
+	f.radioPuts = append(f.radioPuts, radioPutCall{mac: mac, radio: radio, up: up})
+	if _, ok := f.byMAC[mac]; !ok {
+		return RadioView{}, fmt.Errorf("%w: %s", ErrNotFound, mac)
+	}
+	return fakeRadioView(radio, up), nil
+}
+
+func (f *fakeBackend) DeleteDeviceRadioIntent(_ context.Context, mac, radio string) (RadioView, error) {
+	f.radioPuts = append(f.radioPuts, radioPutCall{mac: mac, radio: radio, clear: true})
+	if _, ok := f.byMAC[mac]; !ok {
+		return RadioView{}, fmt.Errorf("%w: %s", ErrNotFound, mac)
+	}
+	return fakeRadioView(radio, RadioIntentUpsert{}), nil
+}
+
+// fakeRadioView echoes the request into the view shape the real backend
+// returns after applying it.
+func fakeRadioView(radio string, up RadioIntentUpsert) RadioView {
+	v := RadioView{Name: radio, Band: "na", EchoChannel: "0", EchoTxPower: "auto", EchoTxPowerMode: "auto"}
+	if up.Channel != nil {
+		c := strconv.Itoa(*up.Channel)
+		v.Channel = &c
+	}
+	if up.Txpower != nil {
+		p := up.Txpower.String()
+		v.Txpower = &p
+	}
+	return v
 }
 
 // ---- harness -------------------------------------------------------------
@@ -990,6 +1040,119 @@ func TestPatchDeviceLEDOverrideRoute(t *testing.T) {
 	// empty string is not one of the three states -> 400 too
 	if rec := patch(`{"led_override":""}`); rec.Code != http.StatusBadRequest {
 		t.Fatalf("empty override: %d, want 400", rec.Code)
+	}
+}
+
+// TestDeviceRadiosRoutes covers the per-radio admin-intent endpoints:
+// list shape, wholesale-replace PUT semantics (absent/null = clear),
+// strict body decoding (fractional/string/unknown-field rejection), the
+// DELETE sugar, and 404/400/401 mapping.
+func TestDeviceRadiosRoutes(t *testing.T) {
+	const known = "/api/v1/devices/f0:9f:c2:84:8f:2a/radios"
+	intPtr := func(n int) *int { return &n }
+
+	// Happy path + response/view shape.
+	run(t, testCase{
+		name: "radios list", method: "GET", path: known, want: http.StatusOK,
+		checks: func(t *testing.T, be *fakeBackend, rec *httptest.ResponseRecorder) {
+			var env radiosEnvelope
+			if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+				t.Fatalf("list body: %v", err)
+			}
+			if len(env.Radios) != 0 {
+				t.Fatalf("fake radios fixture should be empty, got %+v", env.Radios)
+			}
+		},
+	})
+	run(t, testCase{
+		name: "radio put channel+txpower", method: "PUT", path: known + "/wifi1",
+		body: `{"channel":36,"txpower":10}`, want: http.StatusOK,
+		checks: func(t *testing.T, be *fakeBackend, rec *httptest.ResponseRecorder) {
+			if len(be.radioPuts) != 1 {
+				t.Fatalf("backend saw %d puts", len(be.radioPuts))
+			}
+			call := be.radioPuts[0]
+			if call.radio != "wifi1" || call.clear {
+				t.Fatalf("call routed wrong: %+v", call)
+			}
+			if call.up.Channel == nil || *call.up.Channel != 36 ||
+				call.up.Txpower == nil || call.up.Txpower.Auto || call.up.Txpower.DBm != 10 {
+				t.Fatalf("call upsert decoded wrong: %+v", call.up)
+			}
+			var v RadioView
+			if err := json.Unmarshal(rec.Body.Bytes(), &v); err != nil ||
+				v.Channel == nil || *v.Channel != "36" || v.Txpower == nil || *v.Txpower != "10" {
+				t.Fatalf("put response view: %+v err=%v", v, err)
+			}
+		},
+	})
+	run(t, testCase{
+		name: "radio put txpower auto", method: "PUT", path: known + "/wifi1",
+		body: `{"txpower":"auto"}`, want: http.StatusOK,
+		checks: func(t *testing.T, be *fakeBackend, _ *httptest.ResponseRecorder) {
+			call := be.radioPuts[len(be.radioPuts)-1]
+			if call.up.Txpower == nil || !call.up.Txpower.Auto || call.up.Channel != nil {
+				t.Fatalf("txpower auto decode: %+v", call.up)
+			}
+		},
+	})
+	run(t, testCase{
+		name: "radio put empty body clears all", method: "PUT", path: known + "/wifi1",
+		body: `{}`, want: http.StatusOK,
+		checks: func(t *testing.T, be *fakeBackend, _ *httptest.ResponseRecorder) {
+			call := be.radioPuts[len(be.radioPuts)-1]
+			if call.up.Channel != nil || call.up.Txpower != nil {
+				t.Fatalf("empty put must clear wholesale: %+v", call.up)
+			}
+		},
+	})
+	run(t, testCase{
+		name: "radio put null field clears", method: "PUT", path: known + "/wifi1",
+		body: `{"channel":null}`, want: http.StatusOK,
+		checks: func(t *testing.T, be *fakeBackend, _ *httptest.ResponseRecorder) {
+			call := be.radioPuts[len(be.radioPuts)-1]
+			if call.up.Channel != nil || call.up.Txpower != nil {
+				t.Fatalf("null put must equal absent (wholesale clear): %+v", call.up)
+			}
+		},
+	})
+	run(t, testCase{
+		name: "radio delete", method: "DELETE", path: known + "/wifi1", want: http.StatusOK,
+		checks: func(t *testing.T, be *fakeBackend, _ *httptest.ResponseRecorder) {
+			call := be.radioPuts[len(be.radioPuts)-1]
+			if !call.clear || call.up.Channel != nil || call.up.Txpower != nil {
+				t.Fatalf("delete must be the wholesale clear: %+v", call)
+			}
+		},
+	})
+
+	// Strict decoding: 400 for every malformed shape (typo'd clients must
+	// fail loud, never silently drop inputs).
+	for _, tc := range []testCase{
+		{name: "fractional channel", method: "PUT", path: known + "/wifi1", body: `{"channel":36.5}`, want: http.StatusBadRequest},
+		{name: "fractional txpower", method: "PUT", path: known + "/wifi1", body: `{"txpower":10.5}`, want: http.StatusBadRequest},
+		{name: "txpower string number", method: "PUT", path: known + "/wifi1", body: `{"txpower":"10"}`, want: http.StatusBadRequest},
+		{name: "txpower boolean", method: "PUT", path: known + "/wifi1", body: `{"txpower":true}`, want: http.StatusBadRequest},
+		{name: "unknown field", method: "PUT", path: known + "/wifi1", body: `{"chan":36}`, want: http.StatusBadRequest},
+		{name: "trailing data", method: "PUT", path: known + "/wifi1", body: `{"channel":36} x`, want: http.StatusBadRequest},
+		{name: "malformed json", method: "PUT", path: known + "/wifi1", body: `{`, want: http.StatusBadRequest},
+		{name: "unknown mac list", method: "GET", path: "/api/v1/devices/de:ad:be:ef:00:00/radios", want: http.StatusNotFound},
+		{name: "unknown mac put", method: "PUT", path: "/api/v1/devices/de:ad:be:ef:00:00/radios/wifi1", body: `{"channel":36}`, want: http.StatusNotFound},
+		{name: "unknown mac delete", method: "DELETE", path: "/api/v1/devices/de:ad:be:ef:00:00/radios/wifi1", want: http.StatusNotFound},
+		{name: "invalid mac", method: "GET", path: "/api/v1/devices/zz/radios", want: http.StatusBadRequest},
+	} {
+		run(t, tc)
+	}
+
+	// Auth: the routes sit behind the admin token like every /api route.
+	run(t, testCase{
+		name: "radios require token", method: "GET", path: known, token: "secret", want: http.StatusUnauthorized,
+	})
+
+	// PUT int-pointer plumbing sanity (the request struct is decoded by
+	// the handler, not by these literals — this guards the helper).
+	if *intPtr(36) != 36 {
+		t.Fatal("intPtr helper broken")
 	}
 }
 

@@ -10,7 +10,9 @@ package app
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +28,7 @@ import (
 	"github.com/lucavb/open-unifi/internal/metrics"
 	"github.com/lucavb/open-unifi/internal/server/adoption"
 	"github.com/lucavb/open-unifi/internal/store"
+	"github.com/lucavb/open-unifi/internal/wireless"
 )
 
 // unknownDevice builds the canonical wrapped not-found error for a MAC.
@@ -507,6 +510,250 @@ func (a *App) UnblockClient(_ context.Context, mac, client string) (adminapi.Blo
 		return adminapi.BlockedClientsView{}, fmt.Errorf("device store: %w", err)
 	}
 	return view, nil
+}
+
+// ---- per-radio admin intent (admin-owned record state) ---------------------
+
+// radioRowOf finds the device's radio_table row by name; unknown names
+// wrap adminapi.ErrNotFound (HTTP 404 — the radio key is a device-reported
+// name, not admin-invented).
+func radioRowOf(d *store.Device, radio string) (wireless.RadioRow, error) {
+	for _, r := range wireless.StoredRadios(*d) {
+		if r.Name == radio {
+			return r, nil
+		}
+	}
+	return wireless.RadioRow{}, fmt.Errorf("%w: radio %s", adminapi.ErrNotFound, radio)
+}
+
+// validateChannelIntent bounds a channel intent by the radio's band token.
+// These are PHY-level NUMBER bounds only: country-specific legality
+// (regulatory domain lists, DFS) lives in the jar's channel tables, which
+// are not recovered in the tracked bytecode/docs — validating them would
+// be guessing, so stricter checks are deliberately omitted (recorded as a
+// bench obligation, docs/PROTOCOL-systemcfg-wireless.md §8).
+func validateChannelIntent(r wireless.RadioRow, ch int) error {
+	switch r.Band {
+	case "ng": // 2.4 GHz: 0 (explicit auto) or 1..14
+		if ch < 0 || ch > 14 {
+			return fmt.Errorf("%w: channel %d out of range for band ng (0=auto, 1..14)", adminapi.ErrConflict, ch)
+		}
+	case "na": // 5 GHz: 0 (explicit auto) or 36..165
+		if ch != 0 && (ch < 36 || ch > 165) {
+			return fmt.Errorf("%w: channel %d out of range for band na (0=auto, 36..165)", adminapi.ErrConflict, ch)
+		}
+	default:
+		// Real token set includes 6e/scan; intent semantics for those are
+		// unrecovered — reject rather than ship unvalidated rows.
+		return fmt.Errorf("%w: radio %s reports band %q; intent is only supported for the known provisioning bands (ng, na)",
+			adminapi.ErrConflict, r.Name, r.Band)
+	}
+	return nil
+}
+
+// validateTxpowerIntent bounds a fixed dBm intent by the device-reported
+// [min_txpower, max_txpower]; "auto" is always legal. Reading txpower as
+// dBm follows those same radio_table fields' units (live-verified
+// 6..22 on the U7PG2 6.8.2 record). A radio reporting no bounds cannot
+// take a fixed value ("byte-exact or absent" — never guess a range).
+func validateTxpowerIntent(r wireless.RadioRow, tx *adminapi.RadioTxPower) error {
+	if tx.Auto {
+		if r.Band != "ng" && r.Band != "na" {
+			return fmt.Errorf("%w: radio %s reports band %q; intent is only supported for the known provisioning bands (ng, na)",
+				adminapi.ErrConflict, r.Name, r.Band)
+		}
+		return nil
+	}
+	lo := wireless.JSONInt(r.Raw, "min_txpower")
+	hi := wireless.JSONInt(r.Raw, "max_txpower")
+	if lo == 0 && hi == 0 {
+		return fmt.Errorf("%w: radio %s reports no txpower bounds (min_txpower/max_txpower); only \"auto\" is supported",
+			adminapi.ErrConflict, r.Name)
+	}
+	if r.Band != "ng" && r.Band != "na" {
+		return fmt.Errorf("%w: radio %s reports band %q; intent is only supported for the known provisioning bands (ng, na)",
+			adminapi.ErrConflict, r.Name, r.Band)
+	}
+	if tx.DBm < lo || tx.DBm > hi {
+		return fmt.Errorf("%w: txpower %d dBm outside the device-reported range [%d, %d]",
+			adminapi.ErrConflict, tx.DBm, lo, hi)
+	}
+	return nil
+}
+
+// setRadioIntentExtra replaces the radio's entry in
+// Extra["radio_intent"] wholesale (the admin API's PUT doctrine): absent
+// fields drop from the entry, an empty entry removes the radio's key, and
+// an empty map removes the whole layer (absent == empty on disk). Numbers
+// are stored as float64 and "auto" as a string — exactly the scalars the
+// JSON store round-trips and wireless.JSONStr formats back at render time.
+// The copy into a fresh map never aliases store-owned values.
+func setRadioIntentExtra(d *store.Device, radio string, up adminapi.RadioIntentUpsert) {
+	if d.Extra == nil {
+		d.Extra = store.JSONMap{}
+	}
+	cur, _ := d.Extra[wireless.RadioIntentExtraKey].(map[string]any)
+	next := make(map[string]any, len(cur)+1)
+	for k, v := range cur {
+		next[k] = v
+	}
+	entry := map[string]any{}
+	if up.Channel != nil {
+		entry["channel"] = float64(*up.Channel)
+	}
+	if up.Txpower != nil {
+		if up.Txpower.Auto {
+			entry["txpower"] = "auto"
+		} else {
+			entry["txpower"] = float64(up.Txpower.DBm)
+		}
+	}
+	if len(entry) == 0 {
+		delete(next, radio)
+	} else {
+		next[radio] = entry
+	}
+	if len(next) == 0 {
+		delete(d.Extra, wireless.RadioIntentExtraKey)
+	} else {
+		d.Extra[wireless.RadioIntentExtraKey] = next
+	}
+}
+
+// intentChanged compares two parsed intent maps (Go maps are not
+// ==-comparable; RadioIntent values are).
+func intentChanged(before, after map[string]wireless.RadioIntent) bool {
+	if len(before) != len(after) {
+		return true
+	}
+	for k, v := range after {
+		if before[k] != v {
+			return true
+		}
+	}
+	return false
+}
+
+// mintCfgVersion mints the 16-lowercase-hex cfgversion stamp
+// (crypto/rand hex — the same shape and alphabet the server's
+// randKeyChars(16) uses). The jar bumps device.cfgversion on operator
+// config saves; the radio-intent save is open-unifi's operator-save path
+// for these rows. The next inform still echoes the device's OLD applied
+// version, so the engine's default arm full-provisions the new intent.
+func mintCfgVersion() (string, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("cfgversion mint: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+// radioView maps one radio_table row + its parsed intent to the read
+// model; the echo fields use the exact formatting the renderer emits.
+func radioView(r wireless.RadioRow, it wireless.RadioIntent) adminapi.RadioView {
+	v := adminapi.RadioView{
+		Name:            r.Name,
+		Band:            r.Band,
+		EchoChannel:     wireless.JSONStr(r.Raw, "channel", "0"),
+		EchoTxPower:     wireless.JSONStr(r.Raw, "tx_power", "auto"),
+		EchoTxPowerMode: wireless.JSONStr(r.Raw, "tx_power_mode", "auto"),
+	}
+	if it.Channel != "" {
+		c := it.Channel
+		v.Channel = &c
+	}
+	if it.Txpower != "" {
+		p := it.Txpower
+		v.Txpower = &p
+	}
+	return v
+}
+
+// ListDeviceRadios returns the per-radio view (device echo + admin
+// intent) in radio_table name order.
+func (a *App) ListDeviceRadios(_ context.Context, mac string) ([]adminapi.RadioView, error) {
+	canon, cerr := store.CanonicalMAC(mac)
+	if cerr != nil {
+		return nil, fmt.Errorf("%w: %s (%v)", adminapi.ErrNotFound, mac, cerr)
+	}
+	d, err := a.st.Get(canon)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, unknownDevice(canon)
+		}
+		return nil, fmt.Errorf("device store: %w", err)
+	}
+	intent := wireless.RadioIntents(d)
+	rows := wireless.StoredRadios(d)
+	out := make([]adminapi.RadioView, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, radioView(r, intent[r.Name]))
+	}
+	return out, nil
+}
+
+// putRadioIntent is the shared PUT/DELETE core: validate against the
+// device-reported radio row, replace the radio's intent wholesale, and
+// bump the device's cfgversion ONLY on an effective change (idempotent
+// writes never bump) — all inside the store's per-MAC RMW cycle so a
+// concurrent inform cannot interleave.
+func (a *App) putRadioIntent(canon, radio string, up adminapi.RadioIntentUpsert) (adminapi.RadioView, error) {
+	var view adminapi.RadioView
+	err := a.st.UpdateExisting(canon, func(d *store.Device) error {
+		row, rerr := radioRowOf(d, radio)
+		if rerr != nil {
+			return rerr
+		}
+		if up.Channel != nil {
+			if verr := validateChannelIntent(row, *up.Channel); verr != nil {
+				return verr
+			}
+		}
+		if up.Txpower != nil {
+			if verr := validateTxpowerIntent(row, up.Txpower); verr != nil {
+				return verr
+			}
+		}
+		before := wireless.RadioIntents(*d)
+		setRadioIntentExtra(d, radio, up)
+		after := wireless.RadioIntents(*d)
+		view = radioView(row, after[row.Name])
+		if intentChanged(before, after) {
+			nv, merr := mintCfgVersion()
+			if merr != nil {
+				return merr
+			}
+			d.CfgVersion = nv
+		}
+		return nil
+	})
+	if errors.Is(err, store.ErrNotFound) {
+		return adminapi.RadioView{}, unknownDevice(canon)
+	}
+	if err != nil {
+		return adminapi.RadioView{}, err
+	}
+	return view, nil
+}
+
+// PutDeviceRadioIntent replaces the radio's admin intent wholesale and
+// bumps cfgversion on effective changes (see putRadioIntent).
+func (a *App) PutDeviceRadioIntent(_ context.Context, mac, radio string, up adminapi.RadioIntentUpsert) (adminapi.RadioView, error) {
+	canon, cerr := store.CanonicalMAC(mac)
+	if cerr != nil {
+		return adminapi.RadioView{}, fmt.Errorf("%w: %s (%v)", adminapi.ErrNotFound, mac, cerr)
+	}
+	return a.putRadioIntent(canon, radio, up)
+}
+
+// DeleteDeviceRadioIntent clears the radio's admin intent (wholesale
+// clear == a PUT with every field absent).
+func (a *App) DeleteDeviceRadioIntent(_ context.Context, mac, radio string) (adminapi.RadioView, error) {
+	canon, cerr := store.CanonicalMAC(mac)
+	if cerr != nil {
+		return adminapi.RadioView{}, fmt.Errorf("%w: %s (%v)", adminapi.ErrNotFound, mac, cerr)
+	}
+	return a.putRadioIntent(canon, radio, adminapi.RadioIntentUpsert{})
 }
 
 // ListPending returns discovery/inform-reported candidates that do not have

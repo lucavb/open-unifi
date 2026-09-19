@@ -208,6 +208,18 @@ the successive-push gates
     radio + wireless + aaa all restarted on the accepted push), but the
     bridge restart deletes br0 with the IP-blind gap above. **NOT
     PUSH-SAFE; do not push a WLAN-count change to the live AP until C3
+  - **Radio-lane channel-intent candidate** (2026-09-19; zz harness
+    record + `Extra["radio_intent"]={"wifi1":{"channel":36}}`, gate-check
+    both-band open): new successive-push gate
+    `TestZZSuccessivePushChannelIntentVsApplied` requires exactly one
+    intended row — `radio.2.channel: "0" -> "36"` (radio 2 = wifi1 na) —
+    and zero unmanaged violations. Gate compiles and skips in worktrees
+    (baseline absent); **first run on the postmortem workstation main
+    checkout post-merge, recording the gate listing + candidate sha256
+    here, is a live-proof obligation before any production
+    channel-intent push.** The {radio} restart set is NOT yet
+    live-evidenced (every live round restarted {wireless, aaa} only) —
+    see the radio-lane obligations below.
     runs on the bench with console access, or the apply orchestration is
     pinned in Ghidra (u7pg2-ubntbox) showing a re-IP path.**
 - **Real-controller parity note**: WLAN-count changes alter the real
@@ -682,6 +694,29 @@ verified ~07:07 CEST) — A2 flips to `PROVEN`:**
   to connected, expected configuration retained across a raw reboot.
   The boot-race watchdog false-fire is an engine follow-up, not a
   retention failure.
+
+### 2026-09-19 radio lane — per-radio admin intent (offline implementation)
+
+Per-radio channel/txpower intent (admin-owned `Extra["radio_intent"]`,
+admin API `GET/PUT/DELETE /api/v1/devices/{mac}/radios[/{radio}]`,
+renderer overlay on `radio.<n>.channel`/`txpower`) is implemented,
+renderer- and trust-policy-tested offline. No live radio-intent push has
+happened. **Live-proof obligations before the first production
+channel-intent push:**
+1. Run `TestZZSuccessivePushChannelIntentVsApplied` on the postmortem
+   workstation main checkout (tmpwork/harness-20260917 present) and
+   record the gate listing + candidate sha256 here.
+2. Live-evidence the `{radio}` restart set: push the gated
+   channel-intent candidate with `--allow-gated-live-wlan`, verify
+   apply (`/tmp/system.cfg` sha match) and that the intended
+   `radio.2.channel=36` row survived the device's apply path.
+3. Live-verify intent-vs-echo precedence: after apply, a full inform
+   carrying the old channel in its radio_table must NOT revert the
+   rendered row (admin intent wins in the next full provisioning render).
+4. txpower_mode admin semantics and country-specific channel legality
+   (DFS) remain unrecovered from the jar — deliberately not implemented
+   (PROTOCOL-systemcfg-wireless.md §3.2/§9). Do not mint either from a
+   bench observation without a jar citation first.
 
 ### Per-case capture minimum
 
