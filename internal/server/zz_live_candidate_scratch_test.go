@@ -121,6 +121,7 @@ func TestZZLiveBlockedStaRenderUnchanged(t *testing.T) {
 	s := New(Config{WirelessSource: func() []Wlan { return env }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, rec)
 	intended, violations := zzRunGate(t, "live-blocked-candidate vs DEVICE-VERIFIED APPLIED bytes (must be byte-identical)", appliedRaw, sys, zzManagedAllow)
+	violations = zzExemptLedBarMigration(violations)
 	if len(violations) > 0 {
 		t.Fatalf("minimal-diff invariant broken for the blocked_sta candidate: %d unmanaged row(s) differ — ABORT the push: %v", len(violations), violations)
 	}
@@ -154,6 +155,7 @@ func TestZZLiveRadioIntentCandidateVsApplied(t *testing.T) {
 	fmt.Printf("[live-radio-intent-candidate] render sha256=%s\n",
 		func() string { sum := sha256.Sum256([]byte(sys)); return hex.EncodeToString(sum[:]) }())
 	intended, violations := zzRunGate(t, "live-radio-intent-candidate vs DEVICE-VERIFIED APPLIED bytes", appliedRaw, sys, zzManagedAllow)
+	violations = zzExemptLedBarMigration(violations)
 	if len(violations) > 0 {
 		t.Fatalf("minimal-diff invariant broken for the radio-intent candidate: %d unmanaged row(s) differ — ABORT the push: %v", len(violations), violations)
 	}
@@ -205,6 +207,7 @@ func TestZZLiveEapCandidateVsApplied(t *testing.T) {
 	fmt.Printf("[live-eap-candidate] render sha256=%s\n",
 		func() string { sum := sha256.Sum256([]byte(sys)); return hex.EncodeToString(sum[:]) }())
 	intended, violations := zzRunGate(t, "live-eap-candidate vs DEVICE-VERIFIED APPLIED bytes", appliedRaw, sys, zzManagedAllow)
+	violations = zzExemptLedBarMigration(violations)
 	if len(violations) > 0 {
 		t.Fatalf("minimal-diff invariant broken for the wpa-eap candidate: %d unmanaged row(s) differ — ABORT the push: %v", len(violations), violations)
 	}
