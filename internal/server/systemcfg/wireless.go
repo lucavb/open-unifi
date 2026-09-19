@@ -322,6 +322,67 @@ func (rd *render) emitAaaRows(b *strings.Builder, n int, v wireless.VapPlan, ope
 				}
 				line(rp+"secret", v.Wlan.RadiusSecret)
 			}
+			// radius.acct.<i>.* rows (§12 row 1013, doc §4.3 line 416):
+			// the inline profile's accounting servers, emitted ONLY when
+			// accounting_enabled — with accounting off the render is
+			// byte-identical to a WLAN with no accounting fields at all
+			// (pinned by the renderer goldens). Slot semantics mirror the
+			// auth writer: row index = ARRAY POSITION (slots 1..4, empty-IP
+			// slot skipped with NO backfill, a 5th server has no slot) and
+			// port 0 renders as the jar's 1813 default; the admin API
+			// rejects empty IPs and >4 entries, so the guards are renderer
+			// defense, exactly like the auth loop above. The secret is the
+			// profile-level RadiusSecret on every row (the doc's
+			// `<x_secret>` symbol is the same profile-level secret the auth
+			// rows use).
+			if v.Wlan.AccountingEnabled {
+				for idx, srv := range v.Wlan.AcctServers {
+					if idx >= maxRadiusAuthSlots {
+						break
+					}
+					if srv.IP == "" {
+						continue // same jar shape as the auth slots
+					}
+					rp := fmt.Sprintf("radius.acct.%d.", idx+1)
+					line(rp+"ip", srv.IP)
+					if srv.Port == 0 {
+						line(rp+"port", "1813")
+					} else {
+						line(rp+"port", strconv.Itoa(srv.Port))
+					}
+					line(rp+"secret", v.Wlan.RadiusSecret)
+				}
+			}
+			// radius.das.*/radius.dad.* rows (§12 row 1014, doc §4.3
+			// lines 417-419): BLOCKED — the dad/das client rows' `<ip>`
+			// source is unrecovered from the jar and is not invented
+			// (this worktree has no javap access; §12 rows 1013-1015 are
+			// the citation of record). The status/port rows cannot ship
+			// without the client rows: a client-less DAS block is not a
+			// jar shape (the jar gates das.status/das.port/dad.status on
+			// radius_das_enabled AND emits its client rows from jar-side
+			// data this lane cannot cite), so the whole subfamily stays
+			// omitted. radius_das_enabled is REJECTED at the admin API
+			// (adminapi.validateWlanEap); this Alert covers envelopes
+			// built outside it, mirroring the profile-less dead-vap
+			// guard above.
+			if v.Wlan.RadiusDASEnabled {
+				rd.alerts = append(rd.alerts, Alert{
+					Msg: "provisioning WPA-EAP wlan with radius_das_enabled; " +
+						"radius.das/radius.dad rows are not emitted — the DAS/DAD client row source " +
+						"is unrecovered from the jar (PROTOCOL-systemcfg-wireless.md §12 row 1014)",
+				})
+			}
+			// interim_update.* rows (§12 row 1014, doc §4.3 line 420):
+			// gated on interim_update_enabled AND accounting_enabled (the
+			// jar's own gates make them unreachable without accounting
+			// anyway — §12 row 1014 rationale). Row values are the jar's
+			// literals: status=enabled, interval=3600 (the doc's `<3600>`
+			// default; the inline profile carries no interval knob).
+			if v.Wlan.AccountingEnabled && v.Wlan.InterimUpdateEnabled {
+				line("interim_update.status", "enabled")
+				line("interim_update.interval", "3600")
+			}
 			// dynamic_vlan (int §613-624; vlan_wlan_mode knob): ""/disabled
 			// → 0, optional → 1, required → 2.
 			line("dynamic_vlan", dynamicVlanOf(v.Wlan.RadiusVLANMode))

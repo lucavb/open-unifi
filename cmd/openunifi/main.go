@@ -163,14 +163,22 @@ func run() error {
 				Enabled:    w.Enabled,
 				ID:         w.ID,
 				Band:       w.Band,
-				// Inline RADIUS profile (wpa-eap): the slice must be
+				// Inline RADIUS profile (wpa-eap): the slices must be
 				// rebuilt, not aliased — env.Wlans belongs to App's
 				// cached envelope and out outlives this call.
 				RadiusSecret:   w.RadiusSecret,
 				RadiusVLANMode: w.RadiusVLANMode,
+				// Accounting fields (§12 rows 1013-1014): same no-alias
+				// rebuild for acct_servers; the booleans pass through.
+				AccountingEnabled:    w.AccountingEnabled,
+				InterimUpdateEnabled: w.InterimUpdateEnabled,
+				RadiusDASEnabled:     w.RadiusDASEnabled,
 			}
 			for _, s := range w.RadiusServers {
 				wl.RadiusServers = append(wl.RadiusServers, wireless.RadiusServer{IP: s.IP, Port: s.Port})
+			}
+			for _, s := range w.AcctServers {
+				wl.AcctServers = append(wl.AcctServers, wireless.RadiusAcctServer{IP: s.IP, Port: s.Port})
 			}
 			out = append(out, wl)
 		}

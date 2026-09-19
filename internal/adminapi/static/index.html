@@ -458,6 +458,21 @@
   function addWlanRow(w) {
     var tr = document.createElement("tr");
     tr.innerHTML = wlanRowInputs(w || { security: "wpa-p", vlan: 1 });
+    // Preserve the accounting fields (§12 rows 1013-1014) of a loaded
+    // wpa-eap row through console saves: the console has no accounting
+    // editor yet, but saving must not silently strip fields the admin
+    // API accepted. collectWireless re-attaches them for wpa-eap rows
+    // only — a security flip drops them, like the disabled radius
+    // inputs. radius_das_enabled needs no preservation: the API rejects
+    // it while set, so it can never be part of a stored row.
+    if (w && w.security === "wpa-eap" &&
+        (w.accounting_enabled || (w.acct_servers && w.acct_servers.length) || w.interim_update_enabled)) {
+      tr._acct = {
+        accounting_enabled: !!w.accounting_enabled,
+        acct_servers: w.acct_servers || [],
+        interim_update_enabled: !!w.interim_update_enabled
+      };
+    }
     tr.querySelector("[data-rm]").addEventListener("click", function () { tr.remove(); });
     tr.querySelector("[name=security]").addEventListener("change", function () {
       setRadiusInputsEnabled(tr, this.value === "wpa-eap");
@@ -513,6 +528,15 @@
         w.radius_servers = parseRadiusServers(g("radius_servers").value);
         w.radius_secret = g("radius_secret").value;
         w.radius_vlan_mode = g("radius_vlan_mode").value;
+        // Re-attach preserved accounting fields (see addWlanRow): the
+        // console cannot edit them, but a save must keep what the admin
+        // API stored. They ride only wpa-eap rows — the server rejects
+        // them on any other security, so a security flip drops them.
+        if (tr._acct) {
+          w.accounting_enabled = tr._acct.accounting_enabled;
+          w.acct_servers = tr._acct.acct_servers;
+          w.interim_update_enabled = tr._acct.interim_update_enabled;
+        }
       }
       if (!err) {
         err = validateWlan(w);

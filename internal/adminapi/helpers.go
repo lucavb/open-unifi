@@ -318,6 +318,9 @@ func validateWlan(wl *Wlan) string {
 		if wl.hasRadiusFields() {
 			return "radius_servers/radius_secret/radius_vlan_mode require security wpa-eap"
 		}
+		if wl.hasAcctFields() {
+			return "accounting_enabled/acct_servers/interim_update_enabled/radius_das_enabled require security wpa-eap"
+		}
 		if wl.Passphrase != "" {
 			return "passphrase must be empty when security is open"
 		}
@@ -331,6 +334,9 @@ func validateWlan(wl *Wlan) string {
 	if wl.hasRadiusFields() {
 		return "radius_servers/radius_secret/radius_vlan_mode require security wpa-eap"
 	}
+	if wl.hasAcctFields() {
+		return "accounting_enabled/acct_servers/interim_update_enabled/radius_das_enabled require security wpa-eap"
+	}
 	if len(wl.Passphrase) < 8 {
 		return "passphrase must be at least 8 characters when security is " + wl.Security
 	}
@@ -340,6 +346,12 @@ func validateWlan(wl *Wlan) string {
 // hasRadiusFields reports whether any inline RADIUS profile field is set.
 func (wl *Wlan) hasRadiusFields() bool {
 	return len(wl.RadiusServers) > 0 || wl.RadiusSecret != "" || wl.RadiusVLANMode != ""
+}
+
+// hasAcctFields reports whether any inline RADIUS profile accounting
+// field is set (§12 rows 1013-1014).
+func (wl *Wlan) hasAcctFields() bool {
+	return wl.AccountingEnabled || len(wl.AcctServers) > 0 || wl.InterimUpdateEnabled || wl.RadiusDASEnabled
 }
 
 // validateWlanEap enforces the wpa-eap-only rules: a usable inline RADIUS
@@ -379,6 +391,46 @@ func validateWlanEap(wl *Wlan) string {
 		// both emit dynamic_vlan=0.
 	default:
 		return "radius_vlan_mode must be one of disabled, optional, required"
+	}
+	// Accounting fields (§12 rows 1013-1014). acct_servers mirror the
+	// auth-server rules exactly — ≤4 entries (the system_cfg writer's
+	// slot count, mirrored from the auth writer's radius.acct.1..4
+	// slots), non-empty IP, no control characters, port 0..65535 with
+	// 0 meaning the 1813 emission default. acct_servers may be stored
+	// with accounting_enabled false: the radiusprofile shape keeps the
+	// server list and the toggle independent, and the inert list
+	// renders byte-identically to none (pinned by the renderer goldens).
+	if len(wl.AcctServers) > 4 {
+		return "acct_servers supports at most 4 entries"
+	}
+	for i, srv := range wl.AcctServers {
+		if srv.IP == "" {
+			return fmt.Sprintf("acct_servers[%d].ip must not be empty", i)
+		}
+		if hasControlChar(srv.IP) {
+			return fmt.Sprintf("acct_servers[%d].ip must not contain control characters", i)
+		}
+		if srv.Port < 0 || srv.Port > 65535 {
+			return fmt.Sprintf("acct_servers[%d].port must be 1..65535 (0 = the 1813 default)", i)
+		}
+	}
+	// interim_update_enabled needs accounting_enabled: the jar's own
+	// gates make the interim rows unreachable without accounting
+	// (§12 row 1014 rationale), so a stored interim toggle without
+	// accounting would be admin intent the renderer can never honor.
+	if wl.InterimUpdateEnabled && !wl.AccountingEnabled {
+		return "interim_update_enabled requires accounting_enabled"
+	}
+	// radius_das_enabled is REJECTED while set: the DAS/DAD client rows
+	// (dad.client.<i>.cidr/das.client/das.secret) are blocked pending a
+	// jar citation for their client <ip> source — the status/port rows
+	// cannot ship without them (a client-less DAS block is not a jar
+	// shape), and no candidate value is invented (§12 row 1014). The
+	// field stays in the model for radiusprofile parity; flip this
+	// rejection together with the renderer block when the citation
+	// lands.
+	if wl.RadiusDASEnabled {
+		return "radius_das_enabled is not supported yet: the DAS/DAD client rows are blocked pending a jar citation (PROTOCOL-systemcfg-wireless.md §12 row 1014)"
 	}
 	if wl.Passphrase != "" && len(wl.Passphrase) < 8 {
 		return "passphrase must be at least 8 characters when security is " + wl.Security

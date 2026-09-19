@@ -28,6 +28,31 @@ type Wlan struct {
 	RadiusServers  []RadiusServer // auth rows, 1..4 usable entries
 	RadiusSecret   string         // profile-level x_secret, one value for every auth row
 	RadiusVLANMode string         // vlan_wlan_mode: ""/"disabled"→dynamic_vlan=0, "optional"→1, "required"→2
+
+	// Inline RADIUS profile accounting fields (wpa-eap only; §12 rows
+	// 1013-1014, docs/PROTOCOL-systemcfg-wireless.md §4.3). Zero on
+	// non-EAP WLANs and on EAP WLANs that do no accounting — with
+	// AccountingEnabled false the render is byte-identical to a WLAN
+	// with no accounting fields at all (pinned by the renderer goldens).
+	AccountingEnabled    bool               // radiusprofile accounting_enabled: gates the acct rows AND the interim_update rows
+	AcctServers          []RadiusAcctServer // acct rows, 0..4 entries; inert while AccountingEnabled is false (profile-shaped: the radiusprofile stores servers independent of the toggle)
+	InterimUpdateEnabled bool               // radiusprofile interim_update_enabled: needs AccountingEnabled (the jar's own gate, §12 row 1014 rationale)
+	RadiusDASEnabled     bool               // radiusprofile radius_das_enabled: BLOCKED — no emission; the admin API rejects it, the renderer flags out-of-API carriers with an Alert (§12 row 1014)
+}
+
+// RadiusAcctServer is one accounting server of a WLAN's inline RADIUS
+// profile (§12 row 1013: "emitted per radiusprofile accounting server
+// (port 1813) when accounting_enabled"). Row shape and slot semantics
+// mirror the auth server family: row index = ARRAY POSITION (slots
+// 1..4, empty-ip slot skipped with no backfill, a 5th server has no
+// slot), port 0 means "unset" and renders as the jar's 1813 default,
+// and the secret is the PROFILE-LEVEL RadiusSecret on every row — the
+// doc's `<x_secret>` symbol is the same profile-level secret the auth
+// rows use (docs/PROTOCOL-systemcfg-wireless.md §4.3, line 416), so the
+// accounting server carries no secret of its own.
+type RadiusAcctServer struct {
+	IP   string // emitted verbatim into aaa.<n>.radius.acct.<i>.ip
+	Port int    // 0 ⇒ 1813 at emission
 }
 
 // RadiusServer is one auth server of a WLAN's inline RADIUS profile. Port 0

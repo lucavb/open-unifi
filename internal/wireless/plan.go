@@ -271,7 +271,10 @@ func UnknownBandRadios(d store.Device) int {
 // 1812 emission default), so a stored 0 and a stored 1812 — which render
 // the same rows — also hash the same. The vlan mode hashes at its effective
 // spelling too: "" normalizes to "disabled" (both render dynamic_vlan=0),
-// so a spelling-only flip cannot mint a new hash.
+// so a spelling-only flip cannot mint a new hash. The accounting fields
+// follow the same rule one level coarser (see the inline comment): they
+// join ONLY when accounting_enabled, because an inert profile renders
+// byte-identically to none at all.
 func WlanListHash(wls []Wlan) string {
 	m := make([]map[string]any, 0, len(wls))
 	for _, w := range wls {
@@ -305,6 +308,31 @@ func WlanListHash(wls []Wlan) string {
 				servers = append(servers, map[string]any{"ip": s.IP, "port": port})
 			}
 			e["radius_servers"] = servers
+		}
+		// Accounting fields join the hash ONLY when accounting_enabled
+		// (§12 rows 1013-1014): an inert profile — acct servers stored,
+		// accounting off — renders byte-identically to a WLAN with no
+		// accounting fields at all, so it must also hash the same (the
+		// renders-same⇒hashes-same rule the radius block applies above);
+		// otherwise flipping accounting off over unchanged rows would
+		// mint a spurious drift push. Acct ports hash at their EFFECTIVE
+		// value (0 → the 1813 emission default), and empty-IP slots DO
+		// hash (unlike a skipped auth slot they still shift later row
+		// indexes, so they are not render-inert). radius_das_enabled
+		// never joins: its rows are blocked pending a jar citation (§12
+		// row 1014) and no emission changes with it.
+		if w.AccountingEnabled {
+			e["accounting_enabled"] = true
+			acct := make([]map[string]any, 0, len(w.AcctServers))
+			for _, s := range w.AcctServers {
+				port := s.Port
+				if port == 0 {
+					port = 1813
+				}
+				acct = append(acct, map[string]any{"ip": s.IP, "port": port})
+			}
+			e["acct_servers"] = acct
+			e["interim_update_enabled"] = w.InterimUpdateEnabled
 		}
 		m = append(m, e)
 	}

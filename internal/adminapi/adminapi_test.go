@@ -997,6 +997,30 @@ func TestWPAEAPRadiusValidation(t *testing.T) {
 		{"short passphrase",
 			`"security":"wpa-eap","radius_servers":[{"ip":"10.1.0.5"}],"radius_secret":"s","passphrase":"short"`,
 			"passphrase must be at least 8 characters"},
+		{"acct empty ip",
+			`"security":"wpa-eap","radius_servers":[{"ip":"10.1.0.5"}],"radius_secret":"s",` +
+				`"accounting_enabled":true,"acct_servers":[{"ip":""}]`,
+			"acct_servers[0].ip must not be empty"},
+		{"acct five servers",
+			`"security":"wpa-eap","radius_servers":[{"ip":"10.1.0.5"}],"radius_secret":"s",` +
+				`"accounting_enabled":true,"acct_servers":[` + strings.Repeat(`{"ip":"10.2.0.1"},`, 4) + `{"ip":"10.2.0.5"}]`,
+			"acct_servers supports at most 4 entries"},
+		{"acct port out of range",
+			`"security":"wpa-eap","radius_servers":[{"ip":"10.1.0.5"}],"radius_secret":"s",` +
+				`"accounting_enabled":true,"acct_servers":[{"ip":"10.2.0.1","port":65536}]`,
+			"acct_servers[0].port must be 1..65535"},
+		{"interim without accounting",
+			`"security":"wpa-eap","radius_servers":[{"ip":"10.1.0.5"}],"radius_secret":"s","interim_update_enabled":true`,
+			"interim_update_enabled requires accounting_enabled"},
+		{"das knob rejected",
+			`"security":"wpa-eap","radius_servers":[{"ip":"10.1.0.5"}],"radius_secret":"s","radius_das_enabled":true`,
+			"radius_das_enabled is not supported yet"},
+		{"acct on wpa-p",
+			`"security":"wpa-p","passphrase":"correcthorse","accounting_enabled":true`,
+			"require security wpa-eap"},
+		{"acct on open",
+			`"security":"open","acct_servers":[{"ip":"10.2.0.1"}]`,
+			"require security wpa-eap"},
 		{"radius on wpa-p",
 			`"security":"wpa-p","passphrase":"correcthorse","radius_secret":"s"`,
 			"require security wpa-eap"},
@@ -1023,6 +1047,54 @@ func TestWPAEAPRadiusValidation(t *testing.T) {
 	}
 	if body := rec.Body.String(); !strings.Contains(body, `"radius_vlan_mode":"required"`) {
 		t.Fatalf("radius_vlan_mode missing from the echo: %s", body)
+	}
+}
+
+// TestWPAEAPAccountingAcceptance pins the accepted accounting shape
+// (§12 rows 1013-1014): accounting_enabled + acct_servers (port 0 kept
+// as the 1813 default client-side) + interim_update_enabled round-trip
+// through the 200 echo body, stored acct_servers stay acceptable with
+// accounting OFF (radiusprofile shape: server list and toggle are
+// independent; the inert list renders byte-identically to none), and
+// radius_das_enabled stays the one rejected knob (blocked pending the
+// §12 row 1014 jar citation).
+func TestWPAEAPAccountingAcceptance(t *testing.T) {
+	h := New(Config{}, newFakeBackend())
+	profile := `"radius_servers":[{"ip":"10.1.0.5"}],"radius_secret":"s3cr3t!"`
+
+	// Full accounting shape: accepted and echoed.
+	rec := putWireless(t, h, `{"wlans":[{"ssid":"corp","security":"wpa-eap","vlan":1,`+profile+`,`+
+		`"accounting_enabled":true,`+
+		`"acct_servers":[{"ip":"10.2.0.1"},{"ip":"10.2.0.2","port":18131}],`+
+		`"interim_update_enabled":true}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("accounting wpa-eap: %d %q, want 200", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		`"accounting_enabled":true`,
+		`"acct_servers":[{"ip":"10.2.0.1"},{"ip":"10.2.0.2","port":18131}]`,
+		`"interim_update_enabled":true`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("accounting echo missing %q: %s", want, body)
+		}
+	}
+
+	// Stored acct servers with accounting off: accepted (inert list —
+	// the renderer goldens pin the byte-identity).
+	rec = putWireless(t, h, `{"wlans":[{"ssid":"corp","security":"wpa-eap","vlan":1,`+profile+`,`+
+		`"acct_servers":[{"ip":"10.2.0.1"}]}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("inert acct_servers wpa-eap: %d %q, want 200", rec.Code, rec.Body.String())
+	}
+
+	// accounting_enabled alone (zero acct servers): accepted — the
+	// radiusprofile stores toggle and server list independently.
+	rec = putWireless(t, h, `{"wlans":[{"ssid":"corp","security":"wpa-eap","vlan":1,`+profile+`,`+
+		`"accounting_enabled":true}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("accounting without servers: %d %q, want 200", rec.Code, rec.Body.String())
 	}
 }
 

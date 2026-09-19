@@ -123,12 +123,33 @@ type Wlan struct {
 	RadiusServers  []RadiusServer `json:"radius_servers,omitempty"`
 	RadiusSecret   string         `json:"radius_secret,omitempty"`
 	RadiusVLANMode string         `json:"radius_vlan_mode,omitempty"`
+
+	// Inline RADIUS profile accounting fields, wpa-eap only (mirrors
+	// wireless.Wlan; §12 rows 1013-1014): the accounting toggle, the
+	// accounting servers (0..4 entries, port 0 = the 1813 emission
+	// default), and the interim-update toggle. radius_das_enabled is
+	// modeled for profile parity but REJECTED while set — the DAS/DAD
+	// client rows are blocked pending a jar citation (§12 row 1014).
+	AccountingEnabled    bool               `json:"accounting_enabled,omitempty"`
+	AcctServers          []RadiusAcctServer `json:"acct_servers,omitempty"`
+	InterimUpdateEnabled bool               `json:"interim_update_enabled,omitempty"`
+	RadiusDASEnabled     bool               `json:"radius_das_enabled,omitempty"`
 }
 
 // RadiusServer is one auth server of a WLAN's inline RADIUS profile
 // (mirrors wireless.RadiusServer): ip plus an optional port (0 = the
 // system_cfg 1812 default).
 type RadiusServer struct {
+	IP   string `json:"ip"`
+	Port int    `json:"port,omitempty"`
+}
+
+// RadiusAcctServer is one accounting server of a WLAN's inline RADIUS
+// profile (mirrors wireless.RadiusAcctServer; §12 row 1013): ip plus an
+// optional port (0 = the system_cfg 1813 default). No per-server secret —
+// every acct row carries the profile-level radius_secret, like the auth
+// rows.
+type RadiusAcctServer struct {
 	IP   string `json:"ip"`
 	Port int    `json:"port,omitempty"`
 }
