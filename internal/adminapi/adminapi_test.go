@@ -39,8 +39,10 @@ type fakeBackend struct {
 	blocked        map[string][]string
 	blockedAdded   []string
 	blockedRemoved []string
-	radios         []RadioView
-	radioPuts      []radioPutCall
+	// Client-session fixture (device MAC -> rows, colon-hex).
+	clients   map[string][]ClientView
+	radios    []RadioView
+	radioPuts []radioPutCall
 }
 
 func newFakeBackend() *fakeBackend {
@@ -174,6 +176,20 @@ func (f *fakeBackend) UnblockClient(_ context.Context, mac, client string) (Bloc
 }
 
 func (f *fakeBackend) ListPending(context.Context) []PendingView { return f.pending }
+
+// ListDeviceClients mirrors the read-only projection: fixed fixture rows
+// (never nil — the wire contract is a list, never null) for known devices,
+// ErrNotFound for unknown MACs.
+func (f *fakeBackend) ListDeviceClients(_ context.Context, mac string) ([]ClientView, error) {
+	if _, ok := f.byMAC[mac]; !ok {
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, mac)
+	}
+	rows := append([]ClientView{}, f.clients[mac]...)
+	if rows == nil {
+		rows = []ClientView{}
+	}
+	return rows, nil
+}
 
 func (f *fakeBackend) RebootDevice(_ context.Context, mac string) (DeviceView, error) {
 	f.rebootArmed = append(f.rebootArmed, mac)
@@ -1745,5 +1761,88 @@ func TestBlockedClientRoutes(t *testing.T) {
 	}
 	if len(be.blockedRemoved) != 1 || be.blockedRemoved[0] != dev+"/aa:bb:cc:dd:ee:ff" {
 		t.Fatalf("unblock calls recorded = %v", be.blockedRemoved)
+	}
+}
+
+// ---- client-session route ---------------------------------------------------
+
+// TestDeviceClientsRoute pins the read-only client-session listing: fixture
+// rows pass through verbatim (sorted colon-hex + connected state), a device
+// with no sessions lists EMPTY (never null), unknown devices are 404,
+// invalid MACs are boundary 400s, and the token gate applies.
+func TestDeviceClientsRoute(t *testing.T) {
+	be := newFakeBackend()
+	h := New(Config{AdminToken: "s3cret"}, be)
+	const dev = "f0:9f:c2:84:8f:2a" // fixture device from newFakeBackend
+	do := func(method, path, body string) *httptest.ResponseRecorder {
+		var rdr io.Reader
+		if body != "" {
+			rdr = strings.NewReader(body)
+		}
+		req := httptest.NewRequest(method, path, rdr)
+		req.Header.Set("Authorization", "Bearer s3cret")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	var env struct {
+		Clients []ClientView `json:"clients"`
+	}
+
+	// A device with no recorded sessions lists EMPTY (never null).
+	rec := do("GET", "/api/v1/devices/"+dev+"/clients", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("empty device: %d %q", rec.Code, rec.Body.String())
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Clients == nil || len(env.Clients) != 0 {
+		t.Fatalf("empty device clients = %+v, want empty non-nil list", env.Clients)
+	}
+
+	// Seeded rows pass through verbatim in stored order (sorted
+	// colon-hex + connected state + last_seen).
+	be.clients = map[string][]ClientView{
+		dev: {
+			{MAC: "00:11:22:33:44:55", Connected: true, LastSeen: 1700000001},
+			{MAC: "aa:bb:cc:dd:ee:ff", Connected: false, LastSeen: 1700000000},
+		},
+	}
+	rec = do("GET", "/api/v1/devices/"+dev+"/clients", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list: %d %q", rec.Code, rec.Body.String())
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	if len(env.Clients) != 2 ||
+		env.Clients[0].MAC != "00:11:22:33:44:55" || !env.Clients[0].Connected || env.Clients[0].LastSeen != 1700000001 ||
+		env.Clients[1].MAC != "aa:bb:cc:dd:ee:ff" || env.Clients[1].Connected || env.Clients[1].LastSeen != 1700000000 {
+		t.Fatalf("clients = %+v, want the fixture rows with connected state", env.Clients)
+	}
+
+	// Boundary MAC normalization: the hyphen spelling reaches the backend
+	// as colon-hex.
+	if rec = do("GET", "/api/v1/devices/F0-9F-C2-84-8F-2A/clients", ""); rec.Code != http.StatusOK {
+		t.Fatalf("normalized mac: %d %q", rec.Code, rec.Body.String())
+	}
+
+	// Unknown device: 404.
+	if rec = do("GET", "/api/v1/devices/aa:bb:cc:dd:ee:ff/clients", ""); rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown device: %d %q, want 404", rec.Code, rec.Body.String())
+	}
+
+	// Invalid MAC: boundary 400, never a backend call.
+	if rec = do("GET", "/api/v1/devices/zz/clients", ""); rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad device mac: %d, want 400", rec.Code)
+	}
+
+	// Token required, same as every other route.
+	req := httptest.NewRequest("GET", "/api/v1/devices/"+dev+"/clients", nil)
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req)
+	if rec2.Code != http.StatusUnauthorized {
+		t.Fatalf("no token: %d, want 401", rec2.Code)
 	}
 }

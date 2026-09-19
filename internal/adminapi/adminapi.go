@@ -147,6 +147,22 @@ type BlockedClientsView struct {
 	Blocked []string `json:"blocked"`
 }
 
+// ClientView is one client session row of a device: the controller-owned
+// session bookkeeping the inform path derives from decoded full-inform
+// station data (a client present in one full inform and absent in the
+// next has disconnected). Rows persist after disconnect (connected=false)
+// — presence across consecutive full informs is what a session is, and
+// sparse heartbeats never wipe rows (device-refreshable caps semantics).
+// MACs are colon-hex in the rows' canonical (sorted) order.
+type ClientView struct {
+	MAC       string `json:"mac"`
+	Connected bool   `json:"connected"`
+	// LastSeen is the unix-seconds timestamp of the last full inform whose
+	// station table proved the client present (omitted when the device
+	// clock is unknown, i.e. the row predates session timestamps).
+	LastSeen int64 `json:"last_seen,omitempty"`
+}
+
 // blockClientRequest is the POST body of the block route: the client MAC in
 // any common spelling (normalized at the boundary).
 type blockClientRequest struct {
@@ -248,6 +264,12 @@ type Backend interface {
 	ListBlockedClients(ctx context.Context, mac string) (BlockedClientsView, error)
 	BlockClient(ctx context.Context, mac, client string) (BlockedClientsView, error)
 	UnblockClient(ctx context.Context, mac, client string) (BlockedClientsView, error)
+	// ListDeviceClients returns the device's client sessions — the
+	// controller-owned rows the inform path derives from decoded station
+	// data — in canonical (sorted) MAC order. Rows persist after
+	// disconnect (connected=false); a device with no recorded sessions
+	// lists empty (never null). Unknown MACs are ErrNotFound.
+	ListDeviceClients(ctx context.Context, mac string) ([]ClientView, error)
 	// ListPending returns discovery-beacon candidates.
 	ListPending(ctx context.Context) []PendingView
 	// AdoptPending attempts adoption of a pending candidate.
@@ -304,6 +326,7 @@ const version = "0.1.0-dev"
 const (
 	routeDevicesList        = "/api/v1/devices"
 	routeDeviceItem         = "/api/v1/devices/{mac}"
+	routeDeviceClients      = "/api/v1/devices/{mac}/clients"
 	routeDeviceReboot       = "/api/v1/devices/{mac}/reboot"
 	routeDeviceFactoryReset = "/api/v1/devices/{mac}/factory-reset"
 	routeRadiosList         = "/api/v1/devices/{mac}/radios"
@@ -517,6 +540,24 @@ func New(cfg Config, be Backend) http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, v)
+	}))
+	// Client sessions of one device: the controller-owned rows the inform
+	// path derives from decoded station data (read-only projection — the
+	// admin API neither writes nor clears sessions; the inform path owns
+	// them). The listing is never null: a device that never carried
+	// stations lists empty.
+	mux.HandleFunc("GET /api/v1/devices/{mac}/clients", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+		mac, err := normalizeMAC(r.PathValue("mac"))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid mac: "+err.Error())
+			return
+		}
+		clients, err := be.ListDeviceClients(r.Context(), mac)
+		if err != nil {
+			handleBackendErr(w, lg, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, clientsEnvelope{clients})
 	}))
 	// Per-radio admin intent (channel/txpower): the admin-owned layer over
 	// the device's radio_table echo (CONTEXT.md trust policy). PUT is

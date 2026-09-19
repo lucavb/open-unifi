@@ -448,6 +448,34 @@ func (a *App) ListBlockedClients(_ context.Context, mac string) (adminapi.Blocke
 	return blockedClientsView(canon, store.BlockedClients(d)), nil
 }
 
+// ListDeviceClients returns the device's client sessions — the
+// controller-owned rows the inform path derives from decoded station data
+// — in canonical (sorted) MAC order. Read-only projection: the Backend
+// never writes session state; the inform path owns it.
+func (a *App) ListDeviceClients(_ context.Context, mac string) ([]adminapi.ClientView, error) {
+	canon, cerr := store.CanonicalMAC(mac)
+	if cerr != nil {
+		return nil, fmt.Errorf("%w: %s (%v)", adminapi.ErrNotFound, mac, cerr)
+	}
+	d, err := a.st.Get(canon)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, unknownDevice(canon)
+		}
+		return nil, fmt.Errorf("device store: %w", err)
+	}
+	sessions := store.ClientSessions(d)
+	out := make([]adminapi.ClientView, 0, len(sessions))
+	for _, s := range sessions {
+		out = append(out, adminapi.ClientView{
+			MAC:       store.ColonMAC(s.MAC),
+			Connected: s.Connected,
+			LastSeen:  s.LastSeen,
+		})
+	}
+	return out, nil
+}
+
 // BlockClient adds one client MAC to the device's blocked-client set.
 // Idempotent: re-blocking returns the unchanged set, like the adopt route's
 // state-change semantics. The set is an admin-owned record row; the engine

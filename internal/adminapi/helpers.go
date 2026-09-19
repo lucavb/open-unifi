@@ -64,6 +64,12 @@ type pendingEnvelope struct {
 	Pending []PendingView `json:"pending"`
 }
 
+// clientsEnvelope wraps the device-clients listing; Clients is never nil
+// so the JSON is always a list, never null.
+type clientsEnvelope struct {
+	Clients []ClientView `json:"clients"`
+}
+
 type whoAmI struct {
 	Server         string `json:"server"`
 	Version        string `json:"version"`
