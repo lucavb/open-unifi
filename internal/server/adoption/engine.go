@@ -274,25 +274,41 @@ type Deps struct {
 	// fallback).
 	InformListenAddr string
 
-	// AllowGatedLiveWLAN lifts the fail-closed live-WLAN gate for the
-	// exact U7PG2 6.8.2.15592 lane (see RejectUnsupportedLiveWLAN). The
-	// default false keeps live WLAN provisioning fail-closed; this is the
-	// explicit bench opt-in for a sanctioned live push whose candidate has
-	// passed the offline minimal-diff gates (tmpwork harness). It changes
-	// nothing else: the gate remains on for every normal start.
+	// AllowGatedLiveWLAN lifts the fail-closed live-provisioning gate for
+	// the exact U7PG2 6.8.2.15592 lane (see RejectUnsupportedLiveProvisioning).
+	// The default false keeps live WLAN and sshd-fact provisioning
+	// fail-closed; this is the explicit bench opt-in for a sanctioned live
+	// push whose candidate has passed the offline minimal-diff gates
+	// (tmpwork harness). It changes nothing else: the gate remains on for
+	// every normal start.
 	AllowGatedLiveWLAN bool
+
+	// SSHKeyRows and SSHDisablePassword are the distilled site-fact sshd
+	// scalars the gate needs (the renderer packages' inputs, already
+	// resolved by the caller): the count of provisioned authorized-key
+	// rows and whether sshd.auth.passwd renders disabled. Deliberately
+	// scalars, NOT systemcfg facts/keys — the adoption engine must not
+	// depend on the renderer package (HARD RULE, engine deps docblock
+	// above SystemCfg: decisions receive only the wire-facing values the
+	// adapter hands them).
+	SSHKeyRows int
+
+	// SSHDisablePassword mirrors the sshd.auth.passwd=disabled fact.
+	SSHDisablePassword bool
 }
 
 // Engine is the pure adoption decider.
 type Engine struct {
-	lg               *slog.Logger
-	random           func() float64
-	keyChars         func(n int) (string, error)
-	wireless         func() []wireless.Wlan
-	systemCfg        func(store.Device, []wireless.Wlan, wireless.ProvisioningPlan) (string, map[string]string, error)
-	controllerURL    string
-	informListenAddr string
-	allowGatedWLAN   bool
+	lg                 *slog.Logger
+	random             func() float64
+	keyChars           func(n int) (string, error)
+	wireless           func() []wireless.Wlan
+	systemCfg          func(store.Device, []wireless.Wlan, wireless.ProvisioningPlan) (string, map[string]string, error)
+	controllerURL      string
+	informListenAddr   string
+	allowGatedWLAN     bool
+	sshKeyRows         int
+	sshDisablePassword bool
 }
 
 // New builds an Engine. A nil logger falls back to a discarding one.
@@ -302,14 +318,16 @@ func New(d Deps) *Engine {
 		lg = slog.New(slog.NewTextHandler(discard{}, nil))
 	}
 	return &Engine{
-		lg:               lg,
-		random:           d.Random,
-		keyChars:         d.KeyChars,
-		wireless:         d.Wireless,
-		systemCfg:        d.SystemCfg,
-		controllerURL:    d.ControllerURL,
-		informListenAddr: d.InformListenAddr,
-		allowGatedWLAN:   d.AllowGatedLiveWLAN,
+		lg:                 lg,
+		random:             d.Random,
+		keyChars:           d.KeyChars,
+		wireless:           d.Wireless,
+		systemCfg:          d.SystemCfg,
+		controllerURL:      d.ControllerURL,
+		informListenAddr:   d.InformListenAddr,
+		allowGatedWLAN:     d.AllowGatedLiveWLAN,
+		sshKeyRows:         d.SSHKeyRows,
+		sshDisablePassword: d.SSHDisablePassword,
 	}
 }
 
@@ -817,14 +835,19 @@ func (e *Engine) decidePlain(req Request, wls []wireless.Wlan, plan wireless.Pro
 	}
 }
 
-// RejectUnsupportedLiveWLAN gates the exact U7PG2 firmware lane whose
-// system_cfg WLAN template has not been differentially verified against the
-// official controller. wls is the decision's resolved WLAN envelope (the
+// RejectUnsupportedLiveProvisioning gates the exact U7PG2 firmware lane
+// whose system_cfg rows have not been differentially verified against the
+// official controller — the WLAN template (the original trigger) AND, since
+// the 2026-09-20 sshd-auth lane, the firmware-derived but NOT
+// live-bench-validated sshd.auth.key.<n>.* rows / sshd.auth.passwd=disabled
+// knob when the site facts configure them (zero-value site facts keep the
+// rendered sshd block byte-identical to the pre-feature shape, so the gate
+// stays inert for them). wls is the decision's resolved WLAN envelope (the
 // caller's single snapshot for this inform), not the live source. The gate
 // is the fail-closed default; Deps.AllowGatedLiveWLAN is the explicit
 // bench opt-in that lifts it for a sanctioned live push — every normal
 // start keeps the gate on.
-func (e *Engine) RejectUnsupportedLiveWLAN(d store.Device, wls []wireless.Wlan) error {
+func (e *Engine) RejectUnsupportedLiveProvisioning(d store.Device, wls []wireless.Wlan) error {
 	if e.allowGatedWLAN {
 		return nil
 	}
@@ -835,6 +858,9 @@ func (e *Engine) RejectUnsupportedLiveWLAN(d store.Device, wls []wireless.Wlan) 
 		if w.Name != "" || w.SSID != "" {
 			return ErrLiveWLANProvisioningUnsupported
 		}
+	}
+	if e.sshKeyRows > 0 || e.sshDisablePassword {
+		return ErrLiveWLANProvisioningUnsupported
 	}
 	return nil
 }
@@ -870,10 +896,10 @@ func fwMatches68215592(s string) bool {
 // the delivery placements come from the same value the renderer emitted the
 // rows from — no re-derivation inside this tail.
 func (e *Engine) assignedKeyFlow(d *store.Device, now time.Time, wls []wireless.Wlan, plan wireless.ProvisioningPlan) (Outcome, error) {
-	// The unsupported-live-WLAN gate runs FIRST — before any record
-	// mutation (State/CfgVersion must not change on a rejected push) and
-	// before any emission.
-	if err := e.RejectUnsupportedLiveWLAN(*d, wls); err != nil {
+	// The unsupported-live-provisioning gate runs FIRST — before any
+	// record mutation (State/CfgVersion must not change on a rejected
+	// push) and before any emission.
+	if err := e.RejectUnsupportedLiveProvisioning(*d, wls); err != nil {
 		return Outcome{}, err
 	}
 	if d.CfgVersion == "" {

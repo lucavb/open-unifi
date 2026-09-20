@@ -55,6 +55,12 @@ type SiteFacts struct {
 	// (docs/PROTOCOL-systemcfg-wireless.md §13).
 	SSHPublicKeys []PublicKey
 
+	// SSHDisablePassword sets sshd.auth.passwd=disabled: the firmware
+	// respawn builder then appends the dropbear "-s" flag (disable remote
+	// password logins) to "null::respawn:%s -F %s%s%s%s". Default false
+	// (password auth enabled) is byte-identical to the pre-feature render.
+	SSHDisablePassword bool
+
 	// WLANs is the current WLAN envelope (the engine's per-decision
 	// snapshot, so the drift hash and the rendered config always agree).
 	WLANs []wireless.Wlan
@@ -314,7 +320,18 @@ func RenderWithPlan(d store.Device, facts SiteFacts, plan wireless.ProvisioningP
 	// dev is model-specific (record pass-through Extra["mgmt_dev"] allowed
 	// as the admin escape hatch).
 	line("sshd.status", "enabled")
-	line("sshd.auth.passwd", "enabled")
+	if rd.facts.SSHDisablePassword {
+		// sshd.auth.passwd=disabled → the firmware respawn builder appends
+		// dropbear's "-s" flag (disable remote password logins) to
+		// "null::respawn:%s -F %s%s%s%s" (port from sshd.%d.port, host
+		// keys -r /var/run/dropbear_rsa_host_key and
+		// -r /var/run/dropbear_ed25519_host_key). Password auth must be
+		// disabled only with an authorized key provisioned — the caller
+		// (cmd/openunifi) enforces that fail-closed at startup.
+		line("sshd.auth.passwd", "disabled")
+	} else {
+		line("sshd.auth.passwd", "enabled")
+	}
 	line("sshd.1.status", "enabled")
 	line("sshd.1.ifname", mgmtDevOf(d))
 	// sshd.auth.key.<n>.* — the authorized-key row family (firmware:

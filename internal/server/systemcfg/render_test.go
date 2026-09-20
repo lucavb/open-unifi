@@ -829,3 +829,35 @@ func TestParsePublicKeyTable(t *testing.T) {
 		}
 	}
 }
+
+// R6(a): the disable-password fact flips sshd.auth.passwd to "disabled"
+// (the dropbear -s respawn arm) and leaves the unchanged sshd.1.* rows
+// (status, port, ifname) exactly as the default render emits them.
+func TestRenderSSHDisablePassword(t *testing.T) {
+	res, err := Render(renderRecord(), SiteFacts{SSHDisablePassword: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Text, "sshd.auth.passwd=disabled\n") {
+		t.Fatalf("sshd.auth.passwd=disabled missing:\n%s", res.Text)
+	}
+	if strings.Contains(res.Text, "sshd.auth.passwd=enabled\n") {
+		t.Fatalf("sshd.auth.passwd=enabled emitted alongside the disable fact:\n%s", res.Text)
+	}
+	// The disable fact touches ONLY the passwd row: every other sshd.1.*
+	// row must still be present on the disabled path.
+	for _, want := range []string{"sshd.1.status=enabled\n", "sshd.1.ifname=br0\n"} {
+		if !strings.Contains(res.Text, want) {
+			t.Fatalf("sshd row missing on the disable path: %q:\n%s", want, res.Text)
+		}
+	}
+	// Default-fact render keeps the row enabled (byte-identical to the
+	// pre-feature contract, already pinned by the echo block test).
+	def, err := Render(renderRecord(), SiteFacts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(def.Text, "sshd.auth.passwd=enabled\n") {
+		t.Fatalf("default facts must keep sshd.auth.passwd=enabled:\n%s", def.Text)
+	}
+}

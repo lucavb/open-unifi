@@ -99,6 +99,10 @@ type Config struct {
 	// cmd/openunifi at startup (fail-closed); empty ⇒ zero key rows.
 	SSHPublicKeys []systemcfg.PublicKey
 
+	// SSHDisablePassword renders sshd.auth.passwd=disabled (the dropbear
+	// "-s" respawn flag — remote password logins off). Default false.
+	SSHDisablePassword bool
+
 	// OnSessionEvents, when non-nil, receives the client-session
 	// transitions (connect/disconnect counts) each COMMITTED inform cycle
 	// observed in its station refresh — called after the store cycle
@@ -188,6 +192,8 @@ func New(cfg Config, st store.DeviceStore, lg *slog.Logger) *Server {
 		ControllerURL:      cfg.ControllerURL,
 		InformListenAddr:   cfg.InformListenAddr,
 		AllowGatedLiveWLAN: cfg.AllowGatedLiveWLAN,
+		SSHKeyRows:         len(cfg.SSHPublicKeys),
+		SSHDisablePassword: cfg.SSHDisablePassword,
 	})
 	return s
 }
@@ -868,11 +874,12 @@ func (s *Server) renderSystemCfg(d store.Device, wls []wireless.Wlan, plan wirel
 		country = DefaultRegulatoryCountryCode
 	}
 	res, err := systemcfg.RenderWithPlan(d, systemcfg.SiteFacts{
-		ControllerURL: s.cfg.ControllerURL,
-		CountryCode:   country,
-		SSHPassword:   s.cfg.SSHPassword,
-		SSHPublicKeys: s.cfg.SSHPublicKeys,
-		WLANs:         wls,
+		ControllerURL:      s.cfg.ControllerURL,
+		CountryCode:        country,
+		SSHPassword:        s.cfg.SSHPassword,
+		SSHPublicKeys:      s.cfg.SSHPublicKeys,
+		SSHDisablePassword: s.cfg.SSHDisablePassword,
+		WLANs:              wls,
 	}, plan)
 	if err != nil {
 		return "", nil, err

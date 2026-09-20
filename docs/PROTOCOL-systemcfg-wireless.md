@@ -1121,9 +1121,15 @@ password logins) exactly when `sshd.auth.passwd` is disabled; port comes from
 `sshd.%d.port` (`" -p %d"`) and the host keys are
 `-r /var/run/dropbear_rsa_host_key` / `-r /var/run/dropbear_ed25519_host_key`.
 The controller-side startup guard is fail-closed: password auth cannot be
-disabled without at least one provisioned public key — otherwise the next
-cfg-row rebuild leaves an empty `authorized_keys` and dropbear starts with
-`-s`, locking SSH out for good.
+disabled without at least one provisioned public key — the next boot's
+cfg-row rebuild would otherwise leave an empty `authorized_keys` and dropbear
+would start with `-s`, risking a locked-out SSH. Recovery, even then, does
+NOT need SSH: an effective admin device save re-provisions the record on the
+next inform (the controller channel), re-rendering the sshd rows. One
+neutral caveat: the admin `config.system_cfg.<idx>` passthrough rows render
+AFTER the site-fact sshd rows, so a conflicting admin-supplied row's
+duplicate-resolution on the device (`sshd.auth.key` is an indexed family —
+sorted-key row semantics) is unvalidated.
 
 ### 13.3 Live-validation caveat (FOLLOW-UP, NOT YET CLAIMED)
 
@@ -1136,6 +1142,21 @@ requires a live-validated apply first"; two AP resets already consumed
 rebuild is OWED before these rows are treated as trusted. Zero keys /
 default facts keep the render byte-identical to the pre-feature contract,
 so nothing shipped before that validation changes any current wire bytes.
+Until then the LIVE-PROVISIONING GATE COVERS THE SSHD ROWS TOO: the
+adoption engine's fail-closed U7PG2/6.8.2.15592 choke point also rejects
+any full provisioning whose site facts carry key rows or the disable
+knob, lifted by the same `--allow-gated-live-wlan` opt-in (`SSHKeyRows` /
+`SSHDisablePassword` entering the engine as distilled engine deps, scalars
+only).
+
+Delivery semantics: site facts render at EMISSION; they reach an adopted
+device only at ADOPTION or the NEXT CFGVERSION MINT (an effective admin
+device save, a WLAN-change, a blocked-sta change, or the watchdog path).
+A flag flip alone re-provisions nothing — a settled device with an
+unchanged cfgversion noop. And the sshd rows are NOT inform-observable
+(the vap_table/echo reports carry no sshd keys), so the cfgversion echo
+after a full provisioning is the ONLY delivery confirmation a bench round
+can observe; the rows' persistence surfaces at the next boot rebuild.
 
 (End; see PROTOCOL-mgmt.md §3 for the surrounding `system_cfg` order and §6/§7 of
 PROTOCOL-mgmt.md for how system_cfg reaches the device.)

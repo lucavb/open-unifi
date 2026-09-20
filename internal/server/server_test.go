@@ -23,6 +23,7 @@ import (
 
 	"github.com/lucavb/open-unifi/internal/inform"
 	"github.com/lucavb/open-unifi/internal/server/adoption"
+	"github.com/lucavb/open-unifi/internal/server/systemcfg"
 	"github.com/lucavb/open-unifi/internal/store"
 	"github.com/lucavb/open-unifi/internal/wireless"
 )
@@ -270,6 +271,41 @@ func mustBuildSys(t *testing.T, s *Server, rec store.Device) string {
 		rec.Extra[k] = v
 	}
 	return sys
+}
+
+// Site-facts wiring pin: Config.SSHPublicKeys / Config.SSHDisablePassword
+// MUST reach the rendered system_cfg through the renderSystemCfg
+// SiteFacts copy. A dropped SSHPublicKeys wire would render an empty
+// authorized_keys with -s (password auth off) ACTIVE — the lane's own
+// nightmare scenario, locked SSH on the AP — while the cmd-layer guard
+// still passes because it checks the flag slice before the copy. The
+// rendered blob must therefore carry both the key rows and the disabled
+// passwd row. (Synthetic key: the same marker'd RFC 4253 blob the systemcfg
+// package tests use — never a real key.)
+func TestSiteFactsSSHConfigWiring(t *testing.T) {
+	pk, err := systemcfg.ParsePublicKey(
+		"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB test@ap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(Config{
+		SSHPublicKeys:      []systemcfg.PublicKey{pk},
+		SSHDisablePassword: true,
+	}, store.NewMemStore(), testLogger())
+	sys := mustBuildSys(t, s, u7pg2Record())
+	for _, want := range []string{
+		"sshd.auth.key.1.status=enabled\n",
+		"sshd.auth.key.1.value=AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB\n",
+		"sshd.auth.key.1.type=ssh-ed25519\n",
+		"sshd.auth.passwd=disabled\n",
+	} {
+		if !strings.Contains(sys, want) {
+			t.Fatalf("Config→SiteFacts wiring pin: missing %q:\n%s", want, sys)
+		}
+	}
+	if strings.Contains(sys, "sshd.auth.passwd=enabled\n") {
+		t.Fatalf("SSHDisablePassword=false leaked through the wiring:\n%s", sys)
+	}
 }
 
 // ---- tests ---------------------------------------------------------------
@@ -1383,7 +1419,7 @@ func TestGateFirmwareForms(t *testing.T) {
 		{"U6LR", "6.8.2.15592", false},
 	}
 	for _, c := range cases {
-		got := s.engine.RejectUnsupportedLiveWLAN(store.Device{Model: c.model, Firmware: c.fw}, env) != nil
+		got := s.engine.RejectUnsupportedLiveProvisioning(store.Device{Model: c.model, Firmware: c.fw}, env) != nil
 		if got != c.want {
 			t.Fatalf("gate(model=%q, fw=%q) = %v, want %v", c.model, c.fw, got, c.want)
 		}

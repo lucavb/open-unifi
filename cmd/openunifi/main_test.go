@@ -97,3 +97,70 @@ func TestValidateAdminExposure(t *testing.T) {
 		})
 	}
 }
+
+// resolveSSHPublicKeys table: the cmd-layer ssh-key startup composition —
+// flag/env precedence, the one non-obvious semantic (an explicit empty flag
+// value refuses the env and fails the parser), fail-closed key validation
+// with the 1-based "#N" error, and the disable-password guard both arms.
+// Synthetic key material only (the systemcfg tests' marker'd RFC 4253 blob
+// — never a real key).
+const testSSHKeyLine = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB second@ap"
+const testSSHKeyLine2 = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB test@ap"
+
+func TestResolveSSHPublicKeys(t *testing.T) {
+	cases := []struct {
+		name            string
+		flagKeys        []string
+		envValue        string
+		disablePassword bool
+		want            []string // resolved key types, nil = error expected
+		wantErr         string   // substring when want == nil
+	}{
+		{name: "flag-only", flagKeys: []string{testSSHKeyLine}, want: []string{"ssh-rsa"}},
+		{name: "env-only", envValue: testSSHKeyLine2, want: []string{"ssh-ed25519"}},
+		{
+			name: "flag-wins-over-env", flagKeys: []string{testSSHKeyLine}, envValue: testSSHKeyLine2,
+			want: []string{"ssh-rsa"},
+		},
+		{
+			name: "empty-flag-refuses-env", flagKeys: []string{""}, envValue: testSSHKeyLine2,
+			wantErr: "invalid AP SSH public key #1: want exactly 2 or 3 fields",
+		},
+		{
+			name: "malformed-flag-second", flagKeys: []string{testSSHKeyLine2, "ssh-rsa !!!"},
+			wantErr: "invalid AP SSH public key #2: ",
+		},
+		{
+			name:            "disable-without-keys",
+			disablePassword: true,
+			wantErr:         "cannot be disabled without a provisioned public key",
+		},
+		{
+			name: "disable-with-keys", flagKeys: []string{testSSHKeyLine}, disablePassword: true,
+			want: []string{"ssh-rsa"},
+		},
+	}
+	for _, c := range cases {
+		got, err := resolveSSHPublicKeys(c.flagKeys, c.envValue, c.disablePassword)
+		if c.want == nil {
+			if err == nil {
+				t.Fatalf("%s: unexpectedly succeeded", c.name)
+			}
+			if !strings.Contains(err.Error(), c.wantErr) {
+				t.Fatalf("%s: err %v, want substring %q", c.name, err, c.wantErr)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("%s: unexpected err %v", c.name, err)
+		}
+		if len(got) != len(c.want) {
+			t.Fatalf("%s: got %d keys, want %d", c.name, len(got), len(c.want))
+		}
+		for i, typ := range c.want {
+			if got[i].Type != typ {
+				t.Fatalf("%s: key %d type = %q, want %q", c.name, i, got[i].Type, typ)
+			}
+		}
+	}
+}

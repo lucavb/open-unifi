@@ -51,7 +51,9 @@ func run() error {
 	apSSHPassword := flag.String("ap-ssh-password", os.Getenv("OPEN_UNIFI_AP_SSH_PASSWORD"),
 		"SSH password for adopted APs (required; falls back to $OPEN_UNIFI_AP_SSH_PASSWORD)")
 	apSSHKeys := &keyList{}
-	flag.Var(apSSHKeys, "ap-ssh-key", "SSH authorized public key for adopted APs, one authorized_keys line per flag (repeatable; falls back to a single $OPEN_UNIFI_AP_SSH_KEY). Parsed and validated fail-closed at startup; provisioned as sshd.auth.key.<n>.* rows")
+	flag.Var(apSSHKeys, "ap-ssh-key", "LAB ONLY: SSH authorized public key for adopted APs, one authorized_keys line per flag (repeatable; falls back to a single $OPEN_UNIFI_AP_SSH_KEY). Parsed and validated fail-closed at startup; provisioned as sshd.auth.key.<n>.* rows — firmware-derived but NOT yet live-bench-validated, pushes gated behind --allow-gated-live-wlan (docs/PROTOCOL-systemcfg-wireless.md §13)")
+	apSSHDisablePassword := flag.Bool("ap-ssh-disable-password", false,
+		"LAB ONLY: render sshd.auth.passwd=disabled (dropbear -s: no remote password logins); requires at least one --ap-ssh-key. Applies at adoption or the next config push; flipping it alone does not re-provision adopted devices (docs/PROTOCOL-systemcfg-wireless.md §13)")
 	allowDefaultAPSSH := flag.Bool("allow-default-ap-ssh-password", false, "LAB ONLY: permit the insecure AP SSH password \"ubnt\" when --ap-ssh-password is empty")
 	// Default from the provider's token env var; --admin-token overrides it.
 	adminToken := flag.String("admin-token", os.Getenv("OPEN_UNIFI_ADMIN_TOKEN"),
@@ -78,19 +80,9 @@ func run() error {
 	// above. A malformed key must never reach the renderer: the AP rebuilds
 	// /etc/dropbear/authorized_keys from the provisioned rows on every
 	// boot/apply, so a bad value would ship a broken key set at apply time.
-	apKeys := apSSHKeys.keys
-	if len(apKeys) == 0 {
-		if v := os.Getenv("OPEN_UNIFI_AP_SSH_KEY"); v != "" {
-			apKeys = []string{v}
-		}
-	}
-	sshKeys := make([]systemcfg.PublicKey, 0, len(apKeys))
-	for i, raw := range apKeys {
-		k, err := systemcfg.ParsePublicKey(raw)
-		if err != nil {
-			return fmt.Errorf("invalid AP SSH public key #%d: %w", i+1, err)
-		}
-		sshKeys = append(sshKeys, k)
+	sshKeys, err := resolveSSHPublicKeys(apSSHKeys.keys, os.Getenv("OPEN_UNIFI_AP_SSH_KEY"), *apSSHDisablePassword)
+	if err != nil {
+		return err
 	}
 	// The flag default is nonzero, so a zero here can only come from an
 	// explicitly supplied --regulatory-country-code 0. Reject it before the
@@ -217,6 +209,7 @@ func run() error {
 		RegulatoryCountryCode: *regulatoryCountryCode,
 		SSHPassword:           *apSSHPassword,
 		SSHPublicKeys:         sshKeys,
+		SSHDisablePassword:    *apSSHDisablePassword,
 		AllowPlainText:        *allowPlainText,
 		AllowGatedLiveWLAN:    *allowGatedLiveWLAN,
 		WirelessSource:        wirelessSource,
@@ -228,6 +221,13 @@ func run() error {
 	}, st, logger)
 	if *allowGatedLiveWLAN {
 		logger.Warn("live WLAN provisioning gate LIFTED for U7PG2 6.8.2.15592 (--allow-gated-live-wlan): live WLAN pushes are enabled — bench use only, candidate must be pre-cleared by the offline minimal-diff harness")
+	}
+	if len(sshKeys) > 0 || *apSSHDisablePassword {
+		// Prominent, not debug: the sshd site facts are already gated
+		// behind the same live-WLAN opt-in at the engine choke point, but
+		// an admin who just configured keys must SEE that pushes will not
+		// go live until the bench validation lands.
+		logger.Warn("ssh site facts configured (--ap-ssh-key / --ap-ssh-disable-password): the sshd.auth.key rows and auth.passwd knob are firmware-derived but NOT yet live-bench-validated — live pushes stay gated behind --allow-gated-live-wlan (docs/PROTOCOL-systemcfg-wireless.md §13, bench use only)")
 	}
 	// The SSH set-inform push lane (internal/app/setinform.go): armed here
 	// so the console Adopt action can hand never-informed factory pending
@@ -337,6 +337,7 @@ func run() error {
 		"data_dir", *dataDir,
 		"ssh_password_configured", *apSSHPassword != "",
 		"ssh_public_keys", len(sshKeys),
+		"ssh_disable_password", *apSSHDisablePassword,
 		"auth", *adminToken != "",
 		"plaintext_inform", *allowPlainText,
 		"controller_url", *controllerURL,
@@ -414,9 +415,10 @@ func shutdownCtx() (context.Context, context.CancelFunc) {
 
 // keyList is a REPEATABLE flag.Value: every --ap-ssh-key occurrence appends
 // one authorized_keys line. The env fallback ($OPEN_UNIFI_AP_SSH_KEY, a
-// single key) is applied in run() AFTER flag.Parse only when the flag never
-// appeared — the --ap-ssh-password/env fallback pattern, so an explicitly
-// supplied flag wins over the environment.
+// single key) consults the environment — passed in by run() AFTER
+// flag.Parse so this stays pure — only when the flag never appeared, the
+// --ap-ssh-password/env fallback pattern, so an explicitly supplied flag
+// wins over the environment.
 type keyList struct {
 	keys []string
 }
@@ -426,6 +428,38 @@ func (l *keyList) String() string { return strings.Join(l.keys, "\n") }
 func (l *keyList) Set(v string) error {
 	l.keys = append(l.keys, v)
 	return nil
+}
+
+// resolveSSHPublicKeys implements the cmd-layer ssh-key startup composition
+// and validation: the flag occurrences win over the environment (envValue is
+// consulted only when the flag never appeared — an explicit --ap-ssh-key ""
+// still yields [""] and refuses the env, failing the parser), every key is
+// fail-closed parsed, and the guard refuses password auth disabled without
+// keys. Both guard semantics and error strings are preserved verbatim.
+//
+// Fail-closed guard: disabling password auth without a provisioned public
+// key risks locking SSH out — the next boot's cfg rebuild leaves no
+// authorized_keys entry and dropbear starts with -s. Recovery, even then,
+// does NOT need SSH: an effective admin device save re-provisions the
+// record on the next inform (the controller channel), re-rendering the
+// sshd rows.
+func resolveSSHPublicKeys(flagKeys []string, envValue string, disablePassword bool) ([]systemcfg.PublicKey, error) {
+	keys := flagKeys
+	if len(keys) == 0 && envValue != "" {
+		keys = []string{envValue}
+	}
+	sshKeys := make([]systemcfg.PublicKey, 0, len(keys))
+	for i, raw := range keys {
+		k, err := systemcfg.ParsePublicKey(raw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid AP SSH public key #%d: %w", i+1, err)
+		}
+		sshKeys = append(sshKeys, k)
+	}
+	if disablePassword && len(sshKeys) == 0 {
+		return nil, errors.New("AP SSH password auth cannot be disabled without a provisioned public key; set --ap-ssh-key (or $OPEN_UNIFI_AP_SSH_KEY) or SSH access will be locked out")
+	}
+	return sshKeys, nil
 }
 
 // drainShutdown tears both HTTP servers down with a fresh 5s deadline.

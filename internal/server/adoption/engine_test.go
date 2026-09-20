@@ -1036,6 +1036,117 @@ func TestEncryptedGateLiftedByOptIn(t *testing.T) {
 	}
 }
 
+// The sshd site facts ride the SAME fail-closed lane gate as the WLAN
+// template: on the U7PG2 6.8.2.15592 lane, a site with provisioned key rows
+// (SSHKeyRows>0) or with the password-login disable fact emits the typed
+// unsupported error from the assigned-key flow, with NO record mutation —
+// the sshd rows are firmware-derived but not yet live-bench-validated.
+// Zero-valued Deps (every pre-existing test) keep the gate inert.
+func TestEncryptedGateBlocksSSHKeyRows(t *testing.T) {
+	e := newTestEngine(t)
+	e.wireless = func() []wireless.Wlan { return workedEnvelopeAdoption() }
+	e.sshKeyRows = 1
+	const k = "11112222333344445555666677778888"
+	dev := store.Device{
+		MAC:        engineMAC,
+		State:      store.StateAdopted,
+		CfgVersion: "aaaa",
+		AppliedCfg: "",
+		XAuthkey:   k,
+		Authkeys:   []string{k},
+		Model:      "U7PG2",
+		Firmware:   "6.8.2.15592",
+	}
+	out, err := e.Decide(Request{
+		Transport: TransportEncrypted,
+		Device:    dev,
+		Body:      engineBody(""),
+		UsedKey:   k,
+		Now:       time.Unix(1000, 0),
+	})
+	if err != ErrLiveWLANProvisioningUnsupported {
+		t.Fatalf("gated inform err = %v, want unsupported-live-WLAN", err)
+	}
+	if out.Kind != "" || out.SystemCfg != "" || out.SetState || out.SetXAuthkey ||
+		out.SetCfgVersion || out.SetAuthkeys || out.Extra != nil {
+		t.Fatalf("gate must not mutate the record or emit system_cfg: %+v", out)
+	}
+}
+
+// The disable-password fact alone trips the same gate — the -s respawn arm
+// is part of the unvalidated sshd commit.
+func TestEncryptedGateBlocksSSHDisablePassword(t *testing.T) {
+	e := newTestEngine(t)
+	e.wireless = func() []wireless.Wlan { return workedEnvelopeAdoption() }
+	e.sshDisablePassword = true
+	const k = "11112222333344445555666677778888"
+	dev := store.Device{
+		MAC:        engineMAC,
+		State:      store.StateAdopted,
+		CfgVersion: "aaaa",
+		AppliedCfg: "",
+		XAuthkey:   k,
+		Authkeys:   []string{k},
+		Model:      "U7PG2",
+		Firmware:   "6.8.2.15592",
+	}
+	out, err := e.Decide(Request{
+		Transport: TransportEncrypted,
+		Device:    dev,
+		Body:      engineBody(""),
+		UsedKey:   k,
+		Now:       time.Unix(1000, 0),
+	})
+	if err != ErrLiveWLANProvisioningUnsupported {
+		t.Fatalf("gated inform err = %v, want unsupported-live-WLAN", err)
+	}
+	if out.Kind != "" || out.SystemCfg != "" || out.SetState {
+		t.Fatalf("gate must not mutate the record or emit system_cfg: %+v", out)
+	}
+}
+
+// The bench opt-in lifts the gate for the sshd site facts exactly like it
+// lifts it for WLAN rows: the same rejected informs pass untouched
+// otherwise (full provisioning proceeds).
+func TestEncryptedGateSSHFactsLiftedByOptIn(t *testing.T) {
+	e := New(Deps{
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Random:   func() float64 { return 0.5 },
+		KeyChars: func(n int) (string, error) { return strings.Repeat("0", n), nil },
+		Wireless: func() []wireless.Wlan { return workedEnvelopeAdoption() },
+		SystemCfg: func(store.Device, []wireless.Wlan, wireless.ProvisioningPlan) (string, map[string]string, error) {
+			return "# unifi\nunifi.version=0.1.0-dev\n", nil, nil
+		},
+		AllowGatedLiveWLAN: true,
+		SSHKeyRows:         1,
+		SSHDisablePassword: true,
+	})
+	const k = "11112222333344445555666677778888"
+	dev := store.Device{
+		MAC:        engineMAC,
+		State:      store.StateAdopted,
+		CfgVersion: "aaaa",
+		AppliedCfg: "",
+		XAuthkey:   k,
+		Authkeys:   []string{k},
+		Model:      "U7PG2",
+		Firmware:   "6.8.2.15592",
+	}
+	out, err := e.Decide(Request{
+		Transport: TransportEncrypted,
+		Device:    dev,
+		Body:      engineBody(""),
+		UsedKey:   k,
+		Now:       time.Unix(1000, 0),
+	})
+	if err != nil {
+		t.Fatalf("opted-in inform err = %v, want nil (gate lifted)", err)
+	}
+	if out.Kind != KindSetparam || !out.FullProvision || out.SystemCfg == "" {
+		t.Fatalf("opted-in outcome = %+v, want full provisioning with system_cfg", out)
+	}
+}
+
 // With the gate moved into the engine's assigned-key flow, a plaintext
 // mgmt_cfg-only re-send (XAuthkey mismatch → adoption push) from a gated
 // device SUCCEEDS: mgmt pushes keep working, only system_cfg emission is
