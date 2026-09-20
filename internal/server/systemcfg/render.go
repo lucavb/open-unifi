@@ -164,13 +164,13 @@ func Render(d store.Device, facts SiteFacts) (Result, error) {
 	// fallback is the "default" site) — FID-17. Row order per the pair
 	// array: version, anonymous_controller_id, anonymous_site_id,
 	// reporterid, siteid (String.txt:1851-1897).
-	if v, ok := d.Extra["anonymous_controller_id"].(string); ok && v != "" {
+	if v, ok := d.Extra[store.AnonymousControllerIDKey].(string); ok && v != "" {
 		line("unifi.anonymous_controller_id", v)
 	}
-	if v, ok := d.Extra["anonymous_site_id"].(string); ok && v != "" {
+	if v, ok := d.Extra[store.AnonymousSiteIDKey].(string); ok && v != "" {
 		line("unifi.anonymous_site_id", v)
 	}
-	if v, ok := d.Extra["anonymous_controller_id"].(string); ok && v != "" {
+	if v, ok := d.Extra[store.AnonymousControllerIDKey].(string); ok && v != "" {
 		// reporterid = the very same controller anonymous id.
 		line("unifi.reporterid", v)
 	}
@@ -342,7 +342,7 @@ func Render(d store.Device, facts SiteFacts) (Result, error) {
 	// 5. The admin "config.system_cfg.<idx>" passthrough lines
 	//    (config_String.java §appendix: raw pre-formatted lines). FID-62:
 	//    emitted without any "# misc" section header row.
-	if extra, ok := d.Extra["system_cfg_extra_lines"].([]any); ok {
+	if extra, ok := d.Extra[store.SystemCfgExtraLinesKey].([]any); ok {
 		for _, v := range extra {
 			if l, ok := v.(string); ok {
 				raw(l)
@@ -396,7 +396,7 @@ func (rd *render) usersPasswordHash(d store.Device) (string, error) {
 		rd.deltas["ssh_md5passwd"] = fresh
 		return fresh, nil
 	}
-	cached, _ := d.Extra["ssh_sha512passwd"].(string)
+	cached, _ := d.Extra[store.SSHSha512PasswdKey].(string)
 	if cached != "" && sha512CryptMatches(pw, cached) {
 		return cached, nil
 	}
@@ -410,7 +410,7 @@ func (rd *render) usersPasswordHash(d store.Device) (string, error) {
 	if rd.deltas == nil {
 		rd.deltas = map[string]string{}
 	}
-	rd.deltas["ssh_sha512passwd"] = fresh
+	rd.deltas[store.SSHSha512PasswdKey] = fresh
 	return fresh, nil
 }
 

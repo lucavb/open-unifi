@@ -46,7 +46,7 @@ const (
 // (admin escape hatch Extra["mgmt_dev"], else the classic br0 — same shape
 // as the sshd.1.ifname resolver in server.go).
 func mgmtDevOf(d store.Device) string {
-	if v, ok := d.Extra["mgmt_dev"].(string); ok && v != "" {
+	if v, ok := d.Extra[store.MgmtDevKey].(string); ok && v != "" {
 		return v
 	}
 	return "br0"
