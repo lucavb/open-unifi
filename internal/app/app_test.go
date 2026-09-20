@@ -338,14 +338,89 @@ func TestAdoptPendingFlow(t *testing.T) {
 		t.Fatalf("after adopt: %+v err=%v", rec, err)
 	}
 
-	// adopted devices vanish from the pending list
-	if pen := a.ListPending(ctx); len(pen) != 0 {
+	// The promotion leaves the live note in the pending map (it is
+	// consumed by the next inform, not by the promotion), so the record
+	// is a state-1-with-note candidate: LISTED from now on, awaiting its
+	// first inform — the console shape the factory reset round needs.
+	pen := a.ListPending(ctx)
+	if len(pen) != 1 {
 		t.Fatalf("pending after adopt: %+v", pen)
+	}
+	if pen[0].MAC != "a0:40:a0:aa:bb:cc" || pen[0].Name != "" {
+		t.Fatalf("pending after adopt: %+v", pen[0])
 	}
 
 	// adopting again: PENDING record is valid for re-adopt (idempotent)
 	if dv, err := a.AdoptPending(ctx, "a0:40:a0:aa:bb:cc"); err != nil || dv.State != store.StatePending {
 		t.Fatalf("re-adopt: %+v err=%v", dv, err)
+	}
+}
+
+// TestListPendingShapes is the table over the four pending-row shapes
+// the console's pending table can show:
+//
+//	(a) no record + live note   → listed, Name empty (stranger candidate)
+//	(b) state-3 record + note   → skipped (adopted; note is stale)
+//	(c) state-1 record + note   → listed, Name from the record (a KNOWN
+//	    device demoted by factory reset, or promoted and awaiting its
+//	    first inform) — this is the round that lets a factory reset be
+//	    re-adopted from the console with one Accept click
+//	(d) state-1 record, NO note → not listed (the pending map is the
+//	    liveness source, not the record)
+func TestListPendingShapes(t *testing.T) {
+	cases := []struct {
+		name     string
+		seed     *store.Device
+		note     string
+		wantRows int
+		wantName string
+	}{
+		{
+			name: "stranger-no-record",
+			note: "discovery:model=U7PG2,ip=10.10.10.20",
+			// nothing in the store; the map alone lists it
+			wantRows: 1,
+		},
+		{
+			name:     "adopted-record-skipped",
+			seed:     &store.Device{MAC: "112233445566", State: store.StateAdopted, Name: "ceiling-west"},
+			note:     "discovery:model=U7PG2",
+			wantRows: 0,
+		},
+		{
+			name:     "pending-record-listed-named",
+			seed:     &store.Device{MAC: "112233445566", State: store.StatePending, Name: "ceiling-west"},
+			note:     "inform:factory",
+			wantRows: 1,
+			wantName: "ceiling-west",
+		},
+		{
+			name:     "pending-record-without-note-hidden",
+			seed:     &store.Device{MAC: "112233445566", State: store.StatePending, Name: "ceiling-west"},
+			wantRows: 0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, st, _ := testApp(t)
+			if tc.seed != nil {
+				if err := st.Put(*tc.seed); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.note != "" {
+				if err := st.MarkPending("112233445566", tc.note); err != nil {
+					t.Fatal(err)
+				}
+			}
+			rows := a.ListPending(context.Background())
+			if len(rows) != tc.wantRows {
+				t.Fatalf("rows: %+v, want %d", rows, tc.wantRows)
+			}
+			if tc.wantRows == 1 && rows[0].Name != tc.wantName {
+				t.Fatalf("row name: %q, want %q", rows[0].Name, tc.wantName)
+			}
+		})
 	}
 }
 

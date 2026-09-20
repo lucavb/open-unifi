@@ -410,8 +410,12 @@
     }
     var rows = ['<table><tbody>'];
     items.forEach(function (p) {
+      // A name on a pending row means a KNOWN device (state-1 record:
+      // demoted by factory reset or freshly promoted) — show it so the
+      // operator can tell "re-adopt mine" from "adopt a stranger".
       rows.push(
         "<tr><td class=\"mono\">" + esc(p.mac) + "</td>" +
+        "<td>" + esc(p.name || "") + "</td>" +
         "<td>" + esc(p.source || "") + "</td>" +
         '<td class="actions-cell"><button type="button" class="btn btn-small" data-adopt="' + esc(p.mac) + '">Adopt</button></td></tr>'
       );

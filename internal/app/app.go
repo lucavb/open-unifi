@@ -858,8 +858,23 @@ func (a *App) DeleteDeviceRadioIntent(_ context.Context, mac, radio string) (adm
 	return a.putRadioIntent(canon, radio, adminapi.RadioIntentUpsert{})
 }
 
-// ListPending returns discovery/inform-reported candidates that do not have
-// a device record yet.
+// ListPending lists the console's pending rows from the pending map — the
+// single liveness source for who is currently announce/inform-known.
+//
+// The listing includes TWO shapes:
+//   - unheard candidates (no device record yet), and
+//   - existing StatePending records that still carry a live map note —
+//     a record demoted back to the pending-candidate shape by factory
+//     reset (returning to state 1 until its next factory-key inform), or
+//     one just promoted and awaiting its first inform. Surfacing the
+//     latter lets the operator re-click Adopt on a factory-reset device
+//     with NO Forget step: AdoptPending's existing-record branch re-
+//     promotes state-1 records idempotently, one click = one push
+//     attempt per its documented contract.
+//
+// Records in any other state (adopted/lost) are no longer candidates and
+// are skipped even when a stale note lingers. The Name column is filled
+// from the record; stranger candidates render empty.
 func (a *App) ListPending(_ context.Context) []adminapi.PendingView {
 	pend, err := a.st.Pending()
 	if err != nil {
@@ -868,10 +883,17 @@ func (a *App) ListPending(_ context.Context) []adminapi.PendingView {
 	}
 	out := make([]adminapi.PendingView, 0, len(pend))
 	for mac, note := range pend {
-		if _, err := a.st.Get(mac); err == nil {
-			continue // device record exists; no longer a candidate
+		d, err := a.st.Get(mac)
+		if err == nil && d.State != store.StatePending {
+			continue // record exists in a non-candidate state; not adoptable
 		}
-		out = append(out, adminapi.PendingView{MAC: store.ColonMAC(mac), Source: note})
+		pv := adminapi.PendingView{MAC: store.ColonMAC(mac), Source: note}
+		if err == nil {
+			// A state-1 record: surface its admin-assigned name so the
+			// console shows a KNOWN device, not a stranger.
+			pv.Name = d.Name
+		}
+		out = append(out, pv)
 	}
 	return out
 }

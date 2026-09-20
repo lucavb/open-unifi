@@ -129,10 +129,14 @@ type DeviceUpsert struct {
 	SiteID string `json:"site_id,omitempty"`
 }
 
-// PendingView is a discovery-beacon candidate waiting for adoption.
+// PendingView is a discovery-beacon candidate waiting for adoption. Name
+// is filled only when the MAC has an existing StatePending record
+// (demoted-by-factory-reset or freshly promoted) — stranger candidates
+// render without it.
 type PendingView struct {
 	MAC    string `json:"mac"`
 	Source string `json:"source,omitempty"`
+	Name   string `json:"name,omitempty"`
 }
 
 // Wlan is one wireless network entry in the whole-doc wireless config.

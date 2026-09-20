@@ -516,6 +516,42 @@ func TestAuthorizedFullFlow(t *testing.T) {
 	}
 }
 
+// TestPendingJSONCarriesNameWhenSet pins the PendingView.Name wire shape:
+// the GET /pending body carries "name" for rows backed by a StatePending
+// record (the KNOWN device the factory reset round re-adopts) and omits
+// the key entirely for stranger candidates — no empty-string noise on the
+// wire.
+func TestPendingJSONCarriesNameWhenSet(t *testing.T) {
+	be := newFakeBackend()
+	be.pending = []PendingView{
+		{MAC: "a0:40:a0:aa:bb:cc", Source: "inform:factory", Name: "ceiling-west"},
+		{MAC: "de:ad:be:ef:00:01", Source: "discovery:model=U7PG2,ip=10.10.10.20"},
+	}
+	h := New(Config{}, be)
+	req := httptest.NewRequest("GET", "/api/v1/pending", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("pending: %d %q", rec.Code, rec.Body.String())
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &struct {
+		Pending *[]map[string]any `json:"pending"`
+	}{Pending: &rows}); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows: %d", len(rows))
+	}
+	if rows[0]["name"] != "ceiling-west" {
+		t.Fatalf("row 0: %v (want name=ceiling-west)", rows[0])
+	}
+	// omitempty must keep the key OFF the wire for records without a name.
+	if _, ok := rows[1]["name"]; ok {
+		t.Fatalf("row 1 must omit name, got %v", rows[1])
+	}
+}
+
 // TestWrappedErrNotFoundMapsTo404 pins the errors.Is-based mapping: the fake
 // returns the sentinel WRAPPED with the MAC (as real adapters like
 // internal/app do); GET/DELETE/adopt of an unknown MAC must all be 404 with
