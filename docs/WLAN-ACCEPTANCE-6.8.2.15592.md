@@ -1391,7 +1391,14 @@ pushed render sha `ad41cdad…` is **byte-identical to the
 fixture-era baseline render** — the restore reproduced the baseline
 config exactly. The final slow power-cycle materialized the full
 baseline vap set (`ath0/ng` + `ath1/na`, both RUN) and closed E1's
-lost branch. Bench left in baseline state, `in_sync`, delivery
+lost branch. Post-round AP byte proof (the operator re-copied the
+ssh key): the device's `/tmp/system.cfg` is 6659 bytes, sha
+`3f8710b6…` — the boot's fw-sorted re-emission, the A2 behavior —
+with its row set **identical to the fixture** (sort+diff clean
+against `live-applied-sys.txt`, the `ad41cdad…` baseline), vap
+blocks at `wireless.1=ath0`/`wireless.2=ath1`, both
+`openunifi-gate-check`: the restored baseline held device-side,
+row-byte-for-row. Bench left in baseline state, `in_sync`, delivery
 confirmed. The ssh key lane died at the first reboot (the users-apply
 regenerates `authorized_keys` empty — known round-2 behavior;
 workstation re-copy needed after any boot).
