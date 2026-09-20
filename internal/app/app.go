@@ -1212,12 +1212,13 @@ func (a *App) PutWireless(_ context.Context, env adminapi.WlansEnvelope) error {
 	for i := range env.Wlans {
 		env.Wlans[i].ID = wlanID(env.Wlans[i])
 	}
-	for _, w := range env.Wlans {
-		if msg := adminapi.ValidateWlanName(w.Name); msg != "" {
-			return fmt.Errorf("%w: %s", adminapi.ErrConflict, msg)
-		}
-	}
-	if err := validateWlanUniqueness(env); err != nil {
+	// Full-envelope validation, the same fence CreateWlan/UpdateWlan apply
+	// (name + ValidateWlan + uniqueness — a strict superset of the old
+	// name-only loop): IDs are assigned BEFORE validation so derived IDs are
+	// visible to the duplicate-ID check, and a direct caller can no longer
+	// persist an envelope the loader/next boot (loadWirelessFile) would
+	// refuse with a startup failure.
+	if err := a.validateWlans(&env); err != nil {
 		return err
 	}
 	blob, err := json.MarshalIndent(env, "", "  ")
@@ -1285,6 +1286,9 @@ func (a *App) validateWlans(env *adminapi.WlansEnvelope) error {
 	return nil
 }
 
+// validateWlanUniqueness is the loader-side duplicate check
+// (loadWirelessFile); the PUT paths fence through a.validateWlans, which
+// embeds the same duplicates rule alongside the rule set it carries.
 func validateWlanUniqueness(env adminapi.WlansEnvelope) error {
 	names, ssids, ids := map[string]bool{}, map[string]bool{}, map[string]bool{}
 	for _, w := range env.Wlans {

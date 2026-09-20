@@ -1033,8 +1033,12 @@ func TestWirelessServedFromCacheWithoutFileIO(t *testing.T) {
 	ctx := context.Background()
 
 	env := adminapi.WlansEnvelope{Wlans: []adminapi.Wlan{
-		{ID: "w1", Name: "home", SSID: "home-net", Security: "wpa-p", Passphrase: "correct-horse", Enabled: true},
+		{ID: "w1", Name: "home", SSID: "home-net", Security: "wpa-p", Passphrase: "correct-horse", VLAN: 1, Enabled: true},
 	}}
+	// VLAN:1 above (was absent at base): PutWireless fences the FULL
+	// envelope since the convergence, so a VLAN-0 seed the name-only loop
+	// once accepted is now a validation rejection before any caching step
+	// this pin observes.
 	if err := a.PutWireless(ctx, env); err != nil {
 		t.Fatalf("put wireless: %v", err)
 	}
@@ -1057,12 +1061,47 @@ func TestWirelessServedFromCacheWithoutFileIO(t *testing.T) {
 	}
 }
 
+// TestPutWirelessFencesFullEnvelope pins the whole-document PUT's
+// full-envelope fence (the same one CreateWlan/UpdateWlan run): a wlan the
+// route's per-row ValidateWlan loop cannot see through — an empty NAME —
+// is rejected at the Backend, and the error carries the `wlan[0]: `
+// index prefix. That prefix is the one REST-visible body delta: the PUT
+// route loops ValidateWlan (which never checks name emptiness), so a
+// 400-preflighted body could never carry it — only the direct-Backend
+// caller (Terraform provider, tests) now gets the conflict with the
+// offending index named. Before the fence such a document persisted
+// fine and then BLOCKED the next boot (loadWirelessFile refuses invalid
+// documents and cmd/openunifi refuses to launch on it).
+func TestPutWirelessFencesFullEnvelope(t *testing.T) {
+	a, _, _ := testApp(t)
+	ctx := context.Background()
+	err := a.PutWireless(ctx, adminapi.WlansEnvelope{Wlans: []adminapi.Wlan{
+		{Name: "", SSID: "ssid-only", Security: "open", VLAN: 1},
+	}})
+	if !errors.Is(err, adminapi.ErrConflict) {
+		t.Fatalf("empty-name wlan must be ErrConflict, got %v", err)
+	}
+	if err.Error() != "conflict: wlan[0]: name must be 1..64 characters" {
+		t.Fatalf("conflict must carry the wlan[0] index prefix, got %q", err.Error())
+	}
+	// The rejected document must not have landed in the cache or on disk —
+	// Get serves the empty default after a fenced replace.
+	if env := a.GetWireless(ctx); len(env.Wlans) != 0 {
+		t.Fatalf("fenced put must not leave wlans in the cache: %+v", env.Wlans)
+	}
+}
+
 func TestPutWirelessFailureLeavesCacheUntouched(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	a := New(store.NewMemStore(), filepath.Join(dir, "wireless.json"), quietLogger())
 
-	if err := a.PutWireless(ctx, adminapi.WlansEnvelope{Wlans: []adminapi.Wlan{{Name: "ok", SSID: "ok"}}}); err != nil {
+	// Seed and injected-failure payloads are VALID wlans (open security,
+	// in-range VLAN): the failure this pin exercises is persistence
+	// (chmod 0000 directory), not validation — since PutWireless fences the
+	// FULL envelope, an invalid payload would now be rejected before the
+	// persist path and the failure injection would go untested.
+	if err := a.PutWireless(ctx, adminapi.WlansEnvelope{Wlans: []adminapi.Wlan{{Name: "ok", SSID: "ok", Security: "open", VLAN: 1}}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1073,7 +1112,7 @@ func TestPutWirelessFailureLeavesCacheUntouched(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
 
-	err := a.PutWireless(ctx, adminapi.WlansEnvelope{Wlans: []adminapi.Wlan{{Name: "fail", SSID: "fail"}}})
+	err := a.PutWireless(ctx, adminapi.WlansEnvelope{Wlans: []adminapi.Wlan{{Name: "fail", SSID: "fail", Security: "open", VLAN: 1}}})
 	if err == nil {
 		t.Fatal("put into an unwritable directory must fail")
 	}
