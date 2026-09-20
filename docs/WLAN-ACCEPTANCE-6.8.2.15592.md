@@ -1103,19 +1103,31 @@ echo `7def53c29e16e7a3` intact (boot-race grace: `applied WLANs not
 running, miss 1 of 2` on the sparse first inform, both up on the
 next), no re-provisioning — state 3 by 11:15:43.
 
-**Side findings:** (1) post-recovery the SSH lane is dead on the
-device: authorized_keys regenerated empty (the documented users-apply
-pattern), and the ubnt/ubnt password lane now HANGS — banner and
-prompt arrive, then no reject, no session, no eof (three attempts,
-25/45/90 s), and the wedge SURVIVES the 11:13 reboot, so it is not a
-transient. The §6.6 recovery apply kept the password lane working, so
-this is new. Direct AP-side reads (`mgmt.is_default`,
-`mgmt.cfgversion`, `mgmt.use_aes_gcm`, `/tmp/system.cfg` sha) are
-blocked on the recovered device; the controller-side chain
-substitutes for this record: the render diagnostic sha equals the
-morning's AP-read baseline `c4b7f3bf…`, the device's own mint echo
-confirms the applied cfgversion, `in_sync:true`, `wlan_delivery
-confirmed`. Diagnosis queued for Tuesday. (2) poller state dips to 2
+**AP-side proof (post-round, over the restored operator key lane):**
+`/etc/persistent/cfg/mgmt` reads `mgmt.is_default=false` (the
+boot-guard holding on a factory-recovered device),
+`mgmt.cfgversion=7def53c29e16e7a3` == the mint, and
+`mgmt.use_aes_gcm=true` (the rotated key on the GCM lane). The
+post-reboot on-disk `/tmp/system.cfg` is the firmware's sorted
+re-emission (raw sha `3560a780…`) whose row set is byte-identical to
+the pushed document — sorted sha `27aa4247…` on both sides, 268
+rows, zero diff — the A2-resolution post-boot semantics (byte gates
+apply to pushed document order).
+
+**Side findings:** (1) the default-password SSH lane is automation-hostile this
+round: six expect-driven attempts (25/45/90 s timeouts, pre- and
+post-reboot, immediate and 1 s-delayed sends, with and without a
+pinned auth order) all hung at the password prompt — no reject, no
+session, no eof — while the operator's interactive `ssh-copy-id` on
+the same lane completed minutes later and re-installed the operator
+key (authorized_keys had been regenerated empty by the users-apply;
+1 line again), restoring the key lane. Root cause unexplained: the
+§6.6 automation worked against the factory sshd state, the hangs are
+all against the applied config, and interactive works against both.
+Recovery procedure note: drive the set-inform/key-install lane
+interactively when the key lane is down. Direct AP-side reads
+re-opened over the key lane and are complete (the AP-side proof
+above). (2) poller state dips to 2
 exactly inside drift windows (mid-settle 09:07:28 / 09:08:43 /
 09:57:13 and the 10:23:13 post-re-key snapshot), returning to 3 at
 settle, with informs connected noops throughout — the dip is the
@@ -1131,7 +1143,8 @@ fixture sha `a20042ac…`), prior fixture archived as
 `live-devices.preround-20260920-round2.json` (`082fd789…`);
 `live-wireless.json` unchanged (`5620a15d…`); `live-applied-sys.txt`
 unchanged (`c4b7f3bf…` — equal to the recovery render diagnostic, so
-no re-capture). All ZZ gates green on the churned record (11 PASS +
+no re-capture) and re-verified against the AP post-round (sorted
+row-set sha `27aa4247…` both sides). All ZZ gates green on the churned record (11 PASS +
 Wpa SKIP by design — the churned record renders the applied bytes
 byte-exact at `TestZZLiveIntentVsApplied`); `go vet` clean; gofmt
 clean on repo code; full `go test ./...` green.
@@ -1147,8 +1160,10 @@ key rotation, and persistence re-proven on the recovered device.
 Still open: Interim-Update session proof (live RADIUS acct daemon),
 client-dependent session halves (wire key, §6.2(e) trigger,
 retention, association), the classic-controller cmd row `type`
-capture, ledbar lamp eyes-on, the sshd password-wedge diagnosis, and
-the discovery reply emitter (documented TODO, unscheduled).
+capture, ledbar lamp eyes-on, the SSH password lane's
+automation-hostility (expect hangs, interactive works — root cause
+unexplained), and the discovery reply emitter (documented TODO,
+unscheduled).
 
 ## Release gate summary
 
