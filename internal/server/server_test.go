@@ -2200,6 +2200,67 @@ func TestLEDStateMgmtCfgLedBarConsistency(t *testing.T) {
 	}
 }
 
+// TestPlainLaneProvisionsWirelessRows pins the PLAINTEXT lane's rendered
+// wireless rows. The plain suite's other envelope-adjacent assertions are
+// PRESENCE-only (noop/setparam shape, record bookkeeping), so only the
+// encrypted lane had a rendered-row pin: this closes that asymmetry. An
+// adopted record goes through the plaintext inform path (AllowPlainText,
+// identity from the body, _authkey claim == XAuthkey ⇒ the assigned-key
+// flow, which ALWAYS emits full provisioning on this lane) and the
+// setparam body must carry a real wireless row — aaa.1.ssid=<the
+// envelope's SSID> — rendered from the server's WirelessSource envelope.
+//
+// Folded plan pin: the SystemCfg stub installed below asserts the handed
+// plan is consistent with the envelope the test installed — plan.
+// DriftHash == wireless.WlanListHash(envelope) — the engine must thread
+// ONE computation into the renderer, never a re-derived half.
+func TestPlainLaneProvisionsWirelessRows(t *testing.T) {
+	env := []Wlan{{Name: "corp", SSID: "plaintest", Security: "wpa-p",
+		Passphrase: "correcthorse", VLAN: 42, Enabled: true}}
+	st := store.NewMemStore()
+	xk := "11112222333344445555666677778888"
+	rec := u7pg2Record()
+	rec.XAuthkey, rec.Authkeys = xk, []string{xk}
+	rec.CfgVersion, rec.AppliedCfg = "aaaa", "aaaa"
+	if err := st.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	s := New(Config{AllowPlainText: true, WirelessSource: func() []Wlan { return env }}, st, testLogger())
+	realRender := s.renderSystemCfg
+	var handedPlan wireless.ProvisioningPlan
+	s.engine = adoption.New(adoption.Deps{
+		Logger:   testLogger(),
+		Random:   func() float64 { return 0.5 },
+		KeyChars: func(n int) (string, error) { return strings.Repeat("f", n), nil },
+		Wireless: func() []wireless.Wlan { return env },
+		SystemCfg: func(d store.Device, wls []wireless.Wlan, plan wireless.ProvisioningPlan) (string, map[string]string, error) {
+			handedPlan = plan
+			return realRender(d, wls, plan)
+		},
+	})
+	body := infoBody("aaaa")
+	body["_authkey"] = xk
+	resp := post(t, s.InformHandler(), mustJSON(t, body))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("plaintext inform: %d %q", resp.Code, resp.Body.String())
+	}
+	var jm map[string]any
+	if err := json.Unmarshal(resp.Body.Bytes(), &jm); err != nil {
+		t.Fatalf("plain reply JSON: %v", err)
+	}
+	if jm["_type"] != "setparam" || jm["system_cfg"] == nil {
+		t.Fatalf("plaintext assigned-key flow must full-provision, got %v", jm["_type"])
+	}
+	sys := jm["system_cfg"].(string)
+	if !strings.Contains(sys, "aaa.1.ssid=plaintest") {
+		t.Fatalf("plaintext setparam system_cfg missing the wireless row:\n%q", sys)
+	}
+	if handedPlan.DriftHash == "" || handedPlan.DriftHash != wireless.WlanListHash(env) {
+		t.Fatalf("handed plan drift hash %q != WlanListHash(envelope) %q",
+			handedPlan.DriftHash, wireless.WlanListHash(env))
+	}
+}
+
 // ---- discovery table tests (§8a) -------------------------------------------
 
 // mkTLV frames one TLV entry [type:1][len:2 BE][value] (oooO.o00000(B,[B)).

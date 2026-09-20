@@ -356,9 +356,13 @@ func (e *Engine) Decide(req Request) (Outcome, error) {
 	// One provisioning plan per decision: the single value computed from a
 	// device and the wireless envelope (CONTEXT.md) — drift hash, vap
 	// placements, wireless rows together — threaded through both lanes and
-	// into the renderer, so no consumer re-derives a half of it. Plan inputs
-	// (extra radio_table / radio_intent) are device-refreshable caps no
-	// branch below touches before consuming the plan.
+	// into the renderer, so no consumer re-derives a half of it.
+	// radio_table is THE device-refreshable plan input (PlanVaps reads it);
+	// radio_intent is ADMIN-OWNED (store's adminOwnedKeys trust policy,
+	// prev-or-delete) and is read by the renderer from the record at
+	// emission (systemcfg's emitWirelessCfg) — it is NOT a plan input.
+	// The load-bearing statement either way: no branch below touches the
+	// plan inputs before consuming the plan.
 	plan := wireless.PlanProvisioning(work, wls)
 	var out Outcome
 	var err error
