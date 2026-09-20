@@ -9,17 +9,6 @@ import (
 	"github.com/lucavb/open-unifi/internal/wireless"
 )
 
-// ControllerOwnedKeys is the record's controller-owned Extra key class
-// (the trust-policy "controller-owned keys" class): the wlan_cfg_* WLAN
-// delivery bookkeeping, the client-session family (internal/store sessions
-// — the session rows and the one-shot §6.2(e) disconnect-event flag), and
-// the site SSH password cache. Single source: the store trust-policy
-// registry (store.ControllerOwnedKeys) — record absorption restores the
-// class verbatim after every Extra swap, and the §6.6 setdefault demotion
-// sweeps its per-device subset (store.FactoryResetSweepKeys) — a
-// factory-reset device re-adoption starts with fresh session state.
-var ControllerOwnedKeys = store.ControllerOwnedKeys
-
 // wlanCfgState is the typed view over the controller-owned wlan_cfg_* Extra
 // keys (the trust-policy "controller-owned keys" class). load reads them with
 // EXACTLY the type assertions today's readers used; the apply functions write
@@ -76,7 +65,8 @@ type wlanCfgState struct {
 	// two-consecutive-miss arming (the engine's connected-noop fire site;
 	// see notRunningEvidence). Controller-owned bookkeeping, so it
 	// survives sparse heartbeats and device bodies cannot clobber it
-	// (store.ControllerOwnedKeys). Absent = 0 = window unarmed.
+	// (the store trust policy's controller-owned class). Absent = 0 =
+	// window unarmed.
 	notRunningMisses int
 
 	// offeredCfgversion is wlan_cfg_offered_cfgversion: the cfgversion the
@@ -87,7 +77,8 @@ type wlanCfgState struct {
 	// (radio-intent / LED-override saves — the same escape blocked-set
 	// changes have) cannot be held hostage by an exhausted
 	// unchanged-envelope retry. Controller-owned: a device body can
-	// neither write nor clear it (store.ControllerOwnedKeys), and the setdefault
+	// neither write nor clear it (the store trust policy's
+	// controller-owned class), and the setdefault
 	// demotion sweeps it with the rest of the family. Absent = the pending
 	// predates this bookkeeping (the gate keeps its hold-at-gate behavior
 	// for those records).
@@ -331,7 +322,8 @@ func (st *wlanCfgState) appliedNotRunning() bool {
 // (wlan_cfg_not_running_misses) and returns the new count. The write lands
 // in the same extra map every controller-owned bookkeeping write uses, so
 // it persists through the adapter's wholesale Extra assignment and survives
-// later sparse heartbeats via store.ControllerOwnedKeys.
+// later sparse heartbeats via the store trust policy's controller-owned
+// class.
 func (st *wlanCfgState) recordNotRunningMiss() int {
 	st.notRunningMisses++
 	st.extra["wlan_cfg_not_running_misses"] = st.notRunningMisses

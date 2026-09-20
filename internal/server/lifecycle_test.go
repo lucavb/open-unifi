@@ -196,6 +196,10 @@ func TestFactoryResetLifecycleEndToEnd(t *testing.T) {
 		}
 		d.Extra["wlan_cfg_sha"] = "stalebaseline"
 		d.Extra["wlan_cfg_attempts"] = 3.0
+		// Seed the site ssh password cache as well: absorption's
+		// controller-owned restoration must carry it through the inform,
+		// and the §6.6 sweep must SPARE the site-fact cache.
+		d.Extra[store.SSHSha512PasswdKey] = "site-cache-sentinel"
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -238,10 +242,13 @@ func TestFactoryResetLifecycleEndToEnd(t *testing.T) {
 	if _, armed := d.Extra["setdefault_armed"]; armed {
 		t.Fatalf("setdefault flag survived emission: %+v", d.Extra)
 	}
-	for _, k := range adoption.ControllerOwnedKeys {
+	for _, k := range store.FactoryResetSweepKeys {
 		if _, ok := d.Extra[k]; ok {
 			t.Fatalf("controller-owned %q survived the demotion: %+v", k, d.Extra)
 		}
+	}
+	if got, want := d.Extra[store.SSHSha512PasswdKey], "site-cache-sentinel"; got != want {
+		t.Fatalf("the §6.6 sweep must spare the site ssh password cache: %v, want %q", got, want)
 	}
 
 	// 3. factory-reset device re-informs on the factory default key →

@@ -32,6 +32,11 @@ const (
 	// stale match re-derives the identical value). Controller-owned: a
 	// device body can neither clobber it nor wipe it, or every heartbeat
 	// between provisioning rounds would re-emit the credential delta.
+	// The md5 twin (ssh_md5passwd, the $1$ branch in
+	// internal/server/systemcfg/render.go) is deliberately UNCLASSED —
+	// adapter-era behavior, and byte-identity forbids classing it; on
+	// md5-branch devices a clobbered cache self-heals via the next
+	// render's credential delta.
 	SSHSha512PasswdKey = "ssh_sha512passwd"
 
 	// SystemCfgExtraLinesKey holds the admin's raw extra system_cfg lines
@@ -65,10 +70,12 @@ const (
 	BlockedStaShaExtraKey = "blocked_sta_sha"
 )
 
-// ControllerOwnedKeys is the record's controller-owned Extra key class
+// controllerOwnedKeys is the record's controller-owned Extra key class
 // (single source): the wlan_cfg_* WLAN delivery bookkeeping, the
-// client-session family, and the SSH password cache.
-var ControllerOwnedKeys = []string{
+// client-session family, and the SSH password cache. Package-private by
+// design (the sealed surface: Absorb is the only reader); nothing outside
+// this file may copy it.
+var controllerOwnedKeys = []string{
 	"wlan_cfg_sha", "wlan_cfg_pending_sha", "wlan_cfg_pending_wlans",
 	"wlan_cfg_pending_old_wlans", "wlan_cfg_applied_wlans",
 	"wlan_cfg_pending_placements", "wlan_cfg_attempt_sha", "wlan_cfg_attempts",
@@ -78,17 +85,19 @@ var ControllerOwnedKeys = []string{
 	SSHSha512PasswdKey,
 }
 
-// DeviceRefreshableKeys is the device-refreshable caps class: fields only
+// deviceRefreshableKeys is the device-refreshable caps class: fields only
 // the device can supply. Record absorption keeps the record's value when a
 // body omits the key (a sparse heartbeat must not wipe the radio_table) and
 // takes the body's value when present (prev-owns would pin device-side
-// channel reselection forever).
-var DeviceRefreshableKeys = []string{
+// channel reselection forever). Package-private by design (the sealed
+// surface: Absorb is the only reader); nothing outside this file may copy
+// it.
+var deviceRefreshableKeys = []string{
 	"radio_table", "wifi_caps", "fw_caps", "if_table", "ethernet_table",
 	"uplink", "has_eth1",
 }
 
-// AdminOwnedKeys is the admin-owned rows class: a device body can neither
+// adminOwnedKeys is the admin-owned rows class: a device body can neither
 // write nor introduce any of them. The led_override / disabled /
 // led_override_color_* entries are the Extra twins of the typed Device
 // fields above (the classic controller reads all four rows from its own DB,
@@ -98,7 +107,9 @@ var DeviceRefreshableKeys = []string{
 // prev-or-delete rule too: prev-owns alone would let a body INTRODUCE the
 // baseline, and a forged baseline matching a forged set would suppress
 // delivery — only the engine's own emission ever writes it.
-var AdminOwnedKeys = []string{
+// Package-private by design (the sealed surface: Absorb is the only
+// reader); nothing outside this file may copy it.
+var adminOwnedKeys = []string{
 	SystemCfgExtraLinesKey, MgmtDevKey,
 	AnonymousControllerIDKey, AnonymousSiteIDKey,
 	FlagRebootOnConnect, FlagSetdefaultArmed,
@@ -116,9 +127,12 @@ var AdminOwnedKeys = []string{
 // fact — the AP SSH password — which the first post-reset provisioning
 // re-derives verbatim, and the demoted record's shape must not drift from
 // what the inform-path seam has always left behind. Derived from
-// ControllerOwnedKeys, so the sweep can never fall out of sync with the
-// class it clears.
-var FactoryResetSweepKeys = excludeKey(ControllerOwnedKeys, SSHSha512PasswdKey)
+// controllerOwnedKeys, so the sweep can never fall out of sync with the
+// class it clears. TREAT AS IMMUTABLE (do not append or reorder; it holds
+// the registry's own defensive copy — excludeKey built it fresh).
+// This is the only class slice left exported: the adoption engine is its
+// sole consumer, so the class membership itself stays sealed.
+var FactoryResetSweepKeys = excludeKey(controllerOwnedKeys, SSHSha512PasswdKey)
 
 // excludeKey copies keys without the one named (copy so a caller that
 // appends to one list can never clobber the other's backing array).
@@ -159,19 +173,19 @@ func (d *Device) Absorb(body map[string]any, now time.Time, gcmReq bool) {
 		prev = JSONMap{}
 	}
 	d.Extra = JSONMap(body)
-	for _, k := range ControllerOwnedKeys {
+	for _, k := range controllerOwnedKeys {
 		if v, ok := prev[k]; ok {
 			d.Extra[k] = v
 		}
 	}
-	for _, k := range DeviceRefreshableKeys {
+	for _, k := range deviceRefreshableKeys {
 		if _, ok := body[k]; !ok {
 			if v, ok := prev[k]; ok {
 				d.Extra[k] = v
 			}
 		}
 	}
-	for _, k := range AdminOwnedKeys {
+	for _, k := range adminOwnedKeys {
 		if v, ok := prev[k]; ok {
 			d.Extra[k] = v
 		} else {

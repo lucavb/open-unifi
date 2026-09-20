@@ -141,6 +141,11 @@ func TestArmedSetdefaultDemotesToPendingCandidate(t *testing.T) {
 	// with the rest of the family, or the re-adopted device would inherit
 	// a half-armed not-running window.
 	dev.Extra["wlan_cfg_not_running_misses"] = 1.0
+	// Seed the site ssh password cache too: the sweep must SPARE it (a
+	// site-fact cache the first post-reset provisioning re-derives
+	// verbatim) — the lane's one deliberately distinctive demotion
+	// behavior, pinned here at engine level.
+	dev.Extra[store.SSHSha512PasswdKey] = "site-cache-sentinel"
 
 	out, err := e.Decide(Request{
 		Transport: TransportEncrypted, Device: dev,
@@ -176,7 +181,7 @@ func TestArmedSetdefaultDemotesToPendingCandidate(t *testing.T) {
 		dev.CfgVersion != "" || dev.AppliedCfg != "" || len(dev.Authkeys) != 0 {
 		t.Fatalf("record not in pending-candidate shape: %+v", dev)
 	}
-	for _, k := range ControllerOwnedKeys {
+	for _, k := range store.FactoryResetSweepKeys {
 		if _, ok := dev.Extra[k]; ok {
 			t.Fatalf("controller-owned %q survived the setdefault demotion", k)
 		}
@@ -186,6 +191,11 @@ func TestArmedSetdefaultDemotesToPendingCandidate(t *testing.T) {
 	// vacuously for keys that were never seeded).
 	if _, ok := dev.Extra["wlan_cfg_not_running_misses"]; ok {
 		t.Fatalf("the not-running miss counter survived the setdefault demotion: %v", dev.Extra["wlan_cfg_not_running_misses"])
+	}
+	// …and the one member the sweep must NOT touch: the site ssh password
+	// cache survives verbatim.
+	if got, want := dev.Extra[store.SSHSha512PasswdKey], "site-cache-sentinel"; got != want {
+		t.Fatalf("the §6.6 sweep must spare the site ssh password cache: %v, want %q", got, want)
 	}
 }
 

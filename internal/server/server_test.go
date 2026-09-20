@@ -2130,7 +2130,7 @@ func TestAbsorbAdminOwnedLEDFieldsProtected(t *testing.T) {
 		"led_override_color_brightness": 42.0,
 		"led_override_color":            "#ff0000",
 	}
-	s.absorbInform(testMAC, &rec, body, time.Now(), false)
+	s.absorbInform(&rec, body, time.Now(), false)
 	if rec.LEDOverride != "on" {
 		t.Fatalf("device body overwrote admin LED override: %q", rec.LEDOverride)
 	}

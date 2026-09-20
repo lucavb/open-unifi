@@ -81,14 +81,15 @@ func TestAbsorbControllerOwnedPrevWins(t *testing.T) {
 
 // TestAbsorbControllerOwnedRestoresOnlyFromTheRecord pins the loop's exact
 // reach: prev-wins can PRESERVE a record value against a forged body, but
-// it can never DELETE or FEEL a body copy — a record that never held a class
-// member lets a body's forged copy stand (exactly what the inform path
-// always did; changing that reach is a behavior change, not a seam move).
+// it can never overwrite or delete a body copy — a record that never held a
+// class member lets a body's forged copy stand (exactly what the inform
+// path always did; changing that reach is a behavior change, not a seam
+// move).
 func TestAbsorbControllerOwnedRestoresOnlyFromTheRecord(t *testing.T) {
 	rec := Device{MAC: "aabbccddeeff", Extra: JSONMap{}}
 	body := absorbBody()
 	rec.Absorb(body, absorbNow, false)
-	for _, k := range ControllerOwnedKeys {
+	for _, k := range controllerOwnedKeys {
 		if v, ok := body[k]; ok {
 			if got := rec.Extra[k]; !reflect.DeepEqual(got, v) {
 				t.Fatalf("controller-owned %q body copy drifted: %v, want %v", k, got, v)
@@ -124,7 +125,7 @@ func TestAbsorbDeviceRefreshableClass(t *testing.T) {
 	prev := absorbFixture()
 	rec = absorbFixture()
 	rec.Absorb(sparse, absorbNow, false)
-	for _, k := range DeviceRefreshableKeys {
+	for _, k := range deviceRefreshableKeys {
 		if !reflect.DeepEqual(rec.Extra[k], prev.Extra[k]) {
 			t.Fatalf("sparse heartbeat changed device-refreshable %q: %v, want %v", k, rec.Extra[k], prev.Extra[k])
 		}
@@ -139,7 +140,7 @@ func TestAbsorbAdminOwnedPrevOrDelete(t *testing.T) {
 	rec := absorbFixture()
 	rec.Absorb(absorbBody(), absorbNow, false)
 	prev := absorbFixture()
-	for _, k := range AdminOwnedKeys {
+	for _, k := range adminOwnedKeys {
 		want := prev.Extra[k]
 		if got := rec.Extra[k]; !reflect.DeepEqual(got, want) {
 			t.Fatalf("admin-owned %q after absorption = %v, want %v", k, got, want)
@@ -148,7 +149,7 @@ func TestAbsorbAdminOwnedPrevOrDelete(t *testing.T) {
 	// Empty previous record: every admin row the body carries is dropped.
 	rec = Device{MAC: "aabbccddeeff", Extra: JSONMap{}}
 	rec.Absorb(absorbBody(), absorbNow, false)
-	for _, k := range AdminOwnedKeys {
+	for _, k := range adminOwnedKeys {
 		if v, ok := rec.Extra[k]; ok {
 			t.Fatalf("admin-owned %q introduced by body: %v", k, v)
 		}
@@ -164,11 +165,11 @@ func TestAbsorbFactoryResetSweepExcludesSiteCache(t *testing.T) {
 		if k == SSHSha512PasswdKey {
 			t.Fatal("the demotion sweep must not clear the site ssh password cache")
 		}
-		if !containsKey(ControllerOwnedKeys, k) {
+		if !containsKey(controllerOwnedKeys, k) {
 			t.Fatalf("sweep key %q is not controller-owned", k)
 		}
 	}
-	if !containsKey(ControllerOwnedKeys, SSHSha512PasswdKey) {
+	if !containsKey(controllerOwnedKeys, SSHSha512PasswdKey) {
 		t.Fatal("ssh_sha512passwd is not declared controller-owned")
 	}
 }
@@ -232,4 +233,66 @@ func containsKey(keys []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// TestTrustRegistrySnapshot is the registry-completeness tripwire: the full
+// class lists hard-coded verbatim (wire-named literals, not the governing
+// consts — a const drifted from its literal must fail HERE), DeepEqual
+// against the package vars. Without this, a class entry silently dropped
+// during an edit loses its absorption protection with no failing test
+// (append-only edits go unnoticed by the per-key loops above).
+func TestTrustRegistrySnapshot(t *testing.T) {
+	controllerOwned := []string{
+		"wlan_cfg_sha", "wlan_cfg_pending_sha", "wlan_cfg_pending_wlans",
+		"wlan_cfg_pending_old_wlans", "wlan_cfg_applied_wlans",
+		"wlan_cfg_pending_placements", "wlan_cfg_attempt_sha", "wlan_cfg_attempts",
+		"wlan_cfg_last_attempt", "wlan_cfg_delivery_status",
+		"wlan_cfg_not_running_misses", "wlan_cfg_offered_cfgversion",
+		"client_sessions", "client_disconnect_pending",
+		"ssh_sha512passwd",
+	}
+	deviceRefreshable := []string{
+		"radio_table", "wifi_caps", "fw_caps", "if_table", "ethernet_table",
+		"uplink", "has_eth1",
+	}
+	adminOwned := []string{
+		"system_cfg_extra_lines", "mgmt_dev",
+		"anonymous_controller_id", "anonymous_site_id",
+		"reboot_on_connect", "setdefault_armed",
+		"blocked_sta", "blocked_sta_sha",
+		"led_override", "disabled", "led_override_color_brightness",
+		"led_override_color",
+		"radio_intent", "cmd_task",
+	}
+	sweep := []string{
+		"wlan_cfg_sha", "wlan_cfg_pending_sha", "wlan_cfg_pending_wlans",
+		"wlan_cfg_pending_old_wlans", "wlan_cfg_applied_wlans",
+		"wlan_cfg_pending_placements", "wlan_cfg_attempt_sha", "wlan_cfg_attempts",
+		"wlan_cfg_last_attempt", "wlan_cfg_delivery_status",
+		"wlan_cfg_not_running_misses", "wlan_cfg_offered_cfgversion",
+		"client_sessions", "client_disconnect_pending",
+	}
+	cases := []struct {
+		name string
+		got  []string
+		want []string
+	}{
+		{"controller-owned", controllerOwnedKeys, controllerOwned},
+		{"device-refreshable", deviceRefreshableKeys, deviceRefreshable},
+		{"admin-owned", adminOwnedKeys, adminOwned},
+		{"factory-reset sweep", FactoryResetSweepKeys, sweep},
+	}
+	for _, tc := range cases {
+		if !reflect.DeepEqual(tc.got, tc.want) {
+			t.Errorf("%s registry drifted:\n got %q\nwant %q", tc.name, tc.got, tc.want)
+		}
+	}
+	// The sweep must be exactly controller-owned minus the ssh password
+	// cache — no other exclusion is licensed.
+	if !containsKey(controllerOwnedKeys, SSHSha512PasswdKey) {
+		t.Error("ssh_sha512passwd left the controller-owned class")
+	}
+	if containsKey(FactoryResetSweepKeys, SSHSha512PasswdKey) {
+		t.Error("the sweep must spare the site ssh password cache")
+	}
 }

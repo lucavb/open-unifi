@@ -4,7 +4,7 @@
 // lowercase 12-hex client MACs (the same canonical form every other MAC in
 // a record uses; CanonicalMAC is the single normalizer). Only the admin
 // API writes it (internal/app block/unblock); record absorption preserves
-// it verbatim against device-supplied bodies (the AdminOwnedKeys registry
+// it verbatim against device-supplied bodies (the adminOwnedKeys registry
 // — a device can neither write nor introduce the key, CONTEXT.md trust
 // policy), and the adoption engine renders the §4 wire string from it.
 package store

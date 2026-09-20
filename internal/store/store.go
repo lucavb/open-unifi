@@ -55,7 +55,7 @@ type Device struct {
 	// ADMIN-OWNED (CONTEXT.md trust policy): the device can neither write
 	// nor introduce it — Absorb never touches typed fields, and the trust
 	// policy drops a device-supplied Extra["led_override"] copy (see the
-	// AdminOwnedKeys registry in trustpolicy.go).
+	// adminOwnedKeys registry in trustpolicy.go).
 	LEDOverride string `json:"led_override,omitempty"`
 
 	// Disabled is the admin-set per-device disable flag — the classic
@@ -78,7 +78,7 @@ type Device struct {
 	// ADMIN-OWNED (CONTEXT.md trust policy): the device can neither write
 	// nor introduce it — Absorb never touches typed fields, and the trust
 	// policy drops device-supplied Extra["led_override_color_brightness"]
-	// copies (the AdminOwnedKeys registry in trustpolicy.go).
+	// copies (the adminOwnedKeys registry in trustpolicy.go).
 	LEDOverrideColorBrightness *int `json:"led_override_color_brightness,omitempty"`
 
 	// LEDOverrideColor is the admin-set per-device ledbar color — the

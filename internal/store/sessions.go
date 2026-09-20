@@ -7,13 +7,16 @@
 // API can list a device's clients with their state.
 //
 // Trust policy (CONTEXT.md): session rows and the disconnect-event flag
-// are CONTROLLER-OWNED keys — a device can neither overwrite nor
-// introduce them via an inform body. Record absorption carries them
-// across informs (the ControllerOwnedKeys registry in this package), and
-// the only writer is the session refresh computed adapter-side from
-// decoded station data, never a passthrough. The §6.6 setdefault
-// demotion sweeps the controller-owned keys with it: a factory-reset
-// device re-adoption starts with fresh session state.
+// are CONTROLLER-OWNED keys — a device can neither overwrite the rows nor
+// introduce them once the record holds them; on a record that never held
+// them (fresh or just-swept) a body copy stands and is thereafter
+// prev-wins-protected (pinned by
+// TestAbsorbControllerOwnedRestoresOnlyFromTheRecord). Record absorption
+// carries them across informs (the controllerOwnedKeys registry in this
+// package), and the only writer is the session refresh computed
+// adapter-side from decoded station data, never a passthrough. The §6.6
+// setdefault demotion sweeps the controller-owned keys with it: a
+// factory-reset device re-adoption starts with fresh session state.
 //
 // Rows are deliberately never pruned for age or count: no recovered
 // retention rule exists in this worktree's docs, and an invented TTL

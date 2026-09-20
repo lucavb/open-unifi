@@ -6,7 +6,7 @@
 // Extra[CmdTaskKey], an ADMIN-OWNED row (CONTEXT.md trust policy): only
 // the admin API writes it (internal/app EnqueueDeviceCmd), record
 // absorption preserves it verbatim against device-supplied bodies
-// (the AdminOwnedKeys registry — a device can neither write nor
+// (the adminOwnedKeys registry — a device can neither write nor
 // introduce the key), and the adoption engine consumes it one-shot on the
 // next decoded inform.
 //

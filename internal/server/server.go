@@ -456,7 +456,7 @@ func (s *Server) handlePacket(w http.ResponseWriter, pkt *inform.Packet, body []
 	var outcome advanceResult
 	uerr := s.st.UpdateExisting(mac, func(rec *store.Device) error {
 		now := time.Now()
-		s.absorbInform(mac, rec, jm, now, gcmReq)
+		s.absorbInform(rec, jm, now, gcmReq)
 		connects, disconnects := refreshClientSessions(rec, jm, now)
 		out, aerr := s.engine.Decide(adoption.Request{
 			Transport:      adoption.TransportEncrypted,
@@ -630,7 +630,7 @@ func (s *Server) handlePlain(w http.ResponseWriter, mac string, jm map[string]an
 	var outcome advanceResult
 	uerr := s.st.UpdateExisting(mac, func(rec *store.Device) error {
 		now := time.Now()
-		s.absorbInform(mac, rec, jm, now, false)
+		s.absorbInform(rec, jm, now, false)
 		connects, disconnects := refreshClientSessions(rec, jm, now)
 		out, aerr := s.engine.Decide(adoption.Request{
 			Transport:      adoption.TransportPlaintext,
@@ -830,9 +830,8 @@ func (s *Server) applyOutcome(mac string, rec *store.Device, out adoption.Outcom
 // policy that guards it — lives in the record itself (store.Device.Absorb,
 // whose registry holds the three ownership classes), and the per-MAC
 // read-modify-write serialization stays in the inform handlers'
-// UpdateExisting cycles above. The MAC parameter rides the transport call
-// (the inform handler logs with it); the merge ignores it.
-func (s *Server) absorbInform(mac string, rec *store.Device, body map[string]any, now time.Time, gcmReq bool) {
+// UpdateExisting cycles above.
+func (s *Server) absorbInform(rec *store.Device, body map[string]any, now time.Time, gcmReq bool) {
 	rec.Absorb(body, now, gcmReq)
 }
 
