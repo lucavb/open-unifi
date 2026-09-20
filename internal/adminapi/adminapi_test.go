@@ -936,6 +936,49 @@ func TestMACNormalization(t *testing.T) {
 	}
 }
 
+// TestMACInputBoundary pins the narrow end of the MAC spelling boundary —
+// the REJECTION side; the acceptance side (five separator spellings,
+// colon/hyphen/dot/space/bare) is the battery in TestMACNormalization above.
+// Control characters (tab/newline) are NOT in the stripping set: a padded
+// spelling fails the 12-hex count and is rejected BEFORE the Backend, at
+// both the body field and a percent-escaped path segment (ServeMux
+// unescapes per segment, so %09AA:BB:... reaches normalizeMAC as a
+// tab-prefixed spelling).
+func TestMACInputBoundary(t *testing.T) {
+	// Padded body MAC: 400, fake Backend never reached.
+	run(t, testCase{
+		name: "tab/newline-padded body mac is 400", method: "POST", path: "/api/v1/devices",
+		body: `{"mac":"\taabbccddeeff\n"}`,
+		want: http.StatusBadRequest,
+		checks: func(t *testing.T, be *fakeBackend, rec *httptest.ResponseRecorder) {
+			t.Helper()
+			if len(be.created) != 0 {
+				t.Fatalf("padded mac create must not reach the backend: %+v", be.created)
+			}
+		},
+	})
+	// Percent-escaped path segment: unescape happens per segment in
+	// ServeMux, so a tab-prefixed spelling is reachable via GET and 400s.
+	req := httptest.NewRequest("GET", "/api/v1/devices/%09AA%3ABB%3ACC%3ADD%3AEE%3AFF", nil)
+	h := New(Config{}, newFakeBackend())
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("escaped padded mac: got %d, want 400 (body=%s)", rec.Code, rec.Body.String())
+	}
+	// Blank MAC: the exact canonical error body (json.Encoder appends a
+	// trailing newline).
+	req = httptest.NewRequest("POST", "/api/v1/devices", strings.NewReader(`{"mac":""}`))
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("blank mac: got %d, want 400", rec.Code)
+	}
+	if got := strings.TrimSpace(rec.Body.String()); got != `{"error":"invalid mac: want 12 hex chars, got 0"}` {
+		t.Fatalf("blank mac body = %q, want the exact normalized-error shape", got)
+	}
+}
+
 // ---- wireless validation + round trip ----------------------------------------
 
 func putWireless(t *testing.T, h http.Handler, body string) *httptest.ResponseRecorder {

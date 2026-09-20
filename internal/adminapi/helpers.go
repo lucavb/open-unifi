@@ -110,10 +110,12 @@ func requireToken(cfg Config, next http.HandlerFunc) http.HandlerFunc {
 // normalizeMAC accepts common MAC spellings — colon/hyphen/dot/space
 // separated, or bare "aabbccddeeff" — and returns the admin API's
 // lowercase colon-hex form. Garbage is rejected. The implementation is
-// store.CanonicalMAC, the repo's single normalizer for MAC identity
+// store.CanonicalMAC, the controller's single normalizer for MAC identity
 // (a private copy here once meant the REST boundary and the store could
-// disagree on what spellings name the same device); ColonMAC renders the
-// canonical 12-hex into this lane's colon-hex wire spelling.
+// disagree on what spellings name the same device; the Terraform
+// provider's own net.ParseMAC-based copy predates those lanes and sits
+// outside the controller, so it is not covered by this claim); ColonMAC
+// renders the canonical 12-hex into this lane's colon-hex wire spelling.
 func normalizeMAC(s string) (string, error) {
 	canon, err := store.CanonicalMAC(s)
 	if err != nil {
