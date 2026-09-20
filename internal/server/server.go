@@ -847,7 +847,10 @@ func (s *Server) absorbInform(rec *store.Device, body map[string]any, now time.T
 // bounded for malformed passthrough input without echoing a key name). All
 // logging happens inside the producer call, before Decide returns, restoring
 // the pre-extraction relative order (inline-during-render → diagnostic-after).
-func (s *Server) renderSystemCfg(d store.Device, wls []wireless.Wlan) (string, map[string]string, error) {
+// plan is the engine's per-decision provisioning plan — the renderer emits
+// its wireless rows from the same value whose drift hash the decision
+// compared (systemcfg.RenderWithPlan, facts.WLANs = the same snapshot).
+func (s *Server) renderSystemCfg(d store.Device, wls []wireless.Wlan, plan wireless.ProvisioningPlan) (string, map[string]string, error) {
 	if err := ValidateConfig(s.cfg); err != nil {
 		return "", nil, err
 	}
@@ -857,12 +860,12 @@ func (s *Server) renderSystemCfg(d store.Device, wls []wireless.Wlan) (string, m
 		// compatibility value; the renderer takes the code verbatim.
 		country = DefaultRegulatoryCountryCode
 	}
-	res, err := systemcfg.Render(d, systemcfg.SiteFacts{
+	res, err := systemcfg.RenderWithPlan(d, systemcfg.SiteFacts{
 		ControllerURL: s.cfg.ControllerURL,
 		CountryCode:   country,
 		SSHPassword:   s.cfg.SSHPassword,
 		WLANs:         wls,
-	})
+	}, plan)
 	if err != nil {
 		return "", nil, err
 	}

@@ -254,13 +254,17 @@ type Deps struct {
 
 	// SystemCfg renders the system_cfg blob for the record with the NEUTRAL
 	// producer shape: (text, credential deltas, error). The adapter wires
-	// it as a thin closure over the pure systemcfg.Render (assembling
+	// it as a thin closure over the pure systemcfg.RenderWithPlan (assembling
 	// SiteFacts from the server config); the closure also performs the
 	// render's observability (diagnostic) and diagnostics logging, so this
 	// decision module NEVER depends on the renderer package — the only
 	// things crossing back are the text and the credential deltas, which
-	// the ADAPTER applies inside its RMW cycle.
-	SystemCfg func(store.Device, []wireless.Wlan) (text string, credentialDeltas map[string]string, err error)
+	// the ADAPTER applies inside its RMW cycle. The decision's computed
+	// provisioning plan rides alongside the (record, envelope) args —
+	// systemcfg.RenderWithPlan — so the renderer emits rows from the same
+	// plan whose drift hash the branches below compared (one computation,
+	// never a re-derivation).
+	SystemCfg func(store.Device, []wireless.Wlan, wireless.ProvisioningPlan) (text string, credentialDeltas map[string]string, err error)
 
 	// ControllerURL is the configured controller base URL (mgmt_cfg host
 	// facts). Empty means "not overridden".
@@ -285,7 +289,7 @@ type Engine struct {
 	random           func() float64
 	keyChars         func(n int) (string, error)
 	wireless         func() []wireless.Wlan
-	systemCfg        func(store.Device, []wireless.Wlan) (string, map[string]string, error)
+	systemCfg        func(store.Device, []wireless.Wlan, wireless.ProvisioningPlan) (string, map[string]string, error)
 	controllerURL    string
 	informListenAddr string
 	allowGatedWLAN   bool
@@ -349,13 +353,20 @@ func (e *Engine) Decide(req Request) (Outcome, error) {
 	// placements) sees the SAME slice, so the drift hash and the rendered
 	// config can never disagree.
 	wls := e.currentWireless()
+	// One provisioning plan per decision: the single value computed from a
+	// device and the wireless envelope (CONTEXT.md) — drift hash, vap
+	// placements, wireless rows together — threaded through both lanes and
+	// into the renderer, so no consumer re-derives a half of it. Plan inputs
+	// (extra radio_table / radio_intent) are device-refreshable caps no
+	// branch below touches before consuming the plan.
+	plan := wireless.PlanProvisioning(work, wls)
 	var out Outcome
 	var err error
 	switch req.Transport {
 	case TransportPlaintext:
-		out, err = e.decidePlain(req, wls, &work)
+		out, err = e.decidePlain(req, wls, plan, &work)
 	default:
-		out, err = e.decideEncrypted(req, wls, &work)
+		out, err = e.decideEncrypted(req, wls, plan, &work)
 	}
 	if err != nil {
 		return Outcome{}, err
@@ -500,7 +511,7 @@ func CmdTaskString(task store.JSONMap) string {
 
 // decideEncrypted ports the former Server.advance for ENCRYPTED informs.
 // usedKey is the lowercase hex key that authenticated the inform.
-func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, d *store.Device) (Outcome, error) {
+func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless.ProvisioningPlan, d *store.Device) (Outcome, error) {
 	now := req.Now
 
 	rtype, _ := req.Body["_type"].(string)
@@ -541,7 +552,7 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, d *store.Devi
 	st.settle()
 	wlanDrift := false
 	if st.sha != "" {
-		if cur := wireless.WlanListHash(wls); cur != st.sha {
+		if cur := plan.DriftHash; cur != st.sha {
 			wlanDrift = true
 			// Mint ONLY for a genuinely NEW envelope. Live finding
 			// (2026-09-19 EAP round, WLAN-ACCEPTANCE 6.8.2.15592): a
@@ -610,7 +621,7 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, d *store.Devi
 		// case (no mint since the last offer), and records whose pending
 		// predates the offered bookkeeping keep the hold-at-gate behavior.
 		operatorMint := st.offeredPresent && d.CfgVersion != st.offeredCfgversion
-		if !blockedDrift && !operatorMint && st.pendingSHA == wireless.WlanListHash(wls) && !st.retryDue(now) {
+		if !blockedDrift && !operatorMint && st.pendingSHA == plan.DriftHash && !st.retryDue(now) {
 			return e.noopFor(d, now, req.PrevNoopTarget, KindNoopPendingWLAN), nil
 		}
 		wlanDrift = true
@@ -662,7 +673,7 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, d *store.Devi
 	// kind of content change (§6.2(d) delivers it only inside full
 	// provisioning), so the arm is shared.
 	case wlanDrift || blockedDrift:
-		out, err := e.assignedKeyFlow(d, now, wls)
+		out, err := e.assignedKeyFlow(d, now, wls, plan)
 		if err != nil {
 			return Outcome{}, err
 		}
@@ -747,7 +758,7 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, d *store.Devi
 		return e.noopFor(d, now, req.PrevNoopTarget, KindNoop), nil
 
 	default:
-		out, err := e.assignedKeyFlow(d, now, wls)
+		out, err := e.assignedKeyFlow(d, now, wls, plan)
 		if err != nil {
 			return Outcome{}, err
 		}
@@ -774,7 +785,7 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, d *store.Devi
 // It NEVER rotates keys, NEVER initiates adoption, has no default-key
 // rejection, and performs no drift settle — it shares noopFor,
 // assignedKeyFlow and the adoption push with the encrypted lane.
-func (e *Engine) decidePlain(req Request, wls []wireless.Wlan, d *store.Device) (Outcome, error) {
+func (e *Engine) decidePlain(req Request, wls []wireless.Wlan, plan wireless.ProvisioningPlan, d *store.Device) (Outcome, error) {
 	now := req.Now
 	rtype, _ := req.Body["_type"].(string)
 	if informTypeGentleNoop(rtype) {
@@ -798,7 +809,7 @@ func (e *Engine) decidePlain(req Request, wls []wireless.Wlan, d *store.Device) 
 		return e.adoptionPush(*d, req.UsedKey), nil
 
 	default:
-		return e.assignedKeyFlow(d, now, wls)
+		return e.assignedKeyFlow(d, now, wls, plan)
 	}
 }
 
@@ -851,7 +862,10 @@ func fwMatches68215592(s string) bool {
 // the plaintext decidePlain), so one call here gates both. mgmt_cfg-only
 // paths (re-key pushes, adoption pushes, noop) never reach this function and
 // are deliberately NOT gated — mgmt pushes keep working for gated devices.
-func (e *Engine) assignedKeyFlow(d *store.Device, now time.Time, wls []wireless.Wlan) (Outcome, error) {
+// plan is the decision's provisioning plan: the drift hash captured here and
+// the delivery placements come from the same value the renderer emitted the
+// rows from — no re-derivation inside this tail.
+func (e *Engine) assignedKeyFlow(d *store.Device, now time.Time, wls []wireless.Wlan, plan wireless.ProvisioningPlan) (Outcome, error) {
 	// The unsupported-live-WLAN gate runs FIRST — before any record
 	// mutation (State/CfgVersion must not change on a rejected push) and
 	// before any emission.
@@ -866,7 +880,7 @@ func (e *Engine) assignedKeyFlow(d *store.Device, now time.Time, wls []wireless.
 		d.CfgVersion = nv
 	}
 	d.State = store.StateAdopting
-	sys, deltas, serr := e.systemCfg(*d, wls)
+	sys, deltas, serr := e.systemCfg(*d, wls, plan)
 	if serr != nil {
 		// FID-23: provisioning content that cannot be rendered (e.g. an
 		// unusable/empty SSH password hash) fails the whole push, like the
@@ -874,11 +888,11 @@ func (e *Engine) assignedKeyFlow(d *store.Device, now time.Time, wls []wireless.
 		// degraded config. Nothing was persisted (the store cycle aborts).
 		return Outcome{}, serr
 	}
-	cur := wireless.WlanListHash(wls)
+	cur := plan.DriftHash
 	// Do not mark the configuration applied merely because system_cfg was
 	// sent.  Keep the desired snapshot as delivery evidence for the next AP
 	// inform (including deletions, where absence must be observed).
-	placements := wlanPlacements(*d, wls)
+	placements := plan.Placements
 	st := loadWlanCfgState(d.Extra)
 	st.applyProvisioning(cur, now.Unix(), wls, placements, d.CfgVersion)
 	// blocked_sta rides every full provisioning (§6.2(d)): render the §4

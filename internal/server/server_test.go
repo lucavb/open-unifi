@@ -261,7 +261,8 @@ func hexKey(t *testing.T, s string) []byte {
 // adapter's delta application.
 func mustBuildSys(t *testing.T, s *Server, rec store.Device) string {
 	t.Helper()
-	sys, deltas, err := s.renderSystemCfg(rec, s.currentWireless())
+	wls := s.currentWireless()
+	sys, deltas, err := s.renderSystemCfg(rec, wls, wireless.PlanProvisioning(rec, wls))
 	if err != nil {
 		t.Fatalf("system_cfg build: %v", err)
 	}

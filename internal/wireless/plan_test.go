@@ -1,6 +1,11 @@
 package wireless
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+
+	"github.com/lucavb/open-unifi/internal/store"
+)
 
 // TestWlanListHashRadiusVLANModeEquivalence pins the hash half of the
 // ""≡"disabled" radius_vlan_mode equivalence (the render half is
@@ -102,5 +107,118 @@ func TestWlanListHashAcctFieldsDrift(t *testing.T) {
 	onDas.RadiusDASEnabled = true
 	if WlanListHash([]Wlan{onDas}) == WlanListHash([]Wlan{on}) {
 		t.Fatal("radius_das_enabled under accounting must mint a fresh hash (das/dad rows join the render)")
+	}
+}
+
+// planAgreementDevice is a two-radio record (one ng, one na) for the plan
+// agreement test; radio_table is the device-refreshable cap the vap plan
+// reads.
+func planAgreementDevice() store.Device {
+	return store.Device{
+		MAC: "78:8a:20:00:00:01", Model: "U7PG2",
+		Extra: store.JSONMap{
+			"radio_table": []any{
+				map[string]any{"name": "rai0", "radio": "ng"},
+				map[string]any{"name": "rai1", "radio": "na"},
+			},
+		},
+	}
+}
+
+// TestPlanProvisioningAgreement pins the plan-level statement of the
+// hash/render agreement invariant (the prose block on WlanListHash): the
+// drift hash, the vap placements and the wireless rows now travel in ONE
+// value computed from ONE (device, envelope) pair, so the drift decision's
+// hash can never come from a different envelope read than the rows the
+// renderer visits. Two directions hold for the deltas tried here:
+//
+//   - rows move (a change reflected in the aaa.<n>/wireless.<n> content —
+//     the plan's VapPlan rows) ⇒ the hash moves with them, and
+//   - the hash stays (the render-inert normalizations: radius port 0≡1812,
+//     acct port 0≡1813, accounting-gated inert fields, vlan mode
+//     ""≡"disabled") ⇒ the settle-relevant rows (placements) stay too.
+//
+// The DAS residual's device arm (fw_caps, systemcfg's supportsDasDad) is
+// outside this package and stays a documented, bounded asymmetry on
+// WlanListHash; its live pins remain the zz_* scratch gates, and the render
+// halves live in internal/server/systemcfg's renderer tests.
+func TestPlanProvisioningAgreement(t *testing.T) {
+	d := planAgreementDevice()
+	base := []Wlan{
+		{Name: "corp", SSID: "corp", Security: "wpa-p", Passphrase: "correcthorse",
+			VLAN: 42, Enabled: true, ID: "i1"},
+		{Name: "iot", SSID: "iot", Security: "wpa-eap", Enabled: true, ID: "i2",
+			RadiusServers: []RadiusServer{{IP: "10.0.0.5", Port: 0}}, RadiusSecret: "s3cr3t!"},
+	}
+	p := PlanProvisioning(d, base)
+
+	// Composition: one call produces all three halves, mutually consistent.
+	if p.DriftHash != WlanListHash(base) {
+		t.Fatal("plan drift hash must be WlanListHash of the same envelope")
+	}
+	vaps, radios := PlanVaps(d, base)
+	if !reflect.DeepEqual(p.Vaps, vaps) || !reflect.DeepEqual(p.Radios, radios) {
+		t.Fatal("plan rows must be PlanVaps' output for the same (device, envelope)")
+	}
+	if len(p.Vaps) != 4 { // both wlans ride BOTH radios (band default "both")
+		t.Fatalf("want 4 planned vaps, got %d", len(p.Vaps))
+	}
+	wantPlacements := map[string]int{}
+	for _, v := range vaps {
+		wantPlacements[SSIDOf(v.Wlan)+"\x00"+v.Phyname]++
+	}
+	if !reflect.DeepEqual(p.Placements, wantPlacements) {
+		t.Fatalf("plan placements = %v, want %v", p.Placements, wantPlacements)
+	}
+
+	// rows move ⇒ hash moves: every row-moving delta below changes the
+	// emitted aaa/wireless rows (per docs/PROTOCOL-systemcfg-wireless.md
+	// §4/§5) and must mint a fresh DriftHash.
+	rowMovers := map[string][]Wlan{
+		"ssid":     {{Name: "corp", SSID: "corp-hq", Security: "wpa-p", Passphrase: "correcthorse", VLAN: 42, Enabled: true, ID: "i1"}, base[1]},
+		"psk":      {{Name: "corp", SSID: "corp", Security: "wpa-p", Passphrase: "correctbat", VLAN: 42, Enabled: true, ID: "i1"}, base[1]},
+		"vlan":     {{Name: "corp", SSID: "corp", Security: "wpa-p", Passphrase: "correcthorse", VLAN: 43, Enabled: true, ID: "i1"}, base[1]},
+		"enabled":  {{Name: "corp", SSID: "corp", Security: "wpa-p", Passphrase: "correcthorse", VLAN: 42, Enabled: false, ID: "i1"}, base[1]},
+		"security": {{Name: "corp", SSID: "corp", Security: "open", Enabled: true, ID: "i1"}, base[1]},
+	}
+	for name, wls := range rowMovers {
+		q := PlanProvisioning(d, wls)
+		if q.DriftHash == p.DriftHash {
+			t.Errorf("%s: row move must mint a fresh drift hash", name)
+		}
+		if reflect.DeepEqual(q.Vaps, p.Vaps) {
+			t.Errorf("%s: row move must move the planned vaps", name)
+		}
+	}
+
+	// hash stays ⇒ rows stay: the render-inert normalizations keep the hash
+	// identical and the settle projection (placements + vap identity keys)
+	// unchanged, so resyncing a stored baseline after one of these flips
+	// provokes no full provisioning over a byte-identical render.
+	inertMovers := map[string]func([]Wlan) []Wlan{
+		"radius port 0→1812": func(w []Wlan) []Wlan {
+			out := append(w[:0:0], w...)
+			out[1].RadiusServers = []RadiusServer{{IP: "10.0.0.5", Port: 1812}}
+			return out
+		},
+		"vlan mode \"\"→disabled": func(w []Wlan) []Wlan {
+			out := append(w[:0:0], w...)
+			out[1].RadiusVLANMode = "disabled"
+			return out
+		},
+		"inert acct profile": func(w []Wlan) []Wlan {
+			out := append(w[:0:0], w...)
+			out[1].AcctServers = []RadiusAcctServer{{IP: "10.0.0.9", Port: 0}}
+			return out
+		},
+	}
+	for name, fn := range inertMovers {
+		q := PlanProvisioning(d, fn(base))
+		if q.DriftHash != p.DriftHash {
+			t.Errorf("%s: render-inert spelling must not mint a drift hash", name)
+		}
+		if !reflect.DeepEqual(q.Placements, p.Placements) {
+			t.Errorf("%s: render-inert spelling must not move the placements", name)
+		}
 	}
 }

@@ -259,6 +259,64 @@ func UnknownBandRadios(d store.Device) int {
 	return n
 }
 
+// ---- the provisioning plan -------------------------------------------------
+
+// ProvisioningPlan is the single value computed from a device and the
+// wireless envelope (CONTEXT.md: the provisioning plan). It carries the
+// three things the inform path reads out of that (device, envelope) pair
+// TOGETHER — the drift hash for the adoption engine's drift checks, the vap
+// placements for the drift-settle confirmation bookkeeping, and the wireless
+// rows (vaps + their sorted radios) for the system_cfg renderer — so all
+// consumers of one decision answer from one computation and the drift hash
+// can never disagree with the rows it pays for.
+//
+// The two prose invariants on the composition:
+//
+//   - renders-same ⇒ hashes-same: WlanListHash applies the renderer's
+//     effective-value normalizations (radius/acct ports, vlan mode
+//     spelling, inert profile gating), so a bytes-identical render mints
+//     no drift — pinned in-package by the plan tests below and the
+//     WlanListHash tests;
+//   - its residual: the DAS gate's DEVICE arm (fw_caps 0x100000,
+//     systemcfg's supportsDasDad) is envelope-external, so on a record
+//     without the bit a das flip mints a fresh hash over a
+//     byte-identical render (documented on WlanListHash, bounded to one
+//     idempotent full provisioning; the zz_* scratch gates remain the
+//     live pins).
+//
+// Placements keys SSID\x00radio_name → count, the shape the pending
+// confirmation (applyProvisioning/settle) persists.
+type ProvisioningPlan struct {
+	DriftHash  string     // WlanListHash(wls) — the FSM drift input
+	Vaps       []VapPlan  // vap plan in radio-sorted emission order
+	Radios     []RadioRow // sorted radio_table rows (empty ⇒ no radio found)
+	Placements map[string]int
+}
+
+// PlanProvisioning computes the provisioning plan: ONE constructor for the
+// drift hash, the vap placements and the wireless rows, so no consumer
+// re-derives any of them from a separate door.
+func PlanProvisioning(d store.Device, wls []Wlan) ProvisioningPlan {
+	vaps, radios := PlanVaps(d, wls)
+	return ProvisioningPlan{
+		DriftHash:  WlanListHash(wls),
+		Vaps:       vaps,
+		Radios:     radios,
+		Placements: vapPlacements(vaps),
+	}
+}
+
+// vapPlacements records the intended SSID-to-radio placements from the vap
+// plan (SSID\x00radio_name → count) — the settle confirmation cannot be
+// satisfied by a VAP on the wrong band/radio.
+func vapPlacements(vaps []VapPlan) map[string]int {
+	out := map[string]int{}
+	for _, v := range vaps {
+		out[SSIDOf(v.Wlan)+"\x00"+v.Phyname]++
+	}
+	return out
+}
+
 // ---- envelope hash (FSM drift input) ---------------------------------------
 
 // WlanListHash serializes the wireless envelope stably (sorted-key JSON per

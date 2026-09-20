@@ -58,7 +58,12 @@ func mgmtDevOf(d store.Device) string {
 // `# wlans (radio)` block (header + radio.<n4> rows + virtual rows), all
 // per-vap `aaa.<n>`/`wireless.<n>` rows, then `# vlan`, `# bridge`,
 // `# netconf` (mgmt netconf.1 + br0.<vid> instances) and `# dhcpc`.
-func (rd *render) emitWirelessCfg(b *strings.Builder, d store.Device, wls []wireless.Wlan) {
+//
+// The wireless rows come from the plan the caller threads in
+// (wireless.PlanProvisioning — the engine's per-decision value, or the one
+// Render computes from facts.WLANs): the renderer is one of the plan's
+// consumers, not a second computation door.
+func (rd *render) emitWirelessCfg(b *strings.Builder, plan wireless.ProvisioningPlan, d store.Device) {
 	if skipped := wireless.UnknownBandRadios(d); skipped > 0 {
 		// Diagnosability (fix 4): skipping unknown band tokens (real token
 		// set na/ng/6e/scan) is correct behavior, but a table of all-unknown
@@ -66,7 +71,7 @@ func (rd *render) emitWirelessCfg(b *strings.Builder, d store.Device, wls []wire
 		rd.warnings = append(rd.warnings, fmt.Sprintf("wireless provision: skipped %d radio(s) with unrecognized band token "+
 			"(known provisioning bands: na, ng; real tokens also include 6e/scan)", skipped))
 	}
-	vaps, radios := wireless.PlanVaps(d, wls)
+	vaps, radios := plan.Vaps, plan.Radios
 	if len(radios) == 0 {
 		// doc §1 int §489-493 variant.
 		b.WriteString("# no wlan provisioned as no radio found\n")

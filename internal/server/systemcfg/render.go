@@ -129,15 +129,28 @@ func (rd *render) sshPassword() string {
 }
 
 // Render produces the system_cfg text for the device record from the site
-// facts alone. An error aborts the whole provisioning push (FID-23) — the
-// caller must answer the inform with the noop path instead of
-// persisting/shipping partial config.
+// facts alone: it computes the provisioning plan from (d, facts.WLANs) —
+// the same one constructor every other consumer uses — and renders from it.
+// An error aborts the whole provisioning push (FID-23) — the caller must
+// answer the inform with the noop path instead of persisting/shipping
+// partial config.
 //
 // TODO(wireless): see docs/PROTOCOL-systemcfg-wireless.md when it lands —
 // the wireless/aaa.<n>, vlan/bridge/netconf, qos/bandsteering, syslog, snmp
 // and cron/ntp sections from the real int builder are pending
 // reverse-engineering and must NOT be invented here.
 func Render(d store.Device, facts SiteFacts) (Result, error) {
+	return RenderWithPlan(d, facts, wireless.PlanProvisioning(d, facts.WLANs))
+}
+
+// RenderWithPlan is the engine-threaded render entry: instead of computing
+// the provisioning plan from (d, facts.WLANs) itself, it emits from the plan
+// the adoption engine computed for the same record and envelope snapshot, so
+// the renderer's rows and the drift hash the decision compared share ONE
+// computation. Precondition: facts.WLANs must be the same wireless envelope
+// the plan was built from (the engine's single per-decision snapshot).
+// See the wireless section's emission notes in wireless.go.
+func RenderWithPlan(d store.Device, facts SiteFacts, plan wireless.ProvisioningPlan) (Result, error) {
 	rd := &render{facts: facts}
 	var b strings.Builder
 	line := rd.lineWriter(&b, "system_cfg")
@@ -236,7 +249,7 @@ func Render(d store.Device, facts SiteFacts) (Result, error) {
 	// `# wlans (radio)` + radio.<n>/virtual + aaa.<n>/wireless.<n> vaps +
 	// `# vlan`/`# bridge`/`# netconf`/`# dhcpc` wiring. Real section order
 	// per PROTOCOL-mgmt.md §3 puts this before the sshd/syslog ones.
-	rd.emitWirelessCfg(&b, d, facts.WLANs)
+	rd.emitWirelessCfg(&b, plan, d)
 
 	// 4b. Factory-baseline echo sections. The system_cfg apply is a
 	// FULL-CONFIG REPLACEMENT (mcad renames the staged file over

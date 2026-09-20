@@ -190,8 +190,8 @@ func (st *wlanCfgState) settle() {
 	// ever existed in our synthetic test fixtures — status/parent are kept
 	// as fallbacks here pending the capture cross-check so in-flight
 	// fixtures keep working. The placement construction side
-	// (wlanPlacements) keys on radio_table `name` values; the device-side
-	// radio_name carries the same strings.
+	// (the plan's Placements) keys on radio_table `name` values; the
+	// device-side radio_name carries the same strings.
 	for _, raw := range vaps {
 		m, ok := raw.(map[string]any)
 		if !ok || !strings.EqualFold(wireless.JSONStr(m, "state", wireless.JSONStr(m, "status", "")), "RUN") {
@@ -370,8 +370,10 @@ func WlanRetryDue(extra store.JSONMap, now time.Time) bool {
 // the same hash increments it. offeredCfg is the cfgversion THIS offer
 // carries — the pending gate reads it back (wlan_cfg_offered_cfgversion) to
 // tell an operator mint from a genuinely unchanged record, so an exhausted
-// unchanged-envelope retry cannot hold operator content hostage. EXACT key
-// names and value formats preserved.
+// unchanged-envelope retry cannot hold operator content hostage. cur and
+// placements arrive from the decision's provisioning plan (the drift hash
+// and the Placements half of wireless.PlanProvisioning), not separate
+// recomputations. EXACT key names and value formats preserved.
 func (st wlanCfgState) applyProvisioning(cur string, nowUnix int64, wls []wireless.Wlan, placements map[string]int, offeredCfg string) {
 	st.extra["wlan_cfg_pending_sha"] = cur
 	// Each emitted system_cfg is one bounded delivery attempt. Replacing the
@@ -398,17 +400,6 @@ func (st wlanCfgState) applyProvisioning(cur string, nowUnix int64, wls []wirele
 	if raw, err := json.Marshal(placements); err == nil {
 		st.extra["wlan_cfg_pending_placements"] = string(raw)
 	}
-}
-
-// wlanPlacements records the intended SSID-to-radio placements from the vap
-// plan (SSID\x00radio_name → count).
-func wlanPlacements(d store.Device, wls []wireless.Wlan) map[string]int {
-	out := map[string]int{}
-	vaps, _ := wireless.PlanVaps(d, wls)
-	for _, v := range vaps {
-		out[wireless.SSIDOf(v.Wlan)+"\x00"+v.Phyname]++
-	}
-	return out
 }
 
 func containsEnabled(wls []wireless.Wlan, ssid string) bool {
