@@ -471,6 +471,16 @@ func New(cfg Config, be Backend) http.Handler {
 				return
 			}
 		}
+		// Site gate mirrors PATCH (the Backend fences garbage site_id at
+		// 409; a garbage row must never become 201-created state). "" is
+		// NOT a legal create value here either — create has no pointer
+		// semantics to lean on, so a supplied site_id must be a real site.
+		if up.SiteID != "" {
+			if msg := ValidateSiteID(up.SiteID); msg != "" {
+				writeErr(w, http.StatusBadRequest, msg)
+				return
+			}
+		}
 		dv, err := be.CreateDevice(r.Context(), up)
 		if err != nil {
 			handleBackendErr(w, lg, err)

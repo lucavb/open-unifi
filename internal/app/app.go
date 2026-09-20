@@ -112,6 +112,20 @@ func New(st store.DeviceStore, wirelessPath string, lg *slog.Logger) *App {
 // sequence; a verb decodes its admin intent (the REST body spelled as a
 // store change) and hands it over as two closures — no verb hand-rolls the
 // pipeline, so mint conditions and 404/409 mapping cannot drift apart.
+//
+// The EIGHT routed save cores (the verbs riding the skeleton):
+// CreateDevice (savePending mode — its seeding is its own change step and
+// deliberately pending-map-INDEPENDENT, unlike AdoptPending whose change
+// closure re-checks the pending map), AdoptPending, PatchDevice,
+// BlockClient, UnblockClient, the per-radio intent core behind
+// PutDeviceRadioIntent/DeleteDeviceRadioIntent, the lifecycle-arming core
+// behind RebootDevice/FactoryResetDevice, and EnqueueDeviceCmd.
+//
+// Deliberate exclusions: DeleteDevice (a pure delete, not a save — the
+// store's per-MAC delete owns its own cycle) and the wireless-envelope
+// verbs (CreateWlan/GetWlan/UpdateWlan/DeleteWlan/Get/PutWireless operate a
+// controller-level document, not a device record, and carry their own
+// lock/persist discipline).
 
 // saveMode selects the RMW cycle the skeleton runs for a verb.
 type saveMode int
@@ -366,8 +380,12 @@ func (a *App) PatchDevice(_ context.Context, mac string, patch adminapi.DevicePa
 			if patch.SiteID != nil {
 				// The site fence mirrors the name fence (route 400s
 				// first; the Backend is the fence every direct caller
-				// meets). "" is the explicit clear and stays legal
-				// exactly like an empty device name.
+				// meets). "" is the explicit clear AT THE BACKEND door;
+				// the route itself 400s "" (ValidateSiteID demands 1..64
+				// characters), so site_id cannot be cleared via REST
+				// today — a direct caller CAN clear it, which is the
+				// deliberate asymmetry of the route-first/backend-fenced
+				// split.
 				if *patch.SiteID != "" {
 					if msg := adminapi.ValidateSiteID(*patch.SiteID); msg != "" {
 						return false, fmt.Errorf("%w: %s", adminapi.ErrConflict, msg)
@@ -490,48 +508,65 @@ func (a *App) GetDevice(_ context.Context, mac string) (adminapi.DeviceView, err
 }
 
 // CreateDevice registers a device manually as the adopt whitelist (state
-// PENDING). Duplicate posts are an idempotent upsert: the existing record is
-// returned and its name/site updated, so provider re-applies never surface
-// conflict errors. Invalid MACs are a hard reject (adminapi itself 400s at
-// the edge; this adapter-side check is the backstop for other callers).
-//
-// The whole cycle runs inside the store's per-MAC RMW closure: the previous
-// Get→mutate→Put sequence could interleave with a concurrent inform handler
-// and lose updates (e.g. resurrect an overwritten first-seen or clobber an
-// inform-written field between the Get and the Put).
+// PENDING). The save routes through the admin-intent skeleton (saveIntent,
+// savePending mode): the RMW cycle is the upsert — unknown MACs are seeded
+// empty and the change step seeds the pending-candidate rows — so the
+// previous Get→mutate→Put interleave loss is structurally impossible.
+// Duplicate posts are an idempotent upsert: the existing record is returned
+// and its name/site updated, so provider re-applies never surface conflict
+// errors. Invalid MACs map to the skeleton's canonical wrapped-404 error
+// (adminapi itself 400s at the edge; this adapter-side mapping is the
+// backstop for other callers). The cycle reports never-effective: seeding
+// is not a provisioning change, so no cfgversion is minted — the device
+// gets everything it needs when its first inform reaches the adoption
+// engine.
 func (a *App) CreateDevice(_ context.Context, up adminapi.DeviceUpsert) (adminapi.DeviceView, error) {
-	mac, err := store.CanonicalMAC(up.MAC)
-	if err != nil {
-		return adminapi.DeviceView{}, fmt.Errorf("invalid mac %q: %w", up.MAC, err)
-	}
-	var rec store.Device
 	created := false
-	if err := a.st.Update(mac, func(d *store.Device) error {
-		if d.State == 0 { // freshly seeded by the upsert: record did not exist
-			created = true
-			d.State = store.StatePending
-			d.FirstSeen = time.Now().Unix()
-		}
-		if up.Name != "" {
-			if msg := adminapi.ValidateDeviceName(up.Name); msg != "" {
-				return fmt.Errorf("%w: %s", adminapi.ErrConflict, msg)
+	rec, err := saveIntent(a, up.MAC, savePending,
+		func(d *store.Device) (bool, error) {
+			// Seed step (own step, pending-map-INDEPENDENT — unlike
+			// AdoptPending, whose change closure re-checks the map): a
+			// manually created device is by definition known to the admin
+			// (CONTEXT.md: create is the manual whitelist entry).
+			if d.State == 0 { // freshly seeded by the upsert: record did not exist
+				created = true
+				d.State = store.StatePending
+				d.FirstSeen = time.Now().Unix()
 			}
-			d.Name = up.Name
-		}
-		if up.SiteID != "" {
-			d.SiteID = up.SiteID
-		}
+			if up.Name != "" {
+				// Same fence the other admin verbs apply (route 400s
+				// first; the Backend is the fence every direct caller
+				// meets).
+				if msg := adminapi.ValidateDeviceName(up.Name); msg != "" {
+					return false, fmt.Errorf("%w: %s", adminapi.ErrConflict, msg)
+				}
+				d.Name = up.Name
+			}
+			if up.SiteID != "" {
+				// The site fence mirrors PatchDevice/PutWireless-adjacent
+				// fences: never-effective bookkeeping rows, but domain-
+				// validated on the way in.
+				if msg := adminapi.ValidateSiteID(up.SiteID); msg != "" {
+					return false, fmt.Errorf("%w: %s", adminapi.ErrConflict, msg)
+				}
+				d.SiteID = up.SiteID
+			}
+			// Never effective: seeding + bookkeeping rows only — the save
+			// mints no cfgversion (no §6.2 mint site for manual create).
+			return false, nil
+		},
 		// Detached snapshot for the returned view (view reads scalars only).
-		rec = store.Device{
-			MAC: d.MAC, Name: d.Name, Model: d.Model, Firmware: d.Firmware,
-			IP: d.IP, State: d.State, LastSeen: d.LastSeen,
-			CfgVersion: d.CfgVersion, AppliedCfg: d.AppliedCfg,
-		}
-		return nil
-	}); err != nil {
-		return adminapi.DeviceView{}, fmt.Errorf("device store: %w", err)
+		func(d *store.Device) store.Device {
+			return store.Device{
+				MAC: d.MAC, Name: d.Name, Model: d.Model, Firmware: d.Firmware,
+				IP: d.IP, State: d.State, LastSeen: d.LastSeen,
+				CfgVersion: d.CfgVersion, AppliedCfg: d.AppliedCfg,
+			}
+		})
+	if err != nil {
+		return adminapi.DeviceView{}, err
 	}
-	a.lg.Debug("device created/updated via admin api", "mac", store.ColonMAC(mac),
+	a.lg.Debug("device created/updated via admin api", "mac", store.ColonMAC(rec.MAC),
 		"state", rec.State, "created", created)
 	return a.view(rec), nil
 }

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1404,8 +1405,11 @@ func TestInvalidMACIsRejectedOrNotFound(t *testing.T) {
 			t.Fatalf("adopt %q: want error", bad)
 		}
 	}
-	if _, err := a.CreateDevice(ctx, adminapi.DeviceUpsert{MAC: "zz"}); err == nil {
-		t.Fatal("create with unparseable mac must reject")
+	// After the saveIntent convergence the unparseable create maps to the
+	// skeleton's canonical wrapped-404 sentinel (was: a plain "invalid mac"
+	// error) — the route 400s first, so this is the direct-caller shape.
+	if _, err := a.CreateDevice(ctx, adminapi.DeviceUpsert{MAC: "zz"}); !errors.Is(err, adminapi.ErrNotFound) {
+		t.Fatalf("create with unparseable mac must be wrapped-ErrNotFound, got %v", err)
 	}
 	// valid input is behavior-identical to the old private normalizer
 	if _, err := a.CreateDevice(ctx, adminapi.DeviceUpsert{MAC: "A0.40.A0.AA.BB.CC"}); err != nil {
@@ -1729,6 +1733,46 @@ func TestPatchSiteIDBackendFence(t *testing.T) {
 	}
 	if dv, err := a.GetDevice(ctx, "aabbccddeeff"); err != nil || dv.SiteID != "" {
 		t.Fatalf("site clear: %+v err=%v", dv, err)
+	}
+}
+
+// TestCreateDeviceSiteIDBackendFence pins the site_id fence at the Backend
+// seam of the create save (mirror of TestPatchSiteIDBackendFence): garbage
+// site_id is ErrConflict and — the change step aborting inside the store's
+// RMW cycle — mutates nothing: an unknown MAC is NOT seeded (absent), an
+// existing record stays byte-identical (compared by DeepEqual between two
+// st.Get snapshots, never against a constructed clone — CreateDevice
+// stamps FirstSeen). A valid site_id creates normally.
+func TestCreateDeviceSiteIDBackendFence(t *testing.T) {
+	a, st, _ := testApp(t)
+	ctx := context.Background()
+
+	// Unknown MAC + garbage site_id: ErrConflict, and the aborted upsert
+	// cycle must not leave a seeded record behind.
+	if _, err := a.CreateDevice(ctx, adminapi.DeviceUpsert{MAC: "aabbccddeeff", SiteID: "bad site!"}); !errors.Is(err, adminapi.ErrConflict) {
+		t.Fatalf("invalid site_id must be ErrConflict, got %v", err)
+	}
+	if _, err := st.Get("aabbccddeeff"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("rejected create must not seed a record, got %+v", err)
+	}
+
+	// Existing record + garbage site_id: ErrConflict, byte-identical record.
+	if _, err := a.CreateDevice(ctx, adminapi.DeviceUpsert{MAC: "aabbccddeeff", Name: "lobby", SiteID: "s1"}); err != nil {
+		t.Fatalf("valid create: %v", err)
+	}
+	before, err := st.Get("aabbccddeeff")
+	if err != nil {
+		t.Fatalf("pre-fence fetch: %v", err)
+	}
+	if _, err := a.CreateDevice(ctx, adminapi.DeviceUpsert{MAC: "aabbccddeeff", SiteID: "bad site!"}); !errors.Is(err, adminapi.ErrConflict) {
+		t.Fatalf("invalid site_id on existing record must be ErrConflict, got %v", err)
+	}
+	after, err := st.Get("aabbccddeeff")
+	if err != nil {
+		t.Fatalf("post-fence fetch: %v", err)
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("rejected create mutated the record: %+v -> %+v", before, after)
 	}
 }
 

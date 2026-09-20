@@ -1556,6 +1556,30 @@ func TestCreateDeviceRejectsInvalidName(t *testing.T) {
 	})
 }
 
+// TestCreateDeviceRejectsBadgeSiteIDRoute pins the POST /api/v1/devices
+// site gate (mirror of the PATCH route's gate, backend-create edition):
+// garbage site_id 400s at the route and never reaches the Backend — before
+// this gate the Backend's create accepted any site_id spelling and
+// 201-created it.
+func TestCreateDeviceRejectsInvalidSiteID(t *testing.T) {
+	run(t, testCase{
+		name: "create device with garbage site_id is 400", method: "POST", path: "/api/v1/devices",
+		body: `{"mac":"f0:9f:c2:84:8f:2a","site_id":"bad site!"}`,
+		want: http.StatusBadRequest,
+		checks: func(t *testing.T, be *fakeBackend, rec *httptest.ResponseRecorder) {
+			t.Helper()
+			if len(be.created) != 0 {
+				t.Fatalf("invalid site_id create must not reach the backend: %+v", be.created)
+			}
+		},
+	})
+	run(t, testCase{
+		name: "empty site_id create stays legal (unset)", method: "POST", path: "/api/v1/devices",
+		body: `{"mac":"f0:9f:c2:84:8f:2a"}`,
+		want: http.StatusCreated,
+	})
+}
+
 // ---- web console / fallbacks --------------------------------------------------
 
 func TestRootServesEmbeddedConsole(t *testing.T) {
