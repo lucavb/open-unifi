@@ -24,7 +24,8 @@ import (
 
 // SiteFacts are the controller-level inputs a render needs (CONTEXT.md:
 // site facts): controller URL, regulatory country code, AP SSH password,
-// and the current WLANs.
+// the provisioned SSH public keys, the SSH password-login disable knob, and
+// the current WLANs.
 type SiteFacts struct {
 	// ControllerURL is the configured controller base URL. Empty means
 	// "not overridden" (nothing in system_cfg derives from it today; it is
@@ -43,6 +44,16 @@ type SiteFacts struct {
 	// provisioned config; the passphrase itself never appears in mgmt_cfg.
 	// Treat records/config containing the hash as credentials.
 	SSHPassword string
+
+	// SSHPublicKeys are the site's authorized public keys, rendered as the
+	// sshd.auth.key.<n>.* rows (1-based, slice order, no dedup). Zero keys
+	// emit zero rows. The firmware rebuilds /etc/dropbear/authorized_keys
+	// from these rows on every boot/apply, so keys pushed here survive
+	// where a manually written file is wiped (see sshkey.go for the
+	// firmware evidence). NOT yet live-bench-validated — a live-validated
+	// apply is owed before the rows are treated as trusted
+	// (docs/PROTOCOL-systemcfg-wireless.md §13).
+	SSHPublicKeys []PublicKey
 
 	// WLANs is the current WLAN envelope (the engine's per-decision
 	// snapshot, so the drift hash and the rendered config always agree).
@@ -306,6 +317,27 @@ func RenderWithPlan(d store.Device, facts SiteFacts, plan wireless.ProvisioningP
 	line("sshd.auth.passwd", "enabled")
 	line("sshd.1.status", "enabled")
 	line("sshd.1.ifname", mgmtDevOf(d))
+	// sshd.auth.key.<n>.* — the authorized-key row family (firmware:
+	// string cluster 0x0063bd40-0x0063be80; line format "%s %s %s\n"
+	// written to /etc/dropbear/authorized_keys @0x0063f19c). Row order per
+	// the jar's format strings (com.ubnt.service.config.String,
+	// String.txt:2849-2911): status, value, type, comment — matched
+	// byte-exactly even though the device sorts rows at boot. 1-based, in
+	// slice order, NO dedup. Without keys nothing is emitted (zero rows =
+	// byte-identical to the pre-feature render, pinned in render_test);
+	// the comment row is only emitted when non-empty, matching the
+	// firmware's three-field line writer. NOT yet live-bench-validated —
+	// a live-validated apply is owed before these rows are treated as
+	// trusted (render.go minimal-diff policy; docs §13).
+	for i, k := range rd.facts.SSHPublicKeys {
+		n := i + 1
+		line(fmt.Sprintf("sshd.auth.key.%d.status", n), "enabled")
+		line(fmt.Sprintf("sshd.auth.key.%d.value", n), k.Value)
+		line(fmt.Sprintf("sshd.auth.key.%d.type", n), k.Type)
+		if k.Comment != "" {
+			line(fmt.Sprintf("sshd.auth.key.%d.comment", n), k.Comment)
+		}
+	}
 
 	// # route + # ntpclient (real builder: §3 step 9) — factory echo.
 	b.WriteString("# route\n")
@@ -354,7 +386,10 @@ func RenderWithPlan(d store.Device, facts SiteFacts, plan wireless.ProvisioningP
 	// int): the factory baseline carries none of those rows either, so
 	// omitting them keeps the parsed diff empty under the full-config
 	// replacement semantics. Adding any row requires a live-validated
-	// apply first (two AP resets already consumed 2026-09-16).
+	// apply first (two AP resets already consumed 2026-09-16). The ONE
+	// deliberate addition since that policy: the site-fact
+	// sshd.auth.key.<n>.* rows (when keys are configured) — firmware-
+	// derived but still OWED a live-validated apply (docs §13).
 
 	// 5. The admin "config.system_cfg.<idx>" passthrough lines
 	//    (config_String.java §appendix: raw pre-formatted lines). FID-62:

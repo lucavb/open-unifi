@@ -118,7 +118,8 @@ the WLANs, and site facts. It reads nothing else and mutates nothing.
 _Avoid_: builder, emitter.
 
 **Site facts**: the controller-level inputs a render needs: controller URL,
-regulatory country code, AP SSH password, and the current WLANs.
+regulatory country code, AP SSH password, the provisioned SSH public keys,
+the SSH password-login disable knob, and the current WLANs.
 
 **Provisioning plan**: the single value computed from a device and the
 wireless envelope that carries the drift hash, the vap placements, and the

@@ -656,3 +656,176 @@ func TestRenderGolden(t *testing.T) {
 		}
 	}
 }
+
+// ---- sshd.auth.key.<n>.* + sshd.auth.passwd site facts --------------------
+
+// Synthetic test key material: structurally COMPLETE fabricated blobs (the
+// base64 decodes to a marker'd RFC 4253 wire blob — "testkey" padded with
+// 'A's to 32 bytes — so the bytes are visibly fake, never a real key).
+// No real key material, ever: ParsePublicKey checks the RFC 4253 §6.6
+// structure walk (walkWireBlob), so the blobs must at least be
+// well-formed on the wire.
+//
+// ed25519 blob: uint32(11)+"ssh-ed25519"+uint32(32)+32×marker
+// rsa blob:     uint32(7)+"ssh-rsa"+uint32(3)+{01 00 01}+uint32(32)+32×marker
+const (
+	testKeyEd25519 = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB test@ap"
+	testKeyRSA     = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB second@ap"
+)
+
+// R5(a): one key with a comment emits the exact 4-row family, in the jar's
+// row order (status/value/type per the String.txt:2849-2911 format strings,
+// comment last), 1-based index 1.
+func TestRenderSSHPublicKeySingle(t *testing.T) {
+	pk, err := ParsePublicKey(testKeyEd25519)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := Render(renderRecord(), SiteFacts{SSHPublicKeys: []PublicKey{pk}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "sshd.auth.key.1.status=enabled\n" +
+		"sshd.auth.key.1.value=AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB\n" +
+		"sshd.auth.key.1.type=ssh-ed25519\n" +
+		"sshd.auth.key.1.comment=test@ap\n"
+	if !strings.Contains(res.Text, want) {
+		t.Fatalf("single-key row family mismatch:\n%s", res.Text)
+	}
+	// And nothing beyond index 1.
+	for _, absent := range []string{"sshd.auth.key.2.", "sshd.auth.key.0."} {
+		if strings.Contains(res.Text, absent) {
+			t.Fatalf("unexpected row %q emitted:\n%s", absent, res.Text)
+		}
+	}
+}
+
+// R5(b): two keys are numbered 1, 2 in slice order — no dedup, no resort.
+func TestRenderSSHPublicKeysTwoNumbered(t *testing.T) {
+	k1, err := ParsePublicKey(testKeyEd25519)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k2, err := ParsePublicKey(testKeyRSA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := Render(renderRecord(), SiteFacts{SSHPublicKeys: []PublicKey{k1, k2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "sshd.auth.key.1.value=AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB\n" +
+		"sshd.auth.key.1.type=ssh-ed25519\n" +
+		"sshd.auth.key.1.comment=test@ap\n" +
+		"sshd.auth.key.2.status=enabled\n" +
+		"sshd.auth.key.2.value=AAAAB3NzaC1yc2EAAAADAQABAAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB\n" +
+		"sshd.auth.key.2.type=ssh-rsa\n" +
+		"sshd.auth.key.2.comment=second@ap\n"
+	if !strings.Contains(res.Text, want) {
+		t.Fatalf("two-key numbering/order mismatch:\n%s", res.Text)
+	}
+}
+
+// R5(b2): identical parsed keys are BOTH rendered — the documented no-dedup
+// contract: slice position is the only identity on the wire (firmware row
+// name is the index), so dedup at the controller would silently drop a
+// deliberately repeated key entry.
+func TestRenderSSHPublicKeysIdenticalNoDedup(t *testing.T) {
+	k, err := ParsePublicKey(testKeyEd25519)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := Render(renderRecord(), SiteFacts{SSHPublicKeys: []PublicKey{k, k}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"sshd.auth.key.1.type=ssh-ed25519\n", "sshd.auth.key.1.comment=test@ap\n",
+		"sshd.auth.key.2.type=ssh-ed25519\n", "sshd.auth.key.2.comment=test@ap\n",
+	} {
+		if !strings.Contains(res.Text, want) {
+			t.Fatalf("no-dedup pin: missing %q:\n%s", want, res.Text)
+		}
+	}
+}
+
+// R5(c): a commentless key emits NO comment row (the firmware's three-field
+// line writer only sees type+value).
+func TestRenderSSHPublicKeyNoCommentOmitsRow(t *testing.T) {
+	pk, err := ParsePublicKey("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := Render(renderRecord(), SiteFacts{SSHPublicKeys: []PublicKey{pk}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(res.Text, "sshd.auth.key.1.comment") {
+		t.Fatalf("comment row emitted for a commentless key:\n%s", res.Text)
+	}
+	if !strings.Contains(res.Text, "sshd.auth.key.1.value=AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB\n") {
+		t.Fatalf("value row missing:\n%s", res.Text)
+	}
+}
+
+// R5(c2): zero keys emit zero sshd.auth.key rows — the default-facts render
+// is byte-identical to the pre-feature contract.
+func TestRenderSSHNoKeysNoKeyRows(t *testing.T) {
+	res, err := Render(renderRecord(), SiteFacts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(res.Text, "sshd.auth.key.") {
+		t.Fatalf("key rows emitted with zero configured keys:\n%s", res.Text)
+	}
+}
+
+// R5(d): the ParsePublicKey fail-closed table — structurally complete
+// synthetic ed25519 and rsa lines parse, and every malformed shape is an
+// error (never a lenient pass).
+func TestParsePublicKeyTable(t *testing.T) {
+	valid := map[string]PublicKey{
+		testKeyEd25519: {
+			Type:    "ssh-ed25519",
+			Value:   "AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB",
+			Comment: "test@ap",
+		},
+		testKeyRSA: {
+			Type:    "ssh-rsa",
+			Value:   "AAAAB3NzaC1yc2EAAAADAQABAAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB",
+			Comment: "second@ap",
+		},
+	}
+	for line, want := range valid {
+		got, err := ParsePublicKey(line)
+		if err != nil {
+			t.Fatalf("ParsePublicKey(%q) = err %v, want ok", line, err)
+		}
+		if got != want {
+			t.Fatalf("ParsePublicKey(%q) = %+v, want %+v", line, got, want)
+		}
+	}
+	for _, line := range []string{
+		"AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB", // 1 field
+		"", // 0 fields
+		"opendir3 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB",    // bad type token
+		"ssh-ed25519 !!!not-base64!!! test@ap",                                             // invalid base64
+		"SSH-ED25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB", // uppercase rejected
+		"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXk!!!",                               // invalid base64 padding
+		// Structure-walk rejects (the RFC 4253 §6.6 wire shape):
+		"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5", // name-only blob: 1 field < 2 total
+		// Mid-body truncation: the 32-byte final field cut at byte 9
+		// ("AAAAC3...QUFB" prefix of the good blob, trailing "=" gone).
+		"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFB",
+		// Type/value mismatch: token ssh-rsa but the blob names ssh-ed25519.
+		"ssh-rsa AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB",
+		// The newline pin: a \n inside the value yields 4 tokens —
+		// strings.Fields tokenization, NOT the base64 decoder (which
+		// silently skips \n), is the newline gate.
+		"ssh-rsa AAAA\nBBBB",
+	} {
+		if _, err := ParsePublicKey(line); err == nil {
+			t.Fatalf("ParsePublicKey(%q) unexpectedly succeeded", line)
+		}
+	}
+}

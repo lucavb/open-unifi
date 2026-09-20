@@ -1078,5 +1078,64 @@ String.txt:1851-1930, int.txt:16600-16630). Remaining accepted deviations:
 | `aaa.<n>.radius_acct_send_keyid.status`/`aaa.<n>.filter_id` | gated on Uid device classes (IoT/wifi) + `radius_filter_id_enabled` + `supportsRadiusFilter` | omitted (2026-09-19 radius lane; rationale re-confirmed 2026-09-19 acct lane — the gate needs Uid device classes, which U7PG2 cannot report, so no accounting-side work reaches these rows) | no Uid/IoT device classes in the model set; not reachable for U7PG2 |
 | `radio.<n>.channel`/`txpower` when admin intent is set | always the radio_table echo (no admin storage recovered for U7PG2; confirmed by the 2026-09-19 txpower packet's pool-ref sweep — §9) | admin-owned `Extra["radio_intent"]` overlay wins (2026-09-19, §3.2/§8.1) | the feature this lane exists for: admin-saved radio settings must survive inform echoes and reach the device. No intent set ⇒ byte-identical echo render (pinned by tests); `txpower_mode` stays a pure echo — no controller-side writer for it exists in the config classes (txpower packet: reads int.txt 5687-5696 with default "auto", row emission int.txt 5942-5958, pool-ref sweep; resolved-as-echo §9) |
 
+## 13. Addendum — `sshd.auth.key.<n>` rows and `sshd.auth.passwd=disabled` (2026-09-20 sshd-auth lane)
+
+The `sshd` rows carried by the classic builder (config_String.java §309-337:
+`sshd.status`, `sshd.auth.passwd`, `sshd.1.status`, `sshd.1.ifname`) until now
+left `/etc/dropbear/authorized_keys` unpopulated — and the firmware REGENERATES
+that file (together with users/sshd state) from persisted cfg rows on every
+boot/apply (docs/AP-FIRMWARE-APPLY-PATH.md:192-209; live-confirmed wipe
+docs/WLAN-ACCEPTANCE-6.8.2.15592.md:427-432), so a manually planted key was
+wiped at the next boot. This addendum pins the authorized-key row family and
+the password-auth knob the renderer now emits from two new site facts.
+
+### 13.1 The `sshd.auth.key.<n>.*` row family (open-unifi extension)
+
+Row names and the per-key index come from the U7PG2 firmware string cluster
+(ubntbox, fw BZ.6.8.2.15592, 0x0063bd40-0x0063be80):
+`"sshd.auth.key.%d.status"`, `"sshd.auth.key.%d.type"`,
+`"sshd.auth.key.%d.comment"`, the default type `"ssh-rsa"`, and the bare
+`".value"` suffix at 0x0064ec8c. The key line itself is written with format
+`"%s %s %s\n"` (type, value, comment) to `/etc/dropbear/authorized_keys`
+@0x0063f19c. The jar's per-key format strings (com.ubnt.service.config.String,
+String.txt:2849-2911) fix the EMITTED ROW ORDER:
+`sshd.auth.key.<n>.status=enabled`, `.value=<base64>`, `.type=<token>`,
+`.comment=<comment>` — the comment row only when a comment exists (the
+three-field line writer). Keys are 1-based, in site-fact slice order, no
+dedup; zero keys emit zero rows (byte-identical to the pre-feature render).
+The controller-side value is `systemcfg.ParsePublicKey` (fail-closed: exactly
+2 or 3 fields, type `^(ssh|ecdsa)-[a-z0-9-]+$`, standard-base64 value that
+must carry a structurally valid RFC 4253 §6.6 wire blob beginning with its
+own type name and parsing as clean length-prefixed fields — a structure
+check, NOT cryptographic validation) fed
+from the `--ap-ssh-key` flag / `$OPEN_UNIFI_AP_SSH_KEY` env fallback — a new
+site fact, never device-informable (site-facts definition, CONTEXT.md).
+
+### 13.2 `sshd.auth.passwd=disabled`
+
+New site fact `SSHDisablePassword` (flag `--ap-ssh-disable-password`) flips
+`sshd.auth.passwd` from the classic default `enabled` to `disabled`. Firmware
+semantics (ubntbox dropbear respawn builder): the builder assembles
+`"null::respawn:%s -F %s%s%s%s"` and appends the `"-s"` flag (disable remote
+password logins) exactly when `sshd.auth.passwd` is disabled; port comes from
+`sshd.%d.port` (`" -p %d"`) and the host keys are
+`-r /var/run/dropbear_rsa_host_key` / `-r /var/run/dropbear_ed25519_host_key`.
+The controller-side startup guard is fail-closed: password auth cannot be
+disabled without at least one provisioned public key — otherwise the next
+cfg-row rebuild leaves an empty `authorized_keys` and dropbear starts with
+`-s`, locking SSH out for good.
+
+### 13.3 Live-validation caveat (FOLLOW-UP, NOT YET CLAIMED)
+
+Both row families are FIRMWARE-DERIVED from the ubntbox evidence above, but
+NOT yet live-bench-validated on the AP: no full provisioning carrying
+`sshd.auth.key.<n>.*` rows has been applied to the bench U7PG2 yet. Per the
+minimal-diff policy (internal/server/systemcfg/render.go — "Adding any row
+requires a live-validated apply first"; two AP resets already consumed
+2026-09-16), a live-validated apply that proves the keys survive the boot
+rebuild is OWED before these rows are treated as trusted. Zero keys /
+default facts keep the render byte-identical to the pre-feature contract,
+so nothing shipped before that validation changes any current wire bytes.
+
 (End; see PROTOCOL-mgmt.md §3 for the surrounding `system_cfg` order and §6/§7 of
 PROTOCOL-mgmt.md for how system_cfg reaches the device.)

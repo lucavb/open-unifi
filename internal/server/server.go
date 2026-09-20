@@ -92,6 +92,13 @@ type Config struct {
 	// Treat records/config containing the hash as credentials.
 	SSHPassword string
 
+	// SSHPublicKeys are the parsed authorized public keys rendered into
+	// the sshd.auth.key.<n>.* rows (site fact; see systemcfg.PublicKey for
+	// the firmware evidence — the AP rebuilds /etc/dropbear/authorized_keys
+	// from these rows on every boot/apply). Parsed and validated by
+	// cmd/openunifi at startup (fail-closed); empty ⇒ zero key rows.
+	SSHPublicKeys []systemcfg.PublicKey
+
 	// OnSessionEvents, when non-nil, receives the client-session
 	// transitions (connect/disconnect counts) each COMMITTED inform cycle
 	// observed in its station refresh — called after the store cycle
@@ -864,6 +871,7 @@ func (s *Server) renderSystemCfg(d store.Device, wls []wireless.Wlan, plan wirel
 		ControllerURL: s.cfg.ControllerURL,
 		CountryCode:   country,
 		SSHPassword:   s.cfg.SSHPassword,
+		SSHPublicKeys: s.cfg.SSHPublicKeys,
 		WLANs:         wls,
 	}, plan)
 	if err != nil {

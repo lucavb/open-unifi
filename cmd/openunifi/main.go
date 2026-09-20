@@ -25,6 +25,7 @@ import (
 	"github.com/lucavb/open-unifi/internal/app"
 	"github.com/lucavb/open-unifi/internal/metrics"
 	"github.com/lucavb/open-unifi/internal/server"
+	"github.com/lucavb/open-unifi/internal/server/systemcfg"
 	"github.com/lucavb/open-unifi/internal/store"
 	"github.com/lucavb/open-unifi/internal/telemetry"
 	"github.com/lucavb/open-unifi/internal/wireless"
@@ -49,6 +50,8 @@ func run() error {
 	regulatoryCountryCode := flag.Int("regulatory-country-code", server.DefaultRegulatoryCountryCode, "ISO 3166-1 numeric regulatory country code (001-999)")
 	apSSHPassword := flag.String("ap-ssh-password", os.Getenv("OPEN_UNIFI_AP_SSH_PASSWORD"),
 		"SSH password for adopted APs (required; falls back to $OPEN_UNIFI_AP_SSH_PASSWORD)")
+	apSSHKeys := &keyList{}
+	flag.Var(apSSHKeys, "ap-ssh-key", "SSH authorized public key for adopted APs, one authorized_keys line per flag (repeatable; falls back to a single $OPEN_UNIFI_AP_SSH_KEY). Parsed and validated fail-closed at startup; provisioned as sshd.auth.key.<n>.* rows")
 	allowDefaultAPSSH := flag.Bool("allow-default-ap-ssh-password", false, "LAB ONLY: permit the insecure AP SSH password \"ubnt\" when --ap-ssh-password is empty")
 	// Default from the provider's token env var; --admin-token overrides it.
 	adminToken := flag.String("admin-token", os.Getenv("OPEN_UNIFI_ADMIN_TOKEN"),
@@ -69,6 +72,25 @@ func run() error {
 	}
 	if *apSSHPassword == "" && !*allowDefaultAPSSH {
 		return errors.New("AP SSH password is required; set --ap-ssh-password or explicitly opt in with --allow-default-ap-ssh-password for lab use")
+	}
+	// Parse and validate EVERY --ap-ssh-key (plus the env fallback) BEFORE
+	// any listener binds — the same fail-closed shape as the password guard
+	// above. A malformed key must never reach the renderer: the AP rebuilds
+	// /etc/dropbear/authorized_keys from the provisioned rows on every
+	// boot/apply, so a bad value would ship a broken key set at apply time.
+	apKeys := apSSHKeys.keys
+	if len(apKeys) == 0 {
+		if v := os.Getenv("OPEN_UNIFI_AP_SSH_KEY"); v != "" {
+			apKeys = []string{v}
+		}
+	}
+	sshKeys := make([]systemcfg.PublicKey, 0, len(apKeys))
+	for i, raw := range apKeys {
+		k, err := systemcfg.ParsePublicKey(raw)
+		if err != nil {
+			return fmt.Errorf("invalid AP SSH public key #%d: %w", i+1, err)
+		}
+		sshKeys = append(sshKeys, k)
 	}
 	// The flag default is nonzero, so a zero here can only come from an
 	// explicitly supplied --regulatory-country-code 0. Reject it before the
@@ -194,6 +216,7 @@ func run() error {
 		ControllerURL:         *controllerURL,
 		RegulatoryCountryCode: *regulatoryCountryCode,
 		SSHPassword:           *apSSHPassword,
+		SSHPublicKeys:         sshKeys,
 		AllowPlainText:        *allowPlainText,
 		AllowGatedLiveWLAN:    *allowGatedLiveWLAN,
 		WirelessSource:        wirelessSource,
@@ -313,6 +336,7 @@ func run() error {
 		"discovery_port", dport,
 		"data_dir", *dataDir,
 		"ssh_password_configured", *apSSHPassword != "",
+		"ssh_public_keys", len(sshKeys),
 		"auth", *adminToken != "",
 		"plaintext_inform", *allowPlainText,
 		"controller_url", *controllerURL,
@@ -386,6 +410,22 @@ func run() error {
 // shutdownCtx yields the bounded 5s graceful-drain context (caller cancels).
 func shutdownCtx() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), 5*time.Second)
+}
+
+// keyList is a REPEATABLE flag.Value: every --ap-ssh-key occurrence appends
+// one authorized_keys line. The env fallback ($OPEN_UNIFI_AP_SSH_KEY, a
+// single key) is applied in run() AFTER flag.Parse only when the flag never
+// appeared — the --ap-ssh-password/env fallback pattern, so an explicitly
+// supplied flag wins over the environment.
+type keyList struct {
+	keys []string
+}
+
+func (l *keyList) String() string { return strings.Join(l.keys, "\n") }
+
+func (l *keyList) Set(v string) error {
+	l.keys = append(l.keys, v)
+	return nil
 }
 
 // drainShutdown tears both HTTP servers down with a fresh 5s deadline.
