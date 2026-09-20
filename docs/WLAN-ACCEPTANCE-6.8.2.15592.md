@@ -139,11 +139,11 @@ SSID and each intended radio where the row says `2.4 GHz` or `5 GHz`.
 | A2 | **Restart with retained key:** adopted AP is restarted without deleting controller state; it re-informs using the retained key, returns to connected, and receives/retains the expected configuration. | `PROVEN` | §2026-09-18 F-row live round — 74 s gap + retained-key re-inform + cfg echo unchanged proven 08:09–08:12Z; applied config did NOT survive the reboot (recovery via the tested self-heal remedy); §2026-09-18 verify round — retention failure re-confirmed and automatic watchdog recovery live-proven 11:29:59–11:30:48Z; §2026-09-19 root cause resolved — the renderer's `mgmt.is_default=true` factory-echo row tripped the AP preinit boot guard (`/lib/preinit/99_21_ubnt_ubntconf` replaces the MTD-restored text containing it with the factory template; docs/AP-FIRMWARE-APPLY-PATH.md §6.5); fix in render.go; §2026-09-19 A2 re-run — retention PROVEN live: retained-key first re-inform (+67 s) with unchanged cfgversion echo, post-boot `/tmp/system.cfg` byte-identical to the push (`3da7ce3e…`), vaps RUN, 6.5 h steady state; one benign not-running-watchdog boot-race re-provision recorded (two-consecutive-miss guard now live-indicated — see the 2026-09-19 round record); §2026-09-19 full-chain round — controller-armed §6.5 reboot: `kind=reboot` on the retained key, echo unchanged, NO boot-race miss (device came up RUN); post-boot `/tmp/system.cfg` is the fw-sorted re-emission, row set byte-identical to the push |
 | B1 | **WPA-Personal association:** WPA-Personal test client associates to the intended SSID on 2.4 GHz and 5 GHz as applicable; client receives DHCP lease and can pass the defined allowed traffic test. | `PROVEN` | §2026-09-20 client-service round — the first test client in project history: iPhone associated to `openunifi-gate-check` (wpa-p), DHCP + page load; 5 GHz at B1, 2.4 GHz after the C1 rejoin; the round also pinned the sessions wire key from a live capture (fix `c2f29be`): stations arrive as `vap_table[].sta_table[]`, never top-level — controller sessions live (`connected:true`, kick/rejoin transitions both) |
 | B2 | **Open association:** open test client associates; client receives DHCP lease and can pass the defined allowed traffic test. | `PROVEN` | §2026-09-20 client-service round — open WLAN `openunifi-open-check` created live (mint `4e0f64536734d895`, settle confirmed count 4); client joined with IP + page on the open SSID (third per-SSID MAC `aa:bb:cc:dd:ee:03`); vap `num_sta` tracked the client to `ath3/na` |
-| B3 | **Tagged VLAN:** WPA-Personal and/or open test WLAN configured with a tagged VLAN; client associates and receives DHCP on the intended subnet; traffic passes; capture on the AP uplink visibly records 802.1Q with the expected VID (or records the exact reason the observation point cannot see the tag). | `NOT RUN` | `________________` |
-| C1 | **SSID/passphrase/VLAN update:** change the SSID, passphrase, and VLAN; old credentials/SSID no longer work as expected, new credentials associate, DHCP is from the new VLAN, traffic passes, and AP/controller state reflects the update. | `PROVEN` | §2026-09-20 client-service round — SSID+PSK change to `openunifi-gate-check-c1`/`…20260920` (mint `3c3cbc298445997c`, two setparam pushes, delivery count 2, in_sync): phone kicked, session row flipped `connected:false` live, old SSID gone from the air, rejoin on new credentials with IP + page load; VLAN sub-criterion bench-limited (single-LAN bench, VLAN 1 both directions) |
+| B3 | **Tagged VLAN:** WPA-Personal and/or open test WLAN configured with a tagged VLAN; client associates and receives DHCP on the intended subnet; traffic passes; capture on the AP uplink visibly records 802.1Q with the expected VID (or records the exact reason the observation point cannot see the tag). | `PROVEN` | §2026-09-20 tagged-VLAN round — baseline WLAN flipped to `vlan=1000` (mint `3b74d48ba87961fb`, same-shape push, live apply, confirmed): client auto-rejoined after the controller-issued reboot and received DHCP lease `192.0.2.12` on the guest subnet (user-confirmed + controller-side sta row `ip=192.0.2.12` on `ath1`), internet page loads; 802.1Q wire proof: 610 frames from the client MAC `aa:bb:cc:dd:ee:01` on the AP uplink, every one `ethertype 802.1Q … vlan 1000`, bidirectional; mgmt stayed untagged on br0/eth0 |
+| C1 | **SSID/passphrase/VLAN update:** change the SSID, passphrase, and VLAN; old credentials/SSID no longer work as expected, new credentials associate, DHCP is from the new VLAN, traffic passes, and AP/controller state reflects the update. | `PROVEN` | §2026-09-20 client-service round — SSID+PSK change to `openunifi-gate-check-c1`/`…20260920` (mint `3c3cbc298445997c`, two setparam pushes, delivery count 2, in_sync): phone kicked, session row flipped `connected:false` live, old SSID gone from the air, rejoin on new credentials with IP + page load; VLAN sub-criterion closed by the §2026-09-20 tagged-VLAN round (live vlan change with the client lease proven on the tagged subnet) |
 | C2 | **WLAN deletion / VAP disappearance:** delete or disable a WLAN; controller config omits it, AP `vap_table`/equivalent no longer shows the VAP on each applicable radio, and the client can no longer associate to it. | `PROVEN` | §2026-09-20 client-service round — `DELETE /api/v1/wireless/open-check-lab` (mint `97f242fd8011dab9`): deleted WLAN's vaps tore down live, no reboot (`ath1`/`ath3` gone from `vap_table`), SSID gone from the client's available list; surviving WLAN's client never dropped. Asymmetry recorded: count-decrease is push-effective; count-increase vap materialization waits for boot |
-| C3 | **Bridge-apply survival (WLAN-count change):** change the WLAN count so the rendered bridge port list changes (e.g. remove the 5 GHz vap); the AP stays reachable through the apply (inform continues), br0 recovers its address and uplink, and remaining WLAN service recovers. If the AP darks, capture the failure with console access ready — the offline verdict predicts exactly that. | `NOT RUN` | offline: §Bridge-apply verdict; tmpwork/harness-20260917/night-deltas.txt |
-| D1 | **Multiple WLANs on both radios:** configure at least two WLANs, with intended 2.4 GHz and 5 GHz coverage; each expected VAP is present, clients associate to each, receive the correct DHCP/VLAN result, and pass the defined traffic test. | `PROVEN` | §2026-09-20 client-service round — two WLANs, both bands, each served the client; the 2-WLAN push rendered 4/4 vap blocks, applied byte-identically (`wlan_cfg_sha == attempt_sha`); live vap set 3/4 pre-boot (`ath1` configured-not-running), 4/4 after the E1 boot — boot-race grace absorbed the transition; per-radio coverage proven across the boot |
+| C3 | **Bridge-apply survival (WLAN-count change):** change the WLAN count so the rendered bridge port list changes (e.g. remove the 5 GHz vap); the AP stays reachable through the apply (inform continues), br0 recovers its address and uplink, and remaining WLAN service recovers. If the AP darks, capture the failure with console access ready — the offline verdict predicts exactly that. | `PROVEN` | §2026-09-20 client-service round — the live WLAN-count runs the offline verdict demanded, both directions: B2 create (1→2 WLANs, rendered bridge ports 3→5) and C2 delete (2→1, ports 5→3); informs flowed continuously through both applies, no dark, br0 uplink retained, surviving WLAN's client never dropped at C2; §2026-09-20 tagged-VLAN round adds two more live same-shape re-bridges with the AP reachable throughout. Offline verdict: §Bridge-apply verdict — its withholding is retired by this live evidence |
+| D1 | **Multiple WLANs on both radios:** configure at least two WLANs, with intended 2.4 GHz and 5 GHz coverage; each expected VAP is present, clients associate to each, receive the correct DHCP/VLAN result, and pass the defined traffic test. | `PROVEN` | §2026-09-20 client-service round — two WLANs, both bands, each served the client; the 2-WLAN push rendered 4/4 vap blocks, applied byte-identically (`wlan_cfg_sha == attempt_sha`); live vap set 3/4 pre-boot (`ath1` configured-not-running), 4/4 after the E1 boot — boot-race grace absorbed the transition; per-radio coverage proven across the boot; VLAN component closed by the §2026-09-20 tagged-VLAN round (client lease on the tagged subnet) |
 | E1 | **AP lost/recovery:** isolate or power off the AP; controller marks it lost within the documented window; restore connectivity/power; AP re-informs, returns connected, and WLAN client service recovers. | `PROVEN` | §2026-09-20 client-service round — both branches: fast cycle 84 s dark, no lost mark (recovery beat the 75 s window by 2 s), noop-only recovery on the retained key, client auto-rejoined; slow cycle `device marked lost` at `last_seen_age_s=79` (state 4), re-plug → first inform → state 4→3, cfg echo unchanged, baseline vaps 2/2 |
 | F1 | **Controller-side deletion:** delete the adopted AP/controller device record using the approved procedure; record resulting AP state and confirm the expected re-adoption path without claiming success unless completed. | `PROVEN` | §2026-09-18 F-row live round — deletion 07:25:55Z; decrypt-failure informs at escalated cadence; pending sourced from discovery announces; re-adoption completed under F2; §2026-09-18 verify round — re-proven under the fixed engine 11:14:39Z |
 | F2 | **Factory reset, deletion, and re-adoption:** after approved backup, factory-reset the AP, verify it returns to factory state, remove/clean its old controller record as required, adopt it again, and repeat the minimum WLAN association/DHCP check. | `PROVEN` | §2026-09-18 F-row live round — backup/reset/factory verify/re-adopt all proven 07:27–07:34Z; final association/DHCP check NOT RUN: no test client at the bench (same environment condition as the C1-shape round); §2026-09-18 verify round — full chain re-proven automatically under the fixed engine 11:17–11:23Z (mint → provisioning → byte-exact settle, no store surgery); client-side sub-criterion unchanged; §2026-09-19 full-chain round — armed `setdefault` on the retained key; demotion swept the per-device key and the whole `wlan_cfg_*` family; factory recovery via `set-inform`; inform-time adoption push from the demoted pending record (no admin adopt call); settle on the FIRST provisioning attempt; boot-guard (`mgmt.is_default=false`), fresh rotated key, and byte-exact `3da7ce3e…` re-proven on the factory-recovered device; client-side sub-criterion still not run; §2026-09-20 factory-window set-inform round — factory reset → console Forget → console Accept → controller-pushed set-inform chain re-proven, click-to-adopted ≈100 s, key rotation + ssh_sha512 re-mint (fresh crypt salt) recorded, AP byte proof `ad41cdad…`; §2026-09-20 client-service round — the client-side sub-criterion is closed: the first client association+DHCP+traffic ran on the device this factory window re-adopted |
@@ -1452,12 +1452,90 @@ connected); the console still cannot set `led_override` on/off
 (encrypted, SLL2) holds the E1 fast-cycle wire sequence if ever
 needed.
 
+### 2026-09-20 tagged-VLAN round — B3 lease + 802.1Q proof, C3 close-out, the vlan-egress materialization finding (no deploy — binary `0fe5f722f87fcf4f` at `c2f29be` unchanged)
+
+**Premise change:** the bench has a VLAN-capable switch: the AP uplink is a
+trunk (native VLAN 1 untagged; VIDs 5/10/1000/1001 tagged), every VID is
+served by DHCP, and 5/10/1000 route to the internet. The single-LAN
+limitation recorded against B3 and the C1/D1 VLAN sub-criteria is retired.
+
+**Push side — the first live tagged-VLAN renders in project history:** three
+same-shape PUTs of `gate-check` with `vlan=5` (mint `80b703ac6948ae97`),
+`vlan=1000` (mint `3b74d48ba87961fb`), and the `vlan=1` restore (mint
+`2891688a47040fd4`) — all live, all confirmed, the vaps never left RUN.
+The renderer's vlan model produced its first live rows: `vlan.1.id=<vid>`
+on `eth0.<vid>`, a second bridge `br0.<vid>` carrying
+`eth0.<vid>+ath0+ath1`, mgmt untouched on br0/eth0; `brctl show` confirmed
+the runtime membership moved live at every apply.
+
+**VLAN-egress materialization (the load-bearing finding):** after the live
+VID-5 apply the associated client held a self-assigned `169.254.100.100`
+and the counters told the exact story: `ath1` RX 147 → `br0.<vid>` RX 76 →
+dead, `eth0.<vid>` TX 0. `ip link show eth0.1000` read `state DOWN` — the
+live apply creates the vlan subinterface and enslaves it into `br0.<vid>`
+but never performs the administrative bring-up. ebtables and iptables
+FORWARD are empty (no filter explains it); the port is simply down. After
+a boot the same config reads `<UP,LOWER_UP> state UP` and egress flows
+(TX 1362 and counting). The vap materialization rule extends to the
+bridge/vlan layer: structure applies live, administrative bring-up
+materializes at boot. A same-shape vlan change is therefore
+push-effective but not service-effective until the next boot — a second
+data point for the WLAN-count reboot-push design consideration.
+
+**VID-5 leg (negative, superseded):** zero VID-5 frames anywhere on the
+trunk across two captures (vs 662 VID-10 + 110 VID-1001 ambient) — VID 5
+was silent on the wire; the operator moved the leg to VID 1000. (The
+`eth0.5` down state would have blocked the lease regardless.)
+
+**Admin reboot cmd — first live proof of the REST surface:**
+`POST /api/v1/devices/aabbccddee02/reboot` (response carries
+`pending_command:"reboot"`) → 23:26:55 `inform: armed reboot` + reply
+`kind=reboot` → 83 s dark → `device marked lost` (state 4) → recovery
+23:28:54 connected noop, state 4→3, cfg echo unchanged
+(`3b74d48ba87961fb`), no drift. The reboot reply kind itself was already
+live-proven by the 2026-09-19 full-chain round's controller-armed §6.5
+reboot; tonight's new proof is the admin cmd path (pending-command
+queueing → armed reboot on the next inform).
+
+**Client proof (VID 1000):** after the boot the phone auto-rejoined
+`openunifi-gate-check` and received DHCP lease `192.0.2.12` on the guest
+subnet (user-confirmed; controller-side sta row `ip=192.0.2.12` on
+`ath1`); internet page loads. **802.1Q wire proof:** tcpdump on the AP
+uplink recorded 610 frames from the client MAC `aa:bb:cc:dd:ee:01`, every
+one `ethertype 802.1Q (0x8100) … vlan 1000`, bidirectional with tagged
+return traffic; the mgmt informs stayed untagged on br0/eth0 throughout.
+
+**Bench notes:** busybox `timeout` takes `-t SECS` — the positional form
+silently fails (it burned two capture windows); pulling a pcap via
+`ssh cat` while tcpdump runs is a self-amplifying feedback loop (36,751
+self-frames, a 53 MB balloon in the RAM-backed 61 MB `/tmp`) — kill the
+capture before pulling; the ssh key lane wipes at every boot (twice this
+round). Artifacts: workstation copies of the AP captures at
+`/tmp/b3-v1000-era.pcap` and `/tmp/b3-final.pcap`.
+
+**End state:** baseline envelope restored and boot-materialized (the
+final power-cycle stayed inside the 75 s window — no lost mark), 2/2 vaps,
+delivery confirmed, state 3. Fixtures: `live-devices.json` re-seeded from
+the post-round record (`16e669d9…`), the previous seed archived as
+`live-devices.json.preround-b3-20260920` (`8413e21e…`);
+`live-applied-sys.txt` (`ad41cdad…`) and `live-wireless.json`
+(`5620a15d…`) unchanged — the baseline envelope is identical. ZZ gates on
+the fresh record: **11 PASS + Wpa SKIP by design**; intent steady state
+byte-identical.
+
+**Matrix:** B3 → `PROVEN`. C3 → `PROVEN` — the live WLAN-count runs the
+offline verdict demanded already sit in the §2026-09-20 client-service
+round (B2 create: bridge ports 3→5; C2 delete: 5→3; informs continuous,
+no dark, surviving client never dropped). The C1/D1 VLAN sub-criteria are
+closed by this round. Release gate row 1 (all A–F rows `PROVEN`) is met;
+the human review sign-off remains the only open gate class.
+
 ## Release gate summary
 
 | Gate | Result |
 | --- | --- |
-| All A–F required rows are `PROVEN` on firmware 6.8.2.15592 | `OPEN` |
+| All A–F required rows are `PROVEN` on firmware 6.8.2.15592 | `MET` — all twelve rows read `PROVEN` as of the 2026-09-20 tagged-VLAN round; sign-off pending (next row) |
 | Every `PROVEN` row has the exact evidence fields and review sign-off | `OPEN` |
 | Any `FAILED`, `BLOCKED`, or `NOT RUN` row has a documented disposition | `OPEN` |
-| `C3` bridge-apply disposition is reviewed (currently BLOCKED offline — §Bridge-apply verdict: WLAN-count pushes withheld) | `OPEN` |
+| `C3` bridge-apply disposition is reviewed (now `PROVEN` live — §C3 row; the §Bridge-apply verdict's withholding is retired) | `OPEN` |
 | End-user WLAN acceptance claim is authorized | `NO — remains gated until the rows above are reviewed` |
