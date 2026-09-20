@@ -136,7 +136,8 @@ func planAgreementDevice() store.Device {
 //     the plan's VapPlan rows) ⇒ the hash moves with them, and
 //   - the hash stays (the render-inert normalizations: radius port 0≡1812,
 //     acct port 0≡1813, accounting-gated inert fields, vlan mode
-//     ""≡"disabled") ⇒ the settle-relevant rows (placements) stay too.
+//     ""≡"disabled", band ""≡"both") ⇒ the settle-relevant rows
+//     (placements) stay too.
 //
 // The DAS residual's device arm (fw_caps, systemcfg's supportsDasDad) is
 // outside this package and stays a documented, bounded asymmetry on
@@ -209,6 +210,23 @@ func TestPlanProvisioningAgreement(t *testing.T) {
 		"inert acct profile": func(w []Wlan) []Wlan {
 			out := append(w[:0:0], w...)
 			out[1].AcctServers = []RadiusAcctServer{{IP: "10.0.0.9", Port: 0}}
+			return out
+		},
+		// Band spelling: the base omits Band (zero ""), the mover spells it
+		// "both" — a real ""→"both" flip. PlanVaps places "" and "both"
+		// identically, and the hash input's effective-value normalization
+		// makes the two spellings hash identically too; under the OLD
+		// verbatim band hashing this mover would mint a fresh hash and
+		// FAIL, so it is the pin the normalization owes.
+		// NOTE the in-table accounting movers are deliberately NOT here:
+		// accounting-on variants hash differently from the untouched base
+		// (acct rows join the render), so they belong to the rowMover side
+		// of the acct-fields pin in TestWlanListHashAcctFieldsDrift — the
+		// inert-profile mover above is the representation this loop's
+		// hash-equals-untouched-base contract can carry.
+		"band \"\"→\"both\"": func(w []Wlan) []Wlan {
+			out := append(w[:0:0], w...)
+			out[0].Band = "both"
 			return out
 		},
 	}

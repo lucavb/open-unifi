@@ -277,12 +277,19 @@ func UnknownBandRadios(d store.Device) int {
 //     spelling, inert profile gating), so a bytes-identical render mints
 //     no drift — pinned in-package by the plan tests below and the
 //     WlanListHash tests;
-//   - its residual: the DAS gate's DEVICE arm (fw_caps 0x100000,
+//   - its residuals: the DAS gate's DEVICE arm (fw_caps 0x100000,
 //     systemcfg's supportsDasDad) is envelope-external, so on a record
 //     without the bit a das flip mints a fresh hash over a
 //     byte-identical render (documented on WlanListHash, bounded to one
 //     idempotent full provisioning; the zz_* scratch gates remain the
-//     live pins).
+//     live pins); and the WLAN list `name` hashes verbatim yet never
+//     renders into a row while the SSID is set (SSIDOf prefers the
+//     SSID), so a name-only spelling flip can mint a fresh hash over a
+//     byte-identical render too — the reachable form is a fixed-ID
+//     rename (UpdateWlan blocks name changes, and derived IDs hash-move
+//     correctly because id joins the hash), name is an admin-identity
+//     field, and the residual stays bounded to one idempotent full
+//     provisioning.
 //
 // Placements keys SSID\x00radio_name → count, the shape the pending
 // confirmation (applyProvisioning/settle) persists.
@@ -330,13 +337,24 @@ func vapPlacements(vaps []VapPlan) map[string]int {
 // 1812 emission default), so a stored 0 and a stored 1812 — which render
 // the same rows — also hash the same. The vlan mode hashes at its effective
 // spelling too: "" normalizes to "disabled" (both render dynamic_vlan=0),
-// so a spelling-only flip cannot mint a new hash. The accounting fields
-// follow the same rule one level coarser (see the inline comment): they
-// join ONLY when accounting_enabled, because an inert profile renders
-// byte-identically to none at all.
+// so a spelling-only flip cannot mint a new hash. The band hashes at its
+// effective spelling under the same rule: "" ≡ "both" place vaps
+// identically (PlanVaps), so verbatim hashing let a spelling-only band flip
+// mint a spurious drift push over a byte-identical render. The accounting
+// fields follow the same effective-value rule one level coarser (see the
+// inline comment): they join ONLY when accounting_enabled, because an inert
+// profile renders byte-identically to none at all.
 func WlanListHash(wls []Wlan) string {
 	m := make([]map[string]any, 0, len(wls))
 	for _, w := range wls {
+		// Effective spelling, like the acct ports and the vlan mode below:
+		// "" ≡ "both" place vaps identically (PlanVaps normalizes the same
+		// way), so hashing the band verbatim let a spelling-only flip mint
+		// a spurious drift push over a byte-identical render.
+		band := w.Band
+		if band == "" {
+			band = wlanBandDefault
+		}
 		e := map[string]any{
 			"name":       w.Name,
 			"ssid":       w.SSID,
@@ -345,7 +363,7 @@ func WlanListHash(wls []Wlan) string {
 			"vlan":       w.VLAN,
 			"enabled":    w.Enabled,
 			"id":         w.ID,
-			"band":       w.Band,
+			"band":       band,
 		}
 		if len(w.RadiusServers) > 0 || w.RadiusSecret != "" || w.RadiusVLANMode != "" {
 			e["radius_secret"] = w.RadiusSecret
