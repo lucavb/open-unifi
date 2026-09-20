@@ -914,9 +914,89 @@ once per index, dad.client.<i>.cidr=`<ip>`/32 per server),
 WlanListHash joins the knob under the accounting gate (the
 envelope-external capability arm recorded as a bounded residual), and
 §12 row 1014 / §4.3 / §8 are flipped implemented. The bench AP's
-fw_caps (0xE7FD3F3F) carries the bit. Obligation 3's live half stands:
-live accounting push with das on, Interim-Update session proof,
-accounting-off revert, console round-trip.
+fw_caps (0xE7FD3F3F) carries the bit. The live half is closed by the
+2026-09-20 round below: the accounting push with das on and the
+accounting-off revert are device-verified byte-exact; the
+Interim-Update session proof and console round-trip remain open.
+
+### 2026-09-20 DAS/DAD live round — gate-open push, byte-exact AP proof, accounting-off revert (controller `f3a0d41` → binary `3c117b06c5a2`)
+
+**Scope:** live verification of the post-round flip (the das/dad
+emission + `radius_das_enabled` acceptance) on bench AP-1
+(`aabbccddee02`, U7PG2, 6.8.2.15592), 08:31–08:41 CEST: deploy +
+regression, the full-accounting push, AP byte proof, accounting-off
+revert, harness re-seed + a standing live gate. Pre-round backups:
+remote `data/devices.json.bak-20260920T063134Z` (sha256 `cf30ca67…`) +
+`data/wireless.json.bak-20260920T063134Z` (`5620a15d…`).
+
+**Deploy + regression:** binary sha256
+`3c117b06c5a26270…77141dd5969` (rollback
+`openunifi.rollback-20260920T063158Z`); post-swap retained-key GCM
+noops with cfg echo `8977bcd245bd7b44` steady — the swap invisible to
+the device.
+
+**Full-accounting push (gate open):** PUT `gate-check` re-secured to
+wpa-eap with auth `10.10.10.10:1812`, acct `10.10.10.10:1813`,
+interim_update on, `radius_das_enabled` on (test-only secret;
+passphrase preserved — under EAP the psk row keeps the real value,
+the jar's `letmeinnow` default is only for an empty passphrase).
+HTTP 200 echo with `radius_das_enabled:true` — the acceptance
+live-proven (the pre-flip binary rejected the same PUT). Drift
+08:34:52 → mint `15d681812508bc41`, 3 offers (one cfgversion on all),
+echo caught in 15 s (`noop-pending-wlan`), steady connected noops by
+08:36:29 — `in_sync:true`, `wlan_delivery_status:confirmed`, restart
+set `{aaa}` (no other section moved).
+
+**AP byte proof** (default-key SSH lane, commands redacted):
+`/tmp/system.cfg` sha256 `f60d458ee1c0…d3f3a79` == the pushed
+document; `mgmt.cfgversion=15d681812508bc41` == the mint. Rows
+exactly per the javap packet: `aaa.1.radius.dad.status=enabled` +
+`dad.port=3799` once per device render (aaa.1 only),
+`das.status=enabled` + `das.port=3801`/`3802` per emitted index, the
+jar's duplicate `dad.status` preserved (twice under aaa.1, once under
+aaa.2), `das.client`/`das.secret` once per index,
+`dad.client.1.cidr=10.10.10.10/32` + `.secret` per server slot, acct
+rows port 1813, auth rows port 1812, `interim_update.status=enabled` +
+`.interval=3600`. The ledbar block rides both this and the reverted
+capture — the first captured full provisioning with the §12 row 1007
+block — and the `radio.*` `txpower_mode=auto`/`txpower=auto` echo rows
+are in both captures (obligation-4 observation evidence, no admin
+semantics minted). Client assoc/traffic/capture evidence is N/A: the
+bench runs no RADIUS daemon; the round validates envelope shape, the
+`{aaa}` restart set, and the das/dad byte shape on the wire.
+
+**Accounting-off revert:** PUT the wpa-p baseline back → mint
+`f9ea3a736d628506`, 3 offers, echo caught in 13 s, steady noops ~24 s
+end-to-end; AP bytes `c4b7f3bf6f8e…641503c` with das/dad/acct/interim
+row count 0 (the gate closes silently), `wpa.psk` restored, ledbar
+retained; controller `wireless.json` sha `5620a15d…` identical to the
+pre-round backup — the envelope restored byte-for-byte.
+
+**Gates + harness re-seed:** `live-applied-sys.txt` re-seeded from
+the reverted AP bytes (`c4b7f3bf…`; the prior capture preserved as
+`live-applied-sys.preround-20260920.txt`); `live-devices.json`
+`082fd789…`; `live-wireless.json` `5620a15d…`; the das-state capture
+archived as `live-das-applied-sys.txt` (`f60d458e…`).
+`zzExemptLedBarMigration` is retired at the live gates (the
+`zzExemptIsDefaultMigration` precedent — the re-seeded capture is
+post-ledbar, so a `ledbar.*` drift trips them again); the filter
+stays only at the synthetic-baseline gates. New standing gate
+`TestZZLiveDasCandidateVsApplied` (secret = the pushed constant): the
+render reproduces the device-verified das-state bytes byte-exact —
+render sha256 == capture sha256 `f60d458e…`, parse-level zero-diff,
+the duplicate dad.status asserted in raw counts (2× aaa.1, 1× aaa.2)
+— and vs the applied baseline: 37 intended deltas, all inside
+`aaa.*`, zero violations, zero `wireless.*` rows. All ZZ gates green
+(11 PASS + Wpa SKIP by design); `go vet` + full `go test ./...` green.
+
+**Obligations:** closes the flip's live half — accounting push with
+das on, accounting-off revert (both device-verified byte-exact).
+Gap-closure evidence banked: the ledbar block's bytes in a captured
+full provisioning (real-LED-state half remains) and the txpower echo
+rows in a captured provisioning (§3.2 arm remains). Still open:
+Interim-Update session proof (needs a live RADIUS acct daemon),
+console round-trip, sessions `sta_table` pin, tasks
+classic-controller capture.
 
 ## Release gate summary
 
