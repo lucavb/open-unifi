@@ -147,8 +147,12 @@ func Render(d store.Device, facts SiteFacts) (Result, error) {
 // the provisioning plan from (d, facts.WLANs) itself, it emits from the plan
 // the adoption engine computed for the same record and envelope snapshot, so
 // the renderer's rows and the drift hash the decision compared share ONE
-// computation. Precondition: facts.WLANs must be the same wireless envelope
-// the plan was built from (the engine's single per-decision snapshot).
+// computation. Inside THIS entry the plan is the sole wireless input:
+// facts.WLANs is not read for the wireless sections at all (Render's own
+// door above is the only site that passes facts.WLANs into a plan), so a
+// mismatched facts.WLANs cannot leak second-half rows into a
+// plan-consistent render — pinned in-package by
+// TestRenderWithPlanIgnoresFactsWLAN.
 // See the wireless section's emission notes in wireless.go.
 func RenderWithPlan(d store.Device, facts SiteFacts, plan wireless.ProvisioningPlan) (Result, error) {
 	rd := &render{facts: facts}

@@ -57,9 +57,66 @@ func renderUsers1Password(t *testing.T, sys string) string {
 	return ""
 }
 
-// users.1/users.2 row shape + per-device cache stability across renders
-// (moved from package server; the cache now rides as CredentialDeltas that
-// the CALLER applies — here the test, as the adapter stand-in).
+// TestRenderWithPlanIgnoresFactsWLAN pins the RenderWithPlan independence
+// contract the docblock claims: inside this entry the plan is the SOLE
+// wireless input. For one device and one plan-enveloping pair, feeding the
+// facts a DIFFERENT envelope while handing the SAME plan must produce the
+// byte-identical text — the renderer's wireless rows come from the plan,
+// never from facts.WLANs. Only facts.WLANs is varied here deliberately:
+// CountryCode and SSHPassword still render into rows (countrycode and the
+// users.1 hash), so varying them would double as unrelated-fixture churn
+// rather than an independence pin.
+func TestRenderWithPlanIgnoresFactsWLAN(t *testing.T) {
+	d := renderRecord()
+	envA := planPinEnvelopeA()
+	envB := planPinEnvelopeB()
+	if len(envA) == 0 || len(envB) == 0 {
+		t.Fatal("fixtures must be non-empty")
+	}
+	planB := wireless.PlanProvisioning(d, envB)
+	// Warm the sha512 password cache FIRST: users.1.password salts fresh
+	// random on every UNCACHED render, so an uncached pair would differ
+	// even with zero facts leak — the cache row is what makes two renders
+	// byte-comparable (caching is the settle path's own contract).
+	warm, werr := RenderWithPlan(d, SiteFacts{WLANs: envB}, planB)
+	if werr != nil {
+		t.Fatalf("warm render: %v", werr)
+	}
+	for k, v := range warm.CredentialDeltas {
+		d.Extra[k] = v
+	}
+	resA, err := RenderWithPlan(d, SiteFacts{WLANs: planPinEnvelopeA()}, planB)
+	if err != nil {
+		t.Fatalf("render A-facts/B-plan: %v", err)
+	}
+	resB, err := RenderWithPlan(d, SiteFacts{WLANs: envB}, planB)
+	if err != nil {
+		t.Fatalf("render B-facts/B-plan: %v", err)
+	}
+	if resA.Text != resB.Text {
+		t.Fatalf("facts.WLANs must not leak into a RenderWithPlan call whose plan is fixed:\n-facts-A:\n%s\n-facts-B:\n%s", resA.Text, resB.Text)
+	}
+}
+
+// planPinEnvelopeA/B are two materially different envelopes (distinct
+// SSIDs, VLANs and counters visible in a render): if facts.WLANs leaked
+// into the wireless sections the two texts above would diverge loudly.
+func planPinEnvelopeA() []wireless.Wlan {
+	return []wireless.Wlan{
+		{Name: "corpA", SSID: "corpA", Security: "wpa-p", Passphrase: "correcthorse", VLAN: 42, Enabled: true, ID: "ida"},
+	}
+}
+
+func planPinEnvelopeB() []wireless.Wlan {
+	return []wireless.Wlan{
+		{Name: "corpB", SSID: "corpB", Security: "open", VLAN: 7, Enabled: true, ID: "idb"},
+	}
+}
+
+// TestUsers1CacheStability pins the users.1/users.2 row shape: per-device
+// cache stability across renders (moved from package server; the cache now
+// rides as CredentialDeltas that the CALLER applies — here the test, as
+// the adapter stand-in).
 func TestUsers1CacheStability(t *testing.T) {
 	rec := renderRecord()
 	res1, err := Render(rec, SiteFacts{})

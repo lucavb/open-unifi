@@ -1693,6 +1693,35 @@ func TestRadioIntentListView(t *testing.T) {
 // Backend-surface equivalents (rejections are ErrConflict, sentinels are
 // ErrNotFound, rejected saves mutate nothing).
 
+// TestEnqueueCmdFenceRecordByteUntouched pins the cmd fence's no-mutation
+// guarantee by full-DeepEqual comparison: a st.Put-seeded record (no
+// timestamps anywhere — the fetched record is deterministic) fetched after
+// five rejected enqueues must equal the seeded literal EXACTLY, not merely
+// share the rows the earlier partial checks looked at.
+func TestEnqueueCmdFenceRecordByteUntouched(t *testing.T) {
+	a, st, _ := testApp(t)
+	ctx := context.Background()
+	seeded := store.Device{
+		MAC: "f09fc2848f2a", State: store.StateAdopted, Model: "U7PG2",
+		CfgVersion: "aaaabbbbccccdddd", AppliedCfg: "aaaabbbbccccdddd",
+	}
+	if err := st.Put(seeded); err != nil {
+		t.Fatal(err)
+	}
+	for _, cmd := range []string{"", strings.Repeat("x", 65), "re\nstart", " restart", "restart "} {
+		if _, err := a.EnqueueDeviceCmd(ctx, "f0:9f:c2:84:8f:2a", cmd); !errors.Is(err, adminapi.ErrConflict) {
+			t.Fatalf("cmd %q: want ErrConflict, got %v", cmd, err)
+		}
+	}
+	got, err := st.Get("f09fc2848f2a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, seeded) {
+		t.Fatalf("rejected enqueue mutated the record:\n got %+v\nwant %+v", got, seeded)
+	}
+}
+
 // TestEnqueueCmdStringBackendFence pins the §6.3 cmd fence at the
 // Backend seam (mirror of the route's 400 battery, moved home with the
 // save skeleton): empty, oversized, control-character and padded cmd
@@ -1772,6 +1801,34 @@ func TestPatchSiteIDBackendFence(t *testing.T) {
 	}
 	if dv, err := a.GetDevice(ctx, "aabbccddeeff"); err != nil || dv.SiteID != "" {
 		t.Fatalf("site clear: %+v err=%v", dv, err)
+	}
+}
+
+// TestPatchLEDEffectiveChangeEchoesMintedCfgVersion pins the mint ECHO:
+// an EFFECTIVE LED patch ships the fresh cfgversion in the same 200 body —
+// the saveIntent project step runs AFTER the mint inside the same cycle, so
+// the returned DeviceView can never carry the stale pre-mint value. No
+// existing test read the returned CfgVersion (the mint pins read the store
+// record instead), which is exactly the hole this closes.
+func TestPatchLEDEffectiveChangeEchoesMintedCfgVersion(t *testing.T) {
+	a, st, _ := testApp(t)
+	ctx := context.Background()
+	const seeded = "aaaabbbbccccdddd"
+	if err := st.Put(store.Device{
+		MAC: "aabbccddeeff", Model: "U7PG2", State: store.StateAdopted,
+		CfgVersion: seeded, AppliedCfg: seeded,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dv, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{LEDOverride: ledOverridePtr("on")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dv.CfgVersion == seeded || len(dv.CfgVersion) != 16 {
+		t.Fatalf("200 body must echo the minted cfgversion (fresh 16-hex), got %q", dv.CfgVersion)
+	}
+	if dv.LEDOverride != "on" {
+		t.Fatalf("echo view is the projected record state: %+v", dv)
 	}
 }
 
