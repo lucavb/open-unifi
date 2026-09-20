@@ -135,7 +135,7 @@ SSID and each intended radio where the row says `2.4 GHz` or `5 GHz`.
 
 | ID | Required case and pass criteria | Status | Evidence refs |
 | --- | --- | --- | --- |
-| A1 | **Factory adoption:** factory AP is discovered/adopted; AP reports adopted/connected; controller records the expected model and firmware; post-adoption inform is received. | `PROVEN` | §2026-09-18 F-row live round — adoption chain 07:32:47–07:34:09Z (adoption-seed engine finding recorded there); §2026-09-18 verify round — re-proven under the fixed engine, adoption delivers the envelope automatically 11:21:45–11:23:13Z |
+| A1 | **Factory adoption:** factory AP is discovered/adopted; AP reports adopted/connected; controller records the expected model and firmware; post-adoption inform is received. | `PROVEN` | §2026-09-18 F-row live round — adoption chain 07:32:47–07:34:09Z (adoption-seed engine finding recorded there); §2026-09-18 verify round — re-proven under the fixed engine, adoption delivers the envelope automatically 11:21:45–11:23:13Z; §2026-09-20 factory-window set-inform round — the console path re-proven with ZERO operator SSH keystrokes: Forget → Accept → controller-pushed set-inform 12:13:56.881 → first inform 12:13:56.886 on the factory default key → full provisioning 12:14:11.951 → settle state 3 / `in_sync`, AP bytes byte-identical to the push (`ad41cdad…`) |
 | A2 | **Restart with retained key:** adopted AP is restarted without deleting controller state; it re-informs using the retained key, returns to connected, and receives/retains the expected configuration. | `PROVEN` | §2026-09-18 F-row live round — 74 s gap + retained-key re-inform + cfg echo unchanged proven 08:09–08:12Z; applied config did NOT survive the reboot (recovery via the tested self-heal remedy); §2026-09-18 verify round — retention failure re-confirmed and automatic watchdog recovery live-proven 11:29:59–11:30:48Z; §2026-09-19 root cause resolved — the renderer's `mgmt.is_default=true` factory-echo row tripped the AP preinit boot guard (`/lib/preinit/99_21_ubnt_ubntconf` replaces the MTD-restored text containing it with the factory template; docs/AP-FIRMWARE-APPLY-PATH.md §6.5); fix in render.go; §2026-09-19 A2 re-run — retention PROVEN live: retained-key first re-inform (+67 s) with unchanged cfgversion echo, post-boot `/tmp/system.cfg` byte-identical to the push (`3da7ce3e…`), vaps RUN, 6.5 h steady state; one benign not-running-watchdog boot-race re-provision recorded (two-consecutive-miss guard now live-indicated — see the 2026-09-19 round record); §2026-09-19 full-chain round — controller-armed §6.5 reboot: `kind=reboot` on the retained key, echo unchanged, NO boot-race miss (device came up RUN); post-boot `/tmp/system.cfg` is the fw-sorted re-emission, row set byte-identical to the push |
 | B1 | **WPA-Personal association:** WPA-Personal test client associates to the intended SSID on 2.4 GHz and 5 GHz as applicable; client receives DHCP lease and can pass the defined allowed traffic test. | `NOT RUN` | `________________` |
 | B2 | **Open association:** open test client associates; client receives DHCP lease and can pass the defined allowed traffic test. | `NOT RUN` | `________________` |
@@ -146,7 +146,7 @@ SSID and each intended radio where the row says `2.4 GHz` or `5 GHz`.
 | D1 | **Multiple WLANs on both radios:** configure at least two WLANs, with intended 2.4 GHz and 5 GHz coverage; each expected VAP is present, clients associate to each, receive the correct DHCP/VLAN result, and pass the defined traffic test. | `NOT RUN` | `________________` |
 | E1 | **AP lost/recovery:** isolate or power off the AP; controller marks it lost within the documented window; restore connectivity/power; AP re-informs, returns connected, and WLAN client service recovers. | `NOT RUN` | `________________` |
 | F1 | **Controller-side deletion:** delete the adopted AP/controller device record using the approved procedure; record resulting AP state and confirm the expected re-adoption path without claiming success unless completed. | `PROVEN` | §2026-09-18 F-row live round — deletion 07:25:55Z; decrypt-failure informs at escalated cadence; pending sourced from discovery announces; re-adoption completed under F2; §2026-09-18 verify round — re-proven under the fixed engine 11:14:39Z |
-| F2 | **Factory reset, deletion, and re-adoption:** after approved backup, factory-reset the AP, verify it returns to factory state, remove/clean its old controller record as required, adopt it again, and repeat the minimum WLAN association/DHCP check. | `BLOCKED` | §2026-09-18 F-row live round — backup/reset/factory verify/re-adopt all proven 07:27–07:34Z; final association/DHCP check NOT RUN: no test client at the bench (same environment condition as the C1-shape round); §2026-09-18 verify round — full chain re-proven automatically under the fixed engine 11:17–11:23Z (mint → provisioning → byte-exact settle, no store surgery); client-side sub-criterion unchanged; §2026-09-19 full-chain round — armed `setdefault` on the retained key; demotion swept the per-device key and the whole `wlan_cfg_*` family; factory recovery via `set-inform`; inform-time adoption push from the demoted pending record (no admin adopt call); settle on the FIRST provisioning attempt; boot-guard (`mgmt.is_default=false`), fresh rotated key, and byte-exact `3da7ce3e…` re-proven on the factory-recovered device; client-side sub-criterion still not run |
+| F2 | **Factory reset, deletion, and re-adoption:** after approved backup, factory-reset the AP, verify it returns to factory state, remove/clean its old controller record as required, adopt it again, and repeat the minimum WLAN association/DHCP check. | `BLOCKED` | §2026-09-18 F-row live round — backup/reset/factory verify/re-adopt all proven 07:27–07:34Z; final association/DHCP check NOT RUN: no test client at the bench (same environment condition as the C1-shape round); §2026-09-18 verify round — full chain re-proven automatically under the fixed engine 11:17–11:23Z (mint → provisioning → byte-exact settle, no store surgery); client-side sub-criterion unchanged; §2026-09-19 full-chain round — armed `setdefault` on the retained key; demotion swept the per-device key and the whole `wlan_cfg_*` family; factory recovery via `set-inform`; inform-time adoption push from the demoted pending record (no admin adopt call); settle on the FIRST provisioning attempt; boot-guard (`mgmt.is_default=false`), fresh rotated key, and byte-exact `3da7ce3e…` re-proven on the factory-recovered device; client-side sub-criterion still not run; §2026-09-20 factory-window set-inform round — factory reset → console Forget → console Accept → controller-pushed set-inform chain re-proven, click-to-adopted ≈100 s, key rotation + ssh_sha512 re-mint (fresh crypt salt) recorded, AP byte proof `ad41cdad…`; client-side sub-criterion still not run |
 
 ### Bridge-apply verdict (2026-09-17 night pass — offline plugin forensics; no live run)
 
@@ -1164,6 +1164,108 @@ capture, ledbar lamp eyes-on, the SSH password lane's
 automation-hostility (expect hangs, interactive works — root cause
 unexplained), and the discovery reply emitter (documented TODO,
 unscheduled).
+
+### 2026-09-20 factory-window set-inform round — controller-pushed set-inform: zero-SSH-keystroke console adoption (lane commits `037d367` → `3cfde29`, binary `f09dbb852f7d`)
+
+**Scope:** live verification of the controller-side SSH set-inform
+push lane: a factory window driven entirely from the console — the
+operator clicks Accept on a pending candidate and the controller
+pushes the inform URL over SSH itself; no operator SSH keystroke
+anywhere in the chain. Bench AP-1 (`aabbccddee02`, U7PG2, 6.8.2.15592),
+12:07–12:16 CEST. Lane: `037d367` (single-source the inform URL the
+controller hands devices) + `3cfde29` (the push lane —
+internal/app/setinform.go, armed by `--allow-ssh-set-inform-push`,
+one-shot push fired between the pending-candidate commit and the
+adopt API return, 502 mapping on push failure). Pre-round backups:
+local `live-devices.preround-20260920T100620Z.json` (`a20042ac…`),
+bench `data/devices.preround-20260920T100622Z.json` (`3f943682…`),
+local `live-applied-sys.preround-20260920T124833Zround3.txt`
+(`c4b7f3bf…`).
+
+**Deploy + arm:** binary sha256 `f09dbb852f7d` (rollback
+`openunifi.rollback-20260920T100709Z`); the bench start line carries
+`--allow-ssh-set-inform-push`; lane armed with
+`inform_url=http://10.10.10.10:8080/inform`.
+
+**Factory window:** POST
+`/api/v1/devices/aa:bb:cc:dd:ee:02/factory-reset` (colon-MAC) armed
+10:07:57Z → `kind=setdefault` delivered 12:07:58 local; record
+demoted to state 1, armed tasks discarded (the round-2 verdict).
+Factory announces every ~10 s from 12:09:11 (`factory=true`), zero
+informs — the §3 verdict live again: without an inform URL a factory
+device cannot reach the controller, and the discovery announce carries
+none.
+
+**Console path — two UX findings:** the demoted state-1 record still
+bore the MAC, so `GET /api/v1/pending` returned `{"pending":[]}` —
+ListPending skips record-bearing MACs, now observed twice. The
+operator clicked **Forget** in the console, the next announce promoted
+the MAC to a pending candidate (~10 s), then **Accept**. Through the
+window every console poll threw `devices: tbody is not defined` —
+the clients-expansion refactor had orphaned the LED-bar save wiring
+inside `updateOpenClients`, out of `tbody`'s scope, so the LED Save
+buttons were dead on the bench console. Fixed in `4208e8b` (the block
+re-homes into `renderDevices`); rides the next deploy.
+
+**The push + adoption chain (the round's proof):** Accept 12:13:55.856
+→ **`set-inform: pushed` 12:13:56.881**
+(`mac=aa:bb:cc:dd:ee:02 ip=10.10.10.20 outcome=pushed
+url=http://10.10.10.10:8080/inform`); the adopt API call returned 200 in
+1033 ms. First inform 12:13:56.886 — 5 ms behind the push log line,
+`prevState=1`, sealed on the factory default key, gcm=false: an
+inform-time adoption push with no admin adopt call and no operator
+keystroke → adoption setparam; full provisioning 12:14:11.951
+(system_cfg sha256 `ad41cdad…`, cfg_version `46733c22476f0d95`).
+Settled by ~12:15:36: state 3, `in_sync:true`, cfg echo == mint,
+`wlan_delivery_status:confirmed` (count 1) — click-to-adopted ≈100 s.
+Key rotation complete: the post-round record carries a fresh
+per-device key — the factory default key did not survive the adoption.
+
+**AP byte proof (operator key lane, commands redacted):** the
+setdefault wiped authorized_keys (the users-apply regenerates it
+empty — round-2 behavior), so the operator's ssh-copy-id reinstalled
+the key, this time from the workstation. `/tmp/system.cfg` captured
+from the workstation: 6659 bytes, sha256
+`ad41cdad4bd63e54…dec22c21ac9` == the pushed full-provisioning
+render — byte-identical. Side-finding: the applied system_cfg carries
+NO cfgversion row — the stamp rides the setparam envelope only; the
+device's reported cfgversion (== the mint `46733c22476f0d95`) proves
+application. The controller-owned ssh_sha512 cache re-minted with a
+fresh crypt salt — same underlying site default password
+(`ssh_password_configured=false` at startup; no `--ap-ssh-password`
+configured).
+
+**Gates + harness re-seed:** `live-devices.json` re-seeded from the
+post-round record (state 3, cfg `46733c22476f0d95`, rotated key;
+fixture sha `5d1548dc…`); `live-wireless.json` unchanged
+(`5620a15d…`); `live-applied-sys.txt` re-seeded from the round's own
+AP capture (`ad41cdad…`). Post-round, all three live gates had
+tripped on exactly one row — `users.1.password`, the re-adoption
+re-mint — against the stale baselines; the re-capture clears
+intent/eap/das-vs-applied, and `9a2baa7` adds `zzExemptSSHReMint`
+(the `zzExemptIsDefaultMigration` pattern), carried only at the das
+gate's archive comparison (`live-das-applied-sys.txt` `f60d458e…`
+predates the re-adoption; only a next DAS push round re-seeds it —
+its one filtered row is exactly the re-mint). Final, on the merged
+tree (`1d6b56a` record-absorption, that lane's in-flight follow-up
+work present): the full ZZ family green — intent steady state
+byte-identical (0 intended, 0 violations), eap candidate 14 intended
+all inside `aaa.*`, das candidate 37 intended all inside `aaa.*` and
+parse-identical to the das archive modulo the exempted row,
+blocked_sta byte-identical, radio intent one row `radio.2.channel
+0→36`, Wpa SKIP by design; full `go test ./internal/...` green.
+
+**Obligations:** closes the zero-SSH-keystroke adoption path — the
+console Accept now carries a factory device to adoption on its own;
+the §6.6 interactive recovery lane remains the fallback when the key
+lane is down. Recorded for the next deploy: the tbody fix (`4208e8b`)
+restores the LED Save wiring on the bench console; the pending-list
+skip (a demoted record needs a console Forget first) is a
+twice-observed UX candidate, no code change this round. Still open
+(carried): Interim-Update session proof, the client-dependent session
+halves, the classic-controller cmd row `type` capture, ledbar lamp
+eyes-on, the SSH password lane's automation-hostility, the discovery
+reply emitter.
 
 ## Release gate summary
 
