@@ -26,7 +26,6 @@ import (
 
 	"github.com/lucavb/open-unifi/internal/adminapi"
 	"github.com/lucavb/open-unifi/internal/metrics"
-	"github.com/lucavb/open-unifi/internal/server/adoption"
 	"github.com/lucavb/open-unifi/internal/store"
 	"github.com/lucavb/open-unifi/internal/wireless"
 )
@@ -103,6 +102,98 @@ func New(st store.DeviceStore, wirelessPath string, lg *slog.Logger) *App {
 // callers treat invalid input as reject/not-found, same as adminapi's own
 // 400 edge validation.
 
+// ---- admin-intent save skeleton -------------------------------------------
+//
+// Every admin-intent save — the admin verbs that change a device record —
+// runs THE SAME sequence (CONTEXT.md "Admin intent"): canonicalize the MAC,
+// validate and apply the change inside the device's RMW cycle, mint a fresh
+// cfgversion when the change is EFFECTIVE, project the read view, and map a
+// missing device to the canonical wrapped-404 error. saveIntent owns that
+// sequence; a verb decodes its admin intent (the REST body spelled as a
+// store change) and hands it over as two closures — no verb hand-rolls the
+// pipeline, so mint conditions and 404/409 mapping cannot drift apart.
+
+// saveMode selects the RMW cycle the skeleton runs for a verb.
+type saveMode int
+
+const (
+	// saveExisting is the plain device-record save: the record must
+	// already exist (store.UpdateExisting), so the change can never
+	// resurrect a deleted device.
+	saveExisting saveMode = iota
+	// savePending is the candidate promotion (AdoptPending): unknown MACs
+	// are seeded empty (store.Update) and the change decides from the
+	// pending map whether the promotion is legitimate.
+	savePending
+)
+
+// saveIntent is the admin-intent save skeleton.
+//
+//	mac     — the admin-supplied MAC spelling; both an unparseable
+//	          spelling and a missing record map to unknownDevice
+//	          (errors.Is(err, adminapi.ErrNotFound) ⇒ HTTP 404).
+//	change  — the verb's validate+apply step, run inside the store's
+//	          per-MAC RMW closure: it consults and mutates ONLY the
+//	          record handed to it, returns its ErrConflict/ErrNotFound
+//	          wrapped rejections verbatim (the abort persists nothing),
+//	          and reports whether the applied rows are EFFECTIVE —
+//	          i.e. they change rows the device gets provisioned from
+//	          (a save touching bookkeeping only passes false; a save
+//	          that changes nothing mints nothing).
+//	project — the read-model projection, run inside the same closure
+//	          AFTER the optional mint so a bumped cfgversion is echoed
+//	          in the same save; it runs on a record the store handed
+//	          the cycle as a detached deep clone, so retaining the
+//	          projection past the cycle aliases nothing.
+//
+// Errors other than store.ErrNotFound (unknown record) pass through
+// verbatim — verbs own their sentinel wrapping; only the missing-device
+// mapping is centralized.
+//
+// (A free function rather than an App method because the Go language
+// version pins methods' type parameters to go1.27.)
+func saveIntent[T any](a *App, mac string, mode saveMode, change func(d *store.Device) (bool, error), project func(d *store.Device) T) (T, error) {
+	var zero T
+	canon, err := store.CanonicalMAC(mac)
+	if err != nil {
+		return zero, unknownDevice(mac)
+	}
+	rmw := a.st.UpdateExisting
+	if mode == savePending {
+		rmw = a.st.Update
+	}
+	var out T
+	err = rmw(canon, func(d *store.Device) error {
+		effective, cerr := change(d)
+		if cerr != nil {
+			return cerr
+		}
+		if effective {
+			// The single delivery trigger of the admin save: the jar
+			// bumps device.cfgversion on operator config saves, so an
+			// EFFECTIVE change mints a fresh stamp here — the device's
+			// next inform still echoes the OLD applied stamp and the
+			// engine's default arm full-provisions the new rows. A
+			// save that changes nothing mints nothing (pinned by the
+			// drift/noop suites).
+			nv, merr := mintCfgVersion()
+			if merr != nil {
+				return merr
+			}
+			d.CfgVersion = nv
+		}
+		out = project(d)
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return zero, unknownDevice(canon)
+		}
+		return zero, err
+	}
+	return out, nil
+}
+
 // view maps a store record to the admin API read model. Actions is the
 // minimal supported set (delete) and is omitted only if empty.
 func (a *App) view(d store.Device) adminapi.DeviceView {
@@ -145,10 +236,10 @@ func (a *App) view(d store.Device) adminapi.DeviceView {
 // mirrors the engine's armedLifecycle emission precedence exactly, so
 // the view can never name a response the engine would not fire.
 func armedCommand(d store.Device) string {
-	if flagArmed(d.Extra, adoption.FlagSetdefaultArmed) {
+	if flagArmed(d.Extra, store.FlagSetdefaultArmed) {
 		return "factory-reset"
 	}
-	if flagArmed(d.Extra, adoption.FlagRebootOnConnect) {
+	if flagArmed(d.Extra, store.FlagRebootOnConnect) {
 		return "reboot"
 	}
 	if store.ArmedCmdTask(d) != nil {
@@ -254,113 +345,103 @@ func runtimeInSync(d store.Device, desired []adminapi.Wlan) *bool {
 	return &v
 }
 
+// PatchDevice applies the admin's device-name/site/knob rows as one
+// admin-intent save (see saveIntent): the fence validates every supplied
+// row, the RMW cycle applies them, and an EFFECTIVE change — one of the
+// provisioning-carried LED rows — mints a fresh cfgversion; name/site_id
+// are bookkeeping rows the device is never provisioned from, so they mint
+// nothing.
 func (a *App) PatchDevice(_ context.Context, mac string, patch adminapi.DevicePatch) (adminapi.DeviceView, error) {
-	canon, err := store.CanonicalMAC(mac)
+	rec, err := saveIntent(a, mac, saveExisting,
+		func(d *store.Device) (bool, error) {
+			effective := false
+			if patch.Name != nil {
+				// Same fence the wlan flows apply (CreateWlan): the handler
+				// 400s first, but every Backend caller is still fenced in.
+				if msg := adminapi.ValidateDeviceName(*patch.Name); msg != "" {
+					return false, fmt.Errorf("%w: %s", adminapi.ErrConflict, msg)
+				}
+				d.Name = *patch.Name
+			}
+			if patch.SiteID != nil {
+				// The site fence mirrors the name fence (route 400s
+				// first; the Backend is the fence every direct caller
+				// meets). "" is the explicit clear and stays legal
+				// exactly like an empty device name.
+				if *patch.SiteID != "" {
+					if msg := adminapi.ValidateSiteID(*patch.SiteID); msg != "" {
+						return false, fmt.Errorf("%w: %s", adminapi.ErrConflict, msg)
+					}
+				}
+				d.SiteID = *patch.SiteID
+			}
+			if patch.LEDOverride != nil {
+				// ValidateLEDOverride fence (same style as Name).
+				// "default" is the explicit clear: the record's
+				// canonical unset is "" (the jar's getString default
+				// IS "default", so absence and "default" mean the same
+				// wire value — §2 treats them alike).
+				if msg := adminapi.ValidateLEDOverride(*patch.LEDOverride); msg != "" {
+					return false, fmt.Errorf("%w: %s", adminapi.ErrConflict, msg)
+				}
+				next := ""
+				if *patch.LEDOverride != "default" {
+					next = *patch.LEDOverride
+				}
+				if next != d.LEDOverride {
+					effective = true
+				}
+				d.LEDOverride = next
+			}
+			if patch.LEDOverrideColorBrightness != nil {
+				// ValidateLEDOverrideColorBrightness fence (same fence
+				// style). 100 is the explicit clear: the record's
+				// canonical unset is nil, because the jar's getInt
+				// default IS 100 (config_String.txt:2627-2630) — a
+				// saved 100 and an absent knob render the same §12 row.
+				// Every other in-domain value, including 0, is the
+				// admin's explicit pick.
+				if msg := adminapi.ValidateLEDOverrideColorBrightness(*patch.LEDOverrideColorBrightness); msg != "" {
+					return false, fmt.Errorf("%w: %s", adminapi.ErrConflict, msg)
+				}
+				var next *int
+				if *patch.LEDOverrideColorBrightness != 100 {
+					v := *patch.LEDOverrideColorBrightness
+					next = &v
+				}
+				if !intPtrEq(next, d.LEDOverrideColorBrightness) {
+					effective = true
+				}
+				d.LEDOverrideColorBrightness = next
+			}
+			if patch.LEDOverrideColor != nil {
+				// No format fence for the color ON PURPOSE: the §12
+				// render owns the fallback (Color.decode — unparseable
+				// values land on #0000ff, config_String.txt:2669-2678);
+				// the jar accepts any string in this knob and so does
+				// the record. "" is the explicit clear (the jar's
+				// getString default is "#0000ff").
+				if *patch.LEDOverrideColor != d.LEDOverrideColor {
+					effective = true
+				}
+				d.LEDOverrideColor = *patch.LEDOverrideColor
+			}
+			return effective, nil
+		},
+		func(d *store.Device) store.Device {
+			// Detached snapshot for the returned view: scalars only —
+			// the inform passthrough (Extra), stats (LastUps) and key
+			// history (Authkeys) never belong on a device-row echo,
+			// and a save response must not leak the inform body it
+			// merely raced.
+			rec := *d
+			rec.LastUps = nil
+			rec.Extra = nil
+			rec.Authkeys = nil
+			return rec
+		})
 	if err != nil {
-		return adminapi.DeviceView{}, unknownDevice(mac)
-	}
-	var rec store.Device
-	err = a.st.UpdateExisting(canon, func(d *store.Device) error {
-		if patch.Name != nil {
-			// Same backstop the wlan flows apply (CreateWlan): the handler
-			// 400s first, but every Backend caller is still fenced in.
-			if msg := adminapi.ValidateDeviceName(*patch.Name); msg != "" {
-				return fmt.Errorf("%w: %s", adminapi.ErrConflict, msg)
-			}
-			d.Name = *patch.Name
-		}
-		if patch.SiteID != nil {
-			d.SiteID = *patch.SiteID
-		}
-		if patch.LEDOverride != nil {
-			// ValidateLEDOverride is enforced at the route; this is the
-			// backend-side backstop (same fence style as Name). "default"
-			// is the explicit clear: the record's canonical unset is ""
-			// (the jar's getString default IS "default", so absence and
-			// "default" mean the same wire value — §2 treats them alike).
-			if msg := adminapi.ValidateLEDOverride(*patch.LEDOverride); msg != "" {
-				return fmt.Errorf("%w: %s", adminapi.ErrConflict, msg)
-			}
-			next := ""
-			if *patch.LEDOverride != "default" {
-				next = *patch.LEDOverride
-			}
-			// Delivery trigger, putRadioIntent's idempotence discipline:
-			// the LED override only reaches the device inside a full
-			// provisioning's mgmt_cfg (BuildMgmtCfg's led_enabled row), so
-			// an EFFECTIVE change mints a fresh cfgversion here — the
-			// device's next inform still echoes the OLD applied stamp and
-			// the engine's default arm full-provisions. A save that changes
-			// nothing mints nothing.
-			if next != d.LEDOverride {
-				nv, merr := mintCfgVersion()
-				if merr != nil {
-					return merr
-				}
-				d.CfgVersion = nv
-			}
-			d.LEDOverride = next
-		}
-		if patch.LEDOverrideColorBrightness != nil {
-			// ValidateLEDOverrideColorBrightness is enforced at the
-			// route; this is the backend-side backstop (same fence
-			// style as Name/LEDOverride). 100 is the explicit clear:
-			// the record's canonical unset is nil, because the jar's
-			// getInt default IS 100 (config_String.txt:2627-2630) — a
-			// saved 100 and an absent knob render the same §12 row.
-			// Every other in-domain value, including 0, is the admin's
-			// explicit pick.
-			if msg := adminapi.ValidateLEDOverrideColorBrightness(*patch.LEDOverrideColorBrightness); msg != "" {
-				return fmt.Errorf("%w: %s", adminapi.ErrConflict, msg)
-			}
-			var next *int
-			if *patch.LEDOverrideColorBrightness != 100 {
-				v := *patch.LEDOverrideColorBrightness
-				next = &v
-			}
-			// Same delivery trigger as the LED override: the knob only
-			// reaches the device inside a full provisioning's
-			// system_cfg ledbar block (§12), so an EFFECTIVE change
-			// mints a fresh cfgversion here — the device's next inform
-			// still echoes the OLD applied stamp and the engine full-
-			// provisions. A save that changes nothing mints nothing.
-			if !intPtrEq(next, d.LEDOverrideColorBrightness) {
-				nv, merr := mintCfgVersion()
-				if merr != nil {
-					return merr
-				}
-				d.CfgVersion = nv
-			}
-			d.LEDOverrideColorBrightness = next
-		}
-		if patch.LEDOverrideColor != nil {
-			// No format backstop for the color ON PURPOSE: the §12
-			// render owns the fallback (Color.decode — unparseable
-			// values land on #0000ff, config_String.txt:2669-2678);
-			// the jar accepts any string in this knob and so does the
-			// record. "" is the explicit clear (the jar's getString
-			// default is "#0000ff"). Same delivery trigger as above:
-			// an effective change mints cfgversion.
-			if *patch.LEDOverrideColor != d.LEDOverrideColor {
-				nv, merr := mintCfgVersion()
-				if merr != nil {
-					return merr
-				}
-				d.CfgVersion = nv
-			}
-			d.LEDOverrideColor = *patch.LEDOverrideColor
-		}
-		rec = *d
-		rec.LastUps = nil
-		rec.Extra = nil
-		rec.Authkeys = nil
-		return nil
-	})
-	if errors.Is(err, store.ErrNotFound) {
-		return adminapi.DeviceView{}, unknownDevice(canon)
-	}
-	if err != nil {
-		return adminapi.DeviceView{}, fmt.Errorf("device store: %w", err)
+		return adminapi.DeviceView{}, err
 	}
 	return a.view(rec), nil
 }
@@ -550,68 +631,58 @@ func (a *App) ListDeviceClients(_ context.Context, mac string) ([]adminapi.Clien
 	return out, nil
 }
 
-// BlockClient adds one client MAC to the device's blocked-client set.
-// Idempotent: re-blocking returns the unchanged set, like the adopt route's
-// state-change semantics. The set is an admin-owned record row; the engine
-// delivers it inside full provisioning on the next inform via its
-// blocked_sta drift — no admin-time cfgversion mint (exactly the WLAN
-// envelope change machinery).
+// BlockClient adds one client MAC to the device's blocked-client set
+// (the store.BlockedStaExtraKey admin-owned Extra row). Idempotent:
+// re-blocking returns the unchanged set, like the adopt route's
+// state-change semantics. The set is delivered by the engine inside full
+// provisioning on the next inform via its blocked_sta drift — no
+// admin-time cfgversion mint (change reports never-effective, an
+// instance of the saveIntent contract).
 func (a *App) BlockClient(_ context.Context, mac, client string) (adminapi.BlockedClientsView, error) {
 	canon, cclient, perr := blockedPair(mac, client)
 	if perr != nil {
 		return adminapi.BlockedClientsView{}, perr
 	}
-	var view adminapi.BlockedClientsView
-	err := a.st.UpdateExisting(canon, func(d *store.Device) error {
-		if _, err := store.AddBlockedClient(d, cclient); err != nil {
-			return err
-		}
-		// Render INSIDE the closure: the clone is only authoritative within
-		// the RMW cycle, and nothing aliases the record out of it.
-		view = blockedClientsView(canon, store.BlockedClients(*d))
-		return nil
-	})
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return adminapi.BlockedClientsView{}, unknownDevice(canon)
-		}
-		return adminapi.BlockedClientsView{}, fmt.Errorf("device store: %w", err)
-	}
-	return view, nil
+	return saveIntent(a, canon, saveExisting,
+		func(d *store.Device) (bool, error) {
+			if _, err := store.AddBlockedClient(d, cclient); err != nil {
+				return false, err
+			}
+			return false, nil
+		},
+		// Render INSIDE the closure via the project step: the record the
+		// cycle hands over is detached for the whole cycle anyway, but
+		// the set view must reflect exactly the rows this save committed.
+		func(d *store.Device) adminapi.BlockedClientsView {
+			return blockedClientsView(canon, store.BlockedClients(*d))
+		})
 }
 
 // UnblockClient removes one client MAC from the device's blocked-client
 // set. A client that is not currently blocked is ErrNotFound (the route
-// maps it to 404, mirroring DeleteDevice/DeleteWlan semantics).
+// maps it to 404, mirroring DeleteDevice/DeleteWlan semantics). saveIntent
+// passes the not-blocked sentinel error through verbatim — it already
+// carries the canonical 404 shape — while a missing DEVICE record is
+// mapped centrally.
 func (a *App) UnblockClient(_ context.Context, mac, client string) (adminapi.BlockedClientsView, error) {
 	canon, cclient, perr := blockedPair(mac, client)
 	if perr != nil {
 		return adminapi.BlockedClientsView{}, perr
 	}
-	var view adminapi.BlockedClientsView
-	err := a.st.UpdateExisting(canon, func(d *store.Device) error {
-		removed, rerr := store.RemoveBlockedClient(d, cclient)
-		if rerr != nil {
-			return rerr
-		}
-		if !removed {
-			return fmt.Errorf("%w: client not blocked: %s", adminapi.ErrNotFound, store.ColonMAC(cclient))
-		}
-		view = blockedClientsView(canon, store.BlockedClients(*d))
-		return nil
-	})
-	if err != nil {
-		// The not-blocked abort already carries the canonical 404 shape;
-		// only store-level faults get wrapped opaque.
-		if errors.Is(err, adminapi.ErrNotFound) {
-			return adminapi.BlockedClientsView{}, err
-		}
-		if errors.Is(err, store.ErrNotFound) {
-			return adminapi.BlockedClientsView{}, unknownDevice(canon)
-		}
-		return adminapi.BlockedClientsView{}, fmt.Errorf("device store: %w", err)
-	}
-	return view, nil
+	return saveIntent(a, canon, saveExisting,
+		func(d *store.Device) (bool, error) {
+			removed, rerr := store.RemoveBlockedClient(d, cclient)
+			if rerr != nil {
+				return false, rerr
+			}
+			if !removed {
+				return false, fmt.Errorf("%w: client not blocked: %s", adminapi.ErrNotFound, store.ColonMAC(cclient))
+			}
+			return false, nil
+		},
+		func(d *store.Device) adminapi.BlockedClientsView {
+			return blockedClientsView(canon, store.BlockedClients(*d))
+		})
 }
 
 // ---- per-radio admin intent (admin-owned record state) ---------------------
@@ -694,7 +765,7 @@ func setRadioIntentExtra(d *store.Device, radio string, up adminapi.RadioIntentU
 	if d.Extra == nil {
 		d.Extra = store.JSONMap{}
 	}
-	cur, _ := d.Extra[wireless.RadioIntentExtraKey].(map[string]any)
+	cur, _ := d.Extra[store.RadioIntentExtraKey].(map[string]any)
 	next := make(map[string]any, len(cur)+1)
 	for k, v := range cur {
 		next[k] = v
@@ -716,9 +787,9 @@ func setRadioIntentExtra(d *store.Device, radio string, up adminapi.RadioIntentU
 		next[radio] = entry
 	}
 	if len(next) == 0 {
-		delete(d.Extra, wireless.RadioIntentExtraKey)
+		delete(d.Extra, store.RadioIntentExtraKey)
 	} else {
-		d.Extra[wireless.RadioIntentExtraKey] = next
+		d.Extra[store.RadioIntentExtraKey] = next
 	}
 }
 
@@ -794,68 +865,52 @@ func (a *App) ListDeviceRadios(_ context.Context, mac string) ([]adminapi.RadioV
 	return out, nil
 }
 
-// putRadioIntent is the shared PUT/DELETE core: validate against the
-// device-reported radio row, replace the radio's intent wholesale, and
-// bump the device's cfgversion ONLY on an effective change (idempotent
-// writes never bump) — all inside the store's per-MAC RMW cycle so a
-// concurrent inform cannot interleave.
-func (a *App) putRadioIntent(canon, radio string, up adminapi.RadioIntentUpsert) (adminapi.RadioView, error) {
-	var view adminapi.RadioView
-	err := a.st.UpdateExisting(canon, func(d *store.Device) error {
-		row, rerr := radioRowOf(d, radio)
-		if rerr != nil {
-			return rerr
-		}
-		if up.Channel != nil {
-			if verr := validateChannelIntent(row, *up.Channel); verr != nil {
-				return verr
+// putRadioIntent is the shared PUT/DELETE core: the admin intent (a
+// channel/txpower replacement for one radio row) is validated against the
+// device-reported radio_table row and applied as ONE admin-intent save
+// (see saveIntent) — replacing the radio's intent wholesale inside the RMW
+// cycle and bumping the device's cfgversion ONLY on an effective change
+// (idempotent writes never bump). Unknown radio names are ErrNotFound from
+// the change (HTTP 404 — the name is a device-reported key, not
+// admin-invented); band/bounds violations are ErrConflict (HTTP 409).
+func (a *App) putRadioIntent(mac, radio string, up adminapi.RadioIntentUpsert) (adminapi.RadioView, error) {
+	var row wireless.RadioRow
+	return saveIntent(a, mac, saveExisting,
+		func(d *store.Device) (bool, error) {
+			r, rerr := radioRowOf(d, radio)
+			if rerr != nil {
+				return false, rerr
 			}
-		}
-		if up.Txpower != nil {
-			if verr := validateTxpowerIntent(row, up.Txpower); verr != nil {
-				return verr
+			row = r
+			if up.Channel != nil {
+				if verr := validateChannelIntent(r, *up.Channel); verr != nil {
+					return false, verr
+				}
 			}
-		}
-		before := wireless.RadioIntents(*d)
-		setRadioIntentExtra(d, radio, up)
-		after := wireless.RadioIntents(*d)
-		view = radioView(row, after[row.Name])
-		if intentChanged(before, after) {
-			nv, merr := mintCfgVersion()
-			if merr != nil {
-				return merr
+			if up.Txpower != nil {
+				if verr := validateTxpowerIntent(r, up.Txpower); verr != nil {
+					return false, verr
+				}
 			}
-			d.CfgVersion = nv
-		}
-		return nil
-	})
-	if errors.Is(err, store.ErrNotFound) {
-		return adminapi.RadioView{}, unknownDevice(canon)
-	}
-	if err != nil {
-		return adminapi.RadioView{}, err
-	}
-	return view, nil
+			before := wireless.RadioIntents(*d)
+			setRadioIntentExtra(d, radio, up)
+			return intentChanged(before, wireless.RadioIntents(*d)), nil
+		},
+		func(d *store.Device) adminapi.RadioView {
+			return radioView(row, wireless.RadioIntents(*d)[row.Name])
+		})
 }
 
 // PutDeviceRadioIntent replaces the radio's admin intent wholesale and
 // bumps cfgversion on effective changes (see putRadioIntent).
 func (a *App) PutDeviceRadioIntent(_ context.Context, mac, radio string, up adminapi.RadioIntentUpsert) (adminapi.RadioView, error) {
-	canon, cerr := store.CanonicalMAC(mac)
-	if cerr != nil {
-		return adminapi.RadioView{}, fmt.Errorf("%w: %s (%v)", adminapi.ErrNotFound, mac, cerr)
-	}
-	return a.putRadioIntent(canon, radio, up)
+	return a.putRadioIntent(mac, radio, up)
 }
 
 // DeleteDeviceRadioIntent clears the radio's admin intent (wholesale
 // clear == a PUT with every field absent).
 func (a *App) DeleteDeviceRadioIntent(_ context.Context, mac, radio string) (adminapi.RadioView, error) {
-	canon, cerr := store.CanonicalMAC(mac)
-	if cerr != nil {
-		return adminapi.RadioView{}, fmt.Errorf("%w: %s (%v)", adminapi.ErrNotFound, mac, cerr)
-	}
-	return a.putRadioIntent(canon, radio, adminapi.RadioIntentUpsert{})
+	return a.putRadioIntent(mac, radio, adminapi.RadioIntentUpsert{})
 }
 
 // ListPending lists the console's pending rows from the pending map — the
@@ -917,43 +972,47 @@ func (a *App) ListPending(_ context.Context) []adminapi.PendingView {
 // other candidate shape (inform-noted, discovery note without a factory
 // mark) keeps the whitelist-arming-only semantics above.
 func (a *App) AdoptPending(ctx context.Context, mac string) (adminapi.DeviceView, error) {
-	mac, cerr := store.CanonicalMAC(mac)
-	if cerr != nil {
-		return adminapi.DeviceView{}, fmt.Errorf("%w: %s (%v)", adminapi.ErrNotFound, mac, cerr)
-	}
-
-	var rec store.Device
-	err := a.st.Update(mac, func(d *store.Device) error {
-		if d.State == 0 { // freshly seeded by the upsert: no device record yet
-			pend, perr := a.st.Pending()
-			if perr != nil {
-				return fmt.Errorf("device store: %w", perr)
+	rec, err := saveIntent(a, mac, savePending,
+		func(d *store.Device) (bool, error) {
+			// The RMW cycle seeds unknown MACs (savePending); a seeded
+			// record (State 0) is only promotable if the pending map has
+			// heard the candidate — the check and the write share THIS
+			// cycle, so a concurrent inform cannot interleave.
+			if d.State == 0 { // freshly seeded by the upsert: no device record yet
+				pend, perr := a.st.Pending()
+				if perr != nil {
+					return false, fmt.Errorf("device store: %w", perr)
+				}
+				if _, ok := pend[d.MAC]; !ok {
+					// Unknown AND never heard on discovery/inform: not-found.
+					return false, fmt.Errorf("%w: %s", adminapi.ErrNotFound, d.MAC)
+				}
+				d.State = store.StatePending
+				d.FirstSeen = time.Now().Unix()
+			} else if d.State != store.StatePending {
+				return false, fmt.Errorf("adopt: device %s is already in state %d", store.ColonMAC(d.MAC), d.State)
 			}
-			if _, ok := pend[mac]; !ok {
-				// Unknown AND never heard on discovery/inform: not-found.
-				return fmt.Errorf("%w: %s", adminapi.ErrNotFound, mac)
+			// Records in any non-PENDING state already returned above; only
+			// fresh candidates (pending map only) and PENDING records persist.
+			return false, nil
+		},
+		func(d *store.Device) store.Device {
+			// The promotion response echoes the whitelist shape (the
+			// record before any inform handshake key/heartbeat has
+			// landed): scalars only, no cfgversion yet.
+			return store.Device{
+				MAC: d.MAC, Name: d.Name, Model: d.Model, Firmware: d.Firmware,
+				IP: d.IP, State: d.State, LastSeen: d.LastSeen,
 			}
-			d.State = store.StatePending
-			d.FirstSeen = time.Now().Unix()
-		} else if d.State != store.StatePending {
-			return fmt.Errorf("adopt: device %s is already in state %d", store.ColonMAC(mac), d.State)
-		}
-		// Records in any non-PENDING state already returned above; only
-		// fresh candidates (pending map only) and PENDING records persist.
-		rec = store.Device{
-			MAC: d.MAC, Name: d.Name, Model: d.Model, Firmware: d.Firmware,
-			IP: d.IP, State: d.State, LastSeen: d.LastSeen,
-		}
-		return nil
-	})
+		})
 	if err != nil {
 		return adminapi.DeviceView{}, err
 	}
-	a.lg.Debug("device promoted to pending", "mac", store.ColonMAC(mac))
+	a.lg.Debug("device promoted to pending", "mac", store.ColonMAC(rec.MAC))
 	// The whitelist promotion is committed above; the push lane (when
 	// armed) fires once here. A push failure surfaces wrapped
 	// ErrSetInformPushFailed (HTTP 502) while the promotion stands.
-	if perr := a.pushSetInform(ctx, mac); perr != nil {
+	if perr := a.pushSetInform(ctx, rec.MAC); perr != nil {
 		return adminapi.DeviceView{}, perr
 	}
 	return a.view(rec), nil
@@ -968,7 +1027,7 @@ func (a *App) AdoptPending(ctx context.Context, mac string) (adminapi.DeviceView
 // record's state, per-device key and cfgversion are untouched at arming
 // time — the §6.2 mint-site list has no reboot entry.
 func (a *App) RebootDevice(_ context.Context, mac string) (adminapi.DeviceView, error) {
-	return a.armLifecycle(mac, adoption.FlagRebootOnConnect)
+	return a.armLifecycle(mac, store.FlagRebootOnConnect)
 }
 
 // FactoryResetDevice arms the factory reset: sets the admin-owned
@@ -977,75 +1036,65 @@ func (a *App) RebootDevice(_ context.Context, mac string) (adminapi.DeviceView, 
 // pending-candidate shape the existing default-key adoption path
 // re-adopts (the demotion happens at emission, not at arming).
 func (a *App) FactoryResetDevice(_ context.Context, mac string) (adminapi.DeviceView, error) {
-	return a.armLifecycle(mac, adoption.FlagSetdefaultArmed)
+	return a.armLifecycle(mac, store.FlagSetdefaultArmed)
 }
 
 // EnqueueDeviceCmd stores a §6.3 cmd task for the device
 // (docs/PROTOCOL-mgmt.md §6.3): the record gains the admin-owned
-// stored-task row (store.ArmCmdTask — at most one armed task, second
-// enqueue REPLACES), and the device's NEXT decoded inform answers
+// stored-task row (CmdTaskKey — at most one armed task, second enqueue
+// REPLACES), and the device's NEXT decoded inform answers
 // {"_type":"cmd", <stored task fields verbatim>} with the arming consumed
 // one-shot by the adoption engine. Arming touches nothing else on the
-// record — no §6.2 mint site exists for the replay. The cmd string is
-// validated at the admin API boundary (ValidateCmdString) and stored
-// verbatim; this Backend seam trusts the admin lane exactly like the
-// blocked-client row helpers. Unknown MACs map to the wrapped ErrNotFound
-// sentinel (HTTP 404).
+// record — no §6.2 mint site exists for the replay, so the save never
+// reports effective. The cmd string is fenced BY THE BACKEND (the same
+// shape the route 400s with): the admin lane is decoded, then the
+// skeleton's change step validates and applies the row. Unknown MACs map
+// to the wrapped ErrNotFound sentinel (HTTP 404).
 func (a *App) EnqueueDeviceCmd(_ context.Context, mac, cmd string) (adminapi.DeviceView, error) {
-	canon, cerr := store.CanonicalMAC(mac)
-	if cerr != nil {
-		return adminapi.DeviceView{}, fmt.Errorf("%w: %s (%v)", adminapi.ErrNotFound, mac, cerr)
-	}
-	if err := a.st.UpdateExisting(canon, func(d *store.Device) error {
-		store.ArmCmdTask(d, cmd)
-		return nil
-	}); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return adminapi.DeviceView{}, unknownDevice(canon)
-		}
-		return adminapi.DeviceView{}, fmt.Errorf("device store: %w", err)
-	}
-	// Post-cycle read for the returned view: a detached deep copy, so the
-	// response cannot alias store internals even transiently.
-	d, err := a.st.Get(canon)
+	rec, err := saveIntent(a, mac, saveExisting,
+		func(d *store.Device) (bool, error) {
+			if msg := adminapi.ValidateCmdString(cmd); msg != "" {
+				return false, fmt.Errorf("%w: %s", adminapi.ErrConflict, msg)
+			}
+			store.ArmCmdTask(d, cmd)
+			return false, nil
+		},
+		// The whole record snapshot: the view's PendingCommand reads the
+		// armed rows out of Extra, so this save echoes them (unlike the
+		// device-row save above, which never drops passthrough state).
+		func(d *store.Device) store.Device { return *d })
 	if err != nil {
-		return adminapi.DeviceView{}, fmt.Errorf("device store: %w", err)
+		return adminapi.DeviceView{}, err
 	}
-	return a.view(d), nil
+	return a.view(rec), nil
 }
 
 // armLifecycle is the shared arming path for the admin remote-lifecycle
-// commands: one admin-owned Extra flag set to true inside the store's
-// per-MAC RMW cycle (a concurrent inform for the same device cannot
-// interleave), everything else on the record untouched. The flag survives
-// controller restarts (it is a persisted record row) and, being
-// admin-owned, no inform body can introduce, forge or clear it — only
-// the adoption engine consumes it (one-shot, on the next inform).
+// commands: the admin-owned Extra flag (FlagRebootOnConnect /
+// FlagSetdefaultArmed) is set to true as ONE admin-intent save inside the
+// device's RMW cycle (a concurrent inform for the same device cannot
+// interleave), everything else on the record untouched — the save never
+// reports effective (no §6.2 mint site exists for either response). The
+// flag survives controller restarts (it is a persisted record row) and,
+// being admin-owned, no inform body can introduce, forge or clear it —
+// only the adoption engine consumes it (one-shot, on the next inform).
 // Unknown MACs map to the wrapped ErrNotFound sentinel (HTTP 404).
 func (a *App) armLifecycle(mac, flag string) (adminapi.DeviceView, error) {
-	canon, cerr := store.CanonicalMAC(mac)
-	if cerr != nil {
-		return adminapi.DeviceView{}, fmt.Errorf("%w: %s (%v)", adminapi.ErrNotFound, mac, cerr)
-	}
-	if err := a.st.UpdateExisting(canon, func(d *store.Device) error {
-		if d.Extra == nil {
-			d.Extra = store.JSONMap{}
-		}
-		d.Extra[flag] = true
-		return nil
-	}); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return adminapi.DeviceView{}, unknownDevice(canon)
-		}
-		return adminapi.DeviceView{}, fmt.Errorf("device store: %w", err)
-	}
-	// Post-cycle read for the returned view: a detached deep copy, so the
-	// response cannot alias store internals even transiently.
-	d, err := a.st.Get(canon)
+	rec, err := saveIntent(a, mac, saveExisting,
+		func(d *store.Device) (bool, error) {
+			if d.Extra == nil {
+				d.Extra = store.JSONMap{}
+			}
+			d.Extra[flag] = true
+			return false, nil
+		},
+		// The whole record snapshot: the view's PendingCommand reads the
+		// armed rows out of Extra, so an armed state is echoed immediately.
+		func(d *store.Device) store.Device { return *d })
 	if err != nil {
-		return adminapi.DeviceView{}, fmt.Errorf("device store: %w", err)
+		return adminapi.DeviceView{}, err
 	}
-	return a.view(d), nil
+	return a.view(rec), nil
 }
 
 // ---- wireless config file -------------------------------------------------

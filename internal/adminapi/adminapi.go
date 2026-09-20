@@ -2,9 +2,12 @@
 // JSON REST endpoints under /api/v1, the embedded single-page web console
 // at /, and a plain /healthz probe.
 //
-// adminapi defines the Backend CONTRACT in this file; the server/store lane
-// implements it at wire-up time. adminapi deliberately does NOT import
-// internal/store (that contract evolves in a parallel lane).
+// adminapi defines the Backend CONTRACT in this file; the app lane
+// (internal/app) implements it over internal/store. The one internal
+// import this package makes is store, and only for MAC identity:
+// store.CanonicalMAC is the repo's single normalizer, so the REST
+// boundary and every record write agree on canonical 12-hex (a private
+// copy here once silently split device identity between the two lanes).
 package adminapi
 
 import (

@@ -1640,3 +1640,124 @@ func TestRadioIntentListView(t *testing.T) {
 		t.Fatalf("rai0 view (intent over echo): %+v", rai0)
 	}
 }
+
+// ---- admin-intent fences at the Backend (the save skeleton's validate step) --
+//
+// The admin-intent save owns its domain fences — the essential
+// domain-pinning cases that used to hang only on the adminapi helpers are
+// pinned HERE at the Backend seam where the save skeleton validates. The
+// adminapi boundary battery stays untouched on that lane; these are the
+// Backend-surface equivalents (rejections are ErrConflict, sentinels are
+// ErrNotFound, rejected saves mutate nothing).
+
+// TestEnqueueCmdStringBackendFence pins the §6.3 cmd fence at the
+// Backend seam (mirror of the route's 400 battery, moved home with the
+// save skeleton): empty, oversized, control-character and padded cmd
+// strings are ErrConflict and arm nothing; a reject happens before the
+// row write, so the record stays exactly as it was.
+func TestEnqueueCmdStringBackendFence(t *testing.T) {
+	a, st, _ := testApp(t)
+	ctx := context.Background()
+	seeded := store.Device{
+		MAC: "f09fc2848f2a", State: store.StateAdopted, Model: "U7PG2",
+		CfgVersion: "aaaabbbbccccdddd", AppliedCfg: "aaaabbbbccccdddd",
+	}
+	if err := st.Put(seeded); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name, cmd string
+	}{
+		{"empty", ""},
+		{"oversized", strings.Repeat("x", 65)},
+		{"control char", "re\nstart"},
+		{"leading whitespace", " restart"},
+		{"trailing whitespace", "restart "},
+	} {
+		if _, err := a.EnqueueDeviceCmd(ctx, "f0:9f:c2:84:8f:2a", tc.cmd); !errors.Is(err, adminapi.ErrConflict) {
+			t.Fatalf("%s cmd %q: want ErrConflict, got %v", tc.name, tc.cmd, err)
+		}
+		if _, err := st.Get("f09fc2848f2a"); err != nil {
+			t.Fatalf("%s fence left no record: %v", tc.name, err)
+		}
+	}
+	// A rejected enqueue must not have armed the row (second dollar: the
+	// record carries no cmd task row).
+	d, err := st.Get("f09fc2848f2a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.ArmedCmdTask(d) != nil {
+		t.Fatalf("rejected enqueue armed a task row: %+v", d.Extra)
+	}
+	if d.State != store.StateAdopted || d.CfgVersion != seeded.CfgVersion {
+		t.Fatalf("rejected enqueue mutated the record: %+v", d)
+	}
+	// A valid cmd still arms verbatim (the fence rejects, never trims).
+	if _, err := a.EnqueueDeviceCmd(ctx, "f0:9f:c2:84:8f:2a", "restart"); err != nil {
+		t.Fatalf("valid enqueue: %v", err)
+	}
+	if d, err = st.Get("f09fc2848f2a"); err != nil || store.CmdTaskCmd(d) != "restart" {
+		t.Fatalf("valid enqueue row: %+v err=%v", d, err)
+	}
+}
+
+// TestPatchSiteIDBackendFence pins the site_id fence at the Backend seam
+// (mirror of the route's 400, via the same fence style as the name): an
+// out-of-domain site_id is ErrConflict and mutates nothing; "" stays the
+// documented explicit clear.
+func TestPatchSiteIDBackendFence(t *testing.T) {
+	a, _, _ := testApp(t)
+	ctx := context.Background()
+	if _, err := a.CreateDevice(ctx, adminapi.DeviceUpsert{MAC: "aabbccddeeff", SiteID: "default"}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := a.GetDevice(ctx, "aabbccddeeff")
+	if err != nil || before.SiteID != "default" {
+		t.Fatalf("pre-state: %+v err=%v", before, err)
+	}
+	if _, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{SiteID: deviceNamePtr("bad site!")}); !errors.Is(err, adminapi.ErrConflict) {
+		t.Fatalf("invalid site_id must be ErrConflict, got %v", err)
+	}
+	if dv, err := a.GetDevice(ctx, "aabbccddeeff"); err != nil || dv.SiteID != "default" {
+		t.Fatalf("rejected site patch mutated the record: %+v err=%v", dv, err)
+	}
+	// "" is the explicit clear and stays legal at the Backend.
+	if _, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{SiteID: deviceNamePtr("")}); err != nil {
+		t.Fatalf("explicit site clear must stay legal: %v", err)
+	}
+	if dv, err := a.GetDevice(ctx, "aabbccddeeff"); err != nil || dv.SiteID != "" {
+		t.Fatalf("site clear: %+v err=%v", dv, err)
+	}
+}
+
+// TestPatchBookkeepingRowsMintNothing pins the save skeleton's mint
+// condition end to end: name and site_id are bookkeeping rows the device
+// is never provisioned from — saving them effectively changes NO
+// provisioning input and therefore mints no cfgversion.
+func TestPatchBookkeepingRowsMintNothing(t *testing.T) {
+	a, st, _ := testApp(t)
+	ctx := context.Background()
+	if err := st.Put(store.Device{
+		MAC: "aabbccddeeff", Model: "U7PG2", State: store.StateAdopted,
+		CfgVersion: "aaaabbbbccccdddd", AppliedCfg: "aaaabbbbccccdddd",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{
+		Name: deviceNamePtr("renamed"), SiteID: deviceNamePtr("lab"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := st.Get("aabbccddeeff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Name != "renamed" || rec.SiteID != "lab" {
+		t.Fatalf("bookkeeping rows not saved: %+v", rec)
+	}
+	if rec.CfgVersion != "aaaabbbbccccdddd" {
+		t.Fatalf("bookkeeping-only save minted a cfgversion: %q", rec.CfgVersion)
+	}
+}

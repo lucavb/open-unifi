@@ -2,13 +2,14 @@ package adminapi
 
 import (
 	"crypto/subtle"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+
+	"github.com/lucavb/open-unifi/internal/store"
 )
 
 // ErrNotFound is the sentinel backend error mapped to HTTP 404. External
@@ -107,38 +108,18 @@ func requireToken(cfg Config, next http.HandlerFunc) http.HandlerFunc {
 // ---- MAC normalization ---------------------------------------------------
 
 // normalizeMAC accepts common MAC spellings — colon/hyphen/dot/space
-// separated, or bare "aabbccddeeff" — and returns canonical
-// lowercase colon-hex ("aa:bb:cc:dd:ee:ff"). Garbage is rejected.
+// separated, or bare "aabbccddeeff" — and returns the admin API's
+// lowercase colon-hex form. Garbage is rejected. The implementation is
+// store.CanonicalMAC, the repo's single normalizer for MAC identity
+// (a private copy here once meant the REST boundary and the store could
+// disagree on what spellings name the same device); ColonMAC renders the
+// canonical 12-hex into this lane's colon-hex wire spelling.
 func normalizeMAC(s string) (string, error) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return "", errors.New("empty")
-	}
-	// Strip common separators; dots come in pairs (aabb.ccdd.eeff).
-	replaced := strings.NewReplacer(":", "", "-", "", " ", "", ".", "").Replace(s)
-	if len(replaced) != 12 {
-		return "", fmt.Errorf("want 12 hex chars, got %d", len(replaced))
-	}
-	raw, err := hex.DecodeString(strings.ToLower(replaced))
+	canon, err := store.CanonicalMAC(s)
 	if err != nil {
-		return "", errors.New("not hexadecimal")
+		return "", err
 	}
-	const nibble = 2 // hex chars per byte: shapes the colon-hex output loop
-	out := make([]byte, 0, len(raw)*3-nibble)
-	for i, b := range raw {
-		if i > 0 {
-			out = append(out, ':')
-		}
-		out = append(out, hexDigit(b>>4), hexDigit(b&0x0f))
-	}
-	return string(out), nil
-}
-
-func hexDigit(v byte) byte {
-	if v < 10 {
-		return '0' + v
-	}
-	return 'a' + v - 10
+	return store.ColonMAC(canon), nil
 }
 
 // ---- wireless config validation -----------------------------------------
