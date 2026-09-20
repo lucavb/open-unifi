@@ -998,6 +998,158 @@ Interim-Update session proof (needs a live RADIUS acct daemon),
 console round-trip, sessions `sta_table` pin, tasks
 classic-controller capture.
 
+### 2026-09-20 live gap-closure round 2 — the no-RADIUS obligations: tasks cmd, console round-trip, radio §3.2 arm, ledbar, sessions, destructive tail (no deploy — binary `3c117b06c5a2…` unchanged)
+
+**Scope:** live evidence for every gap-closure obligation that needs
+no RADIUS daemon, on bench AP-1 (`aabbccddee02`, U7PG2, 6.8.2.15592),
+08:57–11:16 CEST, same binary as the morning DAS/DAD round (no
+deploy). Pre-round backups `data/devices.json.bak-20260920T0657Z`
+(`a7dfb41c…`) + `data/wireless.json.bak-20260920T0657Z`
+(`5620a15d…`); the wireless envelope stayed `5620a15d…` the whole
+round.
+
+**Tasks §6.3 cmd lane:** three enqueues (spectrum-scan,
+clear-all-dpi-counters, spectrum-scan) all 200 with
+`pending_command:"cmd"`; exactly ONE fire — 08:57:55 `armed cmd task
+cmd=spectrum-scan` → `kind=cmd` gcm=true — the second enqueue
+REPLACED the first (no earlier cmd ever fired), and the fire minted
+NOTHING (connected noops with cfg echo `f9ea3a736d628506`
+unchanged). Accepted bounds live-proven: `""` → 400 `cmd is
+required`, 65 runes → 400 `cmd must be at most 64 characters`,
+edge-whitespace → 400 `cmd must not begin or end with whitespace`
+(`ValidateCmdString` — deliberately no whitelist). Stored row shape
+`{cmd, mac}` only; the classic-controller row `type` value remains a
+capture obligation.
+
+**Console round-trip (acct):** the console HTML carries the full
+accounting surface (5× `accounting_enabled`, 6× `acct_servers`, 5×
+`interim_update_enabled` bindings); envelope GET (199 bytes) → PUT
+back byte-verbatim → 200 `wireless config replaced wlans=1`, no
+mint; `wireless.json` sha `5620a15d…` unchanged and the envelope
+re-GET byte-identical — the round-trip is lossless.
+
+**§3.2 radio intent arm (txpower):** PUT `{"txpower":18}` → mint
+`083860ed2cef6d56`, drift settle ~17 s; AP rows `radio.2.txpower=18`
+with `txpower_mode=auto` UNMINTED (observation mints no admin
+semantics — the §9 verdict, now live), sha `ee745fdd…`. Adversarial
+stale-echo: PUT `{"channel":36,"txpower":18}` 09:02:34.116 with the
+window capture 09:02:34.122 showing intent `channel:"36"` against
+`echo_channel:"0"` → settle `af955d9810e3f006`, AP rows
+`radio.2.channel=36`, sha `48c6482b…` — the renderer keys on the
+intent layer, not the stale echo (live precedence proof). Restore
+`{"channel":0,"txpower":"auto"}` → `c09f85e474c5c584`; DELETE the
+intent layer → one more mint cycle (wholesale-replace doctrine, even
+though render-from-echo is byte-identical) → settle
+`b43ec476e200ee1a`; AP back to the `c4b7f3bf6f8e…641503c` baseline,
+radios view pure echo. Observation: the radio_table echo rows did
+NOT flip while the 36/18 rows ran (echo stayed `0`/`auto`) — the
+echo is not per-push channel telemetry; drift settle keys on
+cfgversion.
+
+**Ledbar overrides (§12 row 1007):** PATCH red@50 % → settle
+`98dcd2817a0068bf` (09:07:41); AP rows `status=enabled`,
+`persistent=true`, `brightness=127` ((255·50)/100 truncated),
+`active=3`, `color.1.color=3`, `r=255 g=0 b=0`, sha `9c0a96d5…`.
+PATCH `off` → settle `f2bf17a982205040` (09:08:51); AP rows
+`status=disabled` + `persistent=true` only (ROWCOUNT 2), sha
+`a3adb25d…`. Revert (`default`/100/`""`) → view omits every LED
+knob, settle `6ed64ead42dd467c`, AP rows back to the enabled/255/blue
+baseline, sha `c4b7f3bf…` — the byte path closed end-to-end;
+lamp-level eyes-on deferred (Tuesday).
+
+**Sessions empty-table:** `GET /api/v1/devices/{mac}/clients` →
+`{"clients":[]}` stable through every full inform of the round, no
+decode errors — empty-table semantics live. The client-dependent
+halves (wire key, the §6.2(e) trigger, retention) still need a real
+client.
+
+**Destructive tail — task fate across reboot, then across factory
+reset:** ENQ `clear-all-dpi-counters` + POST `/reboot` → `armed
+reboot` 09:58:09 → `kind=reboot` → device marked lost 09:59:28 →
+first return inform 10:00:12.901 (announce `factory=false`, uptime
+39): `armed cmd task cmd=clear-all-dpi-counters` → `kind=cmd`
+gcm=true on the RETAINED per-device key — the task SURVIVES the
+reboot branch; connected noops on `6ed64ead42dd467c` (cfg echo
+retained across the raw reboot — persistence, no re-provisioning);
+`cmd_task` row count 0 after the fire. Then ENQ `spectrum-scan` +
+POST `/factory-reset` 10:07:45 → `armed setdefault (factory reset)`
+10:07:58 → `kind=setdefault`, record demoted (state 1) — the task is
+DISCARDED at the decision (the setdefault branch outranks and
+deletes): zero `armed cmd task` lines ever after, `cmd_task` refs 0
+in the record. The AP factory-reset (~10:08:31 boot), announcing
+`factory=true` every ~10 s with ZERO informs 10:08–10:23 — without
+an inform URL the device cannot reach the controller, and the
+discovery announce carries none (the §3 verdict, live). The demoted
+record did NOT appear in `GET /api/v1/pending` (`{"pending":[]}`) —
+a factory-reset known device flows through record demotion +
+inform-time adoption, not the pending-candidate lane.
+
+**Recovery (approved default-password SSH lane):** the reset wiped
+authorized_keys, so the §6.6 lane ran from the workstation:
+`mca-cli-op set-inform http://10.10.10.10:8080/inform` (ubnt/ubnt) →
+factory inform 10:23:02.474 (flags `0x0003`) → **adoption push from
+the demoted pending record** (`prevState=1`, factory-default-key
+sealed, gcm=false — no admin adopt call) → re-keyed inform
+10:23:04.986 (flags `0x000b`, gcm=true) → no-baseline self-heal mint
+→ full inform 10:23:20.271: render diagnostic sha `c4b7f3bf…` —
+byte-identical to the pre-round applied baseline — full
+provisioning (ours `7def53c29e16e7a3` vs device echo
+`9038e8d23ee7987e`, gcm=true) → **settle on the first attempt**
+(connected noops on `7def53c29e16e7a3` by 10:23:55) → poller 1→2→3.
+Key rotation complete (fresh per-device key ≠ pre-reset).
+Persistence re-proof on the recovered device: POST `/reboot`
+11:13:25 → return inform 11:15:33 on the RETAINED fresh key, cfg
+echo `7def53c29e16e7a3` intact (boot-race grace: `applied WLANs not
+running, miss 1 of 2` on the sparse first inform, both up on the
+next), no re-provisioning — state 3 by 11:15:43.
+
+**Side findings:** (1) post-recovery the SSH lane is dead on the
+device: authorized_keys regenerated empty (the documented users-apply
+pattern), and the ubnt/ubnt password lane now HANGS — banner and
+prompt arrive, then no reject, no session, no eof (three attempts,
+25/45/90 s), and the wedge SURVIVES the 11:13 reboot, so it is not a
+transient. The §6.6 recovery apply kept the password lane working, so
+this is new. Direct AP-side reads (`mgmt.is_default`,
+`mgmt.cfgversion`, `mgmt.use_aes_gcm`, `/tmp/system.cfg` sha) are
+blocked on the recovered device; the controller-side chain
+substitutes for this record: the render diagnostic sha equals the
+morning's AP-read baseline `c4b7f3bf…`, the device's own mint echo
+confirms the applied cfgversion, `in_sync:true`, `wlan_delivery
+confirmed`. Diagnosis queued for Tuesday. (2) poller state dips to 2
+exactly inside drift windows (mid-settle 09:07:28 / 09:08:43 /
+09:57:13 and the 10:23:13 post-re-key snapshot), returning to 3 at
+settle, with informs connected noops throughout — the dip is the
+drift state, not a link loss. (3) the discovery reply remains a
+documented TODO (PROTOCOL.md §4 — listen-only today); the factory
+window is live-consistent with the §3 verdict: a reply would only
+make the device visible — the inform URL still rides the SSH
+set-inform channel.
+
+**Gates + harness re-seed:** `live-devices.json` re-seeded from the
+post-round record (state 3, cfg `7def53c29e16e7a3`, rotated key;
+fixture sha `a20042ac…`), prior fixture archived as
+`live-devices.preround-20260920-round2.json` (`082fd789…`);
+`live-wireless.json` unchanged (`5620a15d…`); `live-applied-sys.txt`
+unchanged (`c4b7f3bf…` — equal to the recovery render diagnostic, so
+no re-capture). All ZZ gates green on the churned record (11 PASS +
+Wpa SKIP by design — the churned record renders the applied bytes
+byte-exact at `TestZZLiveIntentVsApplied`); `go vet` clean; gofmt
+clean on repo code; full `go test ./...` green.
+
+**Obligations:** closed this round — console round-trip (lossless,
+no mint); tasks cmd lane (one-fire replay, second-enqueue replaces,
+bounds, no whitelist); task fate across reboot (retained) and across
+factory reset (discarded at the setdefault decision); §3.2 txpower
+arm, `txpower_mode` never minted, adversarial stale-echo precedence,
+DELETE clears; the ledbar override byte path; sessions empty-table
++ API listing; factory recovery with settle on the first attempt,
+key rotation, and persistence re-proven on the recovered device.
+Still open: Interim-Update session proof (live RADIUS acct daemon),
+client-dependent session halves (wire key, §6.2(e) trigger,
+retention, association), the classic-controller cmd row `type`
+capture, ledbar lamp eyes-on, the sshd password-wedge diagnosis, and
+the discovery reply emitter (documented TODO, unscheduled).
+
 ## Release gate summary
 
 | Gate | Result |
