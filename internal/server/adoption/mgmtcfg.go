@@ -55,7 +55,7 @@ func (e *Engine) BuildMgmtCfg(d store.Device, usedKey string) string {
 	// skips the row on null). Devices keep pointing wherever they already
 	// point until an admin overrides.
 	if e.controllerURL != "" && host != "" {
-		line("inform_url", "http://"+host+":"+e.informURLPort()+"/inform")
+		line("inform_url", "http://"+host+":"+informURLPortFor(e.controllerURL, e.informListenAddr)+"/inform")
 	}
 	line("use_aes_gcm", "true")
 	line("report_crash", "true")
@@ -126,17 +126,35 @@ func (e *Engine) advertHost(d store.Device) string {
 	return d.IP
 }
 
-// informURLPort is the port embedded into the inform_url line: the
-// ControllerURL's explicit port, else the configured listen port, else the
-// classic 8080.
-func (e *Engine) informURLPort() string {
-	if u, err := url.Parse(e.controllerURL); err == nil && u != nil && u.Port() != "" {
+// informURLPortFor is the port chain shared by the mgmt_cfg inform_url
+// row and the controller-side SSH set-inform push lane's URL: the
+// ControllerURL's explicit port, else the configured inform listen port,
+// else the classic 8080.
+func informURLPortFor(controllerURL, informListenAddr string) string {
+	if u, err := url.Parse(controllerURL); err == nil && u != nil && u.Port() != "" {
 		return u.Port()
 	}
-	if _, port, err := net.SplitHostPort(strings.TrimSpace(e.informListenAddr)); err == nil && port != "" {
+	if _, port, err := net.SplitHostPort(strings.TrimSpace(informListenAddr)); err == nil && port != "" {
 		return port
 	}
 	return defaultInformPort
+}
+
+// InformURL derives the inform URL the controller hands a device over the
+// SSH set-inform push lane (docs/PROTOCOL-mgmt.md §7): the controller
+// URL's host plus the shared port chain, always http and always the
+// /inform path — exactly the URL the mgmt_cfg inform_url row carries for
+// a configured controller URL (the row ignores the URL's scheme and path
+// the same way). Unlike the row's advertHost chain there is no device
+// fallback here — a push target is a pending candidate with no device
+// record — so an empty or hostless controller URL yields "" and the lane
+// must refuse to fire.
+func InformURL(controllerURL, informListenAddr string) string {
+	host := addrHost(controllerURL)
+	if host == "" {
+		return ""
+	}
+	return "http://" + host + ":" + informURLPortFor(controllerURL, informListenAddr) + "/inform"
 }
 
 // mgmtPort is the HTTPS manage-port embedded into mgmt_url. The classic
