@@ -85,6 +85,18 @@ _Avoid_: device attributes.
 (system_cfg_extra_lines, mgmt_dev, anonymous ids). A device can neither
 write nor introduce them.
 
+**Record absorption**: the single merge that folds a decoded inform body
+into a device record under the trust policy — the only way device data
+enters the record.
+_Avoid_: absorb inform, device merge, field sync.
+
+### Admin surface
+
+**Admin intent**: an admin's desired change to a device record — one save
+that validates the change, applies it inside the device's RMW cycle, mints
+cfgversion on effective change, and projects the read view.
+_Avoid_: patch (that is the REST request shape), mutation, device update.
+
 ### Decision modules (the inform path)
 
 **Adoption engine**: the single decider for every decoded inform — adoption,
@@ -107,6 +119,11 @@ _Avoid_: builder, emitter.
 
 **Site facts**: the controller-level inputs a render needs: controller URL,
 regulatory country code, AP SSH password, and the current WLANs.
+
+**Provisioning plan**: the single value computed from a device and the
+wireless envelope that carries the drift hash, the vap placements, and the
+wireless rows for system_cfg together.
+_Avoid_: wlan plan, envelope hash, render plan.
 
 ## Commits
 
