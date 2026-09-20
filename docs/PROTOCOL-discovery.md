@@ -297,6 +297,52 @@ devices).
   door with "invoke sshd" (`02 0A 00 00`, from the base O0oO method — legacy path,
   kept for AirOS/mFi compat).
 
+### 3.5 Device-side reply disposition — the adoption premise, settled (2026-09-20)
+
+Open question (the GUI-adoption premise): does a U7PG2 on fw 6.8.2.15592 act on a
+cmd-9 reply by informing the replying controller? Answer, from the AP's own
+`/usr/bin/mcad` (Ghidra program `u7pg2-mcad`; evidence plated at
+`mcad_discovery_udp_recv`, 0x00421198) plus the live Sep-16 bench capture — **no,
+on three independent grounds**:
+
+1. **The reply is undeliverable.** The v2 beacon goes out from an EPHEMERAL source
+   port on a socket closed immediately after `sendto`
+   (`mcad_discovery_send_packet` 0x0041fd6c: socket → bind(iface) → sendto →
+   close, per-interface loop). Live capture `capture-adoption-fid57-20260916.pcap`
+   (bench vmbr0, no filter): `10.10.10.20:50791/51280/49987/44806/46459/39791 →
+   255.255.255.255:10001`, a fresh port every 10 s (plus the IPv6 twin
+   `fe80::feec:…:ephemeral → ff02::1:10001`). The reply targets the beacon's
+   source address:port (jar reply path, PROTOCOL.md §4) — a socket already
+   closed. The cmd-10 "invoke sshd" poke to the same address is equally dead on
+   this firmware.
+2. **Even if a v2 packet reaches the persistent `0.0.0.0:10001` socket, cmd 9 is
+   never processed.** The socket pair is created and registered by
+   `mcad_discovery_establish` (0x00411164; sockets via 0x004200dc; event callback
+   thunk 0x00411ab4, arg = `mgmt.discovery.status`, default false). The handler
+   `mcad_discovery_udp_recv` (0x00421198) drops ALL v2 packets while
+   `/proc/ubnthal/status/IsDefault` (factory state) or `/var/run/system.selfrun`
+   is set, skips packets sourced from port 10001, and its only success path
+   records cmd-6 peer beacons (TLV 1 mac, TLV 2 ip, TLV 18/19 seq/sender) into
+   `/var/run/mcad.discovered/<mac>` — the mesh-peer cache consumed by
+   `mcad_mesh_periodic_update` (0x0040b8c0), which fires `syswrapper ssh-adopt`
+   only on a mesh-downlink serial match. No branch reads cmd 9.
+3. **No UDP path can set the inform URL.** The only writers of
+   `mgmt.servers.1.url` / managed state — `reporter_save_config` (0x00412364)
+   and `set-managed` (0x00414274) — are called exclusively from
+   `mcad_reporter_handle_response_json` (0x00414acc), the inform-response chain
+   (docs/AP-FIRMWARE-APPLY-PATH.md §2/§6.5). The v1 lane
+   (`mcad_discovery_v1_responder` 0x00421054, gated by `mgmt.discovery.status`)
+   is a pure outbound responder to discovery-tool requests.
+
+⇒ The reply emitter (PROTOCOL.md:199 TODO) is protocol-completeness only — it can
+never cause an inform from this AP. The ONLY lane that delivers an inform URL on
+this firmware is the SSH set-inform channel (docs/PROTOCOL-mgmt.md §7), exactly as
+§3 concluded. Adoption UX (the console "accept" action) must therefore drive a
+controller-side SSH set-inform push. Consistency note: the 2026-09-20 round-2
+recovery proved the automated SSH lane works against factory sshd state (the
+automation-hostility finding applies to the applied config only) — and the
+adoption case IS the factory case.
+
 ## 4. UNRESOLVED / explicitly searched & not found
 
 - TLV 16 fingerprint SHA-256 algorithm (which two strings are hashed) — only
@@ -306,7 +352,10 @@ devices).
   `board.subtype` (read from controller build info file); tests would need one
   real reply capture.
 - What `TLV 17/4/9/…` map to on the device side (the code only writes, device
-  firmware implements them).
+  firmware implements them) — partially resolved 2026-09-20 (§3.5): the U7PG2 mcad
+  v2 receive path consumes only cmd-6 peer beacons (TLV 1 mac / TLV 2 ip /
+  TLV 18 seq / TLV 19 sender-mac echo) into its mesh-peer cache; cmd 9 has NO
+  device-side consumer on fw 6.8.2.15592.
 - Whether `o\u200d\u30000080` (-128 beacon-ack) exists in the wild: parse accepts
   it like 6 but no special handling.
 - `new`/`_new` "${super}" owner for the *challenge* flow on the controller side is

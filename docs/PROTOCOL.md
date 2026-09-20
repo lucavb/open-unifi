@@ -197,7 +197,13 @@ tmpwork/javap/regen/O0oO_discovery_redump.txt:1462-1564; site-local check
 `Ó00000(SocketAddress)`: tmpwork/javap/regen/O0oO_discovery_redump.txt:1232-1252;
 full reply layout in docs/PROTOCOL-discovery.md §2.3/§2.4).
 "cmd-8 ignored" was an open-unifi limitation (announce-only listener); replying is
-still TODO in open-unifi.
+still TODO in open-unifi — but (2026-09-20, device-side mcad RE, PROTOCOL-discovery.md
+§3.5) a reply can NEVER deliver an inform URL on U7PG2 fw 6.8.2.15592: the beacon
+leaves from an ephemeral port on an immediately-closed socket (a reply to the beacon's
+source address:port is undeliverable), and mcad has no cmd-9 consumer at all (it drops
+every v2 discovery packet while in factory state). The reply emitter stays on the list
+for protocol completeness only; the adoption lane is the SSH set-inform channel
+(docs/PROTOCOL-mgmt.md §7), per line 225 below.
 "invoke sshd" hint sent BY CONTROLLER to device: bytes `02 0A 00 00`.
 Controller announce response packet: ver/cmd built from `oooO(9, 2)` … important TLVs:
 
