@@ -3,14 +3,17 @@ package server
 // zz_live_candidate_scratch_test.go — live-round successive-push candidate
 // gates for the 2026-09-19 full-chain validation round (the nine commits
 // after 34082cd0, the last device-verified round): blocked_sta delivery, the
-// per-radio channel intent, and the WPA-EAP envelope. Every gate loads
+// per-radio channel intent, and the WPA-EAP envelope; and for the
+// 2026-09-20 DAS/DAD round: the standing full-accounting candidate
+// (auth + acct + interim + das). Every gate loads
 // the CURRENT live fixtures (live-devices.json + live-wireless.json) and
 // parse-diffs its candidate against the DEVICE-VERIFIED applied bytes
-// (live-applied-sys.txt, sha256 3da7ce3e… — seeded by the 2026-09-19 A2
-// reboot round), because the live question is exactly "which on-device
-// plugins would this push restart". Gates skip when the harness is
-// absent (it lives only on this workstation under
-// tmpwork/harness-20260917/, which is gitignored).
+// (live-applied-sys.txt, sha256 c4b7f3bf… — re-seeded by the 2026-09-20
+// DAS/DAD round; that round's das-state push is archived row-for-row in
+// live-das-applied-sys.txt, sha256 f60d458e…), because the live question
+// is exactly "which on-device plugins would this push restart". Gates
+// skip when the harness is absent (it lives only on this workstation
+// under tmpwork/harness-20260917/, which is gitignored).
 //
 // Gate discipline (WLAN-ACCEPTANCE-6.8.2.15592.md): zero violations — no
 // unmanaged row may differ — and the intended deltas must stay inside the
@@ -36,7 +39,11 @@ package server
 // zzExemptIsDefaultMigration filter: the live applied bytes were captured
 // POST-fix, so a renderer that ever emits mgmt.is_default again must
 // FAIL here (the fw 6.8.2 boot path would factory-reset the WLAN text on
-// the next AP reboot — see the zzZZAllowPrefix comment).
+// the next AP reboot — see the zzZZAllowPrefix comment). Since the
+// 2026-09-20 re-seed they also do NOT apply zzExemptLedBarMigration: the
+// live applied capture is POST-ledbar, so a ledbar.* drift must FAIL here
+// too (the filter stays only at the synthetic-baseline gates, whose
+// pinned night reference and factory capture predate the lane).
 
 import (
 	"crypto/sha256"
@@ -121,7 +128,6 @@ func TestZZLiveBlockedStaRenderUnchanged(t *testing.T) {
 	s := New(Config{WirelessSource: func() []Wlan { return env }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, rec)
 	intended, violations := zzRunGate(t, "live-blocked-candidate vs DEVICE-VERIFIED APPLIED bytes (must be byte-identical)", appliedRaw, sys, zzManagedAllow)
-	violations = zzExemptLedBarMigration(violations)
 	if len(violations) > 0 {
 		t.Fatalf("minimal-diff invariant broken for the blocked_sta candidate: %d unmanaged row(s) differ — ABORT the push: %v", len(violations), violations)
 	}
@@ -155,7 +161,6 @@ func TestZZLiveRadioIntentCandidateVsApplied(t *testing.T) {
 	fmt.Printf("[live-radio-intent-candidate] render sha256=%s\n",
 		func() string { sum := sha256.Sum256([]byte(sys)); return hex.EncodeToString(sum[:]) }())
 	intended, violations := zzRunGate(t, "live-radio-intent-candidate vs DEVICE-VERIFIED APPLIED bytes", appliedRaw, sys, zzManagedAllow)
-	violations = zzExemptLedBarMigration(violations)
 	if len(violations) > 0 {
 		t.Fatalf("minimal-diff invariant broken for the radio-intent candidate: %d unmanaged row(s) differ — ABORT the push: %v", len(violations), violations)
 	}
@@ -207,7 +212,6 @@ func TestZZLiveEapCandidateVsApplied(t *testing.T) {
 	fmt.Printf("[live-eap-candidate] render sha256=%s\n",
 		func() string { sum := sha256.Sum256([]byte(sys)); return hex.EncodeToString(sum[:]) }())
 	intended, violations := zzRunGate(t, "live-eap-candidate vs DEVICE-VERIFIED APPLIED bytes", appliedRaw, sys, zzManagedAllow)
-	violations = zzExemptLedBarMigration(violations)
 	if len(violations) > 0 {
 		t.Fatalf("minimal-diff invariant broken for the wpa-eap candidate: %d unmanaged row(s) differ — ABORT the push: %v", len(violations), violations)
 	}
@@ -246,4 +250,141 @@ func TestZZLiveEapCandidateVsApplied(t *testing.T) {
 		t.Fatalf("wpa-eap candidate changed %d wireless.* row(s) — authmode must stay 1 across the security flip; got %v", wirelessRows, intended)
 	}
 	fmt.Printf("[live-eap-candidate] %d intended deltas, all inside aaa.* (restart set = {aaa}; {wireless, aaa} pre-cleared shape) — PUSH-PRE-CLEARED\n", len(intended))
+}
+
+// zzLiveDasSecret is the test-only RADIUS shared secret for the 2026-09-20
+// DAS/DAD live round (synthetic bench material, not a site secret; the
+// bench host runs no RADIUS daemon — the round validated the envelope
+// shape, the {aaa} restart set, and the das/dad byte shape on the wire,
+// not client accounting). The same constant was sent by the live PUT, so
+// the gated candidate and the device-verified das-state capture
+// (live-das-applied-sys.txt, sha256 f60d458e…) are the same document.
+// Unlike the EAP gate's mutation the passphrase is KEPT: the live push
+// preserved it, and the applied bytes pin the psk row at the real value
+// (the jar's "letmeinnow" default appears only for an empty passphrase).
+const zzLiveDasSecret = "openunifi-fake-radius-20260920"
+
+// TestZZLiveDasCandidateVsApplied — the standing full-accounting push gate
+// (2026-09-20 DAS/DAD round): the live envelope re-secured to wpa-eap
+// with the complete profile — auth + acct servers, interim_update, and
+// radius_das_enabled — rendered and checked two ways:
+//
+//  1. against the DEVICE-VERIFIED das-state capture (live-das-applied-sys.txt,
+//     the AP's /tmp/system.cfg during the accepted push, sha256 f60d458e…):
+//     the render must reproduce it exactly — parse-level zero-diff — and
+//     must preserve the jar's duplicate aaa.<n>.radius.dad.status row in
+//     the raw emission (the once-per-render dad block re-emits dad.status
+//     inside the das block; a parse-diff collapses it, so the raw counts
+//     are asserted: twice under aaa.1, once under aaa.2).
+//  2. against the wpa-p applied baseline: zero violations and every
+//     intended delta inside {wireless, aaa} — the {aaa} restart set the
+//     round evidenced live (3 offers, echo caught ≤ 15 s, settle
+//     confirmed, no other plugin moved, accounting-off revert clean).
+//
+// The live round reverts the envelope to the wpa-p baseline afterwards,
+// so this stays a standing shape gate; it skips when the envelope is
+// already in the das shape or when the das capture is absent (the
+// harness lives only on this workstation).
+func TestZZLiveDasCandidateVsApplied(t *testing.T) {
+	rec, env, appliedRaw := zzLiveFixtures(t)
+	if len(env) != 1 {
+		t.Fatalf("expected exactly the one live gate-check WLAN, got %d", len(env))
+	}
+	cand := env[0]
+	if cand.Security == "wpa-eap" && cand.RadiusDASEnabled {
+		t.Skipf("live envelope already in the das shape — the candidate would be the steady state; see TestZZLiveIntentVsApplied")
+	}
+	if cand.Security != "wpa-p" {
+		t.Fatalf("live envelope security = %q, expected the wpa-p baseline before the das mutation", cand.Security)
+	}
+	cand.Security = "wpa-eap" // passphrase KEPT — see the zzLiveDasSecret note
+	cand.RadiusServers = []wireless.RadiusServer{{IP: "10.10.10.10", Port: 1812}}
+	cand.RadiusSecret = zzLiveDasSecret
+	cand.RadiusVLANMode = "disabled"
+	cand.AccountingEnabled = true
+	cand.AcctServers = []wireless.RadiusAcctServer{{IP: "10.10.10.10", Port: 1813}}
+	cand.InterimUpdateEnabled = true
+	cand.RadiusDASEnabled = true
+	s := New(Config{WirelessSource: func() []Wlan { return []Wlan{cand} }}, store.NewMemStore(), testLogger())
+	sys := mustBuildSys(t, s, rec)
+	if err := os.WriteFile(zzHarnessDir+"/live-das-candidate-sys.txt", []byte(sys), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(sys))
+	fmt.Printf("[live-das-candidate] render sha256=%s\n", hex.EncodeToString(sum[:]))
+
+	// (1) the device-verified das-state capture — parse-identical, and the
+	// jar's duplicate dad.status preserved in the raw emission.
+	dasRaw, err := os.ReadFile(zzHarnessDir + "/live-das-applied-sys.txt")
+	if err != nil {
+		t.Skipf("device-verified das-state capture not present (%v)", err)
+	}
+	intended, violations := zzRunGate(t, "live-das-candidate vs DEVICE-VERIFIED DAS-STATE bytes (must be parse-identical)", dasRaw, sys, zzManagedAllow)
+	if len(intended) != 0 || len(violations) != 0 {
+		t.Fatalf("the das candidate must reproduce the device-verified das-state bytes exactly: intended=%d violations=%d — %v %v", len(intended), len(violations), intended, violations)
+	}
+	for _, row := range []struct {
+		row  string
+		want int
+	}{
+		{"aaa.1.radius.dad.status=enabled", 2}, // the jar's duplicate survives
+		{"aaa.2.radius.dad.status=enabled", 1}, // the das block re-emits dad.status; no dad.port here
+	} {
+		if got := strings.Count(sys, row.row); got != row.want {
+			t.Fatalf("raw emission lost the jar's duplicate dad.status shape: %s count=%d, want %d", row.row, got, row.want)
+		}
+	}
+
+	// (2) the standing shape gate vs the applied wpa-p baseline.
+	intended, violations = zzRunGate(t, "live-das-candidate vs DEVICE-VERIFIED APPLIED bytes", appliedRaw, sys, zzManagedAllow)
+	if len(violations) > 0 {
+		t.Fatalf("minimal-diff invariant broken for the das candidate: %d unmanaged row(s) differ — ABORT the push: %v", len(violations), violations)
+	}
+	zzFailIsDefaultRegression(t, intended)
+	for _, d := range intended {
+		if !strings.HasPrefix(d, "wireless.") && !strings.HasPrefix(d, "aaa.") {
+			t.Fatalf("das candidate touches rows beyond {wireless, aaa} — ABORT the push: %s", d)
+		}
+	}
+	var auth, acct, das, dad, interim, mgmt bool
+	for _, d := range intended {
+		switch {
+		case strings.Contains(d, "radius.auth."):
+			auth = true
+		case strings.Contains(d, "radius.acct."):
+			acct = true
+		case strings.Contains(d, "radius.das."):
+			das = true
+		case strings.Contains(d, "radius.dad."):
+			dad = true
+		case strings.Contains(d, "interim_update."):
+			interim = true
+		case strings.Contains(d, `aaa.1.wpa.key.1.mgmt: "WPA-PSK" -> "WPA-EAP"`):
+			mgmt = true
+		}
+	}
+	for _, c := range []struct {
+		ok   bool
+		rows string
+	}{
+		{auth, "aaa.*.radius.auth.*"}, {acct, "aaa.*.radius.acct.*"},
+		{das, "aaa.*.radius.das.*"}, {dad, "aaa.*.radius.dad.*"},
+		{interim, "aaa.*.interim_update.*"}, {mgmt, `aaa.*.wpa.key.1.mgmt WPA-PSK -> WPA-EAP`},
+	} {
+		if !c.ok {
+			t.Fatalf("das candidate emits no %s row — the accounting profile did not reach the render; got %v", c.rows, intended)
+		}
+	}
+	// wpa-p and wpa-eap share authmode=1: NO wireless.* row may change (the
+	// EAP gate's precedent — the security flip lives entirely in aaa.*).
+	var wirelessRows int
+	for _, d := range intended {
+		if strings.HasPrefix(d, "wireless.") {
+			wirelessRows++
+		}
+	}
+	if wirelessRows != 0 {
+		t.Fatalf("das candidate changed %d wireless.* row(s) — authmode must stay 1 across the security flip; got %v", wirelessRows, intended)
+	}
+	fmt.Printf("[live-das-candidate] %d intended deltas, all inside aaa.* (restart set = {aaa}; parse-identical to the device-verified das-state capture) — PUSH-PRE-CLEARED\n", len(intended))
 }

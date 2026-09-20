@@ -35,8 +35,9 @@ package server
 // 48dbb631f05d9ff4… — the zzHarnessRecord + gate-check open-WLAN render,
 // regenerated 2026-09-19 with the post-is_default-fix generator); the
 // live AP's device-verified running bytes live separately in
-// live-applied-sys.txt (sha256 3da7ce3e…, re-seeded from the 2026-09-19
-// A2 reboot round that proved them retained across a raw reboot). Each
+// live-applied-sys.txt (sha256 c4b7f3bf…, re-seeded by the 2026-09-20
+// DAS/DAD round's accounting-off revert — the 2026-09-19 A2 round proved
+// the 3da7ce3e… bytes retained row-for-row across a raw reboot). Each
 // next-push candidate — both-band open
 // (control), 2g-only open, both-band wpa-p — is diffed against the
 // APPLIED bytes, because the live question is exactly "which on-device
@@ -177,13 +178,14 @@ func zzExemptIsDefaultMigration(rows []string) (out []string) {
 // zzExemptLedBarMigration filters the known renderer-evolution delta
 // (the §12 row 1007 ledbar block, 2026-09-19 — jar-cited row-for-row in
 // internal/server/systemcfg/ledbar.go, emitted for every supportLedBar
-// model) out of a violation list. Every harness capture (factory,
-// applied, running) predates the lane, so every current U7PG2 render
-// differs from every baseline by exactly this block until the next
-// live apply refreshes the captures. Once the device-verified applied
-// bytes are re-captured post-ledbar this filter becomes inert. Any
-// other row still trips the zero-drift gates; after the refresh a
-// ledbar.* drift trips them again.
+// model) out of a violation list. The synthetic-baseline captures
+// (factory forensics, the night reference render, the pinned night
+// candidates) predate the lane, so every current U7PG2 render differs
+// from them by exactly this block — the filter stays at those gates.
+// The LIVE gates (zz_live_candidate_scratch_test.go) dropped the filter
+// at the 2026-09-20 DAS/DAD round re-capture: their device-verified
+// applied bytes are post-ledbar, so a ledbar.* drift must FAIL there.
+// Any other row still trips the zero-drift gates everywhere.
 func zzExemptLedBarMigration(rows []string) (out []string) {
 	for _, r := range rows {
 		if strings.HasPrefix(r, "ledbar.") {
@@ -351,9 +353,10 @@ func TestZZMinimalDiffGateLiveRecord(t *testing.T) {
 // wireless envelope as fetched from the RUNNING controller
 // (live-devices.json + live-wireless.json), rendered and diffed against
 // the DEVICE-VERIFIED running bytes (live-applied-sys.txt — seeded by a
-// confirmed round: the 2026-09-19 post-is_default-fix push, whose bytes
-// the AP's /tmp/system.cfg reproduced at sha256 3da7ce3e… and, after a
-// raw reboot, the boot-restored text preserved row-for-row) and against
+// confirmed round, most recently the 2026-09-20 DAS/DAD round's
+// accounting-off revert at sha256 c4b7f3bf…; the 2026-09-19 A2 round
+// proved the 3da7ce3e… bytes retained row-for-row across a raw reboot)
+// and against
 // the factory baseline. This is the steady-state drift check: in steady
 // state the render must be byte-identical to what the device runs (zero
 // intended, zero violations); ANY delta is real drift or record change to
@@ -477,7 +480,7 @@ func TestZZLiveWpaCandidateVsApplied(t *testing.T) {
 	}
 	cand := envFile.Wlans[0]
 	if cand.Security == "wpa-p" {
-		t.Skipf("a wpa-p round is complete and device-verified (2026-09-18 C1, superseded by the 2026-09-19 A2 passphrase round, device-verified at sha256 3da7ce3e… and proven retained across a raw reboot); the steady-state check lives in TestZZLiveIntentVsApplied")
+		t.Skipf("a wpa-p round is complete and device-verified (2026-09-18 C1, superseded by the 2026-09-19 A2 passphrase round, proven retained across a raw reboot, re-verified by the 2026-09-20 DAS/DAD round's accounting-off revert at sha256 c4b7f3bf…); the steady-state check lives in TestZZLiveIntentVsApplied")
 	}
 	if cand.Security != "open" {
 		t.Fatalf("live envelope security = %q, expected the open baseline before the C1 mutation", cand.Security)
