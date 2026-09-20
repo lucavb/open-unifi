@@ -60,6 +60,12 @@ type App struct {
 
 	prevMu     sync.Mutex
 	prevStates map[string]int // MAC(file-free bare hex) -> last-observed state
+
+	// informPush is the controller-side SSH set-inform push lane
+	// (internal/app/setinform.go). nil = the --allow-ssh-set-inform-push
+	// opt-in was not supplied: the lane never fires and AdoptPending keeps
+	// its whitelist-arming-only semantics.
+	informPush *setInformPush
 }
 
 // Compile-time proof that App satisfies the admin API storage contract.
@@ -876,7 +882,19 @@ func (a *App) ListPending(_ context.Context) []adminapi.PendingView {
 // inside the store's per-MAC RMW closure so a concurrent inform for the same
 // device cannot interleave between the pending-existence check and the
 // record upsert.
-func (a *App) AdoptPending(_ context.Context, mac string) (adminapi.DeviceView, error) {
+//
+// Set-inform push contract (--allow-ssh-set-inform-push, lab-only):
+// when the push lane is armed and the MAC's pending-candidate note is an
+// announce-derived factory mark (a discovery note carrying factory=true,
+// i.e. discovery TLV 23 present-and-true), a successful adopt ALSO means
+// one SSH set-inform push was delivered to the candidate (the link a
+// never-informed factory device needs to find this controller). A push
+// failure is returned as a wrapped adminapi.ErrSetInformPushFailed (HTTP
+// 502) with the whitelist promotion left standing — the operator can
+// simply click Adopt again, one click = exactly one push attempt. Every
+// other candidate shape (inform-noted, discovery note without a factory
+// mark) keeps the whitelist-arming-only semantics above.
+func (a *App) AdoptPending(ctx context.Context, mac string) (adminapi.DeviceView, error) {
 	mac, cerr := store.CanonicalMAC(mac)
 	if cerr != nil {
 		return adminapi.DeviceView{}, fmt.Errorf("%w: %s (%v)", adminapi.ErrNotFound, mac, cerr)
@@ -910,6 +928,12 @@ func (a *App) AdoptPending(_ context.Context, mac string) (adminapi.DeviceView, 
 		return adminapi.DeviceView{}, err
 	}
 	a.lg.Debug("device promoted to pending", "mac", store.ColonMAC(mac))
+	// The whitelist promotion is committed above; the push lane (when
+	// armed) fires once here. A push failure surfaces wrapped
+	// ErrSetInformPushFailed (HTTP 502) while the promotion stands.
+	if perr := a.pushSetInform(ctx, mac); perr != nil {
+		return adminapi.DeviceView{}, perr
+	}
 	return a.view(rec), nil
 }
 

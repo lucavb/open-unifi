@@ -58,6 +58,8 @@ func run() error {
 	allowPlainText := flag.Bool("allow-plaintext-inform", false, "accept unencrypted JSON inform bodies")
 	allowGatedLiveWLAN := flag.Bool("allow-gated-live-wlan", false,
 		"LAB ONLY: lift the fail-closed live WLAN provisioning gate for U7PG2 fw 6.8.2.15592 (typed 501 without this flag); requires a push candidate pre-cleared by the offline minimal-diff harness")
+	allowSSHSetInformPush := flag.Bool("allow-ssh-set-inform-push", false,
+		"LAB ONLY: arm the controller-side SSH set-inform push lane — the console Adopt action on a factory announce candidate dials ubnt@<candidate-ip> with the factory default password and runs mca-cli-op set-inform (explicit admin-action opt-in, never on by default; requires --controller-url)")
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, error")
 	logFormat := flag.String("log-format", os.Getenv("OPEN_UNIFI_LOG_FORMAT"), "log format: text (default) or json")
 	otlpEndpoint := flag.String("otlp-endpoint", os.Getenv("OPEN_UNIFI_OTLP_ENDPOINT"), "OTLP/HTTP trace endpoint (e.g. http://127.0.0.1:4318); empty = tracing off unless OTEL_EXPORTER_OTLP_ENDPOINT(_TRACES) is set")
@@ -203,6 +205,17 @@ func run() error {
 	}, st, logger)
 	if *allowGatedLiveWLAN {
 		logger.Warn("live WLAN provisioning gate LIFTED for U7PG2 6.8.2.15592 (--allow-gated-live-wlan): live WLAN pushes are enabled — bench use only, candidate must be pre-cleared by the offline minimal-diff harness")
+	}
+	// The SSH set-inform push lane (internal/app/setinform.go): armed here
+	// so the console Adopt action can hand never-informed factory pending
+	// candidates an inform URL over SSH. EnableSetInformPush fails startup
+	// when no inform URL is derivable (empty or hostless --controller-url):
+	// fail fast like the other flag validations, before any listener binds.
+	if *allowSSHSetInformPush {
+		if err := ap.EnableSetInformPush(*controllerURL, *listenInform); err != nil {
+			return fmt.Errorf("--allow-ssh-set-inform-push: %w", err)
+		}
+		logger.Warn("ssh set-inform push lane ARMED (LAB ONLY): console Adopt on a factory announce candidate pushes mca-cli-op set-inform over SSH with factory default credentials")
 	}
 	if *controllerURL == "" {
 		logger.Warn("no --controller-url configured: discovery/adopt replies cannot point the device at an inform URL; prefer SSH 'set-inform <this controller>/inform'")

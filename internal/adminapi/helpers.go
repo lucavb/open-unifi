@@ -17,6 +17,13 @@ import (
 var ErrNotFound = errors.New("device not found")
 var ErrConflict = errors.New("conflict")
 
+// ErrSetInformPushFailed is the sentinel backend error mapped to HTTP 502:
+// the console Adopt action's set-inform push (the delivery lane for
+// never-informed factory pending candidates, docs/PROTOCOL-mgmt.md §7)
+// failed after the whitelist promotion was already committed. The
+// promotion stands — the operator can simply click Adopt again.
+var ErrSetInformPushFailed = errors.New("set-inform push failed")
+
 // ---- response helpers ---------------------------------------------------
 
 // writeErr emits the canonical JSON error shape: {"error":"..."}.

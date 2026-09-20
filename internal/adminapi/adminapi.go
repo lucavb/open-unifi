@@ -337,6 +337,15 @@ type Backend interface {
 	// State 1 (pending) — adoption here only puts the MAC on the inform
 	// adopt whitelist; the native PENDING state is what the device record
 	// holds until the inform handshake completes.
+	//
+	// Set-inform push addendum (lab-only, --allow-ssh-set-inform-push):
+	// when the push lane is armed and the MAC's pending-candidate note is
+	// an announce-derived factory mark (discovery note with factory=true),
+	// a successful adopt ALSO means one SSH set-inform push was delivered;
+	// a push failure is returned as a wrapped ErrSetInformPushFailed
+	// (HTTP 502) with the whitelist promotion left standing — re-clicking
+	// Adopt re-attempts the push. Every other candidate shape keeps the
+	// whitelist-arming-only semantics above.
 	AdoptPending(ctx context.Context, mac string) (DeviceView, error)
 	// RebootDevice arms the remote reboot (docs/PROTOCOL-mgmt.md §6.5):
 	// the device's NEXT decoded inform answers
@@ -907,6 +916,16 @@ func handleBackendErr(w http.ResponseWriter, lg *slog.Logger, err error) {
 	}
 	if errors.Is(err, ErrNotFound) {
 		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	// 502 Bad Gateway: the controller acted as a client to the device over
+	// SSH and that leg failed. Like the 404 above, the error text is
+	// user-facing context (the SSH failure plus the device's own
+	// mca-cli-op output; never credentials — the runner only ever handles
+	// factory defaults); the whitelist promotion the push follows is
+	// already committed, so the operator can simply click Adopt again.
+	if errors.Is(err, ErrSetInformPushFailed) {
+		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	lg.Error("admin api backend error", "err", err)

@@ -1722,6 +1722,35 @@ func Test404PathKeepsErrorTextAndDefaultLoggerWorks(t *testing.T) {
 	}
 }
 
+// ---- set-inform push failures are HTTP 502 ---------------------------------
+
+// TestAdoptSetInformPushFailedMapsTo502 pins the lab-only set-inform push
+// contract at the route level: a backend AdoptPending error wrapping
+// ErrSetInformPushFailed (the SSH leg failed AFTER the whitelist
+// promotion committed) must surface status 502 with the refinement-
+// diagnostics-style extendable error text in the {"error":...} body — a
+// re-click simply re-attempts the push (one click = one attempt).
+func TestAdoptSetInformPushFailedMapsTo502(t *testing.T) {
+	be := &failingBackend{
+		fakeBackend: newFakeBackend(),
+		adoptErr: fmt.Errorf("%w: mca-cli-op set-inform: exit status 1: refused",
+			ErrSetInformPushFailed),
+	}
+	h := New(Config{}, be)
+	req := httptest.NewRequest("POST", "/api/v1/pending/a0:40:a0:aa:bb:cc/adopt", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("set-inform push failure: got %d, want 502", rec.Code)
+	}
+	m := decodeJSON(t, rec)
+	if em, ok := m["error"].(string); !ok ||
+		strings.Contains(em, "internal error") ||
+		!strings.Contains(em, "set-inform push failed") {
+		t.Fatalf("502 body must carry the sentinel text: %v", m["error"])
+	}
+}
+
 // ---- adopt counters are poller-only (item 3) --------------------------------
 
 // adoptCounterValues reads openunifi_adopt_total / _adopt_fail_total through
