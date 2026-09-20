@@ -3,7 +3,9 @@ package inform
 // StationMACs decode gates: the absent/empty distinction (a sparse
 // heartbeat must not read as "zero clients" — CONTEXT.md device-refreshable
 // caps semantics), verbatim MAC spellings, and the never-fatal odd-row
-// tolerance.
+// tolerance. The nested-shape fixtures mirror the 2026-09-20 bench
+// capture (U7PG2, fw 6.8.2.15592): stations arrive inside the vap rows
+// as vap_table[].sta_table[], one vap's table possibly empty.
 
 import "testing"
 
@@ -70,5 +72,119 @@ func TestStationMACsOddRowsSkipped(t *testing.T) {
 	macs, present := StationMACs(body)
 	if !present || len(macs) != 1 || macs[0] != "aa:bb:cc:dd:ee:ff" {
 		t.Fatalf("macs=%v present=%v, want only the one decodable row", macs, present)
+	}
+}
+
+func TestStationMACsVapNestedLivePin(t *testing.T) {
+	// The live-pinned shape (2026-09-20 capture): stations nested in the
+	// vap rows; the 2.4 GHz vap's table is empty while 5 GHz carries the
+	// one associated client. Fixture mirrors the captured inform.
+	body := map[string]any{"vap_table": []any{
+		map[string]any{
+			"essid": "openunifi-gate-check", "name": "ath1", "radio": "na",
+			"num_sta": 1, "state": "RUN", "up": true,
+			"sta_table": []any{
+				map[string]any{"mac": "aa:bb:cc:dd:ee:01", "uptime": 290},
+			},
+		},
+		map[string]any{
+			"essid": "openunifi-gate-check", "name": "ath0", "radio": "ng",
+			"num_sta": 0, "state": "RUN", "up": true,
+			"sta_table": []any{},
+		},
+	}}
+	macs, present := StationMACs(body)
+	if !present || len(macs) != 1 || macs[0] != "aa:bb:cc:dd:ee:01" {
+		t.Fatalf("macs=%v present=%v, want the single 5 GHz station", macs, present)
+	}
+}
+
+func TestStationMACsVapNestedAllEmptyIsReport(t *testing.T) {
+	// Both vaps report empty tables: a genuine zero-client report —
+	// present=true with no MACs, the disconnect-side evidence.
+	body := map[string]any{"vap_table": []any{
+		map[string]any{"name": "ath1", "num_sta": 0, "sta_table": []any{}},
+		map[string]any{"name": "ath0", "num_sta": 0, "sta_table": []any{}},
+	}}
+	macs, present := StationMACs(body)
+	if !present || macs != nil {
+		t.Fatalf("macs=%v present=%v, want nil/true (zero clients)", macs, present)
+	}
+}
+
+func TestStationMACsVapTableWithoutStaKeys(t *testing.T) {
+	// A vap_table whose rows carry no sta_table key at all is an
+	// uncertain shape, not a zero-client report: absent, sessions
+	// untouched.
+	body := map[string]any{"vap_table": []any{
+		map[string]any{"essid": "x", "name": "ath1", "num_sta": 1},
+	}}
+	macs, present := StationMACs(body)
+	if present || macs != nil {
+		t.Fatalf("macs=%v present=%v, want nil/false (uncertain shape)", macs, present)
+	}
+}
+
+func TestStationMACsSparseHeartbeat(t *testing.T) {
+	// The ~935-byte notification heartbeats carry neither vap_table nor
+	// sta_table: no client evidence, rows and events survive untouched.
+	body := map[string]any{
+		"cfgversion": "x", "state": "uap", "uptime": 123456,
+		"inform_as_notif": true, "notif_reason": "heartbeat",
+	}
+	macs, present := StationMACs(body)
+	if present || macs != nil {
+		t.Fatalf("macs=%v present=%v, want nil/false (sparse heartbeat)", macs, present)
+	}
+}
+
+func TestStationMACsBothShapesUnionAndDedupe(t *testing.T) {
+	// The fallback top-level key and the pinned nested shape union;
+	// the same MAC through both shapes is reported once, and the
+	// wire order is top-level rows first, then vap order.
+	body := map[string]any{
+		"sta_table": []any{
+			map[string]any{"mac": "aa:aa:aa:aa:aa:aa"},
+			map[string]any{"mac": "aa:bb:cc:dd:ee:01"}, // also nested below
+		},
+		"vap_table": []any{
+			map[string]any{"name": "ath1", "sta_table": []any{
+				map[string]any{"mac": "aa:bb:cc:dd:ee:01"}, // deduped
+				map[string]any{"mac": "bb:bb:bb:bb:bb:bb"},
+			}},
+			map[string]any{"name": "ath0", "sta_table": []any{}},
+		},
+	}
+	macs, present := StationMACs(body)
+	if !present {
+		t.Fatal("present=false, want true")
+	}
+	want := []string{"aa:aa:aa:aa:aa:aa", "aa:bb:cc:dd:ee:01", "bb:bb:bb:bb:bb:bb"}
+	if len(macs) != len(want) {
+		t.Fatalf("macs=%v, want %v", macs, want)
+	}
+	for i := range want {
+		if macs[i] != want[i] {
+			t.Fatalf("row %d = %q, want %q", i, macs[i], want[i])
+		}
+	}
+}
+
+func TestStationMACsNestedOddRowsSkipped(t *testing.T) {
+	// Odd rows inside a nested table are skipped like top-level ones;
+	// the healthy sibling vap row still decodes.
+	body := map[string]any{"vap_table": []any{
+		map[string]any{"name": "ath1", "sta_table": []any{
+			"noise",
+			map[string]any{"mac": ""},
+			map[string]any{"rssi": -60},
+		}},
+		map[string]any{"name": "ath0", "sta_table": []any{
+			map[string]any{"mac": "cc:cc:cc:cc:cc:cc"},
+		}},
+	}}
+	macs, present := StationMACs(body)
+	if !present || len(macs) != 1 || macs[0] != "cc:cc:cc:cc:cc:cc" {
+		t.Fatalf("macs=%v present=%v, want only the ath0 station", macs, present)
 	}
 }

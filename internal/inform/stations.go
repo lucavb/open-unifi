@@ -5,26 +5,26 @@
 // payloads are DEVICE-supplied bytes and a decode must never fail an
 // inform over odd rows.
 //
-// Field naming (live-proof obligation, docs/PROTOCOL-mgmt.md §6.2): no
-// capture in this worktree pins the per-client table's exact wire key or
-// row shape — the BLOCKED verdict is recorded in the lane report. The
-// reader keys on "sta_table", following the two naming rules this
-// worktree's docs already establish for device-sent payload fields:
-//
-//   - the *_table family for device-sent tables: radio_table, vap_table,
-//     vwire_table, if_table, ethernet_table (docs/PROTOCOL.md §100-131);
-//   - "sta" as the controller's abbreviation for stations/clients:
-//     stat.user-num_sta (docs/PROTOCOL.md §129), blocked_sta
-//     (docs/PROTOCOL-mgmt.md §4).
+// Wire shape, LIVE-PINNED (2026-09-20 bench capture, UAP-AC-Pro-Gen2
+// U7PG2, fw 6.8.2.15592, phone associated): the station table is nested
+// inside the vap rows — body["vap_table"][]["sta_table"][] — with each
+// station row identified by its "mac" field (colon-hex spelling, e.g.
+// "aa:bb:cc:dd:ee:01"). Every observed vap row carries a sta_table array,
+// empty when that vap has no associated clients. The earlier BLOCKED
+// verdict's top-level "sta_table" key was never observed on the wire; it
+// stays readable as a fallback union for firmware variants this worktree
+// has not captured.
 //
 // Row identity is the "mac" field, the same identity spelling the §103
 // top-level body uses. Odd values are skipped, never fatal; an ABSENT
-// table is reported as absent (present=false) so the caller can tell a
-// sparse heartbeat (no table — session rows must survive) from a genuine
-// empty table (zero clients — every previously-connected client
-// disconnected). That distinction is the device-refreshable caps
-// semantics applied to session data (CONTEXT.md: a sparse heartbeat must
-// not wipe controller-side rows).
+// table in BOTH shapes is reported as absent (present=false) so the
+// caller can tell a sparse heartbeat (no table — session rows must
+// survive) from a genuine empty table (zero clients — every
+// previously-connected client disconnected). A vap_table whose rows
+// carry no sta_table keys at all also reports absent: an uncertain shape
+// must never read as "zero clients". That distinction is the
+// device-refreshable caps semantics applied to session data
+// (CONTEXT.md: a sparse heartbeat must not wipe controller-side rows).
 package inform
 
 // StationMACs reads the per-client station table out of a decoded inform
@@ -32,27 +32,52 @@ package inform
 // lane canonicalizes via store.CanonicalMAC; this package is a leaf and
 // must not import it) and a present flag:
 //
-//   - present=false: the body carries no station table (a sparse
-//     heartbeat or an odd-shaped value). Callers must NOT touch session
-//     state on such informs.
-//   - present=true: the table was a JSON array (possibly empty — the
-//     device reports zero associated clients). macs carries the rows whose
-//     "mac" field was a string; odd rows are skipped, never fatal.
+//   - present=false: the body carries no station table in any shape (a
+//     sparse heartbeat or odd-shaped values). Callers must NOT touch
+//     session state on such informs.
+//   - present=true: at least one station-table array was found (top-level
+//     or nested in a vap row), possibly empty — the device reports zero
+//     associated clients. macs carries the rows whose "mac" field was a
+//     string; odd rows are skipped, never fatal. The same MAC reached
+//     through both shapes is reported once.
+//
+// The MAC order is the wire order: top-level rows first (the fallback
+// shape), then vap rows in table order, stations within each vap in row
+// order.
 func StationMACs(body map[string]any) (macs []string, present bool) {
-	raw, ok := body["sta_table"].([]any)
-	if !ok {
-		return nil, false
-	}
-	for _, row := range raw {
-		m, ok := row.(map[string]any)
-		if !ok {
-			continue // tolerate odd rows; never fail an inform over noise
+	seen := map[string]bool{}
+	add := func(rows []any) {
+		for _, row := range rows {
+			m, ok := row.(map[string]any)
+			if !ok {
+				continue // tolerate odd rows; never fail an inform over noise
+			}
+			mac, ok := m["mac"].(string)
+			if !ok || mac == "" || seen[mac] {
+				continue
+			}
+			seen[mac] = true
+			macs = append(macs, mac)
 		}
-		mac, ok := m["mac"].(string)
-		if !ok || mac == "" {
-			continue
-		}
-		macs = append(macs, mac)
 	}
-	return macs, true
+	// Fallback shape: a top-level sta_table array (never observed on the
+	// wire; kept from the pre-pin reader for uncaptured firmware variants).
+	if raw, ok := body["sta_table"].([]any); ok {
+		add(raw)
+		present = true
+	}
+	// Live-pinned shape: stations nested in the vap rows.
+	if vaps, ok := body["vap_table"].([]any); ok {
+		for _, v := range vaps {
+			vm, ok := v.(map[string]any)
+			if !ok {
+				continue // tolerate odd rows; never fail an inform over noise
+			}
+			if rows, ok := vm["sta_table"].([]any); ok {
+				add(rows)
+				present = true
+			}
+		}
+	}
+	return macs, present
 }
