@@ -1391,9 +1391,9 @@ func TestGateFirmwareForms(t *testing.T) {
 
 // Settle FSM with firmware-shaped vap_table (fix 3): confirmation requires
 // every desired SSID RUN on its PLACED radio (placements survive absorption
-// via extraPrevWins). A wrong-radio VAP cannot settle the delivery — the
-// guarantee the pre-fix placements loss made dead — and exhausted attempts
-// flip wlan_cfg_delivery_status to "exhausted".
+// via the controller-owned key class). A wrong-radio VAP cannot settle the
+// delivery — the guarantee the pre-fix placements loss made dead — and
+// exhausted attempts flip wlan_cfg_delivery_status to "exhausted".
 func TestSettleFSMPlacementsAndExhaustion(t *testing.T) {
 	env := workedEnvelope()
 	xkey := "11112222333344445555666677778888"

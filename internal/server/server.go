@@ -825,114 +825,15 @@ func (s *Server) applyOutcome(mac string, rec *store.Device, out adoption.Outcom
 	}
 }
 
-// Extra preservation classes when an inform body replaces rec.Extra:
-//
-//	prevWins     — controller-owned caches that must survive ANY inform
-//	               (forward/push bookkeeping);
-//	fillIfAbsent — device-sided data the device may refresh at any time;
-//	               copy from the previous record ONLY when the incoming body
-//	               omits the key (a sparse heartbeat must not wipe the
-//	               radio_table, but prev-WINS would pin device-side channel
-//	               reselection forever);
-//	adminOwned   — never sourced from a device body: value comes from the
-//	               previous record if present, otherwise the key is DELETED
-//	               (the device can never introduce them). The two
-//	               admin-armed lifecycle flags (reboot_on_connect,
-//	               setdefault_armed — §6.5/§6.6) live here: an armed
-//	               command survives every device inform until the
-//	               adoption engine fires it, and no inform body can
-//	               introduce, forge or clear an arming.
-//
-// extraPrevWins is built from the engine's single-source controller-owned
-// key list (adoption.ControllerOwnedKeys) plus the server-side ssh hash
-// cache key. absorbInform's iteration is order-independent and JSON map
-// marshaling sorts keys, so the copy order carries no byte semantics.
-var (
-	extraPrevWins     = append(append([]string{}, adoption.ControllerOwnedKeys...), "ssh_sha512passwd")
-	extraFillIfAbsent = []string{"radio_table", "wifi_caps", "fw_caps", "if_table", "ethernet_table", "uplink", "has_eth1"}
-	// blocked_sta (the admin-owned blocked-client set) and blocked_sta_sha
-	// (the engine's delivery baseline, internal/server/adoption) are BOTH
-	// admin-owned here: prev-WINS alone would let a device-supplied body
-	// INTRODUCE the baseline — a forged baseline matching a forged set
-	// would suppress delivery — so the baseline uses prev-or-delete too
-	// (only the engine's own emission ever writes it).
-	// led_override and disabled are the TYPED admin-owned record fields
-	// (store.Device) — the classic controller keeps both as controller-side
-	// record state (docs/PROTOCOL-mgmt.md §2 reads device.getString(
-	// "led_override")/device.is("disabled") from the controller DB, not the
-	// inform body), so a device-supplied Extra copy of either name is
-	// dropped here: the admin value lives in the typed field and a body
-	// echo can neither shadow nor introduce it (CONTEXT.md trust policy:
-	// admin-owned).
-	// led_override_color_brightness and led_override_color are the same
-	// again for the ledbar block's two knobs (store.Device typed fields;
-	// the §12 emitter reads device.getInt/getString for them —
-	// config_String.txt:2627-2678): a device body can neither overwrite
-	// the typed value nor introduce a shadowing Extra copy.
-	// radio_intent (wireless.RadioIntentExtraKey) is the per-radio
-	// channel/txpower intent the admin API writes — admin-owned rows in
-	// the CONTEXT.md sense: the device can neither write nor introduce
-	// them, exactly like the other entries here.
-	// cmd_task (store.CmdTaskKey) is the §6.3 stored-task row: admin-owned
-	// like the two armed lifecycle flags — an armed task survives every
-	// device inform until the adoption engine fires it, and no inform
-	// body can introduce, forge, or clear the arming (prev-or-delete).
-	extraAdminOwned = []string{"system_cfg_extra_lines", "mgmt_dev",
-		"anonymous_controller_id", "anonymous_site_id",
-		adoption.FlagRebootOnConnect, adoption.FlagSetdefaultArmed,
-		"blocked_sta", "blocked_sta_sha",
-		"led_override", "disabled", "led_override_color_brightness",
-		"led_override_color", wireless.RadioIntentExtraKey,
-		store.CmdTaskKey}
-)
-
-// absorbInform copies interesting fields from the inform body into the record.
+// absorbInform is the transport-adapter half of the record absorption
+// (CONTEXT.md): every Extra row — the wholesale Extra swap and the trust
+// policy that guards it — lives in the record itself (store.Device.Absorb,
+// whose registry holds the three ownership classes), and the per-MAC
+// read-modify-write serialization stays in the inform handlers'
+// UpdateExisting cycles above. The MAC parameter rides the transport call
+// (the inform handler logs with it); the merge ignores it.
 func (s *Server) absorbInform(mac string, rec *store.Device, body map[string]any, now time.Time, gcmReq bool) {
-	rec.Model = str(body, "model")
-	rec.Firmware = str(body, "version")
-	rec.Serial = str(body, "serial")
-	rec.IP = str(body, "ip")
-	rec.InformURL = str(body, "inform_url")
-	prevExtra := rec.Extra          // caches / admin-owned values live here
-	rec.Extra = store.JSONMap(body) // full raw passthrough (freshly unmarshal'd per request)
-	if prevExtra == nil {
-		prevExtra = store.JSONMap{}
-	}
-	for _, k := range extraPrevWins {
-		if v, ok := prevExtra[k]; ok {
-			rec.Extra[k] = v
-		}
-	}
-	for _, k := range extraFillIfAbsent {
-		if _, ok := body[k]; !ok {
-			if v, ok := prevExtra[k]; ok {
-				rec.Extra[k] = v
-			}
-		}
-	}
-	for _, k := range extraAdminOwned {
-		if v, ok := prevExtra[k]; ok {
-			rec.Extra[k] = v
-		} else {
-			delete(rec.Extra, k)
-		}
-	}
-	if stat, ok := body["stat"].(map[string]any); ok {
-		rec.LastUps = store.JSONMap(stat)
-	}
-	if cfg, ok := body["cfgversion"].(string); ok && cfg != "" {
-		rec.AppliedCfg = cfg
-	}
-	rec.LastSeen = now.Unix()
-	if rec.FirstSeen == 0 {
-		rec.FirstSeen = now.Unix()
-	}
-	if gcmReq {
-		rec.AESGCM = true
-	}
-	if v, ok := body["x_aes_gcm"].(bool); ok && v {
-		rec.AESGCM = true
-	}
+	rec.Absorb(body, now, gcmReq)
 }
 
 // ---- system_cfg producer wiring (the pure renderer) -----------------------

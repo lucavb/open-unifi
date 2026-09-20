@@ -103,9 +103,10 @@ func JSONStr(m map[string]any, key, def string) string {
 
 // RadioIntentExtraKey is the record Extra key holding the admin-owned
 // per-radio intent map, keyed by radio_table `name` (the same key the
-// renderer and StoredRadios use). server.absorbInform lists it under
-// extraAdminOwned: a device inform can neither write nor introduce it.
-const RadioIntentExtraKey = "radio_intent"
+// renderer and StoredRadios use). The literal is single-sourced in the
+// store trust-policy registry (store.RadioIntentExtraKey, which record
+// absorption guards): a device inform can neither write nor introduce it.
+const RadioIntentExtraKey = store.RadioIntentExtraKey
 
 // RadioIntent is the admin-owned provisioning intent for one radio's
 // channel/txpower rows. Channel/Txpower hold the FORMATTED row value

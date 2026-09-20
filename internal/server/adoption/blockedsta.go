@@ -18,15 +18,19 @@ import (
 )
 
 // Extra keys for the blocked_sta projection. The set itself is stored by
-// internal/store under the wire-named key; only the delivery baseline lives
-// here. extraBlockedStaSha holds sha256(blockedStaWire) of the wire string
+// internal/store under the wire-named key (store.BlockedStaExtraKey;
+// adoption-blockedsta reads it through the package-local alias below);
+// only the delivery baseline lives here, aliased to the store trust-policy
+// registry row (store.BlockedStaShaExtraKey — absorption's prev-or-delete
+// rule hides the baseline from device bodies the same way it hides the
+// set). extraBlockedStaSha holds sha256(blockedStaWire) of the wire string
 // last EMITTED by assignedKeyFlow — the same offer-then-confirm shape as
 // the wlan_cfg_sha baseline, except capture happens at emission (blocked
 // content has no observable on-device confirmation beyond the cfgversion
 // echo the equality path already tracks).
 const (
-	extraBlockedSta    = "blocked_sta"
-	extraBlockedStaSha = "blocked_sta_sha"
+	extraBlockedSta    = store.BlockedStaExtraKey
+	extraBlockedStaSha = store.BlockedStaShaExtraKey
 )
 
 // blockedStaWire renders the §4 wire string for the device's blocked-client

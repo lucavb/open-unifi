@@ -46,8 +46,8 @@ func TestBlockedClientsAddRemoveList(t *testing.T) {
 	if _, err := RemoveBlockedClient(&d, "112233445566"); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := d.Extra[blockedStaKey]; ok {
-		t.Fatalf("empty set must delete the Extra key, got %v", d.Extra[blockedStaKey])
+	if _, ok := d.Extra[BlockedStaExtraKey]; ok {
+		t.Fatalf("empty set must delete the Extra key, got %v", d.Extra[BlockedStaExtraKey])
 	}
 	if got := BlockedClients(d); len(got) != 0 {
 		t.Fatalf("empty set read: %v", got)

@@ -8,8 +8,8 @@
 //
 // Trust policy (CONTEXT.md): session rows and the disconnect-event flag
 // are CONTROLLER-OWNED keys — a device can neither overwrite nor
-// introduce them via an inform body. The adapter's prev-wins preservation
-// list carries them across informs (adoption.ControllerOwnedKeys), and
+// introduce them via an inform body. Record absorption carries them
+// across informs (the ControllerOwnedKeys registry in this package), and
 // the only writer is the session refresh computed adapter-side from
 // decoded station data, never a passthrough. The §6.6 setdefault
 // demotion sweeps the controller-owned keys with it: a factory-reset

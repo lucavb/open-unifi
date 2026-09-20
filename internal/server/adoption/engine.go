@@ -91,9 +91,9 @@ const (
 type Request struct {
 	// Transport selects the encrypted or plaintext decision lane.
 	Transport Transport
-	// Device is the device snapshot the adapter absorbed the inform body
-	// into (absorbInform stays adapter-side this checkpoint). The engine
-	// works on an internal clone and never mutates it.
+	// Device is the device snapshot the transport adapter absorbed the
+	// inform body into (the record absorption lives on store.Device). The
+	// engine works on an internal clone and never mutates it.
 	Device store.Device
 	// Body is the decoded inform body (JSON object).
 	Body map[string]any
@@ -153,9 +153,9 @@ const (
 
 // Admin-armed lifecycle command flags (the trust-policy "admin-owned rows"
 // class, CONTEXT.md: only an admin can set or change them — a device can
-// neither write nor introduce them via an inform body; the adapter's
-// absorbInform preserves them from the previous record through the
-// admin-owned key list). Both are one-shot: the engine fires the
+// neither write nor introduce them via an inform body; record absorption
+// preserves them from the previous record through the store registry's
+// admin-owned class). Both are one-shot: the engine fires the
 // corresponding response on the device's next decoded inform and clears
 // the flag in the same decision.
 const (
@@ -163,7 +163,7 @@ const (
 	// reboot response is emitted from (voidsuper comment: "only from
 	// reboot_on_connect flag"). Arming rides POST
 	// /api/v1/devices/{mac}/reboot.
-	FlagRebootOnConnect = "reboot_on_connect"
+	FlagRebootOnConnect = store.FlagRebootOnConnect
 
 	// FlagSetdefaultArmed is open-unifi's arming flag for the §6.6
 	// setdefault response (POST /api/v1/devices/{mac}/factory-reset).
@@ -173,7 +173,7 @@ const (
 	// the arming rides an admin-owned Extra key instead. DEVIATION from
 	// the jar's state-8 arming shape — recorded with the unrecoverable
 	// jar facts in docs/PROTOCOL-mgmt.md §6.6.
-	FlagSetdefaultArmed = "setdefault_armed"
+	FlagSetdefaultArmed = store.FlagSetdefaultArmed
 )
 
 // Outcome carries the response payload plus the record deltas the adapter
@@ -219,8 +219,8 @@ type Outcome struct {
 	CfgVersion    string // also the full-provision payload top-level cfgversion
 	// SetAppliedCfg clears the record's last-reported applied cfgversion.
 	// Carried only by the setdefault demotion to the pending-candidate
-	// shape (every other outcome leaves AppliedCfg to the adapter's
-	// absorbInform).
+	// shape (every other outcome leaves AppliedCfg to the record
+	// absorption).
 	SetAppliedCfg bool
 	AppliedCfg    string
 	SetAuthkeys   bool
@@ -433,13 +433,15 @@ func (e *Engine) armedLifecycle(d *store.Device) (Outcome, bool) {
 		d.CfgVersion = ""
 		d.AppliedCfg = ""
 		d.Authkeys = nil
-		// Drop the controller-owned WLAN bookkeeping (single-source
-		// list): a stale wlan_cfg_sha would let the re-adopted device
-		// settle into connected noops while running factory config. The
-		// baseline is re-captured by the post-adoption self-heal + drift
-		// settle, exactly like a fresh adoption (which deliberately
-		// seeds no baseline).
-		for _, k := range ControllerOwnedKeys {
+		// Drop the controller-owned per-device bookkeeping (store
+		// trust-policy registry, FactoryResetSweepKeys): a stale
+		// wlan_cfg_sha would let the re-adopted device settle into
+		// connected noops while running factory config. The baseline is
+		// re-captured by the post-adoption self-heal + drift settle,
+		// exactly like a fresh adoption (which deliberately seeds no
+		// baseline). The site SSH password cache is deliberately NOT
+		// swept (it re-derives verbatim from the site fact).
+		for _, k := range store.FactoryResetSweepKeys {
 			delete(d.Extra, k)
 		}
 		delete(d.Extra, FlagSetdefaultArmed)

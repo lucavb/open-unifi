@@ -53,9 +53,9 @@ type Device struct {
 	// (docs/PROTOCOL-mgmt.md §2: device.getString("led_override",
 	// "default")). Values: "" (unset ≡ the jar's "default"), "on", "off".
 	// ADMIN-OWNED (CONTEXT.md trust policy): the device can neither write
-	// nor introduce it — absorbInform never touches typed fields, and the
-	// server drops a device-supplied Extra["led_override"] copy (see
-	// server.extraAdminOwned).
+	// nor introduce it — Absorb never touches typed fields, and the trust
+	// policy drops a device-supplied Extra["led_override"] copy (see the
+	// AdminOwnedKeys registry in trustpolicy.go).
 	LEDOverride string `json:"led_override,omitempty"`
 
 	// Disabled is the admin-set per-device disable flag — the classic
@@ -76,9 +76,9 @@ type Device struct {
 	// could not tell an explicit 0 from unset, and setting 100 ≡ clearing
 	// (the renders are byte-identical). The admin API validates 0..100.
 	// ADMIN-OWNED (CONTEXT.md trust policy): the device can neither write
-	// nor introduce it — absorbInform never touches typed fields, and the
-	// server drops device-supplied Extra["led_override_color_brightness"]
-	// copies (server.extraAdminOwned).
+	// nor introduce it — Absorb never touches typed fields, and the trust
+	// policy drops device-supplied Extra["led_override_color_brightness"]
+	// copies (the AdminOwnedKeys registry in trustpolicy.go).
 	LEDOverrideColorBrightness *int `json:"led_override_color_brightness,omitempty"`
 
 	// LEDOverrideColor is the admin-set per-device ledbar color — the
