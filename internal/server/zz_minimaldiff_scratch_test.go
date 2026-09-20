@@ -35,8 +35,9 @@ package server
 // 48dbb631f05d9ff4… — the zzHarnessRecord + gate-check open-WLAN render,
 // regenerated 2026-09-19 with the post-is_default-fix generator); the
 // live AP's device-verified running bytes live separately in
-// live-applied-sys.txt (sha256 c4b7f3bf…, re-seeded by the 2026-09-20
-// DAS/DAD round's accounting-off revert — the 2026-09-19 A2 round proved
+// live-applied-sys.txt (sha256 ad41cdad…, re-seeded by the 2026-09-20
+// factory-window set-inform round, whose full-provisioning render the AP
+// confirmed byte-identical — the 2026-09-19 A2 round proved
 // the 3da7ce3e… bytes retained row-for-row across a raw reboot). Each
 // next-push candidate — both-band open
 // (control), 2g-only open, both-band wpa-p — is diffed against the
@@ -168,6 +169,29 @@ func zzManagedAllow(k string) bool {
 func zzExemptIsDefaultMigration(rows []string) (out []string) {
 	for _, r := range rows {
 		if strings.HasPrefix(r, "mgmt.is_default:") {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// zzExemptSSHReMint filters the known one-time record-change delta
+// (users.1.password, the 2026-09-20 factory-window re-adoption): the
+// console set-inform push lane's live round factory-reset the AP
+// (setdefault), Forget removed the round-2 record, and the fresh
+// state-0 seed re-minted the controller-owned ssh_sha512 password
+// cache with a fresh crypt salt — same underlying site password, new
+// hash representation. Every device-verified capture taken BEFORE the
+// re-adoption differs from every render made AFTER it by exactly this
+// row. The live applied bytes were re-captured post-round so this
+// filter is inert there; the DAS-state archive (live-das-applied-sys.txt)
+// predates the re-adoption and can only be re-seeded by the next DAS
+// push round, so the das gate carries this filter until then. Any other
+// row still trips the zero-drift gates everywhere.
+func zzExemptSSHReMint(rows []string) (out []string) {
+	for _, r := range rows {
+		if strings.HasPrefix(r, "users.1.password:") {
 			continue
 		}
 		out = append(out, r)
@@ -353,8 +377,9 @@ func TestZZMinimalDiffGateLiveRecord(t *testing.T) {
 // wireless envelope as fetched from the RUNNING controller
 // (live-devices.json + live-wireless.json), rendered and diffed against
 // the DEVICE-VERIFIED running bytes (live-applied-sys.txt — seeded by a
-// confirmed round, most recently the 2026-09-20 DAS/DAD round's
-// accounting-off revert at sha256 c4b7f3bf…; the 2026-09-19 A2 round
+// confirmed round, most recently the 2026-09-20 factory-window
+// set-inform round at sha256 ad41cdad…, byte-identical to that round's
+// pushed full-provisioning render; the 2026-09-19 A2 round
 // proved the 3da7ce3e… bytes retained row-for-row across a raw reboot)
 // and against
 // the factory baseline. This is the steady-state drift check: in steady
