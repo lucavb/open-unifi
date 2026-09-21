@@ -35,8 +35,10 @@ package server
 // 48dbb631f05d9ff4… — the zzHarnessRecord + gate-check open-WLAN render,
 // regenerated 2026-09-19 with the post-is_default-fix generator); the
 // live AP's device-verified running bytes live separately in
-// live-applied-sys.txt (sha256 ad41cdad…, re-seeded by the 2026-09-20
-// factory-window set-inform round, whose full-provisioning render the AP
+// live-applied-sys.txt (sha256 11cb0472…, re-seeded by the 2026-09-21
+// site-settings round, whose key-rows full-provisioning render the AP
+// confirmed byte-identical; earlier re-seeds: the 2026-09-20
+// factory-window set-inform round at ad41cdad…, whose render the AP
 // confirmed byte-identical — the 2026-09-19 A2 round proved
 // the 3da7ce3e… bytes retained row-for-row across a raw reboot). Each
 // next-push candidate — both-band open
@@ -66,6 +68,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/lucavb/open-unifi/internal/server/systemcfg"
 	"github.com/lucavb/open-unifi/internal/store"
 	"github.com/lucavb/open-unifi/internal/wireless"
 )
@@ -197,6 +200,67 @@ func zzExemptSSHReMint(rows []string) (out []string) {
 		out = append(out, r)
 	}
 	return out
+}
+
+// zzExemptSSHKeyRows filters the known record-change delta (the
+// sshd.auth.key.<n>.* row family, the 2026-09-21 site-settings round):
+// the live site-settings record first carried a provisioned public key
+// that round, so every render made after it emits the key row family
+// that device-verified captures taken BEFORE the round cannot carry.
+// The live applied bytes were re-captured post-round so this filter is
+// inert there; the DAS-state archive (live-das-applied-sys.txt)
+// predates the round and can only be re-seeded by the next DAS push
+// round, so the das gate carries this filter until then. Any other row
+// still trips the zero-drift gates everywhere.
+func zzExemptSSHKeyRows(rows []string) (out []string) {
+	for _, r := range rows {
+		if strings.HasPrefix(r, "sshd.auth.key.") {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// zzLiveSiteSettings loads the live site-settings record fixture
+// (live-site-settings.json, the on-disk record shape — the four
+// AP-intent facts) and builds the render's SiteSettings for the live
+// gates: the record's raw authorized_keys lines parse through the
+// single fail-closed parser (the adapter-conversion seam cmd/openunifi
+// uses), so every candidate gate renders the CURRENT live sshd rows
+// exactly as the running controller does — without this fixture the
+// applied baseline's key rows would read as drift. Skips when the
+// fixture is absent (the harness lives only on this workstation); a
+// present-but-invalid line fails the gate — the fixture must be a
+// fetch of the live record, never hand input.
+func zzLiveSiteSettings(t *testing.T) SiteSettings {
+	t.Helper()
+	raw, err := os.ReadFile(zzHarnessDir + "/live-site-settings.json")
+	if err != nil {
+		t.Skipf("live site-settings record not present (%v)", err)
+	}
+	var doc struct {
+		RegulatoryCountryCode int      `json:"regulatory_country_code"`
+		APSSHPassword         string   `json:"ap_ssh_password"`
+		APSSHPublicKeys       []string `json:"ap_ssh_public_keys"`
+		APSSHDisablePassword  bool     `json:"ap_ssh_disable_password"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("live site-settings.json: %v", err)
+	}
+	facts := SiteSettings{
+		CountryCode:        doc.RegulatoryCountryCode,
+		SSHPassword:        doc.APSSHPassword,
+		SSHDisablePassword: doc.APSSHDisablePassword,
+	}
+	for _, line := range doc.APSSHPublicKeys {
+		k, perr := systemcfg.ParsePublicKey(line)
+		if perr != nil {
+			t.Fatalf("live site-settings key line does not parse (the fixture must be a fetch of the live record): %v", perr)
+		}
+		facts.SSHPublicKeys = append(facts.SSHPublicKeys, k)
+	}
+	return facts
 }
 
 // zzExemptLedBarMigration filters the known renderer-evolution delta
@@ -373,13 +437,16 @@ func TestZZMinimalDiffGateLiveRecord(t *testing.T) {
 	}
 }
 
-// TestZZLiveIntentVsApplied — the CURRENT live intent: the record and the
-// wireless envelope as fetched from the RUNNING controller
-// (live-devices.json + live-wireless.json), rendered and diffed against
+// TestZZLiveIntentVsApplied — the CURRENT live intent: the record, the
+// wireless envelope, and the site-settings record as fetched from the
+// RUNNING controller
+// (live-devices.json + live-wireless.json + live-site-settings.json),
+// rendered and diffed against
 // the DEVICE-VERIFIED running bytes (live-applied-sys.txt — seeded by a
-// confirmed round, most recently the 2026-09-20 factory-window
-// set-inform round at sha256 ad41cdad…, byte-identical to that round's
-// pushed full-provisioning render; the 2026-09-19 A2 round
+// confirmed round, most recently the 2026-09-21 site-settings round at
+// sha256 11cb0472…, byte-identical to that round's pushed key-rows
+// full-provisioning render; before it the 2026-09-20 factory-window
+// set-inform round at ad41cdad…; the 2026-09-19 A2 round
 // proved the 3da7ce3e… bytes retained row-for-row across a raw reboot)
 // and against
 // the factory baseline. This is the steady-state drift check: in steady
@@ -428,7 +495,8 @@ func TestZZLiveIntentVsApplied(t *testing.T) {
 	if len(envFile.Wlans) == 0 {
 		t.Fatalf("live wireless envelope is empty")
 	}
-	s := New(Config{WirelessSource: func() []Wlan { return envFile.Wlans }}, store.NewMemStore(), testLogger())
+	facts := zzLiveSiteSettings(t)
+	s := New(Config{WirelessSource: func() []Wlan { return envFile.Wlans }, SiteSettings: func() (SiteSettings, error) { return facts, nil }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, rec)
 	if err := os.WriteFile(zzHarnessDir+"/live-intent-sys.txt", []byte(sys), 0o644); err != nil {
 		t.Fatal(err)
