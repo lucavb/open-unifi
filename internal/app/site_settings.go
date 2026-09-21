@@ -133,10 +133,10 @@ func validateSiteSettingsChange(s SiteSettings) error {
 // semantically invalid does not brick startup — the file loads and the
 // administrator fixes it through the API (the single validator going
 // forward). Note the flag path can never seed the disable-without-keys
-// combo: cmd's resolveSSHPublicKeys has rejected it at startup since
-// before this record existed. A disable-without-keys value that DID reach
-// disk is fail-closed where it matters: the adoption engine's
-// live-provisioning gate (typed 501) blocks that combo's pushes. Zero
+// combo: cmd's validateSSHDisableSeed guard rejects it at startup. A
+// disable-without-keys value that DID reach disk is fail-closed where it
+// matters: the adoption engine's live-provisioning gate (typed 501)
+// blocks that combo's pushes. Zero
 // seed (tests, first boot without flags) passes by construction.
 func validateSettingsSyntax(s SiteSettings) error {
 	if code := s.CountryCode; code != 0 && (code < 1 || code > 999) {
@@ -247,9 +247,8 @@ func (a *App) currentSiteSettings() (SiteSettings, error) {
 }
 
 // CurrentSiteSettings exposes the cached record without the Backend
-// shape, for wiring-side use (current server.Config construction still
-// takes the four facts from startup flags; the future source swap reads
-// them from here instead — including from inside the engine's decision
+// shape, for wiring-side use (the server sources the four AP-intent site
+// facts from here — including from inside the engine's decision
 // path, which is exactly why smu must stay a leaf lock: this reader takes
 // smu while the caller may already hold a per-MAC store lock). Mirrors
 // CurrentWireless: the error is REAL — the New-time load/persist error —

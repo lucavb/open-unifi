@@ -1108,20 +1108,26 @@ The controller-side value is `systemcfg.ParsePublicKey` (fail-closed: exactly
 must carry a structurally valid RFC 4253 §6.6 wire blob beginning with its
 own type name and parsing as clean length-prefixed fields — a structure
 check, NOT cryptographic validation) fed
-from the `--ap-ssh-key` flag / `$OPEN_UNIFI_AP_SSH_KEY` env fallback — a new
-site fact, never device-informable (site-facts definition, CONTEXT.md).
+from the persisted site-settings record — a new site fact, never
+device-informable (site-facts definition, CONTEXT.md). The
+`--ap-ssh-key` flag / `$OPEN_UNIFI_AP_SSH_KEY` env fallback is the
+first-boot seed only; the record is the source afterwards (§13.3).
 
 ### 13.2 `sshd.auth.passwd=disabled`
 
-New site fact `SSHDisablePassword` (flag `--ap-ssh-disable-password`) flips
+New site fact `SSHDisablePassword` (record field `ap_ssh_disable_password`
+in the persisted site-settings record; the `--ap-ssh-disable-password` flag
+is the first-boot seed only) flips
 `sshd.auth.passwd` from the classic default `enabled` to `disabled`. Firmware
 semantics (ubntbox dropbear respawn builder): the builder assembles
 `"null::respawn:%s -F %s%s%s%s"` and appends the `"-s"` flag (disable remote
 password logins) exactly when `sshd.auth.passwd` is disabled; port comes from
 `sshd.%d.port` (`" -p %d"`) and the host keys are
 `-r /var/run/dropbear_rsa_host_key` / `-r /var/run/dropbear_ed25519_host_key`.
-The controller-side startup guard is fail-closed: password auth cannot be
-disabled without at least one provisioned public key — the next boot's
+The controller-side guard is fail-closed at every writer an admin can
+reach: the admin API's pre-backend fence AND the app save verb both reject
+a disable-without-keys save (400), and the cmd first-boot seed path
+(`validateSSHDisableSeed`) refuses the same flag combo — the next boot's
 cfg-row rebuild would otherwise leave an empty `authorized_keys` and dropbear
 would start with `-s`, risking a locked-out SSH. Recovery, even then, does
 NOT need SSH: an effective admin device save re-provisions the record on the
@@ -1145,18 +1151,28 @@ so nothing shipped before that validation changes any current wire bytes.
 Until then the LIVE-PROVISIONING GATE COVERS THE SSHD ROWS TOO: the
 adoption engine's fail-closed U7PG2/6.8.2.15592 choke point also rejects
 any full provisioning whose site facts carry key rows or the disable
-knob, lifted by the same `--allow-gated-live-wlan` opt-in (`SSHKeyRows` /
-`SSHDisablePassword` entering the engine as distilled engine deps, scalars
-only).
+knob, lifted by the same `--allow-gated-live-wlan` opt-in (the engine
+reads the distilled sshd scalars LIVE at gate time — `Deps.SSHSiteFacts
+func() (keyRows, disable)`, sourced from the persisted record, not frozen
+at construction).
 
 Delivery semantics: site facts render at EMISSION; they reach an adopted
-device only at ADOPTION or the NEXT CFGVERSION MINT (an effective admin
-device save, a WLAN-change, a blocked-sta change, or the watchdog path).
-A flag flip alone re-provisions nothing — a settled device with an
-unchanged cfgversion noop. And the sshd rows are NOT inform-observable
-(the vap_table/echo reports carry no sshd keys), so the cfgversion echo
-after a full provisioning is the ONLY delivery confirmation a bench round
-can observe; the rows' persistence surfaces at the next boot rebuild.
+device at ADOPTION or the NEXT CFGVERSION MINT (a site-settings save, an
+effective admin device save, a WLAN-change, a blocked-sta change, or the
+watchdog path). The site-settings path is REAL end-to-end: a save (admin
+API `PUT /api/v1/site-settings` or the Terraform `open-unifi_site_settings`
+resource) applies the persisted record and — on effective change — mints
+`cfgversion` across every device record carrying a cfgversion intent;
+each device's next inform then full-provisions carrying the new sshd
+rows (pinned E2E — save → mint → inform → `setparam` — in
+internal/server/lifecycle_test.go). The record is the source of the four
+AP-intent facts; the cmd flags are first-boot seeds only, ignored
+whenever the record file exists. A no-change save mints nothing — a
+settled device with an unchanged cfgversion noop. And the sshd rows are
+NOT inform-observable (the vap_table/echo reports carry no sshd keys), so
+the cfgversion echo after a full provisioning is the ONLY delivery
+confirmation a bench round can observe; the rows' persistence surfaces at
+the next boot rebuild.
 
 (End; see PROTOCOL-mgmt.md §3 for the surrounding `system_cfg` order and §6/§7 of
 PROTOCOL-mgmt.md for how system_cfg reaches the device.)

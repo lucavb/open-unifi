@@ -119,7 +119,12 @@ _Avoid_: builder, emitter.
 
 **Site facts**: the controller-level inputs a render needs: controller URL,
 regulatory country code, AP SSH password, the provisioned SSH public keys,
-the SSH password-login disable knob, and the current WLANs.
+the SSH password-login disable knob, and the current WLANs. The four
+AP-intent facts are record-sourced — persisted in the admin-owned
+site-settings record (keys as an ordered list of authorized_keys lines);
+controller URL and the WLANs stay outside it.
+_Avoid_: flag-sourced site facts (the flags are first-boot seeds only),
+re-seeding.
 
 **Provisioning plan**: the single value computed from a device and the
 wireless envelope that carries the drift hash, the vap placements, and the
