@@ -334,6 +334,24 @@ func TestProviderDecodesRealServerSiteSettings(t *testing.T) {
 	if want := "http 400: missing field ap_ssh_disable_password"; err.Error() != want {
 		t.Fatalf("missing field message = %q, want %q", err.Error(), want)
 	}
+
+	// Zero-document PUT (Delete's restore-defaults body,
+	// resource_site_settings.go): ALL FOUR fields present with zero values —
+	// country 0, empty password, [] (a PRESENT field, not a missing/null
+	// one), disable false — through the provider's own wire struct against
+	// the real server's strict decode. The noKeys 400 above differs only in
+	// values; this pins that zero VALUES alone never read as missing.
+	zero := siteSettings{APSSHPublicKeys: []string{}}
+	viewZ, err := c.putSiteSettings(ctx, zero)
+	if err != nil {
+		t.Fatalf("zero-doc PUT rejected: %v", err)
+	}
+	if got := status["PUT /api/v1/site-settings"]; got != http.StatusOK {
+		t.Fatalf("zero-doc PUT status = %d, want 200", got)
+	}
+	if !reflect.DeepEqual(*viewZ, zero) {
+		t.Fatalf("zero-doc PUT view = %+v, want verbatim echo of %+v", *viewZ, zero)
+	}
 }
 
 func TestImportAndNormalizeHelpers(t *testing.T) {
