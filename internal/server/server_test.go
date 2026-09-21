@@ -277,19 +277,27 @@ func mustBuildSys(t *testing.T, s *Server, rec store.Device) string {
 // carries the four facts as fields) MUST reach the rendered system_cfg
 // through the renderSystemCfg SiteFacts copy. A dropped SSHPublicKeys wire
 // would render an empty authorized_keys with -s (password auth off) ACTIVE
-// — the lane's own nightmare scenario, locked SSH on the AP. The rendered
-// blob must therefore carry both the key rows and the disabled passwd row.
-// (Synthetic key: the same marker'd RFC 4253 blob the systemcfg package
-// tests use — never a real key.)
+// — the lane's own nightmare scenario, locked SSH on the AP — and a dropped
+// SSHPassword wire would silently render the site default "ubnt" hash with
+// zero failures (every settings E2E saves ""). The rendered blob must
+// therefore carry both key rows, the disabled passwd row, and a
+// users.1.password hash that verifies against "hunter2" and NOT against
+// "ubnt", judged by the renderer's own cache matcher as the in-package
+// oracle (sha512CryptMatches is unexported; the matcher path is exercised
+// below — see TestSiteFactsSSHPasswordSeam's cache dance). (Synthetic key:
+// the same marker'd RFC 4253 blob the systemcfg package tests use — never
+// a real key.)
 func TestSiteFactsSSHConfigWiring(t *testing.T) {
 	pk, err := systemcfg.ParsePublicKey(
 		"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB test@ap")
 	if err != nil {
 		t.Fatal(err)
 	}
+	// hunter2 in the source facts; the empty-password row is rendered by
+	// TestSiteFactsSSHPasswordSeam below against the same record shape.
 	s := New(Config{
 		SiteSettings: func() (SiteSettings, error) {
-			return SiteSettings{SSHPublicKeys: []systemcfg.PublicKey{pk}, SSHDisablePassword: true}, nil
+			return SiteSettings{SSHPassword: "hunter2", SSHPublicKeys: []systemcfg.PublicKey{pk}, SSHDisablePassword: true}, nil
 		},
 	}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, u7pg2Record())
@@ -298,6 +306,7 @@ func TestSiteFactsSSHConfigWiring(t *testing.T) {
 		"sshd.auth.key.1.value=AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB\n",
 		"sshd.auth.key.1.type=ssh-ed25519\n",
 		"sshd.auth.passwd=disabled\n",
+		"users.1.password=$6$",
 	} {
 		if !strings.Contains(sys, want) {
 			t.Fatalf("Config→SiteFacts wiring pin: missing %q:\n%s", want, sys)
@@ -306,6 +315,89 @@ func TestSiteFactsSSHConfigWiring(t *testing.T) {
 	if strings.Contains(sys, "sshd.auth.passwd=enabled\n") {
 		t.Fatalf("SSHDisablePassword=false leaked through the wiring:\n%s", sys)
 	}
+}
+
+// TestSiteFactsSSHPasswordSeam pins the facts.SSHPassword → SiteFacts copy
+// in renderSystemCfg (the one settings seam no settings E2E covers: all
+// four settings saves carry ""). The dance uses the renderer's own cache
+// matcher (sha512CryptMatches — the same oracle the systemcfg round-trip
+// tests use, reachable here because the renderer verifies the record's
+// ssh_sha512passwd cache against the CURRENT site password on every
+// render):
+//
+//  1. render with EMPTY password → the default-row hash D rides into the
+//     record cache as the ssh_sha512passwd delta (mustBuildSys applies
+//     deltas, the direct-call stand-in for the adapter);
+//  2. render with SSHPassword "hunter2" → the row must NOT be D: the
+//     cached hash self-verifies against "ubnt" only, so under the real
+//     seam the render regenerates — a row identical to D means the copy
+//     was dropped and hunter2 rendered the default-"ubnt" hash;
+//  3. render AGAIN with hunter2 → the row byte-identically REUSES step
+//     2's row (a positive self-check: the rendered hash verifies against
+//     hunter2 itself, not merely differs from D's salt draw).
+//
+// Reverting the facts.SSHPassword copy (server.go:931) makes step 2 reuse
+// D verbatim (the "hunter2" render's site password falls back to "ubnt",
+// which self-checks against the cached D) and steps 2/3 collapse — the
+// test fails. Random salts do not perturb the shape: step 2's fresh draw
+// deterministically differs from the cached D only because the matcher
+// rejected it (an equal draw is probability ≈ 0 bug-noise, and under the
+// revert its reuse is EXACT), and step 3's reuse is exact.
+func TestSiteFactsSSHPasswordSeam(t *testing.T) {
+	rec := u7pg2Record()
+	serverWith := func(pw string) *Server {
+		return New(Config{
+			SiteSettings: func() (SiteSettings, error) {
+				return SiteSettings{SSHPassword: pw}, nil
+			},
+		}, store.NewMemStore(), testLogger())
+	}
+
+	// 1. default-password row D, cached into the record by the delta.
+	rowD := users1PasswordRow(t, mustBuildSys(t, serverWith(""), rec))
+	if _, ok := rec.Extra[store.SSHSha512PasswdKey]; !ok {
+		t.Fatalf("default render wrote no ssh_sha512passwd cache — the delta seam moved:\n%v", rec.Extra)
+	}
+
+	// 2. hunter2 must NOT self-verify against the default cache row.
+	row2 := users1PasswordRow(t, mustBuildSys(t, serverWith("hunter2"), rec))
+	if row2 == rowD {
+		t.Fatalf("SSHPassword %q rendered the default-cache row %q — the facts→SiteFacts copy is dropped:\n%s",
+			"hunter2", rowD, row2)
+	}
+
+	// 3. the positive oracle: the same facts render again must reuse step
+	// 2's row byte-identically (matcher self-check against hunter2) and
+	// mint no fresh delta.
+	before, err := json.Marshal(rec.Extra)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row3 := users1PasswordRow(t, mustBuildSys(t, serverWith("hunter2"), rec))
+	after, err := json.Marshal(rec.Extra)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row3 != row2 {
+		t.Fatalf("rendered users.1.password %q did not self-check against hunter2 (fresh draw %q)", row2, row3)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("hunter2 self-check render minted a delta (Extra changed): %s → %s", before, after)
+	}
+}
+
+// users1PasswordRow extracts the users.1.password row from a rendered
+// system_cfg, failing the test when the row is absent.
+func users1PasswordRow(t *testing.T, sys string) string {
+	t.Helper()
+	const row = "users.1.password="
+	for _, ln := range strings.Split(sys, "\n") {
+		if strings.HasPrefix(ln, row) && len(ln) > len(row) {
+			return ln
+		}
+	}
+	t.Fatalf("users.1.password row not found:\n%s", sys)
+	return ""
 }
 
 // Adapter-level byte-identity pin: the zero-value site-settings record

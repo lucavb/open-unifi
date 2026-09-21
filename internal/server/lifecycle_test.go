@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -722,4 +723,189 @@ func TestSiteSettingsSaveEscapesExhaustedWLANDeliveryE2E(t *testing.T) {
 			t.Fatalf("escape offer missing %q:\n%s", want, sys)
 		}
 	}
+}
+
+// TestSiteSettingsPutConcurrentWithInformsNoDeadlock: the smu leaf-lock
+// canary. The lock graph is acyclic ONLY because PutSiteSettings releases
+// smu (the settings apply lock) BEFORE any store call, while the inform
+// path takes smu INSIDE the store's per-MAC RMW cycle (macLock → smu — the
+// render closure's CurrentSiteSettings read; internal/app site_settings.go
+// LOCK SHAPE). A refactor that moves the PUT's mint sweep (or any other
+// store work) back inside the smu apply section flips the PUT to
+// smu → macLock: a live AB-BA deadlock against every concurrent inform,
+// with no test failure anywhere else. This canary makes the invariant
+// executable: fanned-out REAL informs (the mismatch arc → full
+// provisioning, whose render reads the settings source inside the RMW)
+// race REAL effective PUTs (each candidate document mints a cfgversion
+// sweep over the store's List/UpdateExisting).
+//
+// Watchdog discipline (plain `go test`, no -race, only timing assert): the
+// fan-out runs without any panic-prone t.Fatal from worker goroutines —
+// their outcomes are COLLECTED under a mutex and judged by the test
+// goroutine — and the test goroutine owns the only time assertion, the
+// watchdog bound. Green code is deadlock-free under the acyclic lock
+// graph (every smu acquisition provably resolves), so the watchdog can
+// never fire on the committed tree; it only names the invariant when a
+// regression wedges the WaitGroup. The fan-out is looped (the mints churn
+// cfgversion; every round opens fresh interleaving) so an AB-BA-shaped
+// regression is caught within the rounds rather than by the luck of one
+// interleave.
+func TestSiteSettingsPutConcurrentWithInformsNoDeadlock(t *testing.T) {
+	adminH, informH, st := siteSettingsFixture(t, app.SiteSettings{}, nil, false)
+	const cfg = "aaaabbbbccccdddd"
+	const xk = "11112222333344445555666677778888"
+	registerAdopted(t, st, cfg, xk)
+	kx := hexKey(t, xk)
+
+	// Ungated shape: the fixture's model/version (U7PG2 / 6.6.55) is what
+	// the live gate does NOT cover, so each mismatched inform — an info
+	// body WITHOUT the echoed cfgversion — answers one full provisioning
+	// whose render calls the settings source inside the store's RMW.
+	informBody := encryptCBC(t, mustJSON(t, infoBody("")), kx, testIV)
+	// Three documents that all differ (country 840 ↔ 276 ↔ 0 with a
+	// different key line, valid facts each): rotating saves stay effective
+	// in the common interleaving, so the PUT keeps minting through the
+	// store instead of resting on the no-change early return.
+	docs := []string{
+		siteSettingsPutBodyJSON(840, "", []string{ssKeyLine1}, true),
+		siteSettingsPutBodyJSON(276, "", []string{ssKeyLine1}, true),
+		siteSettingsPutBodyJSON(0, "", []string{ssKeyLine2}, true),
+	}
+
+	var (
+		wg sync.WaitGroup
+		mu sync.Mutex
+		// errs carries every worker outcome failure to the test goroutine;
+		// informs/puts count the completed successes.
+		errs    []string
+		informs int
+		puts    int
+	)
+	addErr := func(format string, args ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		errs = append(errs, fmt.Sprintf(format, args...))
+	}
+
+	// Fan-out calibration (see the docblock): several dozen rounds of
+	// interleaving so an AB-BA-shaped regression is caught with negligible
+	// miss probability — the watchdog measures wall clock only, never the
+	// happy-path timing.
+	const rounds = 48
+	const informsPerRound = 6
+	const putsPerRound = 3
+	for round := 0; round < rounds; round++ {
+		for n := 0; n < informsPerRound; n++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				resp := post(t, informH, informBody)
+				if resp.Code != http.StatusOK {
+					addErr("inform: status %d body %q", resp.Code, resp.Body.String())
+					return
+				}
+				jm, derr := decodeInformResponse(resp.Body.Bytes(), kx)
+				if derr != nil {
+					addErr("inform decrypt: %v", derr)
+					return
+				}
+				// The storm's outcomes may interleave with the concurrent
+				// mints (setparam vs noop) — the canary pins the transport
+				// seam, not the planner, and BOTH shapes carry the §
+				// universal timestamp.
+				if kind := jm["_type"]; kind != "noop" && kind != "setparam" {
+					addErr("inform response type %v, want noop or setparam", kind)
+					return
+				}
+				if _, ok := jm["server_time_in_utc"]; !ok {
+					addErr("inform %v response missing server_time_in_utc", jm["_type"])
+					return
+				}
+				mu.Lock()
+				informs++
+				mu.Unlock()
+			}()
+		}
+		for m := 0; m < putsPerRound; m++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				rec := postAdminBody(t, adminH, http.MethodPut, "/api/v1/site-settings", docs[i%len(docs)])
+				if rec.Code != http.StatusOK {
+					addErr("PUT: status %d body %q", rec.Code, rec.Body.String())
+					return
+				}
+				mu.Lock()
+				puts++
+				mu.Unlock()
+			}(round*putsPerRound + m)
+		}
+	}
+
+	// The watchdog: the WaitGroup releases only when every worker returns.
+	// On the committed tree each smu (and each store) acquisition is
+	// bounded by construction, so this selects the done channel in a
+	// fraction of the bound; when the PUT holds smu across a store call,
+	// one inform wedges behind one PUT and the fan-out never drains.
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(45 * time.Second):
+		t.Fatalf(`AB-BA deadlock detected in the site-settings PUT × inform fan-out (completed before the watchdog: %d informs / %d PUTs): the smu leaf-lock invariant is violated — PutSiteSettings must release the settings lock BEFORE any store call, because the inform path takes smu INSIDE the store's per-MAC RMW cycle (macLock → smu). A store call under smu flips the PUT to smu → macLock and wedges every live controller's inform traffic.`, informs, puts)
+	}
+
+	// Outcomes — all under the test goroutine: every PUT was answered 200
+	// and every inform got a well-shaped sealed response.
+	if len(errs) != 0 {
+		t.Fatalf("%d fan-out outcome failures:\n%s", len(errs), strings.Join(errs, "\n"))
+	}
+	if wantInforms, wantPuts := rounds*informsPerRound, rounds*putsPerRound; informs != wantInforms || puts != wantPuts {
+		t.Fatalf("fan-out accounting: %d informs / %d PUTs, want %d / %d (errs %v)",
+			informs, puts, wantInforms, wantPuts, errs)
+	}
+
+	// Post-storm sanity: the storm must leave the record's controller-side
+	// identity intact and its intent stamped: the per-device key survived
+	// (the absorbed informs never touch it — trust policy), the record
+	// still sits in an assigned-key-slot state (Adopting — the storm body
+	// never echoes a cfgversion, so the assigned-key re-provisioning arc
+	// owns every cycle; Adopted if a settled noop raced last), and the
+	// seed cfgversion is long minted away by the effective saves.
+	d, err := st.Get(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.XAuthkey != xk {
+		t.Fatalf("post-storm per-device key disturbed: %q (seed %q)", d.XAuthkey, xk)
+	}
+	if d.State != store.StateAdopted && d.State != store.StateAdopting {
+		t.Fatalf("post-storm record state %d, want an assigned-key-slot state", d.State)
+	}
+	if d.CfgVersion == cfg || !isHex(d.CfgVersion) {
+		t.Fatalf("post-storm record cfgversion %q (seed %q) unstamped", d.CfgVersion, cfg)
+	}
+}
+
+// decodeInformResponse is decryptResponse's worker-safe twin: decrypt and
+// JSON-decode a sealed response WITHOUT t.Fatal, for use inside fan-out
+// goroutines (their outcomes are collected by the test goroutine rather
+// than asserted mid-flight).
+func decodeInformResponse(respBody []byte, keyHex []byte) (map[string]any, error) {
+	pkt, perr := inform.ParsePacket(respBody)
+	if perr != nil {
+		return nil, fmt.Errorf("framing: %w", perr)
+	}
+	plain, derr := pkt.DecryptPayload(keyHex)
+	if derr != nil {
+		return nil, fmt.Errorf("decrypt: %w", derr)
+	}
+	var jm map[string]any
+	if err := json.Unmarshal(plain, &jm); err != nil {
+		return nil, fmt.Errorf("response json: %w", err)
+	}
+	return jm, nil
 }
