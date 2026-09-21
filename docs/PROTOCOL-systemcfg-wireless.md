@@ -1154,7 +1154,25 @@ any full provisioning whose site facts carry key rows or the disable
 knob, lifted by the same `--allow-gated-live-wlan` opt-in (the engine
 reads the distilled sshd scalars LIVE at gate time — `Deps.SSHSiteFacts
 func() (keyRows, disable)`, sourced from the persisted record, not frozen
-at construction).
+at construction). Coverage note: the gate's model/firmware predicate
+trusts the device-reported values, absorbed verbatim from the inform body
+under record absorption — a device naming another model (or another
+firmware) leaves the gate inert for itself. The gate is bench-safety for
+the controller's own emissions to the U7PG2/6.8.2.15592 lane, NOT a
+device-trust boundary.
+
+Known residual (recorded; deliberately not yet fixed): the gate read
+(`Deps.SSHSiteFacts`) and the render read of the site-settings record are
+two independent live reads within one decision. A site-settings save whose
+settings-mutex acquisition lands in the microsecond window between the two
+reads can emit ONE ungated full provisioning of the just-saved sshd rows
+(the gate read the old facts, the render read the new). The escape is
+one-shot and self-corrects at the next inform: the mint sweep's per-MAC
+write is ordered after the escape's cycle, so the device's next inform is
+guaranteed to mismatch and gate. The recorded remedy (not applied until
+the owed live-bench round): re-derive the gate's sshd half render-side
+inside `renderSystemCfg` under its own single facts read — the same
+defense-in-depth shape as the country-code re-check.
 
 Delivery semantics: site facts render at EMISSION; they reach an adopted
 device at ADOPTION or the NEXT CFGVERSION MINT (a site-settings save, an

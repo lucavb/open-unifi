@@ -78,7 +78,17 @@ that file does not exist yet. After that the persisted record is the single
 source of truth — manage it through `PUT /api/v1/site-settings` or Terraform
 (`open-unifi_site_settings`, below); a save that changes the record mints
 `cfgversion` and every adopted AP picks the new sshd rows up at its next
-inform. Supplying any of the four when the record already exists logs a
+inform. Caveat on default-gated deployments (U7PG2 firmware 6.8.2.15592):
+a save that carries the provisioned SSH public keys or the password-disable
+knob still returns 200 — but every subsequent full provisioning, including
+the delivery of future WLAN changes, is rejected with the typed 501
+live-provisioning gate until the sshd facts are cleared (an effective
+site-settings save of the defaults) or the controller restarts with
+`--allow-gated-live-wlan` (startup-only; a runtime save can never lift the
+gate). The rejected inform aborts its whole store cycle, so record
+absorption freezes too — affected devices go stale in the console (they
+look dead, not gated). See `docs/PROTOCOL-systemcfg-wireless.md` §13.
+Supplying any of the four when the record already exists logs a
 startup warning and the record wins (the deployment-input flags like
 `--controller-url` are unaffected).
 
@@ -194,7 +204,15 @@ regulatory country code, the AP SSH password, the provisioned
 authorized_keys lines (ordered; one `sshd.auth.key.<n>` row family per
 line), and the SSH password-login disable knob. A change to any of them
 re-provisions every adopted AP at its next inform. Deleting the resource
-restores the controller defaults.
+restores the controller defaults. Watch the live gate before combining
+these fields: the example above (`ap_ssh_public_keys` plus
+`ap_ssh_disable_password = true`) is exactly the combination the gate
+blocks on the supported hardware (U7PG2 firmware 6.8.2.15592) — the apply
+succeeds, but every subsequent full provisioning returns the typed 501
+until the sshd facts are cleared (an effective save of the defaults) or
+the controller restarts with `--allow-gated-live-wlan` (startup-only),
+and blocked devices then go stale in the console; see
+`docs/PROTOCOL-systemcfg-wireless.md` §13.
 
 See `examples/terraform/` (includes filesystem-mirror dev overrides so
 `terraform init` isn't needed during development).
@@ -202,8 +220,11 @@ See `examples/terraform/` (includes filesystem-mirror dev overrides so
 ## WLAN provisioning status
 
 Live WLAN provisioning is unsupported/gated pending an official-controller
-differential fixture. U7PG2 firmware 6.8.2.15592 with any nonempty managed
-WLAN fails closed with a typed status and never emits `system_cfg`.
+differential fixture. On U7PG2 firmware 6.8.2.15592 the gate fails closed
+with a typed status and never emits `system_cfg`, on EITHER trigger: any
+nonempty managed WLAN, OR site-fact sshd provisioning (provisioned SSH
+public keys or the password-login disable knob). The startup-only
+`--allow-gated-live-wlan` flag lifts it for sanctioned bench pushes.
 
 ## Protocol documentation
 

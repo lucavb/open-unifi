@@ -326,8 +326,15 @@ func RenderWithPlan(d store.Device, facts SiteFacts, plan wireless.ProvisioningP
 		// "null::respawn:%s -F %s%s%s%s" (port from sshd.%d.port, host
 		// keys -r /var/run/dropbear_rsa_host_key and
 		// -r /var/run/dropbear_ed25519_host_key). Password auth must be
-		// disabled only with an authorized key provisioned — the caller
-		// (cmd/openunifi) enforces that fail-closed at startup.
+		// disabled only with an authorized key provisioned: every
+		// admin-reachable writer rejects the disable-without-keys
+		// combination fail-closed — the admin API's pre-backend fence, the
+		// app save verb, and the cmd first-boot seed guard. A hand-edited
+		// on-disk record deliberately still boots (do-not-brick doctrine);
+		// recovery there is an effective site-settings save. The inform-time
+		// live gate does not substitute for these fences: it is scoped to
+		// U7PG2 firmware 6.8.2.15592 and does not cover other models or
+		// firmware.
 		line("sshd.auth.passwd", "disabled")
 	} else {
 		line("sshd.auth.passwd", "enabled")

@@ -298,7 +298,23 @@ type Deps struct {
 	// real error before anything persists (the store cycle aborts, so the
 	// in-memory record writes are discarded with it) — net fail-closed
 	// (the CLI refuses startup on that error anyway, so it is
-	// embedder-only). nil ⇒ zero facts.
+	// embedder-only).
+	//
+	// Residual race (documented, not yet fixed): the gate read (this
+	// closure) and the render read of the settings record (renderSystemCfg)
+	// are two independent live reads of the settings within one decision.
+	// A site-settings save whose smu acquisition lands in the microsecond
+	// window between the two reads can emit ONE ungated full provisioning
+	// of the just-saved sshd rows (the gate read the old facts, the render
+	// read the new). The escape is one-shot and self-corrects at the next
+	// inform: the mint sweep's per-MAC write is ordered after the escape's
+	// cycle, so the device's next inform is guaranteed to mismatch and
+	// gate. KNOWN REMEDY (recorded here, deliberately not implemented):
+	// re-derive the gate's sshd half render-side inside renderSystemCfg
+	// under its own single facts read — the same defense-in-depth shape as
+	// the country-code re-check — to be applied before the owed
+	// live-bench validation round (docs/PROTOCOL-systemcfg-wireless.md
+	// §13.3). nil ⇒ zero facts.
 	SSHSiteFacts func() (keyRows int, disable bool)
 }
 
