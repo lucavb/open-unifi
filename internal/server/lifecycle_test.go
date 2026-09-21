@@ -62,7 +62,7 @@ func decryptResponseRaw(t *testing.T, respBody []byte, keyHex []byte) (uint16, [
 func lifecycleFixture(t *testing.T) (admin, informH http.Handler, st store.DeviceStore) {
 	t.Helper()
 	st = store.NewMemStore()
-	a := app.New(st, filepath.Join(t.TempDir(), "wireless.json"), testLogger())
+	a := app.New(st, filepath.Join(t.TempDir(), "wireless.json"), filepath.Join(t.TempDir(), "site-settings.json"), app.SiteSettings{}, testLogger())
 	return adminapi.New(adminapi.Config{}, a), New(Config{}, st, testLogger()).InformHandler(), st
 }
 

@@ -29,7 +29,7 @@ import (
 func composeAPI(t *testing.T) (*apiClient, store.DeviceStore, map[string]int) {
 	t.Helper()
 	st := store.NewMemStore()
-	ap := app.New(st, filepath.Join(t.TempDir(), "wireless.json"), nil) // slog default logger
+	ap := app.New(st, filepath.Join(t.TempDir(), "wireless.json"), filepath.Join(t.TempDir(), "site-settings.json"), app.SiteSettings{}, nil) // slog default logger
 	handler := adminapi.New(adminapi.Config{}, ap)
 
 	status := map[string]int{}

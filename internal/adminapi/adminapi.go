@@ -9,6 +9,11 @@
 // boundary and every record write agree on canonical 12-hex; a private
 // copy here once silently split device identity between the two lanes)
 // and metrics (the /metrics handler wiring and its request instrumentation).
+// The site-settings pre-backend validator adds a THIRD, one-directional
+// edge: systemcfg (the fail-closed RFC 4253 authorized_keys parser is the
+// controller's single key validator — the app verb, the first-boot seed,
+// and this REST layer all fence through it; systemcfg does not import this
+// package, so the edge cannot cycle).
 package adminapi
 
 import (
@@ -312,6 +317,77 @@ type RadioView struct {
 	Txpower         *string `json:"txpower,omitempty"`
 }
 
+// SiteSettingsDocument is the whole-document site-settings request: the
+// four AP-intent facts (regulatory country code, AP SSH password, ordered
+// SSH authorized_keys lines, SSH password-login disable). PUT replaces the
+// record WHOLESALE (the wireless-envelope doctrine) — every field is
+// required and an absent list is an empty list, never null. The document
+// shape is ALSO the on-disk shape of <data-dir>/site-settings.json, so a
+// round-trip through the API is byte-representable on disk.
+//
+// Validation semantics (the Backend verb enforces them; the API layer
+// pre-validates the same rules): country code 0 = unset (server-side
+// default) or 1..999; every key line must be a valid RFC 4253
+// authorized_keys line (the fail-closed systemcfg parser is the single
+// validator); disabling password login requires at least one key line.
+type SiteSettingsDocument struct {
+	RegulatoryCountryCode int      `json:"regulatory_country_code"`
+	APSSHPassword         string   `json:"ap_ssh_password"`
+	APSSHPublicKeys       []string `json:"ap_ssh_public_keys"`
+	APSSHDisablePassword  bool     `json:"ap_ssh_disable_password"`
+}
+
+// SiteSettingsView is the read model of the site-settings record. The
+// password IS echoed: this is the admin's own surface (the record's admin
+// owner), and the Terraform provider needs the read-back to detect drift.
+type SiteSettingsView struct {
+	RegulatoryCountryCode int      `json:"regulatory_country_code"`
+	APSSHPassword         string   `json:"ap_ssh_password"`
+	APSSHPublicKeys       []string `json:"ap_ssh_public_keys"`
+	APSSHDisablePassword  bool     `json:"ap_ssh_disable_password"`
+}
+
+// siteSettingsPutBody is the strict decode shape of the PUT
+// /api/v1/site-settings body: every field is a POINTER so the decoder can
+// tell an absent field from a zero one. PUT is whole-document (the
+// wireless-envelope doctrine): a partial body must never silently zero a
+// fact, so any missing field is a 400 BEFORE the backend runs — never an
+// implicit zero write.
+type siteSettingsPutBody struct {
+	RegulatoryCountryCode *int      `json:"regulatory_country_code"`
+	APSSHPassword         *string   `json:"ap_ssh_password"`
+	APSSHPublicKeys       *[]string `json:"ap_ssh_public_keys"`
+	APSSHDisablePassword  *bool     `json:"ap_ssh_disable_password"`
+}
+
+// missingField returns the JSON name of the first REQUIRED field absent
+// from the decoded body ("" when the document is complete).
+func (b *siteSettingsPutBody) missingField() string {
+	switch {
+	case b.RegulatoryCountryCode == nil:
+		return "regulatory_country_code"
+	case b.APSSHPassword == nil:
+		return "ap_ssh_password"
+	case b.APSSHPublicKeys == nil:
+		return "ap_ssh_public_keys"
+	case b.APSSHDisablePassword == nil:
+		return "ap_ssh_disable_password"
+	}
+	return ""
+}
+
+// toDocument builds the whole-document request from the decoded pointers
+// (every field present by construction — the route rejects missing ones
+// first).
+func (b *siteSettingsPutBody) toDocument() SiteSettingsDocument {
+	return SiteSettingsDocument{
+		RegulatoryCountryCode: *b.RegulatoryCountryCode,
+		APSSHPassword:         *b.APSSHPassword,
+		APSSHPublicKeys:       *b.APSSHPublicKeys,
+		APSSHDisablePassword:  *b.APSSHDisablePassword,
+	}
+}
+
 // Backend is the storage/service contract implemented by the server lane.
 type Backend interface {
 	ListDevices(ctx context.Context) []DeviceView
@@ -388,6 +464,22 @@ type Backend interface {
 	GetWlan(ctx context.Context, name string) (Wlan, error)
 	UpdateWlan(ctx context.Context, name string, wlan Wlan) (Wlan, error)
 	DeleteWlan(ctx context.Context, name string) error
+	// GetSiteSettings returns the site-settings read view — the four
+	// AP-intent facts (controller-level record, site_settings file), read
+	// from the Backend's cache. The Backend's error is reserved for its
+	// New-time load problem (an unreadable/corrupt/invalid settings file).
+	// Like every other Backend method it takes a context (implementations
+	// currently ignore it — the record is an in-process cache read).
+	GetSiteSettings(ctx context.Context) (SiteSettingsView, error)
+	// PutSiteSettings replaces the whole site-settings document wholesale
+	// (the wireless-envelope doctrine) and returns the read view. An
+	// EFFECTIVE change re-stamps cfgversion across the provisioned devices
+	// (the operator-save trigger — settings mint ON SAVE), so the next
+	// inform full-provisions the new AP-intent facts; a save that changes
+	// nothing mints nothing. Validation failures wrap ErrInvalid (HTTP
+	// 400): country code 0/unset or 001..999, every authorized_keys line
+	// through the fail-closed parser, disable-without-keys rejected.
+	PutSiteSettings(ctx context.Context, doc SiteSettingsDocument) (SiteSettingsView, error)
 	// ListDeviceRadios returns the per-radio view (device echo + admin
 	// intent) in radio_table name order. Unknown MACs are ErrNotFound.
 	ListDeviceRadios(ctx context.Context, mac string) ([]RadioView, error)
@@ -422,6 +514,7 @@ const (
 	routePendingList        = "/api/v1/pending"
 	routePendingAdopt       = "/api/v1/pending/{mac}/adopt"
 	routeWireless           = "/api/v1/wireless"
+	routeSiteSettings       = "/api/v1/site-settings"
 	routeWhoAmI             = "/api/v1/whoami"
 	routeOther              = "/api/other"
 	apiPrefix               = "/api/"
@@ -868,6 +961,47 @@ func New(cfg Config, be Backend) http.Handler {
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "name": name})
 	}))
+	mux.HandleFunc("GET /api/v1/site-settings", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+		out, err := be.GetSiteSettings(r.Context())
+		if err != nil {
+			handleBackendErr(w, lg, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+	}))
+	// The site-settings PUT is WHOLE-DOCUMENT (the wireless-envelope
+	// doctrine): every field is required (the strict pointer decode below
+	// rejects any missing one before the backend runs), the record is
+	// replaced wholesale, and an EFFECTIVE save re-stamps cfgversion across
+	// the provisioned devices Backend-side. The Backend verbs take a
+	// context like every other method (implementations currently ignore
+	// it — the record is an in-process cache read).
+	mux.HandleFunc("PUT /api/v1/site-settings", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+		var raw siteSettingsPutBody
+		if err := readJSON(r, &raw); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		if name := raw.missingField(); name != "" {
+			writeErr(w, http.StatusBadRequest, "missing field "+name)
+			return
+		}
+		doc := raw.toDocument()
+		// The same rule set the Backend verb enforces — defense-in-depth,
+		// both layers validate (a future direct caller cannot bypass the
+		// pre-backend 400s, and a hand-written Backend cannot bypass the
+		// route fence either).
+		if msg := ValidateSiteSettings(&doc); msg != "" {
+			writeErr(w, http.StatusBadRequest, msg)
+			return
+		}
+		out, err := be.PutSiteSettings(r.Context(), doc)
+		if err != nil {
+			handleBackendErr(w, lg, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+	}))
 	mux.HandleFunc("GET /api/v1/whoami", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, whoAmI{
 			Server:         "open-unifi",
@@ -930,6 +1064,14 @@ func New(cfg Config, be Backend) http.Handler {
 func handleBackendErr(w http.ResponseWriter, lg *slog.Logger, err error) {
 	if errors.Is(err, ErrConflict) {
 		writeErr(w, http.StatusConflict, err.Error())
+		return
+	}
+	// 400 Bad Request: the body decoded fine but the backend rejected it
+	// semantically. Like the 409 arm above, these messages are
+	// user-facing validation context (what is wrong and what is accepted)
+	// and harmless to echo.
+	if errors.Is(err, ErrInvalid) {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if errors.Is(err, ErrNotFound) {

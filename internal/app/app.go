@@ -57,6 +57,21 @@ type App struct {
 	// surfaced by CurrentWireless so startup can refuse to launch.
 	loadErr error
 
+	// settingsPath is the JSON file holding the site-settings record
+	// (site_settings.go), the wireless-envelope precedent for a
+	// controller-level whole-document record.
+	settingsPath string
+	smu          sync.Mutex // guards the settings cache (Get/Put pairs)
+	// cachedSettings is set EXACTLY ONCE by New (from the seed on first
+	// boot, from the file otherwise); the site-settings verbs serve the
+	// cache — no per-request file I/O.
+	cachedSettings SiteSettings
+	// settingsLoadErr is the error from that one eager load OR from the
+	// first-boot seed persist; missing file is NOT an error (the seed
+	// path is the happy path). Fixed at New time and surfaced by
+	// CurrentSiteSettings so startup can refuse to launch.
+	settingsLoadErr error
+
 	prevMu     sync.Mutex
 	prevStates map[string]int // MAC(file-free bare hex) -> last-observed state
 
@@ -77,18 +92,41 @@ var _ adminapi.Backend = (*App)(nil)
 // or JSON-corrupt file is retained in loadErr — callers must check
 // CurrentWireless at startup (cmd/openunifi refuses to launch) instead of
 // silently provisioning APs with zero WLANs.
-func New(st store.DeviceStore, wirelessPath string, lg *slog.Logger) *App {
+//
+// settingsPath + seed carry the site-settings record (site_settings.go),
+// the wireless-envelope precedent for a controller-level whole-document
+// document: the file is read EXACTLY ONCE here, a present file wins over
+// the seed (the startup flags are first-boot seeds only), and an absent
+// file seeds, validates, and persists the seed immediately.
+func New(st store.DeviceStore, wirelessPath, settingsPath string, seed SiteSettings, lg *slog.Logger) *App {
 	if lg == nil {
 		lg = slog.Default()
 	}
 	env, err := loadWirelessFile(wirelessPath)
+	settings, loaded, serr := loadSettingsFile(settingsPath)
+	settingsErr := serr
+	if !loaded {
+		// First boot: the seed (cmd/openunifi's startup flags, or the
+		// zero record for tests/embedders) becomes the initial record.
+		// Validation is the SEED rule (fail-closed, like the flag
+		// resolution already was) — not the save verb's rule.
+		if verr := validateSettingsSyntax(seed); verr != nil {
+			settingsErr = fmt.Errorf("first-boot site-settings seed: %w", verr)
+		} else if perr := persistSettingsFile(settingsPath, seed); perr != nil {
+			settingsErr = fmt.Errorf("site settings seed persist: %w", perr)
+		}
+		settings = seed
+	}
 	return &App{
-		st:             st,
-		lg:             lg,
-		wirelessPath:   wirelessPath,
-		cachedWireless: env,
-		loadErr:        err,
-		prevStates:     map[string]int{},
+		st:              st,
+		lg:              lg,
+		wirelessPath:    wirelessPath,
+		cachedWireless:  env,
+		loadErr:         err,
+		settingsPath:    settingsPath,
+		cachedSettings:  settings,
+		settingsLoadErr: settingsErr,
+		prevStates:      map[string]int{},
 	}
 }
 

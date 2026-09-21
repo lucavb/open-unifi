@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/lucavb/open-unifi/internal/server/systemcfg"
 	"github.com/lucavb/open-unifi/internal/store"
 )
 
@@ -17,6 +18,15 @@ import (
 // uses errors.Is) wherever a referenced device/MAC does not exist.
 var ErrNotFound = errors.New("device not found")
 var ErrConflict = errors.New("conflict")
+
+// ErrInvalid is the sentinel backend error mapped to HTTP 400: the request
+// body is well-formed JSON but semantically invalid (a range violation, a
+// malformed authorized_keys line, a violated constraint). External Backend
+// implementations should wrap it with the human message — fmt.Errorf("%w:
+// %s", ErrInvalid, msg) or fmt.Errorf("%w: %s ...", ErrInvalid, ...) — the
+// mapping uses errors.Is and echoes the message to the client (validation
+// text is user-facing).
+var ErrInvalid = errors.New("invalid request")
 
 // ErrSetInformPushFailed is the sentinel backend error mapped to HTTP 502:
 // the console Adopt action's set-inform push (the delivery lane for
@@ -103,6 +113,43 @@ func requireToken(cfg Config, next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+// ---- site settings validation -------------------------------------------
+
+// ValidateSiteSettings is the pre-backend fence for the site-settings save
+// (PUT /api/v1/site-settings): the SAME rule set the app verb enforces
+// (defense-in-depth — both layers validate, one rule set). Returns ""
+// when valid, else a short human message for the 400 body. The rules:
+//
+//   - regulatory_country_code: 0 = unset (the record's canonical
+//     persisted-first-boot default; the server seam renders it as 840) or
+//     an ISO 3166-1 numeric code 001..999 — the server.ValidateConfig
+//     range semantics;
+//   - every ap_ssh_public_keys line through systemcfg.ParsePublicKey, the
+//     controller's single fail-closed RFC 4253 authorized_keys parser
+//     (structure check, not cryptography — the AP's dropbear rejects a
+//     well-formed wrong key at first use). The FIRST failing line names
+//     itself in the 400. There is deliberately no list-size cap: the
+//     renderer emits one sshd.auth.key.<n> row family per line in slice
+//     order with no jar-cited bound (the RADIUS 4-slot cap has a wire
+//     reason; this list does not);
+//   - ap_ssh_disable_password == true requires at least one provisioned
+//     key line — the next cfg rebuild would otherwise leave dropbear with
+//     -s and an empty authorized_keys (SSH lockout).
+func ValidateSiteSettings(doc *SiteSettingsDocument) string {
+	if code := doc.RegulatoryCountryCode; code != 0 && (code < 1 || code > 999) {
+		return fmt.Sprintf("regulatory country code must be an ISO 3166-1 numeric code from 001 to 999 (or 0 = unset), got %d", code)
+	}
+	for i, line := range doc.APSSHPublicKeys {
+		if _, err := systemcfg.ParsePublicKey(line); err != nil {
+			return fmt.Sprintf("invalid AP SSH public key #%d: %v", i+1, err)
+		}
+	}
+	if doc.APSSHDisablePassword && len(doc.APSSHPublicKeys) == 0 {
+		return "AP SSH password auth cannot be disabled without a provisioned public key; add an authorized_keys line or SSH access will be locked out"
+	}
+	return ""
 }
 
 // ---- MAC normalization ---------------------------------------------------

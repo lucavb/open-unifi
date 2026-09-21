@@ -24,7 +24,10 @@ func testApp(t *testing.T) (*App, store.DeviceStore, string) {
 	t.Helper()
 	st := store.NewMemStore()
 	wpath := filepath.Join(t.TempDir(), "wireless.json")
-	a := New(st, wpath, quietLogger())
+	// The settings file lives in its own temp dir: TestWirelessRoundtrip
+	// asserts its directory holds exactly one file (the old-world pin),
+	// and the site-settings record persists a file at New on first boot.
+	a := New(st, wpath, filepath.Join(t.TempDir(), "site-settings.json"), SiteSettings{}, quietLogger())
 	return a, st, wpath
 }
 
@@ -789,7 +792,7 @@ func TestWirelessRoundTripPersistence(t *testing.T) {
 	}
 
 	// persistence: reopen a fresh App over the same file
-	a2 := New(store.NewMemStore(), wpath, quietLogger())
+	a2 := New(store.NewMemStore(), wpath, filepath.Join(t.TempDir(), "site-settings.json"), SiteSettings{}, quietLogger())
 	if re := a2.GetWireless(ctx); len(re.Wlans) != 2 || re.Wlans[0].Passphrase != "correct-horse" {
 		t.Fatalf("reopened: %+v", re)
 	}
@@ -928,7 +931,7 @@ func TestNewWithCorruptWirelessFileRetainsError(t *testing.T) {
 	if err := os.WriteFile(wpath, []byte("{this is not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	a := New(store.NewMemStore(), wpath, quietLogger())
+	a := New(store.NewMemStore(), wpath, filepath.Join(t.TempDir(), "site-settings.json"), SiteSettings{}, quietLogger())
 
 	env, err := a.CurrentWireless()
 	if err == nil {
@@ -969,7 +972,7 @@ func TestNewLoadsEapWirelessDocument(t *testing.T) {
 	if err := os.WriteFile(wpath, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	a := New(store.NewMemStore(), wpath, quietLogger())
+	a := New(store.NewMemStore(), wpath, filepath.Join(t.TempDir(), "site-settings.json"), SiteSettings{}, quietLogger())
 	if _, err := a.CurrentWireless(); err != nil {
 		t.Fatalf("valid EAP document must load, got %v", err)
 	}
@@ -1007,7 +1010,7 @@ func TestNewRejectsInvalidWirelessDocument(t *testing.T) {
 		if err := os.WriteFile(wpath, []byte(tc.body), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		a := New(store.NewMemStore(), wpath, quietLogger())
+		a := New(store.NewMemStore(), wpath, filepath.Join(t.TempDir(), "site-settings.json"), SiteSettings{}, quietLogger())
 		env, err := a.CurrentWireless()
 		if err == nil {
 			t.Fatalf("%s: invalid document must fail the load error", tc.name)
@@ -1094,7 +1097,7 @@ func TestPutWirelessFencesFullEnvelope(t *testing.T) {
 func TestPutWirelessFailureLeavesCacheUntouched(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	a := New(store.NewMemStore(), filepath.Join(dir, "wireless.json"), quietLogger())
+	a := New(store.NewMemStore(), filepath.Join(dir, "wireless.json"), filepath.Join(t.TempDir(), "site-settings.json"), SiteSettings{}, quietLogger())
 
 	// Seed and injected-failure payloads are VALID wlans (open security,
 	// in-range VLAN): the failure this pin exercises is persistence
@@ -1153,7 +1156,7 @@ func TestUpdateWlanFailureLeavesCacheUntouched(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	wpath := filepath.Join(dir, "wireless.json")
-	a := New(store.NewMemStore(), wpath, quietLogger())
+	a := New(store.NewMemStore(), wpath, filepath.Join(t.TempDir(), "site-settings.json"), SiteSettings{}, quietLogger())
 	pre := wirelessFixture()
 	if err := a.PutWireless(ctx, pre); err != nil {
 		t.Fatal(err)
@@ -1218,7 +1221,7 @@ func TestDeleteWlanFailureLeavesCacheUntouched(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	wpath := filepath.Join(dir, "wireless.json")
-	a := New(store.NewMemStore(), wpath, quietLogger())
+	a := New(store.NewMemStore(), wpath, filepath.Join(t.TempDir(), "site-settings.json"), SiteSettings{}, quietLogger())
 	pre := wirelessFixture()
 	if err := a.PutWireless(ctx, pre); err != nil {
 		t.Fatal(err)
