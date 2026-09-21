@@ -24,9 +24,11 @@ const engineMAC = "aabbccddeeff"
 
 // newTestEngine builds an Engine with fully deterministic injections: the
 // random source returns 0.5, key generation mints an incrementing hex
-// sequence (distinct per call), the wireless source is empty and the
-// system_cfg producer returns a canned blob. Tests override e.random /
-// e.wireless / e.systemCfg directly (in-package).
+// sequence (distinct per call), the wireless source is empty, the site
+// facts read zero (the gate stays inert — gate tests override
+// e.sshSiteFacts directly) and the system_cfg producer returns a canned
+// blob. Tests override e.random / e.wireless / e.systemCfg /
+// e.sshSiteFacts directly (in-package).
 func newTestEngine(t *testing.T) *Engine {
 	t.Helper()
 	counter := 0
@@ -35,6 +37,9 @@ func newTestEngine(t *testing.T) *Engine {
 		Random:   func() float64 { return 0.5 },
 		KeyChars: func(n int) (string, error) { return "", nil }, // replaced below
 		Wireless: func() []wireless.Wlan { return nil },
+		SSHSiteFacts: func() (int, bool) {
+			return 0, false
+		},
 		SystemCfg: func(store.Device, []wireless.Wlan, wireless.ProvisioningPlan) (string, map[string]string, error) {
 			return "# unifi\nunifi.version=0.1.0-dev\n", nil, nil
 		},
@@ -1038,14 +1043,14 @@ func TestEncryptedGateLiftedByOptIn(t *testing.T) {
 
 // The sshd site facts ride the SAME fail-closed lane gate as the WLAN
 // template: on the U7PG2 6.8.2.15592 lane, a site with provisioned key rows
-// (SSHKeyRows>0) or with the password-login disable fact emits the typed
-// unsupported error from the assigned-key flow, with NO record mutation —
-// the sshd rows are firmware-derived but not yet live-bench-validated.
-// Zero-valued Deps (every pre-existing test) keep the gate inert.
+// (the gate func returning keyRows>0) emits the typed unsupported error
+// from the assigned-key flow, with NO record mutation — the sshd rows are
+// firmware-derived but not yet live-bench-validated. Zero-valued site
+// facts (every pre-existing test) keep the gate inert.
 func TestEncryptedGateBlocksSSHKeyRows(t *testing.T) {
 	e := newTestEngine(t)
 	e.wireless = func() []wireless.Wlan { return workedEnvelopeAdoption() }
-	e.sshKeyRows = 1
+	e.sshSiteFacts = func() (int, bool) { return 1, false }
 	const k = "11112222333344445555666677778888"
 	dev := store.Device{
 		MAC:        engineMAC,
@@ -1078,7 +1083,7 @@ func TestEncryptedGateBlocksSSHKeyRows(t *testing.T) {
 func TestEncryptedGateBlocksSSHDisablePassword(t *testing.T) {
 	e := newTestEngine(t)
 	e.wireless = func() []wireless.Wlan { return workedEnvelopeAdoption() }
-	e.sshDisablePassword = true
+	e.sshSiteFacts = func() (int, bool) { return 0, true }
 	const k = "11112222333344445555666677778888"
 	dev := store.Device{
 		MAC:        engineMAC,
@@ -1118,8 +1123,7 @@ func TestEncryptedGateSSHFactsLiftedByOptIn(t *testing.T) {
 			return "# unifi\nunifi.version=0.1.0-dev\n", nil, nil
 		},
 		AllowGatedLiveWLAN: true,
-		SSHKeyRows:         1,
-		SSHDisablePassword: true,
+		SSHSiteFacts:       func() (int, bool) { return 1, true },
 	})
 	const k = "11112222333344445555666677778888"
 	dev := store.Device{
@@ -1182,6 +1186,77 @@ func TestPlainMgmtResendNotGated(t *testing.T) {
 	}
 	if out.MgmtCfg == "" {
 		t.Fatal("mgmt re-send missing mgmt_cfg")
+	}
+}
+
+// GATE LIVENESS: the sshd scalars are read AT GATE TIME through the
+// Deps.SSHSiteFacts func, not frozen at engine construction. A U7PG2 /
+// 6.8.2.15592 device with an EMPTY WLAN envelope (the WLAN arm stays
+// inert — only the ssh facts can trip the gate here) walks the full arc
+// of one gate closure in a single test: the func returns (0,false) and
+// the cfgversion-drift inform proceeds through FULL provisioning; the
+// func is then FLIPPED mid-test to (2,true) — a site-settings save that
+// landed between two informs, the real-world shape the frozen scalars
+// could never see — and the SAME push is now rejected with
+// ErrLiveWLANProvisioningUnsupported; the bench opt-in lifts it again.
+// No record mutation rides any rejected arm (same contract the block
+// tests above pin).
+func TestEncryptedGateSSHSiteFactsReadLive(t *testing.T) {
+	keyRows, disable := 0, false
+	e := newTestEngine(t)
+	e.wireless = func() []wireless.Wlan { return nil } // no WLANs: the ssh facts are the only gate input
+	e.sshSiteFacts = func() (int, bool) { return keyRows, disable }
+	gatedDev := func() store.Device {
+		return store.Device{
+			MAC:        engineMAC,
+			State:      store.StateAdopted,
+			CfgVersion: "aaaa",
+			AppliedCfg: "", // cfgversion drift → the full-provisioning path
+			XAuthkey:   "11112222333344445555666677778888",
+			Authkeys:   []string{"11112222333344445555666677778888"},
+			Model:      "U7PG2",
+			Firmware:   "6.8.2.15592",
+		}
+	}
+	decide := func() (Outcome, error) {
+		return e.Decide(Request{
+			Transport: TransportEncrypted,
+			Device:    gatedDev(),
+			Body:      engineBody(""),
+			UsedKey:   "11112222333344445555666677778888",
+			Now:       time.Unix(1000, 0),
+		})
+	}
+
+	// (1) Zero site facts: the gate is inert — full provisioning proceeds.
+	out, err := decide()
+	if err != nil {
+		t.Fatalf("zero-facts inform err = %v, want nil (gate inert)", err)
+	}
+	if out.Kind != KindSetparam || !out.FullProvision || out.SystemCfg == "" {
+		t.Fatalf("zero-facts outcome = %+v, want full provisioning with system_cfg", out)
+	}
+
+	// (2) Flip the func mid-test (the settings save the frozen scalars
+	// would have missed): the SAME push is rejected, record untouched.
+	keyRows, disable = 2, true
+	out, err = decide()
+	if err != ErrLiveWLANProvisioningUnsupported {
+		t.Fatalf("flipped-facts inform err = %v, want unsupported-live-WLAN", err)
+	}
+	if out.Kind != "" || out.SystemCfg != "" || out.SetState || out.SetXAuthkey ||
+		out.SetCfgVersion || out.SetAuthkeys || out.Extra != nil {
+		t.Fatalf("flipped gate must not mutate the record or emit system_cfg: %+v", out)
+	}
+
+	// (3) The bench opt-in lifts the gate despite the live facts.
+	e.allowGatedWLAN = true
+	out, err = decide()
+	if err != nil {
+		t.Fatalf("opted-in inform err = %v, want nil (gate lifted)", err)
+	}
+	if out.Kind != KindSetparam || !out.FullProvision || out.SystemCfg == "" {
+		t.Fatalf("opted-in outcome = %+v, want full provisioning with system_cfg", out)
 	}
 }
 

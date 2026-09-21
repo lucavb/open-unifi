@@ -20,3 +20,16 @@ func (s *Server) currentWireless() []Wlan {
 	}
 	return s.cfg.WirelessSource()
 }
+
+// currentSiteSettings resolves the configured site-settings source; nil
+// source ⇒ zero facts (the four rendering defaults), mirroring
+// currentWireless. A non-nil error is the REAL retained settings load error
+// (a present-but-unreadable/corrupt/invalid site-settings file): the render
+// fails on it (no record mutation, no emission); the gate closure maps it
+// to zero facts so the gate stays inert — net fail-closed.
+func (s *Server) currentSiteSettings() (SiteSettings, error) {
+	if s.cfg.SiteSettings == nil {
+		return SiteSettings{}, nil
+	}
+	return s.cfg.SiteSettings()
+}

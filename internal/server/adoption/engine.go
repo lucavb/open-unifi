@@ -283,32 +283,36 @@ type Deps struct {
 	// every normal start.
 	AllowGatedLiveWLAN bool
 
-	// SSHKeyRows and SSHDisablePassword are the distilled site-fact sshd
-	// scalars the gate needs (the renderer packages' inputs, already
-	// resolved by the caller): the count of provisioned authorized-key
-	// rows and whether sshd.auth.passwd renders disabled. Deliberately
-	// scalars, NOT systemcfg facts/keys — the adoption engine must not
-	// depend on the renderer package (HARD RULE, engine deps docblock
-	// above SystemCfg: decisions receive only the wire-facing values the
-	// adapter hands them).
-	SSHKeyRows int
-
-	// SSHDisablePassword mirrors the sshd.auth.passwd=disabled fact.
-	SSHDisablePassword bool
+	// SSHSiteFacts supplies the distilled site-fact sshd scalars the gate
+	// needs (the renderer package's inputs, already resolved by the caller)
+	// AT GATE TIME, not construction time: the count of provisioned
+	// authorized-key rows and whether sshd.auth.passwd renders disabled.
+	// Like Deps.Wireless this is a live source — a site-settings save
+	// between engine construction and the next inform must flip the gate on
+	// that inform. Deliberately scalars, NOT systemcfg facts/keys — the
+	// adoption engine must not depend on the renderer package (HARD RULE,
+	// engine deps docblock above SystemCfg: decisions receive only the
+	// wire-facing values the adapter hands them). The signature cannot
+	// fail: on a settings load error the adapter closure returns ZERO
+	// facts, the gate stays inert, and the subsequent render propagates the
+	// real error before anything persists (the store cycle aborts, so the
+	// in-memory record writes are discarded with it) — net fail-closed
+	// (the CLI refuses startup on that error anyway, so it is
+	// embedder-only). nil ⇒ zero facts.
+	SSHSiteFacts func() (keyRows int, disable bool)
 }
 
 // Engine is the pure adoption decider.
 type Engine struct {
-	lg                 *slog.Logger
-	random             func() float64
-	keyChars           func(n int) (string, error)
-	wireless           func() []wireless.Wlan
-	systemCfg          func(store.Device, []wireless.Wlan, wireless.ProvisioningPlan) (string, map[string]string, error)
-	controllerURL      string
-	informListenAddr   string
-	allowGatedWLAN     bool
-	sshKeyRows         int
-	sshDisablePassword bool
+	lg               *slog.Logger
+	random           func() float64
+	keyChars         func(n int) (string, error)
+	wireless         func() []wireless.Wlan
+	systemCfg        func(store.Device, []wireless.Wlan, wireless.ProvisioningPlan) (string, map[string]string, error)
+	controllerURL    string
+	informListenAddr string
+	allowGatedWLAN   bool
+	sshSiteFacts     func() (int, bool)
 }
 
 // New builds an Engine. A nil logger falls back to a discarding one.
@@ -318,16 +322,15 @@ func New(d Deps) *Engine {
 		lg = slog.New(slog.NewTextHandler(discard{}, nil))
 	}
 	return &Engine{
-		lg:                 lg,
-		random:             d.Random,
-		keyChars:           d.KeyChars,
-		wireless:           d.Wireless,
-		systemCfg:          d.SystemCfg,
-		controllerURL:      d.ControllerURL,
-		informListenAddr:   d.InformListenAddr,
-		allowGatedWLAN:     d.AllowGatedLiveWLAN,
-		sshKeyRows:         d.SSHKeyRows,
-		sshDisablePassword: d.SSHDisablePassword,
+		lg:               lg,
+		random:           d.Random,
+		keyChars:         d.KeyChars,
+		wireless:         d.Wireless,
+		systemCfg:        d.SystemCfg,
+		controllerURL:    d.ControllerURL,
+		informListenAddr: d.InformListenAddr,
+		allowGatedWLAN:   d.AllowGatedLiveWLAN,
+		sshSiteFacts:     d.SSHSiteFacts,
 	}
 }
 
@@ -859,7 +862,21 @@ func (e *Engine) RejectUnsupportedLiveProvisioning(d store.Device, wls []wireles
 			return ErrLiveWLANProvisioningUnsupported
 		}
 	}
-	if e.sshKeyRows > 0 || e.sshDisablePassword {
+	// The sshd scalars are read AT GATE TIME (Deps.SSHSiteFacts is live):
+	// a site-settings save between engine construction and this inform
+	// flips the gate on it. nil/zero facts keep the gate inert (the
+	// zero-value rendered sshd block stays byte-identical to the
+	// pre-feature shape); on a settings load error the adapter closure
+	// returns zero facts, the gate stays inert, and the subsequent render
+	// propagates the real error before anything persists (the store cycle
+	// aborts, so the in-memory record writes are discarded with it) —
+	// net fail-closed (the CLI refuses startup on that error anyway, so it
+	// is embedder-only).
+	keyRows, disable := 0, false
+	if e.sshSiteFacts != nil {
+		keyRows, disable = e.sshSiteFacts()
+	}
+	if keyRows > 0 || disable {
 		return ErrLiveWLANProvisioningUnsupported
 	}
 	return nil

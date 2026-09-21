@@ -1,6 +1,7 @@
 package main
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -98,69 +99,65 @@ func TestValidateAdminExposure(t *testing.T) {
 	}
 }
 
-// resolveSSHPublicKeys table: the cmd-layer ssh-key startup composition —
-// flag/env precedence, the one non-obvious semantic (an explicit empty flag
-// value refuses the env and fails the parser), fail-closed key validation
-// with the 1-based "#N" error, and the disable-password guard both arms.
-// Synthetic key material only (the systemcfg tests' marker'd RFC 4253 blob
-// — never a real key).
-const testSSHKeyLine = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB second@ap"
-const testSSHKeyLine2 = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB test@ap"
-
-func TestResolveSSHPublicKeys(t *testing.T) {
+// effectiveSSHKeyLines table: the cmd-layer ssh-key flag/env composition —
+// flag/env precedence and the one non-obvious semantic (an explicit empty
+// flag value refuses the env: the flag slice is non-empty, so the env
+// fallback never engages — the exact semantic the former cmd-layer resolver
+// carried into the seed). The key LINES themselves are validated fail-closed
+// at the app record seams (app/site_settings.go: seed + save, the single
+// systemcfg.ParsePublicKey parser) — that parse coverage lives in the
+// internal/app and internal/adminapi tests and is not duplicated here.
+func TestEffectiveSSHKeyLines(t *testing.T) {
 	cases := []struct {
-		name            string
-		flagKeys        []string
-		envValue        string
-		disablePassword bool
-		want            []string // resolved key types, nil = error expected
-		wantErr         string   // substring when want == nil
+		name     string
+		flagKeys []string
+		envValue string
+		want     []string
 	}{
-		{name: "flag-only", flagKeys: []string{testSSHKeyLine}, want: []string{"ssh-rsa"}},
-		{name: "env-only", envValue: testSSHKeyLine2, want: []string{"ssh-ed25519"}},
-		{
-			name: "flag-wins-over-env", flagKeys: []string{testSSHKeyLine}, envValue: testSSHKeyLine2,
-			want: []string{"ssh-rsa"},
-		},
-		{
-			name: "empty-flag-refuses-env", flagKeys: []string{""}, envValue: testSSHKeyLine2,
-			wantErr: "invalid AP SSH public key #1: want exactly 2 or 3 fields",
-		},
-		{
-			name: "malformed-flag-second", flagKeys: []string{testSSHKeyLine2, "ssh-rsa !!!"},
-			wantErr: "invalid AP SSH public key #2: ",
-		},
-		{
-			name:            "disable-without-keys",
-			disablePassword: true,
-			wantErr:         "cannot be disabled without a provisioned public key",
-		},
-		{
-			name: "disable-with-keys", flagKeys: []string{testSSHKeyLine}, disablePassword: true,
-			want: []string{"ssh-rsa"},
-		},
+		{name: "flag-only", flagKeys: []string{"ssh-rsa AAAAflag first@ap"}, want: []string{"ssh-rsa AAAAflag first@ap"}},
+		{name: "env-only", envValue: "ssh-ed25519 AAAAenv second@ap", want: []string{"ssh-ed25519 AAAAenv second@ap"}},
+		{name: "flag-wins-over-env", flagKeys: []string{"ssh-rsa AAAAflag first@ap"}, envValue: "ssh-ed25519 AAAAenv second@ap", want: []string{"ssh-rsa AAAAflag first@ap"}},
+		{name: "empty-flag-refuses-env", flagKeys: []string{""}, envValue: "ssh-ed25519 AAAAenv second@ap", want: []string{""}},
+		{name: "neither-source", want: nil},
 	}
 	for _, c := range cases {
-		got, err := resolveSSHPublicKeys(c.flagKeys, c.envValue, c.disablePassword)
-		if c.want == nil {
-			if err == nil {
-				t.Fatalf("%s: unexpectedly succeeded", c.name)
-			}
-			if !strings.Contains(err.Error(), c.wantErr) {
-				t.Fatalf("%s: err %v, want substring %q", c.name, err, c.wantErr)
+		got := effectiveSSHKeyLines(c.flagKeys, c.envValue)
+		if !reflect.DeepEqual(got, c.want) {
+			t.Fatalf("%s: effectiveSSHKeyLines(%q, %q) = %q, want %q", c.name, c.flagKeys, c.envValue, got, c.want)
+		}
+	}
+}
+
+// validateSSHDisableSeed table: the fail-closed disable-without-keys
+// startup guard, restored verbatim from the pre-lane cmd-layer resolver
+// (both arms — the refusal message and the pass-through) and pinned like
+// the composition above, so the lane's deletion of the guard can never
+// regress silently again.
+func TestValidateSSHDisableSeed(t *testing.T) {
+	cases := []struct {
+		name            string
+		keys            []string
+		disablePassword bool
+		wantErr         string // substring; "" = must pass
+	}{
+		{name: "disable-without-keys", keys: nil, disablePassword: true, wantErr: "cannot be disabled without a provisioned public key"},
+		{name: "disable-with-keys", keys: []string{"ssh-rsa AAAAflag first@ap"}, disablePassword: true},
+		{name: "keys-without-disable", keys: []string{"ssh-rsa AAAAflag first@ap"}},
+		{name: "neither"},
+	}
+	for _, c := range cases {
+		err := validateSSHDisableSeed(c.keys, c.disablePassword)
+		if c.wantErr == "" {
+			if err != nil {
+				t.Fatalf("%s: unexpected err %v", c.name, err)
 			}
 			continue
 		}
-		if err != nil {
-			t.Fatalf("%s: unexpected err %v", c.name, err)
+		if err == nil {
+			t.Fatalf("%s: unexpectedly succeeded", c.name)
 		}
-		if len(got) != len(c.want) {
-			t.Fatalf("%s: got %d keys, want %d", c.name, len(got), len(c.want))
-		}
-		for i, typ := range c.want {
-			if got[i].Type != typ {
-				t.Fatalf("%s: key %d type = %q, want %q", c.name, i, got[i].Type, typ)
-			}
+		if !strings.Contains(err.Error(), c.wantErr) {
+			t.Fatalf("%s: err %v, want substring %q", c.name, err, c.wantErr)
 		}
 	}
 }

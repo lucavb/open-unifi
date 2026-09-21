@@ -62,10 +62,22 @@ type Config struct {
 	// e.g. "http://10.0.0.5:8080".
 	ControllerURL string
 
-	// RegulatoryCountryCode is the ISO 3166-1 numeric country code emitted
-	// into wireless system_cfg. Zero selects the conservative US default for
-	// backwards compatibility; operators should set this to their jurisdiction.
-	RegulatoryCountryCode int
+	// SiteSettings supplies the CURRENT site-settings record — the four
+	// managed AP-intent facts — at use time (the WirelessSource precedent:
+	// a live source closure, read per decision). The adoption engine's
+	// live-provisioning gate and renderSystemCfg both call it per inform,
+	// so a site-settings save is visible on the device's NEXT inform with
+	// no wiring refresh. nil ⇒ zero facts (the four rendering defaults).
+	// The returned error is REAL (a present-but-unreadable/corrupt/invalid
+	// site-settings file retained by the app): renderSystemCfg propagates
+	// it as a render failure — no record mutation, no emission; the gate
+	// closure maps it to zero facts so the gate stays inert and the
+	// render's error does the failing (net fail-closed). The record stores
+	// RAW authorized_keys lines; the adapter closure parses them into
+	// SSHPublicKeys via systemcfg.ParsePublicKey at its single seam (in
+	// cmd/openunifi or the test fixtures — the server never imports the
+	// app package).
+	SiteSettings func() (SiteSettings, error)
 
 	// AllowPlainText permits unencrypted JSON inform bodies (classic
 	// controllers reject these unless pre-adoption plain text inform is on).
@@ -85,24 +97,6 @@ type Config struct {
 	// push candidate separately, before any bytes reach the AP.
 	AllowGatedLiveWLAN bool
 
-	// SSHPassword overrides the default SSH password ("ubnt") hashed into
-	// system_cfg users.1. SECURITY NOTE: this string lives in server memory
-	// and, by protocol design, travels VERBATIM (hashed) inside the
-	// provisioned config; the passphrase itself never appears in mgmt_cfg.
-	// Treat records/config containing the hash as credentials.
-	SSHPassword string
-
-	// SSHPublicKeys are the parsed authorized public keys rendered into
-	// the sshd.auth.key.<n>.* rows (site fact; see systemcfg.PublicKey for
-	// the firmware evidence — the AP rebuilds /etc/dropbear/authorized_keys
-	// from these rows on every boot/apply). Parsed and validated by
-	// cmd/openunifi at startup (fail-closed); empty ⇒ zero key rows.
-	SSHPublicKeys []systemcfg.PublicKey
-
-	// SSHDisablePassword renders sshd.auth.passwd=disabled (the dropbear
-	// "-s" respawn flag — remote password logins off). Default false.
-	SSHDisablePassword bool
-
 	// OnSessionEvents, when non-nil, receives the client-session
 	// transitions (connect/disconnect counts) each COMMITTED inform cycle
 	// observed in its station refresh — called after the store cycle
@@ -114,23 +108,50 @@ type Config struct {
 	OnSessionEvents func(deviceMAC string, connects, disconnects int)
 }
 
+// SiteSettings carries the four MANAGED AP-intent site facts the server
+// renders into system_cfg and the adoption engine's live-provisioning gate
+// reads: the regulatory country code (0 = unset → the server-side 840
+// default at renderSystemCfg), the AP SSH password ("" = site default
+// "ubnt", renderer semantics), the PARSED authorized public keys, and the
+// SSH password-login disable knob. It mirrors the app site-settings record
+// (whose SSHPublicKeys are raw lines); the raw→parsed conversion belongs to
+// the adapter closure, not the record. The four facts are managed content
+// (admin intent via the site-settings API); ControllerURL is NOT among them
+// — it stays a deployment input wired from Config.ControllerURL.
+type SiteSettings struct {
+	// CountryCode is the ISO 3166-1 numeric regulatory country code; 0 =
+	// unset (renders as the 840 default).
+	CountryCode int
+	// SSHPassword overrides the default SSH password ("ubnt") hashed into
+	// system_cfg users.1. SECURITY NOTE: this string lives in server
+	// memory and, by protocol design, travels VERBATIM (hashed) inside the
+	// provisioned config; the passphrase itself never appears in mgmt_cfg.
+	// Treat records/config containing the hash as credentials.
+	SSHPassword string
+	// SSHPublicKeys are the parsed authorized public keys rendered into
+	// the sshd.auth.key.<n>.* rows (site fact; see systemcfg.PublicKey for
+	// the firmware evidence — the AP rebuilds /etc/dropbear/authorized_keys
+	// from these rows on every boot/apply). Parsed from the record's raw
+	// lines by the settings-source closure (fail-closed single parser).
+	SSHPublicKeys []systemcfg.PublicKey
+	// SSHDisablePassword renders sshd.auth.passwd=disabled (the dropbear
+	// "-s" respawn flag — remote password logins off). Default false.
+	SSHDisablePassword bool
+}
+
 const DefaultRegulatoryCountryCode = 840
 
 // ValidateConfig validates values that affect device addressing or generated
 // configuration. ControllerURL may include a path (for deployments using a
 // reverse proxy), but must not include query, fragment, or userinfo.
+// (The regulatory country code check moved to the site-settings record:
+// app/site_settings.go validates it at save and at seed; the server coerces
+// the record's 0-unset to the 840 default at renderSystemCfg.)
 func ValidateConfig(cfg Config) error {
 	if cfg.ControllerURL != "" {
 		if err := validateBaseURL(cfg.ControllerURL, "controller URL"); err != nil {
 			return err
 		}
-	}
-	code := cfg.RegulatoryCountryCode
-	if code == 0 {
-		code = DefaultRegulatoryCountryCode
-	}
-	if code < 1 || code > 999 {
-		return fmt.Errorf("regulatory country code must be an ISO 3166-1 numeric code from 001 to 999, got %d", code)
 	}
 	return nil
 }
@@ -192,8 +213,21 @@ func New(cfg Config, st store.DeviceStore, lg *slog.Logger) *Server {
 		ControllerURL:      cfg.ControllerURL,
 		InformListenAddr:   cfg.InformListenAddr,
 		AllowGatedLiveWLAN: cfg.AllowGatedLiveWLAN,
-		SSHKeyRows:         len(cfg.SSHPublicKeys),
-		SSHDisablePassword: cfg.SSHDisablePassword,
+		// The gate reads the CURRENT sshd site facts at gate time: the
+		// closure resolves the site-settings source per call (nil source ⇒
+		// zero facts). On a settings load error the closure below returns
+		// ZERO facts — the gate stays inert — and the subsequent render
+		// propagates the real error before anything persists (the store
+		// cycle aborts, so the in-memory record writes are discarded with
+		// it): net fail-closed (the CLI refuses startup on that error
+		// anyway, so it is embedder-only).
+		SSHSiteFacts: func() (int, bool) {
+			facts, ferr := s.currentSiteSettings()
+			if ferr != nil {
+				return 0, false
+			}
+			return len(facts.SSHPublicKeys), facts.SSHDisablePassword
+		},
 	})
 	return s
 }
@@ -851,9 +885,11 @@ func (s *Server) absorbInform(rec *store.Device, body map[string]any, now time.T
 // ---- system_cfg producer wiring (the pure renderer) -----------------------
 
 // renderSystemCfg is the adapter's wiring of the pure systemcfg renderer
-// (the D5 producer shape): it assembles SiteFacts from the server config and
-// the engine-threaded WLAN snapshot, validates the config exactly like the
-// former render path did, and performs the render's observability here —
+// (the D5 producer shape): it assembles SiteFacts from the CURRENT
+// site-settings record (the four managed facts — read per decision, the
+// WirelessSource precedent) plus the deployment inputs, validates the
+// deployment config exactly like the former render path did, and performs
+// the render's observability here —
 // the renderer's diagnostics (warn-level alerts with their structured attrs,
 // debug-level warnings) and the full-config diagnostic (digest and ordered
 // names, never config values; the "unavailable" wording keeps the debug path
@@ -863,22 +899,38 @@ func (s *Server) absorbInform(rec *store.Device, body map[string]any, now time.T
 // plan is the engine's per-decision provisioning plan — the renderer emits
 // its wireless rows from the same value whose drift hash the decision
 // compared (systemcfg.RenderWithPlan, facts.WLANs = the same snapshot).
+//
+// Deployment input vs managed content: ControllerURL keeps flowing from
+// s.cfg.ControllerURL (the vehicle's own address — NEVER record-sourced);
+// the four managed facts (country, SSH password, SSH public keys, sshd
+// disable knob) come from the SiteSettings source. A settings load error
+// fails the render — the engine outcome error path propagates it and the
+// store cycle aborts with NO record mutation (assignedKeyFlow runs the gate
+// first and the render before any record write, so the abort happens before
+// State/CfgVersion/wlan bookkeeping move).
 func (s *Server) renderSystemCfg(d store.Device, wls []wireless.Wlan, plan wireless.ProvisioningPlan) (string, map[string]string, error) {
 	if err := ValidateConfig(s.cfg); err != nil {
 		return "", nil, err
 	}
-	country := s.cfg.RegulatoryCountryCode
+	facts, serr := s.currentSiteSettings()
+	if serr != nil {
+		// The retained settings load error: fail the push here (FID-23
+		// doctrine — the cycle aborts, nothing was persisted), not with a
+		// silently-degraded config.
+		return "", nil, serr
+	}
+	country := facts.CountryCode
 	if country == 0 {
-		// R3: defense-in-depth — ValidateConfig already defaults zero to the
+		// R3: defense-in-depth — the record's 0 = unset renders as the
 		// compatibility value; the renderer takes the code verbatim.
 		country = DefaultRegulatoryCountryCode
 	}
 	res, err := systemcfg.RenderWithPlan(d, systemcfg.SiteFacts{
 		ControllerURL:      s.cfg.ControllerURL,
 		CountryCode:        country,
-		SSHPassword:        s.cfg.SSHPassword,
-		SSHPublicKeys:      s.cfg.SSHPublicKeys,
-		SSHDisablePassword: s.cfg.SSHDisablePassword,
+		SSHPassword:        facts.SSHPassword,
+		SSHPublicKeys:      facts.SSHPublicKeys,
+		SSHDisablePassword: facts.SSHDisablePassword,
 		WLANs:              wls,
 	}, plan)
 	if err != nil {

@@ -273,15 +273,14 @@ func mustBuildSys(t *testing.T, s *Server, rec store.Device) string {
 	return sys
 }
 
-// Site-facts wiring pin: Config.SSHPublicKeys / Config.SSHDisablePassword
-// MUST reach the rendered system_cfg through the renderSystemCfg
-// SiteFacts copy. A dropped SSHPublicKeys wire would render an empty
-// authorized_keys with -s (password auth off) ACTIVE — the lane's own
-// nightmare scenario, locked SSH on the AP — while the cmd-layer guard
-// still passes because it checks the flag slice before the copy. The
-// rendered blob must therefore carry both the key rows and the disabled
-// passwd row. (Synthetic key: the same marker'd RFC 4253 blob the systemcfg
-// package tests use — never a real key.)
+// Site-facts wiring pin: the SiteSettings SOURCE closure (Config no longer
+// carries the four facts as fields) MUST reach the rendered system_cfg
+// through the renderSystemCfg SiteFacts copy. A dropped SSHPublicKeys wire
+// would render an empty authorized_keys with -s (password auth off) ACTIVE
+// — the lane's own nightmare scenario, locked SSH on the AP. The rendered
+// blob must therefore carry both the key rows and the disabled passwd row.
+// (Synthetic key: the same marker'd RFC 4253 blob the systemcfg package
+// tests use — never a real key.)
 func TestSiteFactsSSHConfigWiring(t *testing.T) {
 	pk, err := systemcfg.ParsePublicKey(
 		"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB test@ap")
@@ -289,8 +288,9 @@ func TestSiteFactsSSHConfigWiring(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := New(Config{
-		SSHPublicKeys:      []systemcfg.PublicKey{pk},
-		SSHDisablePassword: true,
+		SiteSettings: func() (SiteSettings, error) {
+			return SiteSettings{SSHPublicKeys: []systemcfg.PublicKey{pk}, SSHDisablePassword: true}, nil
+		},
 	}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, u7pg2Record())
 	for _, want := range []string{
@@ -305,6 +305,68 @@ func TestSiteFactsSSHConfigWiring(t *testing.T) {
 	}
 	if strings.Contains(sys, "sshd.auth.passwd=enabled\n") {
 		t.Fatalf("SSHDisablePassword=false leaked through the wiring:\n%s", sys)
+	}
+}
+
+// Adapter-level byte-identity pin: the zero-value site-settings record
+// (the first-boot seed with no flags, and the empty-on-disk shape) renders
+// BYTE-IDENTICALLY to the old flag-default render (the nil settings source
+// — the pre-swap Config{} shape, whose only site-fact inputs were the four
+// zero-valued flags). The renderer's own goldens pin the factory-echo block
+// shape; this pins the SEAM: the live settings source introduces no bytes
+// of its own, and country 0 coerces to the 840 default on the way through.
+func TestSiteSettingsZeroRecordRendersByteIdentical(t *testing.T) {
+	rec := u7pg2Record()
+	// The nil source: the old flag-default path (all four facts zero).
+	sysNil := mustBuildSys(t, New(Config{}, store.NewMemStore(), testLogger()), rec)
+	// The live closure over a ZERO-VALUE record: country 0 = unset, no
+	// password, no keys, password login enabled.
+	sysZero := mustBuildSys(t, New(Config{
+		SiteSettings: func() (SiteSettings, error) { return SiteSettings{}, nil },
+	}, store.NewMemStore(), testLogger()), rec)
+	if sysNil != sysZero {
+		t.Fatalf("zero-value settings render must be byte-identical to the old flag-default render\n--- nil source ---\n%s\n--- zero record ---\n%s", sysNil, sysZero)
+	}
+	// The factory-echo sshd block shape, through the new seam: no
+	// sshd.auth.key rows at all, password login enabled, and the
+	// country 0→840 coercion (the same echo-block rows the renderer
+	// goldens pin).
+	if strings.Contains(sysZero, "sshd.auth.key.") {
+		t.Fatalf("zero-value settings must render no sshd.auth.key rows:\n%s", sysZero)
+	}
+	if !strings.Contains(sysZero, "sshd.auth.passwd=enabled\n") {
+		t.Fatalf("zero-value settings must keep password login enabled:\n%s", sysZero)
+	}
+	for _, want := range []string{
+		"radio.countrycode=840\n",
+		"radio.1.countrycode=840\n",
+		"radio.2.countrycode=840\n",
+	} {
+		if !strings.Contains(sysZero, want) {
+			t.Fatalf("country 0 must coerce to the 840 default at the server seam, missing %q:\n%s", want, sysZero)
+		}
+	}
+}
+
+// Country coercion across the new seam: the record's 0 = unset coerces to
+// the 840 default; a set code passes through verbatim.
+func TestSiteSettingsCountryCoercion(t *testing.T) {
+	rec := u7pg2Record()
+	render := func(cc int) string {
+		return mustBuildSys(t, New(Config{
+			SiteSettings: func() (SiteSettings, error) {
+				return SiteSettings{CountryCode: cc}, nil
+			},
+		}, store.NewMemStore(), testLogger()), rec)
+	}
+	sys0, sys276 := render(0), render(276)
+	if !strings.Contains(sys0, "radio.countrycode=840\n") {
+		t.Fatalf("record country 0 must coerce to 840:\n%s", sys0)
+	}
+	if !strings.Contains(sys276, "radio.countrycode=276\n") ||
+		!strings.Contains(sys276, "radio.1.countrycode=276\n") ||
+		!strings.Contains(sys276, "radio.2.countrycode=276\n") {
+		t.Fatalf("record country 276 must pass through verbatim:\n%s", sys276)
 	}
 }
 
@@ -2269,6 +2331,16 @@ func TestPlainLaneProvisionsWirelessRows(t *testing.T) {
 		Random:   func() float64 { return 0.5 },
 		KeyChars: func(n int) (string, error) { return strings.Repeat("f", n), nil },
 		Wireless: func() []wireless.Wlan { return env },
+		// The same live sshd-facts closure the real server wires (the
+		// gate must read the current settings at gate time even in this
+		// rebuilt engine).
+		SSHSiteFacts: func() (int, bool) {
+			facts, ferr := s.currentSiteSettings()
+			if ferr != nil {
+				return 0, false
+			}
+			return len(facts.SSHPublicKeys), facts.SSHDisablePassword
+		},
 		SystemCfg: func(d store.Device, wls []wireless.Wlan, plan wireless.ProvisioningPlan) (string, map[string]string, error) {
 			handedPlan = plan
 			return realRender(d, wls, plan)
@@ -2734,6 +2806,41 @@ func TestAdapterLiveWLANGate501(t *testing.T) {
 	var unsupported *ErrLiveWLANProvisioningUnsupported
 	if !errors.As(mapped, &unsupported) || unsupported.Status() != http.StatusNotImplemented {
 		t.Fatalf("gate error mapping = %v, want typed 501 error", mapped)
+	}
+
+	// Adapter-level sshd-facts gate arm (the live settings seam): a
+	// U7PG2 / 6.8.2.15592 inform with NO WLAN envelope is gated by the
+	// SITE SETTINGS closure alone. A closure returning 2 keys trips the
+	// typed 501; the SAME closure returning zero facts (a settings save
+	// back to defaults) lets the SAME push through — the gate reads the
+	// source AT GATE TIME, not a construction-frozen scalar.
+	st2 := store.NewMemStore()
+	if err := st2.Put(store.Device{
+		MAC: testMAC, State: store.StateAdopted,
+		CfgVersion: "aaaa", AppliedCfg: "",
+		XAuthkey: xkey, Authkeys: []string{xkey}, Model: "U7PG2",
+		Extra: u7pg2Record().Extra,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	keyRows := 2
+	s2 := New(Config{SiteSettings: func() (SiteSettings, error) {
+		return SiteSettings{SSHPublicKeys: make([]systemcfg.PublicKey, keyRows)}, nil
+	}}, st2, testLogger())
+	gateBody := infoBody("")
+	gateBody["version"] = "6.8.2.15592"
+	resp2 := post(t, s2.InformHandler(), encryptCBC(t, mustJSON(t, gateBody), hexKey(t, xkey), testIV))
+	if resp2.Code != http.StatusNotImplemented {
+		t.Fatalf("ssh-facts-gated inform status = %d, want 501", resp2.Code)
+	}
+	keyRows = 0
+	resp2 = post(t, s2.InformHandler(), encryptCBC(t, mustJSON(t, gateBody), hexKey(t, xkey), testIV))
+	if resp2.Code != http.StatusOK {
+		t.Fatalf("zero-facts inform status = %d, want 200 (gate inert)", resp2.Code)
+	}
+	_, jm2 := decryptResponse(t, resp2.Body.Bytes(), hexKey(t, xkey))
+	if jm2["_type"] != "setparam" || jm2["system_cfg"] == nil {
+		t.Fatalf("zero-facts inform must full-provision, got %v", jm2["_type"])
 	}
 }
 
