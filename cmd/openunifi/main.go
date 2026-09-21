@@ -49,7 +49,7 @@ func run() error {
 	controllerURL := flag.String("controller-url", "", "base URL devices are pointed at during adoption (e.g. http://10.0.0.5:8080)")
 	regulatoryCountryCode := flag.Int("regulatory-country-code", server.DefaultRegulatoryCountryCode, "ISO 3166-1 numeric regulatory country code (001-999); first-boot seed only — managed at runtime via the site-settings API")
 	apSSHPassword := flag.String("ap-ssh-password", os.Getenv("OPEN_UNIFI_AP_SSH_PASSWORD"),
-		"SSH password for adopted APs (required; falls back to $OPEN_UNIFI_AP_SSH_PASSWORD); first-boot seed only — managed at runtime via the site-settings API")
+		"SSH password for adopted APs (required on first boot — the seed; falls back to $OPEN_UNIFI_AP_SSH_PASSWORD); first-boot seed only — managed at runtime via the site-settings API")
 	apSSHKeys := &keyList{}
 	flag.Var(apSSHKeys, "ap-ssh-key", "LAB ONLY: SSH authorized public key for adopted APs, one authorized_keys line per flag (repeatable; falls back to a single $OPEN_UNIFI_AP_SSH_KEY); first-boot seed only — managed at runtime via the site-settings API. Parsed and validated fail-closed at startup; provisioned as sshd.auth.key.<n>.* rows — firmware-derived but NOT yet live-bench-validated, pushes gated behind --allow-gated-live-wlan (docs/PROTOCOL-systemcfg-wireless.md §13)")
 	apSSHDisablePassword := flag.Bool("ap-ssh-disable-password", false,
@@ -72,17 +72,33 @@ func run() error {
 	if err := validateAdminExposure(*listenAdmin, *adminToken, *allowAnonymousAdmin, *allowInsecureAdmin); err != nil {
 		return err
 	}
-	if *apSSHPassword == "" && !*allowDefaultAPSSH {
+	// settingsExisted reports whether a site-settings record was already on
+	// disk BEFORE app.New runs. Both the seed-flag guards below and the
+	// ignored-flags warn are conditioned on this pre-New determination:
+	// app.New seeds AND persists the record inside the call, and a post-New
+	// stat could never tell a preexisting record apart from the one this
+	// boot just wrote. A missing file (first boot, including the
+	// deleted-file re-seed flow — app.New treats a missing file as first
+	// boot) stats ENOENT → false. A non-ENOENT stat error also counts as
+	// false, conservative: the guards stay on and any real file problem
+	// surfaces via loadSettingsFile/CurrentSiteSettings startup refusal.
+	_, settingsStatErr := os.Stat(filepath.Join(*dataDir, "site-settings.json"))
+	settingsExisted := settingsStatErr == nil
+	// Seed-flag validation posture: on FIRST BOOT (!settingsExisted) the
+	// seed flags are validated fail-closed — the key lines by app.New's
+	// seed validation (the single parser), the disable-without-keys combo
+	// by the cmd guard below, an explicit --regulatory-country-code 0 by
+	// the guard further down. Once the record exists the flags are dead
+	// seeds: warned as ignored (below), never validated — one consistent
+	// posture for every equally-dead input (the password guard above
+	// narrows the same way). app's seed validation applies the same
+	// save-verb rule (it rejects the combo too — the seed is admin
+	// intent); the deliberately-accepting rule is the DISK-LOAD one, so
+	// a hand-edited record cannot brick startup. The cmd guard is the
+	// one the CLI boot honors.
+	if !settingsExisted && *apSSHPassword == "" && !*allowDefaultAPSSH {
 		return errors.New("AP SSH password is required; set --ap-ssh-password or explicitly opt in with --allow-default-ap-ssh-password for lab use")
 	}
-	// The flag/env ssh-key composition feeding the first-boot seed. The
-	// LINES are validated fail-closed inside app.New's seed path (the
-	// single parser): a malformed key line leaves App with a retained
-	// settings error and the CurrentSiteSettings check below refuses the
-	// launch — same fail-closed shape as the password guard above. The
-	// disable-without-keys combo, by contrast, is guarded HERE (app's
-	// seed validation deliberately accepts it — a hand-edited record must
-	// not brick startup; the live gate fail-closes its pushes):
 	// Fail-closed guard: disabling password auth without a provisioned
 	// public key risks locking SSH out — the next boot's cfg rebuild
 	// leaves no authorized_keys entry and dropbear starts with -s.
@@ -90,14 +106,18 @@ func run() error {
 	// save re-provisions the record on the next inform (the controller
 	// channel), re-rendering the sshd rows.
 	sshSeedKeys := effectiveSSHKeyLines(apSSHKeys.keys, os.Getenv("OPEN_UNIFI_AP_SSH_KEY"))
-	if err := validateSSHDisableSeed(sshSeedKeys, *apSSHDisablePassword); err != nil {
-		return err
-	}
-	// The flag default is nonzero, so a zero here can only come from an
-	// explicitly supplied --regulatory-country-code 0. Reject it before the
-	// server-side coercion silently maps 0 to the 840 default.
-	if err := validateRegulatoryCountryCode(*regulatoryCountryCode); err != nil {
-		return err
+	if !settingsExisted {
+		if err := validateSSHDisableSeed(sshSeedKeys, *apSSHDisablePassword); err != nil {
+			return err
+		}
+		// The flag default is nonzero, so a zero here can only come from an
+		// explicitly supplied --regulatory-country-code 0. Reject it before the
+		// server-side coercion silently maps 0 to the 840 default. Once the
+		// record exists ALL flag values (including 0 and out-of-range ones
+		// such as 1000) are dead seeds — warned as ignored, never validated.
+		if err := validateRegulatoryCountryCode(*regulatoryCountryCode); err != nil {
+			return err
+		}
 	}
 	if err := server.ValidateConfig(server.Config{ControllerURL: *controllerURL}); err != nil {
 		return fmt.Errorf("invalid configuration: %w", err)
@@ -169,13 +189,13 @@ func run() error {
 		return fmt.Errorf("site settings: %w", serr)
 	}
 	// The four AP-intent inputs are first-boot seeds only. Warn that they
-	// were ignored ONLY when at least one was actually supplied — on every
-	// later launch (settings managed via the API) the default flow is the
-	// happy path, not a warning.
-	if apIntentSupplied() {
-		if _, statErr := os.Stat(filepath.Join(*dataDir, "site-settings.json")); statErr == nil {
-			logger.Warn("site settings exist; --regulatory-country-code/--ap-ssh-password/--ap-ssh-key/--ap-ssh-disable-password ignored (first-boot seeds only — managed at runtime via the site-settings API)")
-		}
+	// were ignored ONLY when a record existed before this boot (the pre-New
+	// settingsExisted determination — after app.New the file always exists,
+	// because the call seeds and persists it) AND at least one flag was
+	// actually supplied. On the seeding first boot the flags were honored:
+	// the default flow is the happy path, not a warning.
+	if apIntentSupplied() && settingsExisted {
+		logger.Warn("site settings exist; --regulatory-country-code/--ap-ssh-password/--ap-ssh-key/--ap-ssh-disable-password ignored (first-boot seeds only — managed at runtime via the site-settings API)")
 	}
 	adminH := adminapi.New(adminapi.Config{AdminToken: *adminToken}, ap)
 
@@ -502,9 +522,11 @@ func (l *keyList) Set(v string) error {
 // AP-intent flags. The key lines are passed RAW (the composition ran above
 // through effectiveSSHKeyLines; app.New runs the single fail-closed parser;
 // nothing is pre-parsed here). The saved record preserves what the flags
-// say, verbatim: main's validators above (password guard, disable-without-
-// keys guard, country range) and app.New's seed validation (key parse)
-// already gated this boot.
+// say, verbatim: on the first-boot path main's pre-New seed-flag guards
+// (password guard, disable-without-keys guard, explicit-0 country
+// rejection) and app.New's seed validation (the save-verb rule, key parse
+// among them) already gated this boot. Once the record exists the flags
+// are dead seeds and this value is ignored by app.New anyway.
 func siteSettingsSeed(countryCode int, password string, keys []string, disablePassword bool) app.SiteSettings {
 	return app.SiteSettings{
 		CountryCode:        countryCode,
@@ -554,15 +576,22 @@ func apIntentSupplied() bool {
 }
 
 // validateSSHDisableSeed is the fail-closed disable-without-keys guard
-// (the pre-lane cmd-layer semantics, restored verbatim): disabling
-// password auth without a provisioned public key risks locking SSH out —
-// the next boot's cfg rebuild leaves no authorized_keys entry and dropbear
-// starts with -s. Recovery, even then, does NOT need SSH: an effective
-// admin device save re-provisions the record on the next inform (the
-// controller channel), re-rendering the sshd rows. This guard is
-// deliberate here and NOT app's seed rule (app deliberately accepts the
-// combo so a hand-edited record cannot brick startup — the API is the
-// validator going forward, the engine's live gate fail-closes its pushes).
+// for the first-boot seed (the pre-lane cmd-layer semantics, restored
+// verbatim): disabling password auth without a provisioned public key
+// risks locking SSH out — the next boot's cfg rebuild leaves no
+// authorized_keys entry and dropbear starts with -s. Recovery, even then,
+// does NOT need SSH: an effective admin device save re-provisions the
+// record on the next inform (the controller channel), re-rendering the
+// sshd rows. This guard and app's seed rule (the save-verb rule — the
+// seed is admin intent) both reject the combo; the deliberately
+// accepting rule is the DISK-LOAD one (a hand-edited record cannot
+// brick startup — the API is the validator going forward). The engine's live
+// gate is NOT a fail-closed backstop for this combo: it is scoped to
+// U7PG2 firmware 6.8.2.15592 ONLY, and other models/firmware deliver the
+// combo ungated. The honest invariant is that every admin-reachable
+// WRITER rejects the combo (the API fence, the app save verb, app's seed
+// validation for the CLI seed path); a hand-edited disk file deliberately
+// still boots, and recovery goes through an API PUT — no SSH needed.
 func validateSSHDisableSeed(keys []string, disablePassword bool) error {
 	if disablePassword && len(keys) == 0 {
 		return errors.New("AP SSH password auth cannot be disabled without a provisioned public key; set --ap-ssh-key (or $OPEN_UNIFI_AP_SSH_KEY) or SSH access will be locked out")
@@ -651,6 +680,9 @@ func discoveryPort(addr string) (host string, port int, err error) {
 // validateRegulatoryCountryCode rejects an explicitly supplied 0 before the
 // server-side coercion would silently map it to the 840 default; the flag
 // default is nonzero, so a zero here always means the user passed 0.
+// Called only on the first-boot seed path (no site-settings record yet);
+// once the record exists every flag value is a dead seed — warned as
+// ignored, never validated.
 func validateRegulatoryCountryCode(code int) error {
 	if code == 0 {
 		return errors.New("--regulatory-country-code 0 is not a valid ISO 3166-1 numeric code; omit the flag to use the default")
