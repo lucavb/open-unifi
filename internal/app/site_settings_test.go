@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -253,6 +255,100 @@ func TestPutSiteSettingsValidation(t *testing.T) {
 		}
 		if !errors.Is(err, adminapi.ErrInvalid) {
 			t.Fatalf("%s: want adminapi.ErrInvalid, got %v", tc.name, err)
+		}
+	}
+}
+
+// TestSiteSettingsRuleEquivalenceAcrossLayers pins the Gate A finding #5
+// follow-up: the adminapi pre-backend fence (ValidateSiteSettings) and the
+// app save verb's internal validation (validateSiteSettingsChange)
+// accept/reject the SAME inputs — one rule set, two layers
+// (defense-in-depth). Both are pure syntax rules (country range, per-line
+// key parse, disable-without-keys); list ORDER is deliberately out of
+// scope here — order is a semantics rule (an order-only diff mints one
+// harmless re-provisioning), not a rejection rule. The seam is legal
+// because internal/app already imports internal/adminapi (the Backend
+// interface assertion); adminapi can never import app back, so the pin
+// lives beside the verb it cross-checks.
+func TestSiteSettingsRuleEquivalenceAcrossLayers(t *testing.T) {
+	cases := []struct {
+		name   string
+		doc    adminapi.SiteSettingsDocument
+		reject bool
+		keyIdx int // 1-based position both layers must name (0 = n/a)
+	}{
+		{
+			name: "valid document",
+			doc: adminapi.SiteSettingsDocument{
+				RegulatoryCountryCode: 840,
+				APSSHPassword:         "pw",
+				APSSHPublicKeys:       []string{testKeyEd25519Line, testKeyRSALine},
+			},
+		},
+		{
+			name: "valid document, empty keys accepted",
+			doc: adminapi.SiteSettingsDocument{
+				RegulatoryCountryCode: 276,
+				APSSHPassword:         "pw",
+			},
+		},
+		{
+			name: "valid document, country unset (0)",
+			doc: adminapi.SiteSettingsDocument{
+				APSSHPassword:   "pw",
+				APSSHPublicKeys: []string{testKeyEd25519Line},
+			},
+		},
+		{
+			name: "invalid second key line names #2",
+			doc: adminapi.SiteSettingsDocument{
+				RegulatoryCountryCode: 840,
+				APSSHPublicKeys: []string{
+					testKeyEd25519Line,
+					// render_test.go TestParsePublicKeyTable: a typeless
+					// line (no type token) is a malformed authorized_keys
+					// line.
+					"AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB",
+				},
+			},
+			reject: true,
+			keyIdx: 2,
+		},
+		{
+			name: "disable without keys",
+			doc: adminapi.SiteSettingsDocument{
+				RegulatoryCountryCode: 840,
+				APSSHPassword:         "pw",
+				APSSHDisablePassword:  true,
+			},
+			reject: true,
+		},
+		{
+			name:   "country out of range high",
+			doc:    adminapi.SiteSettingsDocument{RegulatoryCountryCode: 1000},
+			reject: true,
+		},
+	}
+	for _, tc := range cases {
+		msg := adminapi.ValidateSiteSettings(&tc.doc)
+		err := validateSiteSettingsChange(siteSettingsFromDoc(tc.doc))
+		if (msg == "") != (err == nil) {
+			t.Errorf("%s: layer disagreement: adminapi fence %q, app verb error %v", tc.name, msg, err)
+			continue
+		}
+		if !tc.reject {
+			continue
+		}
+		// Rejection parity extends to the #N position: both layers report
+		// the FIRST failing key line with its 1-based index.
+		if tc.keyIdx != 0 {
+			pos := fmt.Sprintf("#%d", tc.keyIdx)
+			if !strings.Contains(msg, pos) {
+				t.Errorf("%s: adminapi fence message missing %s: %q", tc.name, pos, msg)
+			}
+			if !strings.Contains(err.Error(), pos) {
+				t.Errorf("%s: app verb error missing %s: %v", tc.name, pos, err)
+			}
 		}
 	}
 }
