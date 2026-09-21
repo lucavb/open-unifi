@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -231,6 +233,106 @@ func TestRealServer404AndIDRoundTrip(t *testing.T) {
 	}
 	if got.ID != "srv-1" {
 		t.Fatalf("round trip lost server ID: %+v", got)
+	}
+}
+
+// TestProviderDecodesRealServerSiteSettings walks the site-settings flow
+// against the real handler: whole-document PUT (2 keys + disable), the
+// verbatim ordered GET roundtrip, and the API's 400 rejections (invalid key
+// line, disable-without-keys, missing field). These pin the provider↔API
+// contract end to end: the provider's siteSettings wire struct must decode
+// exactly what adminapi emits and encode exactly what its strict PUT decode
+// accepts.
+func TestProviderDecodesRealServerSiteSettings(t *testing.T) {
+	c, _, status := composeAPI(t)
+	ctx := context.Background()
+
+	// The repo's canonical valid authorized_keys line (adminapi/app tests).
+	key1 := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB test@ap"
+	key2 := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB second@ap"
+	doc := siteSettings{
+		RegulatoryCountryCode: 276,
+		APSSHPassword:         "s3cret",
+		APSSHPublicKeys:       []string{key1, key2},
+		APSSHDisablePassword:  true,
+	}
+
+	view, err := c.putSiteSettings(ctx, doc)
+	if err != nil {
+		t.Fatalf("real PUT /api/v1/site-settings: %v", err)
+	}
+	if got := status["PUT /api/v1/site-settings"]; got != http.StatusOK {
+		t.Fatalf("PUT status = %d, want 200", got)
+	}
+	if !reflect.DeepEqual(*view, doc) {
+		t.Fatalf("PUT view = %+v, want verbatim echo of %+v", *view, doc)
+	}
+
+	// GET roundtrip: all four fields verbatim, keys in slice order (the
+	// order-sensitive echo the provider's drift detection relies on).
+	got, err := c.getSiteSettings(ctx)
+	if err != nil {
+		t.Fatalf("real GET /api/v1/site-settings: %v", err)
+	}
+	if !reflect.DeepEqual(*got, doc) {
+		t.Fatalf("GET roundtrip = %+v, want %+v", *got, doc)
+	}
+	if got.APSSHPublicKeys[0] != key1 || got.APSSHPublicKeys[1] != key2 {
+		t.Fatalf("key order not preserved: %q, %q", got.APSSHPublicKeys[0], got.APSSHPublicKeys[1])
+	}
+
+	// PUT with an invalid key line → 400, the FIRST failing line named in
+	// the message.
+	bad := doc
+	bad.APSSHPublicKeys = []string{key1, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXk!!!"}
+	if view, err := c.putSiteSettings(ctx, bad); err == nil {
+		t.Fatalf("invalid key line accepted: %+v", view)
+	} else {
+		var ae *apiError
+		if !errors.As(err, &ae) || ae.status != http.StatusBadRequest {
+			t.Fatalf("invalid key line: expected typed 400, got %v", err)
+		}
+		if !strings.Contains(err.Error(), "invalid AP SSH public key #2") {
+			t.Fatalf("invalid key line message = %q, want the #2 line named", err.Error())
+		}
+	}
+
+	// PUT disable-without-keys → 400 (SSH lockout guard).
+	noKeys := siteSettings{
+		RegulatoryCountryCode: 276,
+		APSSHPassword:         "s3cret",
+		APSSHPublicKeys:       []string{},
+		APSSHDisablePassword:  true,
+	}
+	if view, err := c.putSiteSettings(ctx, noKeys); err == nil {
+		t.Fatalf("disable-without-keys accepted: %+v", view)
+	} else {
+		var ae *apiError
+		if !errors.As(err, &ae) || ae.status != http.StatusBadRequest {
+			t.Fatalf("disable-without-keys: expected typed 400, got %v", err)
+		}
+		if !strings.Contains(err.Error(), "cannot be disabled without a provisioned public key") {
+			t.Fatalf("disable-without-keys message = %q", err.Error())
+		}
+	}
+
+	// PUT missing a field → 400 "missing field <name>" (the provider's wire
+	// struct always emits all four; a hand-rolled partial body must not).
+	partial := map[string]any{
+		"regulatory_country_code": 0,
+		"ap_ssh_password":         "",
+		"ap_ssh_public_keys":      []string{},
+	}
+	err = c.do(ctx, http.MethodPut, "/api/v1/site-settings", partial, nil)
+	if err == nil {
+		t.Fatal("partial PUT accepted")
+	}
+	var ae *apiError
+	if !errors.As(err, &ae) || ae.status != http.StatusBadRequest {
+		t.Fatalf("missing field: expected typed 400, got %v", err)
+	}
+	if want := "http 400: missing field ap_ssh_disable_password"; err.Error() != want {
+		t.Fatalf("missing field message = %q, want %q", err.Error(), want)
 	}
 }
 

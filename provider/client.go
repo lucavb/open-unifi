@@ -288,6 +288,43 @@ func (c *apiClient) deleteWireless(ctx context.Context, name string) error {
 	return c.do(ctx, http.MethodDelete, "/api/v1/wireless/"+url.PathEscape(name), nil, nil)
 }
 
+// siteSettings is the wire shape of GET/PUT /api/v1/site-settings
+// (adminapi.SiteSettingsDocument/SiteSettingsView). All four fields are
+// ALWAYS on the wire, so none carries omitempty: PUT is whole-document
+// (the strict server decode rejects a missing/null field with a 400
+// "missing field <name>") and the GET view echoes all four. An empty
+// ap_ssh_public_keys marshals as [] — never null (a JSON null decodes to a
+// nil pointer server-side and trips the same missing-field 400).
+type siteSettings struct {
+	RegulatoryCountryCode int      `json:"regulatory_country_code"`
+	APSSHPassword         string   `json:"ap_ssh_password"`
+	APSSHPublicKeys       []string `json:"ap_ssh_public_keys"`
+	APSSHDisablePassword  bool     `json:"ap_ssh_disable_password"`
+}
+
+// getSiteSettings GETs /api/v1/site-settings. The controller carries
+// exactly one site-settings record and it ALWAYS serves — GET never 404s.
+func (c *apiClient) getSiteSettings(ctx context.Context) (*siteSettings, error) {
+	var out siteSettings
+	if err := c.do(ctx, http.MethodGet, "/api/v1/site-settings", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// putSiteSettings PUTs the whole-document site-settings record and returns
+// the server's read view (already refreshed — an effective save re-stamps
+// cfgversion across provisioned devices Backend-side). No retry: PUT is
+// non-idempotent in effect (each effective save is a mint), per the
+// apiClient doc comment.
+func (c *apiClient) putSiteSettings(ctx context.Context, doc siteSettings) (*siteSettings, error) {
+	var out siteSettings
+	if err := c.do(ctx, http.MethodPut, "/api/v1/site-settings", doc, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // whoami is a cheap health/auth probe: GET /api/v1/whoami. It always
 // exists on an open-unifi admin API (any /api/v1 route), so it doubles as
 // the provider's Configure-time connection check: a connection failure,

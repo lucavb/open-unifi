@@ -133,6 +133,7 @@ func (p *openUnifiProvider) Resources(_ context.Context) []func() resource.Resou
 	return []func() resource.Resource{
 		func() resource.Resource { return &accessPointResource{} },
 		func() resource.Resource { return &wlanResource{} },
+		func() resource.Resource { return &siteSettingsResource{} },
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -32,12 +33,19 @@ import (
 //	GET/DELETE   /api/v1/devices/{mac}
 //	POST          /api/v1/wireless
 //	GET/PUT/DELETE /api/v1/wireless/{name}
+//	GET/PUT      /api/v1/site-settings
 //	GET          /api/v1/whoami
 type fakeBackend struct {
 	token    string            // required bearer token; "" means anonymous allowed
 	devices  map[string]string // mac -> raw device JSON (DeviceView shape)
 	wireless map[string]string // name -> raw item JSON
-	lastAuth string            // observed Authorization header of the last request
+	// siteSettings is the raw SiteSettingsView JSON served by GET; PUT
+	// replaces it wholesale. siteSettingsErr, when non-empty, makes every
+	// PUT reply 400 {"error": siteSettingsErr} (models the API's
+	// disable-without-keys / invalid-key rejections).
+	siteSettings    string
+	siteSettingsErr string
+	lastAuth        string // observed Authorization header of the last request
 }
 
 // lastSeenFixture is a fixed unix timestamp used in device fixtures.
@@ -48,6 +56,9 @@ func newFakeBackend(token string) *fakeBackend {
 		token:    token,
 		devices:  map[string]string{},
 		wireless: map[string]string{},
+		// The zero view: exactly what the real API echoes for an untouched
+		// controller (all four fields present, empty key list as []).
+		siteSettings: `{"regulatory_country_code":0,"ap_ssh_password":"","ap_ssh_public_keys":[],"ap_ssh_disable_password":false}`,
 	}
 	return fb
 }
@@ -165,6 +176,47 @@ func (fb *fakeBackend) handler() http.Handler {
 				return
 			}
 			delete(fb.wireless, name)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+
+	// Site settings: the real API is whole-document PUT (missing/null field
+	// → 400 "missing field <name>"); the fake mirrors the shape check plus
+	// the canned siteSettingsErr rejection.
+	mux.HandleFunc("/api/v1/site-settings", auth(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			_, _ = w.Write([]byte(fb.siteSettings + "\n"))
+		case http.MethodPut:
+			bodyBytes, err := io.ReadAll(r.Body)
+			if err != nil {
+				writeFakeErr(w, http.StatusBadRequest, "unreadable body")
+				return
+			}
+			var raw map[string]json.RawMessage
+			if err := json.Unmarshal(bodyBytes, &raw); err != nil {
+				writeFakeErr(w, http.StatusBadRequest, "invalid JSON body")
+				return
+			}
+			for _, field := range []string{"regulatory_country_code", "ap_ssh_password", "ap_ssh_public_keys", "ap_ssh_disable_password"} {
+				if _, ok := raw[field]; !ok {
+					writeFakeErr(w, http.StatusBadRequest, "missing field "+field)
+					return
+				}
+			}
+			if fb.siteSettingsErr != "" {
+				writeFakeErr(w, http.StatusBadRequest, fb.siteSettingsErr)
+				return
+			}
+			var doc siteSettings
+			if err := json.Unmarshal(bodyBytes, &doc); err != nil {
+				writeFakeErr(w, http.StatusBadRequest, "invalid JSON body")
+				return
+			}
+			buf, _ := json.Marshal(doc)
+			fb.siteSettings = string(buf)
+			_, _ = w.Write(append(buf, '\n'))
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
@@ -601,6 +653,96 @@ func TestDeviceStructParityWithServer(t *testing.T) {
 		if t2, ok := provFields["apDevice"][key]; !ok || t2 != tag {
 			t.Fatalf("device field %q (%s) missing/changed in apDevice (%q)", key, tag, t2)
 		}
+	}
+}
+
+// TestSiteSettingsGetEcho pins the GET decode: the fake serves the zero
+// view (all four fields present, [] keys) and a set view; the client maps
+// both verbatim onto siteSettings.
+func TestSiteSettingsGetEcho(t *testing.T) {
+	ctx := context.Background()
+
+	// Zero view: the untouched controller's echo.
+	fb := newFakeBackend("")
+	c := clientFor(fb, "")
+	got, err := c.getSiteSettings(ctx)
+	if err != nil {
+		t.Fatalf("getSiteSettings zero view: %v", err)
+	}
+	if got.RegulatoryCountryCode != 0 || got.APSSHPassword != "" || got.APSSHDisablePassword || len(got.APSSHPublicKeys) != 0 {
+		t.Fatalf("zero view decode mismatch: %+v", got)
+	}
+
+	// A populated view must decode verbatim, keys in order.
+	fb.siteSettings = `{"regulatory_country_code":276,"ap_ssh_password":"s3cret",` +
+		`"ap_ssh_public_keys":["ssh-ed25519 AAAA a@ap","ssh-rsa AAAA b@ap"],"ap_ssh_disable_password":true}`
+	got, err = c.getSiteSettings(ctx)
+	if err != nil {
+		t.Fatalf("getSiteSettings populated view: %v", err)
+	}
+	want := siteSettings{
+		RegulatoryCountryCode: 276,
+		APSSHPassword:         "s3cret",
+		APSSHPublicKeys:       []string{"ssh-ed25519 AAAA a@ap", "ssh-rsa AAAA b@ap"},
+		APSSHDisablePassword:  true,
+	}
+	if !reflect.DeepEqual(*got, want) {
+		t.Fatalf("populated view decode: got %+v, want %+v", *got, want)
+	}
+}
+
+// TestSiteSettingsPutRoundTrip pins the PUT contract: the whole document
+// goes out with all four fields (the strict server decode would 400 on a
+// missing one) and the returned view is the server's echo of it, which the
+// subsequent GET confirms.
+func TestSiteSettingsPutRoundTrip(t *testing.T) {
+	fb := newFakeBackend("")
+	ctx := context.Background()
+	c := clientFor(fb, "")
+
+	doc := siteSettings{
+		RegulatoryCountryCode: 840,
+		APSSHPassword:         "s3cret",
+		APSSHPublicKeys:       []string{"ssh-ed25519 AAAA a@ap", "ssh-ed25519 AAAA b@ap"},
+		APSSHDisablePassword:  true,
+	}
+	view, err := c.putSiteSettings(ctx, doc)
+	if err != nil {
+		t.Fatalf("putSiteSettings: %v", err)
+	}
+	if !reflect.DeepEqual(*view, doc) {
+		t.Fatalf("PUT view = %+v, want echo of %+v", *view, doc)
+	}
+	// The stored record round-trips: a later GET returns the same view.
+	got, err := c.getSiteSettings(ctx)
+	if err != nil {
+		t.Fatalf("getSiteSettings after PUT: %v", err)
+	}
+	if !reflect.DeepEqual(*got, doc) {
+		t.Fatalf("GET after PUT = %+v, want %+v", *got, doc)
+	}
+}
+
+// TestSiteSettingsPutError pins that the API's 400 rejections surface
+// through the typed apiError machinery with the server's message extracted
+// (disable-without-keys is the canonical case).
+func TestSiteSettingsPutError(t *testing.T) {
+	fb := newFakeBackend("")
+	fb.siteSettingsErr = "AP SSH password auth cannot be disabled without a provisioned public key; add an authorized_keys line or SSH access will be locked out"
+	c := clientFor(fb, "")
+	_, err := c.putSiteSettings(context.Background(), siteSettings{APSSHDisablePassword: true})
+	if err == nil {
+		t.Fatal("expected 400 error, got nil")
+	}
+	var ae *apiError
+	if !errors.As(err, &ae) {
+		t.Fatalf("expected typed *apiError, got %T: %v", err, err)
+	}
+	if ae.status != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d", ae.status)
+	}
+	if want := "http 400: AP SSH password auth cannot be disabled without a provisioned public key; add an authorized_keys line or SSH access will be locked out"; err.Error() != want {
+		t.Fatalf("error message = %q, want %q", err.Error(), want)
 	}
 }
 
