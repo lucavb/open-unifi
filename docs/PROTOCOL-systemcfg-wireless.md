@@ -1130,26 +1130,34 @@ a disable-without-keys save (400), and the cmd first-boot seed path
 (`validateSSHDisableSeed`) refuses the same flag combo — the next boot's
 cfg-row rebuild would otherwise leave an empty `authorized_keys` and dropbear
 would start with `-s`, risking a locked-out SSH. Recovery, even then, does
-NOT need SSH: an effective admin device save re-provisions the record on the
-next inform (the controller channel), re-rendering the sshd rows. One
+NOT need SSH: an effective admin device save re-provisions the record on
+the next inform (the controller channel), re-rendering the sshd rows. LIVE
+(2026-09-21): the disabled row's push settled but the dropbear listener
+never returned on fw 6.8.2.15592 — the outage and the controller-channel
+recovery are recorded in §13.3. One
 neutral caveat: the admin `config.system_cfg.<idx>` passthrough rows render
 AFTER the site-fact sshd rows, so a conflicting admin-supplied row's
 duplicate-resolution on the device (`sshd.auth.key` is an indexed family —
 sorted-key row semantics) is unvalidated.
 
-### 13.3 Live-validation caveat (FOLLOW-UP, NOT YET CLAIMED)
+### 13.3 Live-validation status (apply-validated keys; live-broken knob)
 
-Both row families are FIRMWARE-DERIVED from the ubntbox evidence above, but
-NOT yet live-bench-validated on the AP: no full provisioning carrying
-`sshd.auth.key.<n>.*` rows has been applied to the bench U7PG2 yet. Per the
-minimal-diff policy (internal/server/systemcfg/render.go — "Adding any row
-requires a live-validated apply first"; two AP resets already consumed
-2026-09-16), a live-validated apply that proves the keys survive the boot
-rebuild is OWED before these rows are treated as trusted. Zero keys /
-default facts keep the render byte-identical to the pre-feature contract,
-so nothing shipped before that validation changes any current wire bytes.
-Until then the LIVE-PROVISIONING GATE COVERS THE SSHD ROWS TOO: the
-adoption engine's fail-closed U7PG2/6.8.2.15592 choke point also rejects
+Both row families are FIRMWARE-DERIVED from the ubntbox evidence above.
+Live-bench status after the 2026-09-21 site-settings round
+(WLAN-ACCEPTANCE-6.8.2.15592.md §2026-09-21): the KEY rows are
+APPLY-VALIDATED on the bench U7PG2 — a full provisioning carrying
+`sshd.auth.key.1.*` settled byte-identically (applied sha `11cb0472…`),
+the device rebuilt `/etc/dropbear/authorized_keys` FROM the rows, and a
+BatchMode key login worked — but BOOT-REBUILD SURVIVAL is still OWED
+(the round applied, it did not reboot; the pre-lane evidence is that
+boot wipes manually-installed keys, so the row-driven boot path is
+untested). The DISABLE knob is live-BROKEN on the one firmware: the
+round's `sshd.auth.passwd=disabled` push settled, and the dropbear
+listener never returned (port 22 RST-refused ~10 min while informs
+flowed; recovery via the controller channel worked). The
+LIVE-PROVISIONING GATE therefore STAYS for both sshd facts, now with
+live evidence it is right to refuse them:
+the adoption engine's fail-closed U7PG2/6.8.2.15592 choke point also rejects
 any full provisioning whose site facts carry key rows or the disable
 knob, lifted by the same `--allow-gated-live-wlan` opt-in (the engine
 reads the distilled sshd scalars LIVE at gate time — `Deps.SSHSiteFacts

@@ -1530,6 +1530,120 @@ no dark, surviving client never dropped). The C1/D1 VLAN sub-criteria are
 closed by this round. Release gate row 1 (all A–F rows `PROVEN`) is met;
 the human review sign-off remains the only open gate class.
 
+### 2026-09-21 site-settings live round — sshd-facts provisioning, disable-knob outage, 501 gate proof (controller `3757061` → binary `8475be053e27`)
+
+**Scope:** live verification of the twelve-commit site-settings lane
+(`fb82c6ba…3757061`: the persisted admin-owned record, record-sourced
+AP-intent facts, the sshd.auth.key row emission, the fail-closed
+password-disable knob, the `open-unifi_site_settings` Terraform
+resource) on bench AP-1 (`aabbccddee02`, U7PG2, 6.8.2.15592), 19:16–20:01
+CEST. Pre-round backups: `data/devices.preround-20260921.json` +
+`data/wireless.preround-20260921.json`; pre-round applied sha `3f8710b6…`
+(the fw-sorted post-boot form of the `ad41cdad…` row set).
+
+**Deploy + first boot:** binary sha256 `8475be053e278876…` (rollback
+`openunifi.rollback-20260921T171842Z`); first boot seeded
+`data/site-settings.json` (country 840, empty password, no keys, knob
+off — ctl.sh passes no AP-intent flags) and minted NOTHING: retained-key
+GCM noops with cfg echo `2891688a47040fd4` steady — record-sourced
+defaults render byte-equivalent to the pre-lane flag-sourced defaults
+(the equivalence fence, live). GET `/api/v1/site-settings` served the
+defaults view (404 on the pre-round binary).
+
+**Key round (apply-validated):** PUT with the ed25519 key → 200 echo +
+the bench-safety WARN + `devices_minted=1` → full provisioning
+(`setparam`, mint `9a75134c03122c4d`) → settle confirmed. AP byte
+proof: `/tmp/system.cfg` rows `sshd.auth.key.1.status=enabled`,
+`.value=AAAAC3…MjJ`, `.type=ssh-ed25519`,
+`.comment=admin@lab-bench` — wire-exact per the javap family — and
+`/etc/dropbear/authorized_keys` rebuilt FROM the rows (file rewritten at
+the apply; the pre-round manual `ssh-copy-id` artifact superseded).
+BatchMode key login worked from the workstation; the password lane
+stayed live (`sshd.auth.passwd=enabled`). Applied sha `11cb0472…`
+(6859 B).
+
+**Disable-knob outage (the round's finding):** PUT `disable=true` (keys
+retained) → mint `5218380856a838ab` → setparam → settle confirmed —
+and the dropbear listener NEVER returned: port 22 RST-refused
+persistently (~10 min, two probes minutes apart) while the device kept
+informing and settling (ping 0.19 ms; `in_sync:true`). On-device root
+cause unobserved — the outage killed the only shell lane by design
+(the fw respawn builder's `-s` invocation is the suspect; §13.2). The
+typed 501 gate's refusal of sshd facts on this firmware is thereby
+VINDICATED live. Recovery needed no SSH, exactly as the docs promise:
+an effective defaults save over the controller channel → mint
+`4bfc1f299019f7f6` → settle → port 22 back, `sshd.auth.passwd=enabled`,
+applied sha restored to `ad41cdad…` (the archived row set) — byte-exact
+revert. The authorized_keys file tracked the rows in BOTH directions:
+zero rows after the revert → 0-byte file (key login denied, password
+lane live) — the pre-lane manual key does not survive a row-driven
+rebuild.
+
+**501 negative gate:** controller restarted WITHOUT
+`--allow-gated-live-wlan` (hand-rolled nohup, cmdline verified), then
+the key facts saved — the race-free order. Every inform answered the
+typed 501 (`inform: live WLAN provisioning gated` status=501) at the
+device's escalated cadence; record absorption froze (`last_seen_age_s`
+growing, 41 s+ at sample) while intent `e28b68ad9e6cbd23` sat
+undelivered; the device itself untouched (keeps its config, retries).
+Recovery via `ctl.sh` restart (flag present) → FIRST inform full
+provisioning → settle; key login restored; the rendered document
+reproduced `11cb0472…` byte-identically (render determinism across the
+whole cycle).
+
+**Negative fences:** PUT disable-without-keys → 400 with the exact
+lockout-guard message (the adminapi pre-backend fence, live); boot with
+a dead-seed `--ap-ssh-key` flag against the existing record → the
+"first-boot seeds only… managed at runtime via the site-settings API"
+WARN + the record wins (zero deadseed occurrences on disk, GET
+unchanged, no mint).
+
+**Terraform provider round:** `open-unifi_site_settings` applied
+against the LIVE controller via dev_overrides (ssh tunnel to :8443 —
+the workstation's Go dialer cannot route 10.10.10.10 directly while
+curl/ssh can; recorded as a bench-access quirk, not a provider defect).
+The first apply tripped Terraform's sensitive-attribute consistency
+check because the test HCL wrote the documented-unwritable literals
+(`ap_ssh_password = ""`, `ap_ssh_disable_password = false` — the schema
+says the unset echo maps them to null; write null or omit): config-side
+error, not a provider bug, but it TAINTED the resource so the corrected
+apply exercised Delete (zero-doc PUT → defaults) AND Create 11 ms apart
+→ both mints, ONE full provisioning delivered (newest intent wins — the
+intermediate keyless push never hit the wire). Follow-up plan: "No
+changes." Drift detection clean against the live record.
+
+**Persistence:** `ctl.sh restart` → record byte-identical
+(840/""/1 key/false), no re-seed, boot banner record-sourced
+(`ssh_public_keys=1`), the boot sshd-facts WARN fired, retained-key
+noop with cfg echo unchanged — restarts mint nothing.
+
+**Fixtures + gates:** `live-devices.json` re-seeded from the post-round
+record; `live-applied-sys.txt` re-seeded at `11cb0472…` (the round's
+push-echo bytes WITH the key rows; prior seeds archived
+`.preround-20260921`); NEW fourth fixture `live-site-settings.json`
+(the on-disk record) — the live gates now render candidates through
+`zzLiveSiteSettings` (the adapter's fail-closed parse seam) so the
+steady-state and push gates carry the CURRENT sshd rows. New
+`zzExemptSSHKeyRows` exemption on the DAS-archive comparison (the
+archive predates the row family; cleared at the next DAS re-seed — the
+`zzExemptSSHReMint` precedent). ZZ gates: **12 PASS + Wpa SKIP by
+design**; `go test -count=1 ./...` green.
+
+**End state:** the record keeps the lab-bench key provisioned
+(controller-managed key access; the manual `ssh-copy-id` lane is
+retired), defaults otherwise; applied `11cb0472…`, in_sync, standard
+ctl flags. No WLAN matrix row changes (the site-settings lane is
+orthogonal to the A–F matrix).
+
+**Owed:** (1) BOOT-rebuild survival of the row-sourced keys — this
+round validated the APPLY path only (§13.3's original ask); a reboot
+with the rows live is the remaining half. (2) The disable-knob outage's
+on-device root cause (no shell during the window; the §13.2 respawn
+line is the suspect). (3) The runtime WARN strings ("NOT yet
+live-bench-validated") are now half-stale — the key rows ARE
+apply-validated — flagged for a code-truth pass. (4) The H3 two-read
+gate residual stands as recorded.
+
 ## Release gate summary
 
 | Gate | Result |
