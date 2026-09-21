@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lucavb/open-unifi/internal/adminapi"
@@ -71,6 +72,23 @@ type App struct {
 	// path is the happy path). Fixed at New time and surfaced by
 	// CurrentSiteSettings so startup can refuse to launch.
 	settingsLoadErr error
+	// sweepFailed marks a site-settings mint sweep that failed mid-way
+	// (site_settings.go): the record was already committed, but some
+	// provisioned devices did not get their fresh cfgversion. A retry of
+	// the SAME document must re-sweep instead of hitting the no-change
+	// early return (which would answer 200 and leave the un-swept
+	// devices nooping on stale intent until the next effective change).
+	//
+	// It is an atomic.Bool because PutSiteSettings is served
+	// concurrently: one save's sweep can fail while another reads the
+	// flag inside its smu section. An atomic read needs no lock, so the
+	// leaf-lock doctrine is untouched (no thread holds smu while
+	// acquiring a store lock, and the flag never participates in that
+	// ordering). The flag is in-memory only: a crash — or a restart after
+	// a failed sweep — loses it; the remaining recovery is the next
+	// effective change, and a persisted marker is recorded as optional
+	// future hardening (not implemented).
+	sweepFailed atomic.Bool
 
 	prevMu     sync.Mutex
 	prevStates map[string]int // MAC(file-free bare hex) -> last-observed state
@@ -108,9 +126,18 @@ func New(st store.DeviceStore, wirelessPath, settingsPath string, seed SiteSetti
 	if !loaded {
 		// First boot: the seed (cmd/openunifi's startup flags, or the
 		// zero record for tests/embedders) becomes the initial record.
-		// Validation is the SEED rule (fail-closed, like the flag
-		// resolution already was) — not the save verb's rule.
-		if verr := validateSettingsSyntax(seed); verr != nil {
+		// Validation is the SAVE-verb rule (validateSiteSettingsChange):
+		// the seed is admin intent — the same thing the save verb
+		// validates — so a disable-without-keys seed is rejected exactly
+		// like an equivalent API save (a rejected seed persists nothing
+		// and produces the same settingsLoadErr → startup refusal as an
+		// invalid disk file). The WEAK rule (validateSettingsSyntax)
+		// stays at the disk-load site only: a hand-edited file must never
+		// brick startup. The CLI seed path is already guarded upstream
+		// (cmd validateSSHDisableSeed rejects the combo before New runs),
+		// so this tightening changes no CLI behavior — it closes the
+		// embedder/test surface.
+		if verr := validateSiteSettingsChange(seed); verr != nil {
 			settingsErr = fmt.Errorf("first-boot site-settings seed: %w", verr)
 		} else if perr := persistSettingsFile(settingsPath, seed); perr != nil {
 			settingsErr = fmt.Errorf("site settings seed persist: %w", perr)

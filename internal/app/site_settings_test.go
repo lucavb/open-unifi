@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -536,5 +537,188 @@ func TestSiteSettingsLoadAndSeedErrorRefusal(t *testing.T) {
 			}
 			tc.wantFile(t, spath)
 		})
+	}
+}
+
+// failingSweepStore wraps a DeviceStore and injects a bounded number of
+// UpdateExisting failures for one target MAC (fault injection for the mint
+// sweep). The injected error is deliberately NOT store.ErrNotFound — the
+// sweep must treat it as a real sweep failure, not a deleted-device skip.
+type failingSweepStore struct {
+	store.DeviceStore
+	mac       string
+	remaining int // failures still to inject for mac
+	injected  int // failures injected so far
+}
+
+func (f *failingSweepStore) UpdateExisting(mac string, fn func(*store.Device) error) error {
+	if mac == f.mac && f.remaining > 0 {
+		f.remaining--
+		f.injected++
+		return fmt.Errorf("injected sweep fault for %s", mac)
+	}
+	return f.DeviceStore.UpdateExisting(mac, fn)
+}
+
+// TestPutSiteSettingsSweepFailureRetryResweeps pins the failed-sweep retry:
+// a mid-sweep store error propagates AFTER the record is committed (disk +
+// cache already hold the new document), so a blind retry of the same
+// document would hit the no-change early return and answer 200 with
+// devices still missing their mint. The sweepFailed flag turns that retry
+// into a bounded re-sweep instead — and once a retry completes cleanly the
+// flag is cleared, so further no-change saves mint nothing again.
+func TestPutSiteSettingsSweepFailureRetryResweeps(t *testing.T) {
+	spath := filepath.Join(t.TempDir(), "site-settings.json")
+	base := store.NewMemStore()
+	// Fail the FIRST UpdateExisting for the target MAC only; List is
+	// MAC-ordered, so 112233445566 sweeps cleanly first and the fault
+	// hits aabbccddeeff deterministically.
+	st := &failingSweepStore{DeviceStore: base, mac: "aabbccddeeff", remaining: 1}
+	a := New(st, filepath.Join(t.TempDir(), "wireless.json"), spath, SiteSettings{}, quietLogger())
+
+	if err := base.Put(store.Device{MAC: "112233445566", State: store.StateAdopted, CfgVersion: "cccc3333dddd4444"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Put(store.Device{MAC: "aabbccddeeff", State: store.StateAdopted, CfgVersion: "aaaa1111bbbb2222"}); err != nil {
+		t.Fatal(err)
+	}
+
+	doc := adminapi.SiteSettingsDocument{
+		RegulatoryCountryCode: 276,
+		APSSHPassword:         "changed-password",
+		APSSHPublicKeys:       []string{testKeyEd25519Line},
+	}
+	ctx := context.Background()
+
+	// (a) The failing PUT: the error propagates, but persist+swap already
+	// ran — the record is committed, so the retry below is legitimately
+	// "no change" and must be rescued by the re-sweep, not answered 200.
+	if _, err := a.PutSiteSettings(ctx, doc); err == nil {
+		t.Fatal("put with injected sweep fault: want an error")
+	}
+	if st.injected != 1 {
+		t.Fatalf("injected failures = %d, want 1", st.injected)
+	}
+	if d := readSettingsDoc(t, spath); d.RegulatoryCountryCode != 276 || d.APSSHPassword != "changed-password" {
+		t.Fatalf("failed sweep did not commit the record: %+v", d)
+	}
+	if d, err := base.Get("aabbccddeeff"); err != nil || d.CfgVersion != "aaaa1111bbbb2222" {
+		t.Fatalf("target cfgversion changed despite the fault: %q, %v", d.CfgVersion, err)
+	}
+
+	// (b) The retry: 200, and the previously un-swept device got its mint.
+	if _, err := a.PutSiteSettings(ctx, doc); err != nil {
+		t.Fatalf("retry of the same document: %v", err)
+	}
+	target, err := base.Get("aabbccddeeff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target.CfgVersion == "" || target.CfgVersion == "aaaa1111bbbb2222" {
+		t.Fatalf("retry did not re-sweep the un-swept device: cfgversion %q", target.CfgVersion)
+	}
+	if other, err := base.Get("112233445566"); err != nil || other.CfgVersion == "cccc3333dddd4444" {
+		t.Fatalf("clean device was not re-minted by the retry: %q, %v", other.CfgVersion, err)
+	}
+
+	// (c) The flag is cleared after the successful sweep: a further
+	// no-change PUT mints nothing (TestPutSiteSettingsNoOpMintsNothing's
+	// rule restored).
+	if _, err := a.PutSiteSettings(ctx, doc); err != nil {
+		t.Fatalf("no-change put after retry: %v", err)
+	}
+	if d, err := base.Get("aabbccddeeff"); err != nil || d.CfgVersion != target.CfgVersion {
+		t.Fatalf("post-retry no-change save minted again: got %q want %q (%v)", d.CfgVersion, target.CfgVersion, err)
+	}
+	if st.injected != 1 {
+		t.Fatalf("injection re-fired: %d failures, want still 1", st.injected)
+	}
+}
+
+// TestSeedDisableWithoutKeysRefusedButDiskComboBoots pins the split seed/disk
+// validation rules (the review's H4): the seed site now uses the SAVE-verb
+// rule (the seed is admin intent), while the disk-load site keeps the weak
+// syntax rule.
+//
+//  1. a disable-without-keys SEED is rejected exactly like the equivalent
+//     API save: the startup-refusal shape is retained (settingsLoadErr,
+//     mirrored from TestSiteSettingsLoadAndSeedErrorRefusal) and NOTHING
+//     persists — a bad seed never becomes a record;
+//  2. the same combination arriving on DISK (a hand-edited
+//     site-settings.json) does NOT brick startup: the file loads, the
+//     record serves it, and the administrator can fix it through the API.
+func TestSeedDisableWithoutKeysRefusedButDiskComboBoots(t *testing.T) {
+	spath := filepath.Join(t.TempDir(), "site-settings.json")
+
+	// (a) Leg 1 — the seed is refused.
+	a := New(store.NewMemStore(), filepath.Join(t.TempDir(), "wireless.json"), spath,
+		SiteSettings{CountryCode: 840, SSHPassword: "pw", SSHDisablePassword: true}, quietLogger())
+	if _, err := a.CurrentSiteSettings(); err == nil {
+		t.Fatal("disable-without-keys seed accepted; want the startup-refusal shape")
+	}
+	if _, err := os.Stat(spath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("refused seed persisted a settings file: %v", err)
+	}
+
+	// (b) Leg 2 — the disk file carrying the same combo boots.
+	combo := []byte(`{"regulatory_country_code": 840, "ap_ssh_password": "pw", "ap_ssh_disable_password": true}`)
+	if err := os.WriteFile(spath, combo, 0o600); err != nil {
+		t.Fatalf("prep disk file: %v", err)
+	}
+	a2 := New(store.NewMemStore(), filepath.Join(t.TempDir(), "wireless.json"), spath,
+		SiteSettings{}, quietLogger())
+	got, err := a2.CurrentSiteSettings()
+	if err != nil {
+		t.Fatalf("combo disk file failed to load (must never brick startup): %v", err)
+	}
+	if !got.SSHDisablePassword || len(got.SSHPublicKeys) != 0 || got.CountryCode != 840 {
+		t.Fatalf("loaded record is not the disk combo: %+v", got)
+	}
+}
+
+// TestPutSiteSettingsWarnsOnSSHFactSave pins the one-line save-time warn
+// (the startup warn's save-moment twin): an effective save whose SAVED
+// record carries SSHPublicKeys or SSHDisablePassword emits exactly one
+// Warn — unconditional on the facts, because the app layer does not know
+// the gate flag (the warn honestly says pushes stay gated BEHIND it).
+func TestPutSiteSettingsWarnsOnSSHFactSave(t *testing.T) {
+	buf := &bytes.Buffer{}
+	capture := slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	spath := filepath.Join(t.TempDir(), "site-settings.json")
+	a := New(store.NewMemStore(), filepath.Join(t.TempDir(), "wireless.json"), spath, SiteSettings{}, capture)
+
+	doc := adminapi.SiteSettingsDocument{
+		RegulatoryCountryCode: 840,
+		APSSHPassword:         "pw",
+		APSSHPublicKeys:       []string{testKeyEd25519Line},
+	}
+	if _, err := a.PutSiteSettings(context.Background(), doc); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	warns := 0
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if strings.Contains(line, "level=WARN") && strings.Contains(line, "saved into the site-settings record") {
+			warns++
+		}
+	}
+	if warns != 1 {
+		t.Fatalf("warn lines with the save-moment phrase = %d, want 1; log:\n%s", warns, buf.String())
+	}
+	if !strings.Contains(buf.String(), "--allow-gated-live-wlan") {
+		t.Fatalf("warn does not name the gate flag; log:\n%s", buf.String())
+	}
+
+	// A no-change save (and a save carrying no SSH facts) stay silent.
+	buf.Reset()
+	if _, err := a.PutSiteSettings(context.Background(), doc); err != nil {
+		t.Fatalf("no-change put: %v", err)
+	}
+	if _, err := a.PutSiteSettings(context.Background(), adminapi.SiteSettingsDocument{
+		RegulatoryCountryCode: 276,
+	}); err != nil {
+		t.Fatalf("facts-free put: %v", err)
+	}
+	if warns := strings.Count(buf.String(), "saved into the site-settings record"); warns != 0 {
+		t.Fatalf("non-fact or no-change saves warned %d times; log:\n%s", warns, buf.String())
 	}
 }

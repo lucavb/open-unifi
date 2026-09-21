@@ -125,19 +125,25 @@ func validateSiteSettingsChange(s SiteSettings) error {
 	return nil
 }
 
-// validateSettingsSyntax is the SEED/LOAD rule, deliberately weaker than
-// the save verb's: it checks only key-line syntax (same single parser,
-// fail-closed) and the country range. It does NOT enforce
+// validateSettingsSyntax is the DISK-LOAD rule, deliberately weaker than
+// the save verb's; its ONLY caller is loadSettingsFile. It checks key-line
+// syntax (same single parser, fail-closed) and the country range, but NOT
 // disable-without-keys, because the weaker rule exists so a hand-edited
 // or foreign-written site-settings.json that is syntactically valid but
 // semantically invalid does not brick startup — the file loads and the
 // administrator fixes it through the API (the single validator going
-// forward). Note the flag path can never seed the disable-without-keys
-// combo: cmd's validateSSHDisableSeed guard rejects it at startup. A
-// disable-without-keys value that DID reach disk is fail-closed where it
-// matters: the adoption engine's live-provisioning gate (typed 501)
-// blocks that combo's pushes. Zero
-// seed (tests, first boot without flags) passes by construction.
+// forward). The SEED site does NOT get this weak rule any more: New
+// validates the seed with the save-verb rule (the seed is admin intent),
+// with the CLI already guarded upstream by cmd's validateSSHDisableSeed.
+//
+// What actually happens when a disable-without-keys combination is in the
+// record (possible only via the disk-load path): it is NOT fail-closed.
+// The adoption engine's live-provisioning gate covers ONLY the U7PG2
+// firmware 6.8.2.15592 lane; any other model or firmware renders and
+// delivers password-auth-disabled with no provisioned key ungated, which
+// locks SSH out on that device. Recovery does not need SSH: an effective
+// site-settings save re-provisions every minted device and can re-enable
+// password auth (or add keys) at the next full provisioning.
 func validateSettingsSyntax(s SiteSettings) error {
 	if code := s.CountryCode; code != 0 && (code < 1 || code > 999) {
 		return fmt.Errorf("regulatory country code must be an ISO 3166-1 numeric code from 001 to 999 (or 0 = unset), got %d", code)
@@ -306,25 +312,92 @@ func (a *App) PutSiteSettings(_ context.Context, doc adminapi.SiteSettingsDocume
 		a.smu.Unlock()
 		return zero, fmt.Errorf("site settings: %w", a.settingsLoadErr)
 	}
-	if !siteSettingsChanged(a.cachedSettings, next) {
-		// A save that changes nothing mints nothing (the no-op save is
-		// pinned by test): project the read view and return.
+	changed := siteSettingsChanged(a.cachedSettings, next)
+	// A save that changes nothing mints nothing (the no-op save is pinned
+	// by test) — EXCEPT when a previous sweep failed mid-way
+	// (a.sweepFailed): then the same document is re-swept below instead
+	// of being answered 200 with some devices still missing their mint.
+	if !changed && !a.sweepFailed.Load() {
 		view := projectSettingsView(a.cachedSettings)
 		a.smu.Unlock()
 		return view, nil
 	}
-	// Wholesale replace: persist FIRST (crash between persist and sweep
-	// = the on-disk record is already the new intent), then swap the
-	// cache, then sweep the mints below (outside this section).
-	if err := persistSettingsFile(a.settingsPath, next); err != nil {
-		a.smu.Unlock()
-		return zero, err
+	if changed {
+		// Wholesale replace: persist FIRST (crash between persist and
+		// sweep = the on-disk record is already the new intent), then
+		// swap the cache, then sweep the mints below (outside this
+		// section). On a sweepFailed retry there is nothing to persist
+		// or swap — the record already holds exactly this document; only
+		// the interrupted mints need re-delivery.
+		if err := persistSettingsFile(a.settingsPath, next); err != nil {
+			a.smu.Unlock()
+			return zero, err
+		}
+		a.cachedSettings = next
 	}
-	a.cachedSettings = next
 	a.smu.Unlock()
 	// smu RELEASED: everything below is store work and must never re-take
 	// smu (see the lock-shape comment above).
 
+	minted, err := a.runSettingsMintSweep()
+	if err != nil {
+		// The record is already committed (persist + cache swap ran);
+		// runSettingsMintSweep marked the sweep as failed so the next
+		// PUT of this same document re-sweeps instead of returning a
+		// silent 200.
+		return zero, err
+	}
+	if changed && (len(next.SSHPublicKeys) > 0 || next.SSHDisablePassword) {
+		// Mirrors the startup warn (cmd/openunifi, same document):
+		// the app layer does not know whether the live gate was lifted
+		// via --allow-gated-live-wlan, so the warn fires on the FACTS —
+		// and it is honest either way: it says pushes stay gated BEHIND
+		// the flag, not that they are blocked. One line per effective
+		// save (not per device, and not on a sweepFailed retry — a
+		// retry arms nothing new).
+		a.lg.Warn("ssh site facts saved into the site-settings record: the sshd.auth.key rows and the auth.passwd knob are firmware-derived but NOT yet live-bench-validated — live pushes stay gated behind --allow-gated-live-wlan (docs/PROTOCOL-systemcfg-wireless.md §13, bench use only)")
+	}
+	a.lg.Debug("site settings replaced",
+		"country_code", next.CountryCode,
+		"keys", len(next.SSHPublicKeys),
+		"disable_password", next.SSHDisablePassword,
+		"devices_minted", minted)
+	// Project from the LOCAL record, not the cache: `next` is exactly what
+	// this save swapped in (or, on a sweepFailed retry, already equals the
+	// cache), and re-reading the cache would mean re-taking smu after
+	// store work (the lock-shape rule) — while a concurrent effective save
+	// could have legitimately swapped a newer document in that is not
+	// this save's read view.
+	return projectSettingsView(next), nil
+}
+
+// runSettingsMintSweep runs ONE bounded mint-sweep attempt (the store
+// method shape rides the device RMW cycle, see the sweep commentary below)
+// and maintains a.sweepFailed: any error marks the sweep failed so the next
+// PUT of the same document re-sweeps instead of silently no-oping, and only
+// a sweep that completes without error clears the flag. It is called with
+// NO lock held (smu is a leaf lock — never held across store calls) and
+// never takes a lock itself; the flag is an atomic, so concurrent PUTs
+// (each running at most this one bounded sweep attempt) cannot deadlock or
+// corrupt it.
+func (a *App) runSettingsMintSweep() (int, error) {
+	minted, err := a.sweepSiteCfgVersionMints()
+	if err != nil {
+		a.sweepFailed.Store(true)
+		return minted, err
+	}
+	a.sweepFailed.Store(false)
+	return minted, nil
+}
+
+// sweepSiteCfgVersionMints is the sweep body proper (no flag bookkeeping —
+// runSettingsMintSweep owns that).
+func (a *App) sweepSiteCfgVersionMints() (int, error) {
+	minted := 0
+	devices, err := a.st.List()
+	if err != nil {
+		return minted, fmt.Errorf("site settings mint sweep list: %w", err)
+	}
 	// ---- the MINT SWEEP: one fresh cfgversion per provisioned device ----
 	//
 	// Site settings mint on save, not in the engine's drift arms. Reasons:
@@ -335,15 +408,19 @@ func (a *App) PutSiteSettings(_ context.Context, doc adminapi.SiteSettingsDocume
 	// 3. The pending-delivery gate's operator-mint escape (engine.go:645) frees an
 	//    externally minted cfgversion, the same shape as an operator device-save.
 	//
-	// Settings are persisted before the sweep; a crash mid-sweep leaves
+	// Settings are persisted before the sweep; a CRASH mid-sweep leaves
 	// the un-swept subset nooping until the next effective change
 	// (self-healing, matches the single-process local-file persistence
-	// posture of the rest of the store). A FAILED sweep (persist succeeded,
-	// a store error mid-sweep) is NOT healed by retrying the same document:
-	// the no-change early return turns a retry into a 200 without
-	// sweeping — the next effective change of ANY mint kind (a later
-	// site-settings save, an operator device save, wireless envelope
-	// drift, a blocked-sta change) re-delivers to the un-swept devices.
+	// posture of the rest of the store). A FAILED sweep (persist
+	// succeeded, a store error mid-sweep) used to be a silent hole — the
+	// no-change early return answered a retry with 200 and nothing
+	// re-swept — but a.sweepFailed now carries the failure, so the next
+	// PUT of the same document re-sweeps. The flag is in-memory only: a
+	// restart (or a crash) after a failed sweep loses it and falls back
+	// to the next-effective-change healing; a persisted marker is
+	// recorded as optional future hardening, not implemented. A
+	// persistently failing store cannot loop: each PUT runs at most this
+	// one bounded sweep attempt.
 	//
 	// Concurrent sweeps may interleave (two effective saves back to back,
 	// or a save racing a device-save mint): that is fine and expected —
@@ -358,18 +435,13 @@ func (a *App) PutSiteSettings(_ context.Context, doc adminapi.SiteSettingsDocume
 	// noise. This is also why the sweep rides the device RMW cycle
 	// (store.UpdateExisting — saveIntent's saveExisting shape) instead of
 	// a plain Put: it cannot resurrect or race an inform handler.
-	minted := 0
-	devices, err := a.st.List()
-	if err != nil {
-		return zero, fmt.Errorf("site settings mint sweep list: %w", err)
-	}
 	for _, d := range devices {
 		if d.CfgVersion == "" {
 			continue
 		}
 		nv, merr := mintCfgVersion()
 		if merr != nil {
-			return zero, merr
+			return minted, merr
 		}
 		if err := a.st.UpdateExisting(d.MAC, func(rec *store.Device) error {
 			rec.CfgVersion = nv
@@ -380,19 +452,9 @@ func (a *App) PutSiteSettings(_ context.Context, doc adminapi.SiteSettingsDocume
 				// provision, not a sweep failure.
 				continue
 			}
-			return zero, fmt.Errorf("site settings mint sweep %s: %w", d.MAC, err)
+			return minted, fmt.Errorf("site settings mint sweep %s: %w", d.MAC, err)
 		}
 		minted++
 	}
-	a.lg.Debug("site settings replaced",
-		"country_code", next.CountryCode,
-		"keys", len(next.SSHPublicKeys),
-		"disable_password", next.SSHDisablePassword,
-		"devices_minted", minted)
-	// Project from the LOCAL record, not the cache: `next` is exactly what
-	// this save swapped in, and re-reading the cache would mean re-taking
-	// smu after store work (the lock-shape rule) — while a concurrent
-	// effective save could have legitimately swapped a newer document in
-	// that is not this save's read view.
-	return projectSettingsView(next), nil
+	return minted, nil
 }
