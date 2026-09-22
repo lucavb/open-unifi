@@ -35,7 +35,7 @@ make provider-build # dist/openunifi-tfprovider
 ```
 go run ./cmd/openunifi \
   --listen-inform :8080 \
-  --listen-admin :8443 \
+  --listen-admin 127.0.0.1:8443 \
   --listen-discovery :10001 \
   --discovery \
   --data-dir data \
@@ -320,9 +320,10 @@ Still open (classic behavior vs open-unifi):
 - **No jar-anchored differential test harness.** Byte-exactness claims are
   grounded in bytecode citation, not yet in an automated golden-comparison
   against captures from a real classic controller (FID-57).
-- **Single-process assumption.** There is no advisory file locking on the JSON
-  store — running two controller processes against one `--data-dir` is
-  unsupported and will lose updates (FID-63).
+- **Single-process store (FID-63).** The data directory is guarded by an
+  exclusive advisory lock taken at startup; a second controller process
+  against the same `--data-dir` fails fast ("data directory … is already
+  in use") instead of racing JSON writes.
 - **Plaintext inform mode (`--allow-plaintext-inform`).** The response to a
   re-key push echoes the device's *current* authkey as cleartext on the wire.
   Opt-in flag for a reason; trusted lab segments only (FID-42).

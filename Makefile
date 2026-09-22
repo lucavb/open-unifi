@@ -8,8 +8,10 @@ build:
 test:
 	$(GO) test ./...
 
+# Dev convenience: loopback-only admin with a throwaway token; for anything
+# exposed use a real --admin-token behind an HTTPS reverse proxy.
 run:
-	$(GO) run ./cmd/openunifi --listen-inform :8080 --listen-admin :8443
+	$(GO) run ./cmd/openunifi --listen-inform :8080 --listen-admin 127.0.0.1:8443 --admin-token dev-local
 
 provider-build:
 	$(GO) build -o dist/openunifi-tfprovider ./cmd/tfprovider
