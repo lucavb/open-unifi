@@ -67,12 +67,12 @@ func TestFirstBootSeedPersistsThenFileWins(t *testing.T) {
 		t.Fatalf("get after seed: %v", err)
 	}
 	if got.RegulatoryCountryCode != 276 || got.APSSHPassword != "first-boot-password" ||
-		len(got.APSSHPublicKeys) != 1 || got.APSSHPublicKeys[0] != testKeyEd25519Line || got.APSSHDisablePassword {
+		len(got.APSSHPublicKeys) != 1 || got.APSSHPublicKeys[0] != testKeyEd25519Line {
 		t.Fatalf("seed not served: %+v", got)
 	}
 	doc := readSettingsDoc(t, spath)
 	if doc.RegulatoryCountryCode != 276 || doc.APSSHPassword != "first-boot-password" ||
-		len(doc.APSSHPublicKeys) != 1 || doc.APSSHPublicKeys[0] != testKeyEd25519Line || doc.APSSHDisablePassword {
+		len(doc.APSSHPublicKeys) != 1 || doc.APSSHPublicKeys[0] != testKeyEd25519Line {
 		t.Fatalf("seed not persisted: %+v", doc)
 	}
 
@@ -121,7 +121,7 @@ func TestPutSiteSettingsMintsProvisionedOnly(t *testing.T) {
 		t.Fatalf("put: %v", err)
 	}
 	if view.RegulatoryCountryCode != 276 || view.APSSHPassword != "changed-password" ||
-		len(view.APSSHPublicKeys) != 1 || view.APSSHDisablePassword {
+		len(view.APSSHPublicKeys) != 1 {
 		t.Fatalf("view: %+v", view)
 	}
 	for mac, old := range before {
@@ -207,8 +207,8 @@ func TestPutSiteSettingsOrderOnlyDiffMints(t *testing.T) {
 
 // TestPutSiteSettingsValidation pins the verb's fail-closed rule set —
 // every failure is an adminapi.ErrInvalid (HTTP 400 via handleBackendErr):
-// one malformed authorized_keys line fails the WHOLE save, an explicit
-// out-of-range country fails, and disable-without-keys fails.
+// one malformed authorized_keys line fails the WHOLE save, and an explicit
+// out-of-range country fails.
 func TestPutSiteSettingsValidation(t *testing.T) {
 	a, _, _ := testSettingsApp(t, SiteSettings{})
 
@@ -230,14 +230,6 @@ func TestPutSiteSettingsValidation(t *testing.T) {
 			doc: adminapi.SiteSettingsDocument{
 				RegulatoryCountryCode: 840,
 				APSSHPublicKeys:       []string{"opendir3 " + "AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB"},
-			},
-		},
-		{
-			name: "disable without keys",
-			doc: adminapi.SiteSettingsDocument{
-				RegulatoryCountryCode: 840,
-				APSSHPassword:         "pw",
-				APSSHDisablePassword:  true,
 			},
 		},
 		{
@@ -265,7 +257,7 @@ func TestPutSiteSettingsValidation(t *testing.T) {
 // app save verb's internal validation (validateSiteSettingsChange)
 // accept/reject the SAME inputs — one rule set, two layers
 // (defense-in-depth). Both are pure syntax rules (country range, per-line
-// key parse, disable-without-keys); list ORDER is deliberately out of
+// key parse); list ORDER is deliberately out of
 // scope here — order is a semantics rule (an order-only diff mints one
 // harmless re-provisioning), not a rejection rule. The seam is legal
 // because internal/app already imports internal/adminapi (the Backend
@@ -314,15 +306,6 @@ func TestSiteSettingsRuleEquivalenceAcrossLayers(t *testing.T) {
 			},
 			reject: true,
 			keyIdx: 2,
-		},
-		{
-			name: "disable without keys",
-			doc: adminapi.SiteSettingsDocument{
-				RegulatoryCountryCode: 840,
-				APSSHPassword:         "pw",
-				APSSHDisablePassword:  true,
-			},
-			reject: true,
 		},
 		{
 			name:   "country out of range high",
@@ -383,7 +366,6 @@ func TestRecordAbsorptionCannotTouchSiteSettings(t *testing.T) {
 		"regulatory_country_code": float64(1),
 		"ap_ssh_password":         "poison-password",
 		"ap_ssh_public_keys":      []any{"ssh-rsa AAAA poison"},
-		"ap_ssh_disable_password": true,
 	}
 	err = st.UpdateExisting("aabbccddeeff", func(d *store.Device) error {
 		d.Absorb(body, time.Now(), true)
@@ -635,50 +617,9 @@ func TestPutSiteSettingsSweepFailureRetryResweeps(t *testing.T) {
 	}
 }
 
-// TestSeedDisableWithoutKeysRefusedButDiskComboBoots pins the split seed/disk
-// validation rules (the review's H4): the seed site now uses the SAVE-verb
-// rule (the seed is admin intent), while the disk-load site keeps the weak
-// syntax rule.
-//
-//  1. a disable-without-keys SEED is rejected exactly like the equivalent
-//     API save: the startup-refusal shape is retained (settingsLoadErr,
-//     mirrored from TestSiteSettingsLoadAndSeedErrorRefusal) and NOTHING
-//     persists — a bad seed never becomes a record;
-//  2. the same combination arriving on DISK (a hand-edited
-//     site-settings.json) does NOT brick startup: the file loads, the
-//     record serves it, and the administrator can fix it through the API.
-func TestSeedDisableWithoutKeysRefusedButDiskComboBoots(t *testing.T) {
-	spath := filepath.Join(t.TempDir(), "site-settings.json")
-
-	// (a) Leg 1 — the seed is refused.
-	a := New(store.NewMemStore(), filepath.Join(t.TempDir(), "wireless.json"), spath,
-		SiteSettings{CountryCode: 840, SSHPassword: "pw", SSHDisablePassword: true}, quietLogger())
-	if _, err := a.CurrentSiteSettings(); err == nil {
-		t.Fatal("disable-without-keys seed accepted; want the startup-refusal shape")
-	}
-	if _, err := os.Stat(spath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("refused seed persisted a settings file: %v", err)
-	}
-
-	// (b) Leg 2 — the disk file carrying the same combo boots.
-	combo := []byte(`{"regulatory_country_code": 840, "ap_ssh_password": "pw", "ap_ssh_disable_password": true}`)
-	if err := os.WriteFile(spath, combo, 0o600); err != nil {
-		t.Fatalf("prep disk file: %v", err)
-	}
-	a2 := New(store.NewMemStore(), filepath.Join(t.TempDir(), "wireless.json"), spath,
-		SiteSettings{}, quietLogger())
-	got, err := a2.CurrentSiteSettings()
-	if err != nil {
-		t.Fatalf("combo disk file failed to load (must never brick startup): %v", err)
-	}
-	if !got.SSHDisablePassword || len(got.SSHPublicKeys) != 0 || got.CountryCode != 840 {
-		t.Fatalf("loaded record is not the disk combo: %+v", got)
-	}
-}
-
 // TestPutSiteSettingsWarnsOnSSHFactSave pins the one-line save-time warn
 // (the startup warn's save-moment twin): an effective save whose SAVED
-// record carries SSHPublicKeys or SSHDisablePassword emits exactly one
+// record carries SSHPublicKeys emits exactly one
 // Warn — unconditional on the facts, because the app layer does not know
 // the gate flag (the warn honestly says pushes stay gated BEHIND it).
 func TestPutSiteSettingsWarnsOnSSHFactSave(t *testing.T) {

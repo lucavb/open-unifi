@@ -1,7 +1,7 @@
-// Site settings are the controller-level AP-intent document: the four
+// Site settings are the controller-level AP-intent document: the three
 // AP-intent site facts that used to live only in startup flags — the
-// regulatory country code, the AP SSH password, the ordered SSH
-// authorized_keys lines, and the SSH password-login disable knob.
+// regulatory country code, the AP SSH password, and the ordered SSH
+// authorized_keys lines.
 //
 // It follows the wireless-envelope precedent exactly: an app-owned JSON
 // file (`<data-dir>/site-settings.json`) loaded EXACTLY ONCE in New,
@@ -30,8 +30,7 @@ import (
 // zero value carries exactly the semantics of the old flag defaults:
 // CountryCode 0 renders as the 840 default at the server seam, an empty
 // SSHPassword renders as the site default ("ubnt", renderer semantics,
-// unchanged), no keys render as no sshd.auth.key rows, and
-// SSHDisablePassword false keeps password login enabled.
+// unchanged), and no keys render as no sshd.auth.key rows.
 type SiteSettings struct {
 	// CountryCode is the ISO 3166-1 numeric regulatory country code.
 	// 0 = unset (renders as the default 840 at the server seam).
@@ -45,9 +44,6 @@ type SiteSettings struct {
 	// sshd.auth.key.<n> ordering, so an order-only diff is an effective
 	// change (harmless re-provisioning, pinned by test).
 	SSHPublicKeys []string
-	// SSHDisablePassword renders sshd.auth.passwd=disabled (dropbear -s,
-	// no remote password logins).
-	SSHDisablePassword bool
 }
 
 // toDocument converts the record to the admin-API wire shape (which is
@@ -64,7 +60,6 @@ func (s SiteSettings) toDocument() adminapi.SiteSettingsDocument {
 		RegulatoryCountryCode: s.CountryCode,
 		APSSHPassword:         s.SSHPassword,
 		APSSHPublicKeys:       keys,
-		APSSHDisablePassword:  s.SSHDisablePassword,
 	}
 }
 
@@ -77,10 +72,9 @@ func siteSettingsFromDoc(doc adminapi.SiteSettingsDocument) SiteSettings {
 		keys = []string{}
 	}
 	return SiteSettings{
-		CountryCode:        doc.RegulatoryCountryCode,
-		SSHPassword:        doc.APSSHPassword,
-		SSHPublicKeys:      keys,
-		SSHDisablePassword: doc.APSSHDisablePassword,
+		CountryCode:   doc.RegulatoryCountryCode,
+		SSHPassword:   doc.APSSHPassword,
+		SSHPublicKeys: keys,
 	}
 }
 
@@ -96,7 +90,6 @@ func projectSettingsView(s SiteSettings) adminapi.SiteSettingsView {
 		RegulatoryCountryCode: s.CountryCode,
 		APSSHPassword:         s.SSHPassword,
 		APSSHPublicKeys:       keys,
-		APSSHDisablePassword:  s.SSHDisablePassword,
 	}
 }
 
@@ -104,10 +97,9 @@ func projectSettingsView(s SiteSettings) adminapi.SiteSettingsView {
 // must be 0 (= unset, renders as the server-side 840 default) or an ISO
 // 3166-1 numeric code 1..999; every key line must pass the single
 // fail-closed RFC 4253 parser (systemcfg.ParsePublicKey — no other
-// validator exists for this shape); password auth disabled requires at
-// least one provisioned key line, or the next cfg rebuild would lock SSH
-// out. All validation failures wrap the adminapi.ErrInvalid sentinel so
-// handleBackendErr maps them to HTTP 400 with the human message echoed.
+// validator exists for this shape). All validation failures wrap the
+// adminapi.ErrInvalid sentinel so handleBackendErr maps them to HTTP 400
+// with the human message echoed.
 func validateSiteSettingsChange(s SiteSettings) error {
 	if code := s.CountryCode; code != 0 && (code < 1 || code > 999) {
 		return fmt.Errorf("%w: regulatory country code must be an ISO 3166-1 numeric code from 001 to 999 (or 0 = unset), got %d",
@@ -118,32 +110,14 @@ func validateSiteSettingsChange(s SiteSettings) error {
 			return fmt.Errorf("%w: invalid AP SSH public key #%d: %v", adminapi.ErrInvalid, i+1, err)
 		}
 	}
-	if s.SSHDisablePassword && len(s.SSHPublicKeys) == 0 {
-		return fmt.Errorf("%w: AP SSH password auth cannot be disabled without a provisioned public key; add an authorized_keys line or SSH access will be locked out",
-			adminapi.ErrInvalid)
-	}
 	return nil
 }
 
 // validateSettingsSyntax is the DISK-LOAD rule, deliberately weaker than
 // the save verb's; its ONLY caller is loadSettingsFile. It checks key-line
-// syntax (same single parser, fail-closed) and the country range, but NOT
-// disable-without-keys, because the weaker rule exists so a hand-edited
-// or foreign-written site-settings.json that is syntactically valid but
-// semantically invalid does not brick startup — the file loads and the
-// administrator fixes it through the API (the single validator going
-// forward). The SEED site does NOT get this weak rule any more: New
-// validates the seed with the save-verb rule (the seed is admin intent),
-// with the CLI already guarded upstream by cmd's validateSSHDisableSeed.
-//
-// What actually happens when a disable-without-keys combination is in the
-// record (possible only via the disk-load path): it is NOT fail-closed.
-// The adoption engine's live-provisioning gate covers ONLY the U7PG2
-// firmware 6.8.2.15592 lane; any other model or firmware renders and
-// delivers password-auth-disabled with no provisioned key ungated, which
-// locks SSH out on that device. Recovery does not need SSH: an effective
-// site-settings save re-provisions every minted device and can re-enable
-// password auth (or add keys) at the next full provisioning.
+// syntax (same single parser, fail-closed) and the country range. The
+// weaker rule exists so a hand-edited or foreign-written
+// site-settings.json that is syntactically valid does not brick startup.
 func validateSettingsSyntax(s SiteSettings) error {
 	if code := s.CountryCode; code != 0 && (code < 1 || code > 999) {
 		return fmt.Errorf("regulatory country code must be an ISO 3166-1 numeric code from 001 to 999 (or 0 = unset), got %d", code)
@@ -253,7 +227,7 @@ func (a *App) currentSiteSettings() (SiteSettings, error) {
 }
 
 // CurrentSiteSettings exposes the cached record without the Backend
-// shape, for wiring-side use (the server sources the four AP-intent site
+// shape, for wiring-side use (the server sources the AP-intent site
 // facts from here — including from inside the engine's decision
 // path, which is exactly why smu must stay a leaf lock: this reader takes
 // smu while the caller may already hold a per-MAC store lock). Mirrors
@@ -264,7 +238,7 @@ func (a *App) CurrentSiteSettings() (SiteSettings, error) {
 }
 
 // siteSettingsChanged reports an EFFECTIVE change under the save verb's
-// doctrine: any difference in the four facts. The key list comparison is
+// doctrine: any difference in the three facts. The key list comparison is
 // ORDER-SENSITIVE — the list is provisioned as sshd.auth.key.<n> rows in
 // order, so a reorder IS a different intended config. An order-only diff
 // therefore mints one harmless re-provisioning (idempotent content, the
@@ -272,7 +246,6 @@ func (a *App) CurrentSiteSettings() (SiteSettings, error) {
 func siteSettingsChanged(before, after SiteSettings) bool {
 	return before.CountryCode != after.CountryCode ||
 		before.SSHPassword != after.SSHPassword ||
-		before.SSHDisablePassword != after.SSHDisablePassword ||
 		!slices.Equal(before.SSHPublicKeys, after.SSHPublicKeys)
 }
 
@@ -347,7 +320,7 @@ func (a *App) PutSiteSettings(_ context.Context, doc adminapi.SiteSettingsDocume
 		// silent 200.
 		return zero, err
 	}
-	if changed && (len(next.SSHPublicKeys) > 0 || next.SSHDisablePassword) {
+	if changed && len(next.SSHPublicKeys) > 0 {
 		// Mirrors the startup warn (cmd/openunifi, same document):
 		// the app layer does not know whether the live gate was lifted
 		// via --allow-gated-live-wlan, so the warn fires on the FACTS —
@@ -355,12 +328,11 @@ func (a *App) PutSiteSettings(_ context.Context, doc adminapi.SiteSettingsDocume
 		// the flag, not that they are blocked. One line per effective
 		// save (not per device, and not on a sweepFailed retry — a
 		// retry arms nothing new).
-		a.lg.Warn("ssh site facts saved into the site-settings record: the sshd.auth.key rows and the auth.passwd knob are firmware-derived but NOT yet live-bench-validated — live pushes stay gated behind --allow-gated-live-wlan (docs/PROTOCOL-systemcfg-wireless.md §13, bench use only)")
+		a.lg.Warn("ssh site facts saved into the site-settings record: the sshd.auth.key rows are firmware-derived but NOT yet live-bench-validated — live pushes stay gated behind --allow-gated-live-wlan (docs/PROTOCOL-systemcfg-wireless.md §13, bench use only)")
 	}
 	a.lg.Debug("site settings replaced",
 		"country_code", next.CountryCode,
 		"keys", len(next.SSHPublicKeys),
-		"disable_password", next.SSHDisablePassword,
 		"devices_minted", minted)
 	// Project from the LOCAL record, not the cache: `next` is exactly what
 	// this save swapped in (or, on a sweepFailed retry, already equals the

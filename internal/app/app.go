@@ -128,15 +128,12 @@ func New(st store.DeviceStore, wirelessPath, settingsPath string, seed SiteSetti
 		// zero record for tests/embedders) becomes the initial record.
 		// Validation is the SAVE-verb rule (validateSiteSettingsChange):
 		// the seed is admin intent — the same thing the save verb
-		// validates — so a disable-without-keys seed is rejected exactly
-		// like an equivalent API save (a rejected seed persists nothing
-		// and produces the same settingsLoadErr → startup refusal as an
+		// validates — so an invalid seed is rejected exactly like an
+		// equivalent API save (a rejected seed persists nothing and
+		// produces the same settingsLoadErr → startup refusal as an
 		// invalid disk file). The WEAK rule (validateSettingsSyntax)
 		// stays at the disk-load site only: a hand-edited file must never
-		// brick startup. The CLI seed path is already guarded upstream
-		// (cmd validateSSHDisableSeed rejects the combo before New runs),
-		// so this tightening changes no CLI behavior — it closes the
-		// embedder/test surface.
+		// brick startup.
 		if verr := validateSiteSettingsChange(seed); verr != nil {
 			settingsErr = fmt.Errorf("first-boot site-settings seed: %w", verr)
 		} else if perr := persistSettingsFile(settingsPath, seed); perr != nil {
