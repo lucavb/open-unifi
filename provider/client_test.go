@@ -42,7 +42,7 @@ type fakeBackend struct {
 	// siteSettings is the raw SiteSettingsView JSON served by GET; PUT
 	// replaces it wholesale. siteSettingsErr, when non-empty, makes every
 	// PUT reply 400 {"error": siteSettingsErr} (models the API's
-	// disable-without-keys / invalid-key rejections).
+	// invalid-key rejections).
 	siteSettings    string
 	siteSettingsErr string
 	lastAuth        string // observed Authorization header of the last request
@@ -57,8 +57,8 @@ func newFakeBackend(token string) *fakeBackend {
 		devices:  map[string]string{},
 		wireless: map[string]string{},
 		// The zero view: exactly what the real API echoes for an untouched
-		// controller (all four fields present, empty key list as []).
-		siteSettings: `{"regulatory_country_code":0,"ap_ssh_password":"","ap_ssh_public_keys":[],"ap_ssh_disable_password":false}`,
+		// controller (all fields present, empty key list as []).
+		siteSettings: `{"regulatory_country_code":0,"ap_ssh_password":"","ap_ssh_public_keys":[]}`,
 	}
 	return fb
 }
@@ -199,7 +199,7 @@ func (fb *fakeBackend) handler() http.Handler {
 				writeFakeErr(w, http.StatusBadRequest, "invalid JSON body")
 				return
 			}
-			for _, field := range []string{"regulatory_country_code", "ap_ssh_password", "ap_ssh_public_keys", "ap_ssh_disable_password"} {
+			for _, field := range []string{"regulatory_country_code", "ap_ssh_password", "ap_ssh_public_keys"} {
 				if _, ok := raw[field]; !ok {
 					writeFakeErr(w, http.StatusBadRequest, "missing field "+field)
 					return
@@ -657,7 +657,7 @@ func TestDeviceStructParityWithServer(t *testing.T) {
 }
 
 // TestSiteSettingsGetEcho pins the GET decode: the fake serves the zero
-// view (all four fields present, [] keys) and a set view; the client maps
+// view (all fields present, [] keys) and a set view; the client maps
 // both verbatim onto siteSettings.
 func TestSiteSettingsGetEcho(t *testing.T) {
 	ctx := context.Background()
@@ -669,13 +669,15 @@ func TestSiteSettingsGetEcho(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getSiteSettings zero view: %v", err)
 	}
-	if got.RegulatoryCountryCode != 0 || got.APSSHPassword != "" || got.APSSHDisablePassword || len(got.APSSHPublicKeys) != 0 {
+	if got.RegulatoryCountryCode != 0 || got.APSSHPassword != "" || len(got.APSSHPublicKeys) != 0 {
 		t.Fatalf("zero view decode mismatch: %+v", got)
 	}
 
-	// A populated view must decode verbatim, keys in order.
+	// A populated view must decode verbatim, keys in order. The removed
+	// disable knob's wire name must not map onto anything (it is not in
+	// the wire struct; the record is gone).
 	fb.siteSettings = `{"regulatory_country_code":276,"ap_ssh_password":"s3cret",` +
-		`"ap_ssh_public_keys":["ssh-ed25519 AAAA a@ap","ssh-rsa AAAA b@ap"],"ap_ssh_disable_password":true}`
+		`"ap_ssh_public_keys":["ssh-ed25519 AAAA a@ap","ssh-rsa AAAA b@ap"]}`
 	got, err = c.getSiteSettings(ctx)
 	if err != nil {
 		t.Fatalf("getSiteSettings populated view: %v", err)
@@ -684,7 +686,6 @@ func TestSiteSettingsGetEcho(t *testing.T) {
 		RegulatoryCountryCode: 276,
 		APSSHPassword:         "s3cret",
 		APSSHPublicKeys:       []string{"ssh-ed25519 AAAA a@ap", "ssh-rsa AAAA b@ap"},
-		APSSHDisablePassword:  true,
 	}
 	if !reflect.DeepEqual(*got, want) {
 		t.Fatalf("populated view decode: got %+v, want %+v", *got, want)
@@ -692,7 +693,7 @@ func TestSiteSettingsGetEcho(t *testing.T) {
 }
 
 // TestSiteSettingsPutRoundTrip pins the PUT contract: the whole document
-// goes out with all four fields (the strict server decode would 400 on a
+// goes out with all three fields (the strict server decode would 400 on a
 // missing one) and the returned view is the server's echo of it, which the
 // subsequent GET confirms.
 func TestSiteSettingsPutRoundTrip(t *testing.T) {
@@ -704,7 +705,6 @@ func TestSiteSettingsPutRoundTrip(t *testing.T) {
 		RegulatoryCountryCode: 840,
 		APSSHPassword:         "s3cret",
 		APSSHPublicKeys:       []string{"ssh-ed25519 AAAA a@ap", "ssh-ed25519 AAAA b@ap"},
-		APSSHDisablePassword:  true,
 	}
 	view, err := c.putSiteSettings(ctx, doc)
 	if err != nil {
@@ -725,12 +725,12 @@ func TestSiteSettingsPutRoundTrip(t *testing.T) {
 
 // TestSiteSettingsPutError pins that the API's 400 rejections surface
 // through the typed apiError machinery with the server's message extracted
-// (disable-without-keys is the canonical case).
+// (an invalid authorized_keys line is the canonical case).
 func TestSiteSettingsPutError(t *testing.T) {
 	fb := newFakeBackend("")
-	fb.siteSettingsErr = "AP SSH password auth cannot be disabled without a provisioned public key; add an authorized_keys line or SSH access will be locked out"
+	fb.siteSettingsErr = "invalid AP SSH public key #1: want exactly 2 or 3 fields (type value [comment]), got 1"
 	c := clientFor(fb, "")
-	_, err := c.putSiteSettings(context.Background(), siteSettings{APSSHDisablePassword: true})
+	_, err := c.putSiteSettings(context.Background(), siteSettings{APSSHPublicKeys: []string{"not-a-key-line"}})
 	if err == nil {
 		t.Fatal("expected 400 error, got nil")
 	}
@@ -741,7 +741,7 @@ func TestSiteSettingsPutError(t *testing.T) {
 	if ae.status != http.StatusBadRequest {
 		t.Fatalf("expected status 400, got %d", ae.status)
 	}
-	if want := "http 400: AP SSH password auth cannot be disabled without a provisioned public key; add an authorized_keys line or SSH access will be locked out"; err.Error() != want {
+	if want := "http 400: invalid AP SSH public key #1: want exactly 2 or 3 fields (type value [comment]), got 1"; err.Error() != want {
 		t.Fatalf("error message = %q, want %q", err.Error(), want)
 	}
 }

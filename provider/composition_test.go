@@ -237,9 +237,9 @@ func TestRealServer404AndIDRoundTrip(t *testing.T) {
 }
 
 // TestProviderDecodesRealServerSiteSettings walks the site-settings flow
-// against the real handler: whole-document PUT (2 keys + disable), the
+// against the real handler: whole-document PUT (2 keys), the
 // verbatim ordered GET roundtrip, and the API's 400 rejections (invalid key
-// line, disable-without-keys, missing field). These pin the provider↔API
+// line, missing field). These pin the provider↔API
 // contract end to end: the provider's siteSettings wire struct must decode
 // exactly what adminapi emits and encode exactly what its strict PUT decode
 // accepts.
@@ -254,7 +254,6 @@ func TestProviderDecodesRealServerSiteSettings(t *testing.T) {
 		RegulatoryCountryCode: 276,
 		APSSHPassword:         "s3cret",
 		APSSHPublicKeys:       []string{key1, key2},
-		APSSHDisablePassword:  true,
 	}
 
 	view, err := c.putSiteSettings(ctx, doc)
@@ -268,7 +267,7 @@ func TestProviderDecodesRealServerSiteSettings(t *testing.T) {
 		t.Fatalf("PUT view = %+v, want verbatim echo of %+v", *view, doc)
 	}
 
-	// GET roundtrip: all four fields verbatim, keys in slice order (the
+	// GET roundtrip: all fields verbatim, keys in slice order (the
 	// order-sensitive echo the provider's drift detection relies on).
 	got, err := c.getSiteSettings(ctx)
 	if err != nil {
@@ -297,50 +296,45 @@ func TestProviderDecodesRealServerSiteSettings(t *testing.T) {
 		}
 	}
 
-	// PUT disable-without-keys → 400 (SSH lockout guard).
-	noKeys := siteSettings{
-		RegulatoryCountryCode: 276,
-		APSSHPassword:         "s3cret",
-		APSSHPublicKeys:       []string{},
-		APSSHDisablePassword:  true,
+	// PUT an unknown field → 400 (the strict decoder's
+	// DisallowUnknownFields): a stale client still carrying the removed
+	// disable knob's wire name is rejected before the Backend runs.
+	stale := map[string]any{
+		"regulatory_country_code": 0,
+		"ap_ssh_password":         "",
+		"ap_ssh_public_keys":      []string{},
+		"ap_ssh_disable_password": false,
 	}
-	if view, err := c.putSiteSettings(ctx, noKeys); err == nil {
-		t.Fatalf("disable-without-keys accepted: %+v", view)
-	} else {
-		var ae *apiError
-		if !errors.As(err, &ae) || ae.status != http.StatusBadRequest {
-			t.Fatalf("disable-without-keys: expected typed 400, got %v", err)
-		}
-		if !strings.Contains(err.Error(), "cannot be disabled without a provisioned public key") {
-			t.Fatalf("disable-without-keys message = %q", err.Error())
-		}
+	err = c.do(ctx, http.MethodPut, "/api/v1/site-settings", stale, nil)
+	if err == nil {
+		t.Fatal("unknown-field PUT accepted")
+	}
+	var ae *apiError
+	if !errors.As(err, &ae) || ae.status != http.StatusBadRequest {
+		t.Fatalf("unknown field: expected typed 400, got %v", err)
 	}
 
 	// PUT missing a field → 400 "missing field <name>" (the provider's wire
-	// struct always emits all four; a hand-rolled partial body must not).
+	// struct always emits all three; a hand-rolled partial body must not).
 	partial := map[string]any{
 		"regulatory_country_code": 0,
-		"ap_ssh_password":         "",
 		"ap_ssh_public_keys":      []string{},
 	}
 	err = c.do(ctx, http.MethodPut, "/api/v1/site-settings", partial, nil)
 	if err == nil {
 		t.Fatal("partial PUT accepted")
 	}
-	var ae *apiError
+	ae = nil
 	if !errors.As(err, &ae) || ae.status != http.StatusBadRequest {
 		t.Fatalf("missing field: expected typed 400, got %v", err)
 	}
-	if want := "http 400: missing field ap_ssh_disable_password"; err.Error() != want {
-		t.Fatalf("missing field message = %q, want %q", err.Error(), want)
-	}
 
 	// Zero-document PUT (Delete's restore-defaults body,
-	// resource_site_settings.go): ALL FOUR fields present with zero values —
+	// resource_site_settings.go): ALL THREE fields present with zero values —
 	// country 0, empty password, [] (a PRESENT field, not a missing/null
-	// one), disable false — through the provider's own wire struct against
-	// the real server's strict decode. The noKeys 400 above differs only in
-	// values; this pins that zero VALUES alone never read as missing.
+	// one) — through the provider's own wire struct against
+	// the real server's strict decode. This pins that zero VALUES alone
+	// never read as missing.
 	zero := siteSettings{APSSHPublicKeys: []string{}}
 	viewZ, err := c.putSiteSettings(ctx, zero)
 	if err != nil {

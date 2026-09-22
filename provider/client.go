@@ -289,17 +289,16 @@ func (c *apiClient) deleteWireless(ctx context.Context, name string) error {
 }
 
 // siteSettings is the wire shape of GET/PUT /api/v1/site-settings
-// (adminapi.SiteSettingsDocument/SiteSettingsView). All four fields are
+// (adminapi.SiteSettingsDocument/SiteSettingsView). All three fields are
 // ALWAYS on the wire, so none carries omitempty: PUT is whole-document
 // (the strict server decode rejects a missing/null field with a 400
-// "missing field <name>") and the GET view echoes all four. An empty
+// "missing field <name>") and the GET view echoes all three. An empty
 // ap_ssh_public_keys marshals as [] — never null (a JSON null decodes to a
 // nil pointer server-side and trips the same missing-field 400).
 type siteSettings struct {
 	RegulatoryCountryCode int      `json:"regulatory_country_code"`
 	APSSHPassword         string   `json:"ap_ssh_password"`
 	APSSHPublicKeys       []string `json:"ap_ssh_public_keys"`
-	APSSHDisablePassword  bool     `json:"ap_ssh_disable_password"`
 }
 
 // getSiteSettings GETs /api/v1/site-settings. The controller carries

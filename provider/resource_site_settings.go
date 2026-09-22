@@ -23,8 +23,8 @@ var _ resource.ResourceWithImportState = (*siteSettingsResource)(nil)
 const siteSettingsID = "site-settings"
 
 // siteSettingsResource manages the controller's single site-settings record:
-// the four AP-intent site facts (regulatory country code, AP SSH password,
-// provisioned SSH public keys, SSH password-login disable). A save replaces
+// the AP-intent site facts (regulatory country code, AP SSH password,
+// provisioned SSH public keys). A save replaces
 // the whole document wholesale (the wireless-envelope doctrine) and —
 // server-side — mints cfgversion across provisioned devices on effective
 // change, so adopted APs receive the new sshd rows at their next inform.
@@ -46,10 +46,10 @@ func (r *siteSettingsResource) Configure(_ context.Context, req resource.Configu
 
 func (r *siteSettingsResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "The singleton site-settings record of the open-unifi control plane: the four " +
+		MarkdownDescription: "The singleton site-settings record of the open-unifi control plane: the " +
 			"AP-intent site facts. A change re-provisions every adopted AP at its next inform (cfgversion mint). " +
 			"Deleting the resource restores the controller defaults. Caveat on default-gated deployments " +
-			"(U7PG2 firmware 6.8.2.15592): a save carrying SSH public keys or the password-disable knob " +
+			"(U7PG2 firmware 6.8.2.15592): a save carrying SSH public keys " +
 			"succeeds, but every subsequent server-side full provisioning is rejected with the typed 501 " +
 			"live-provisioning gate until the sshd facts are cleared (an effective save of the defaults) or " +
 			"the controller restarts with --allow-gated-live-wlan (a startup-only flag); the rejected " +
@@ -84,14 +84,6 @@ func (r *siteSettingsResource) Schema(_ context.Context, _ resource.SchemaReques
 				ElementType: types.StringType,
 				Optional:    true,
 			},
-			"ap_ssh_disable_password": schema.BoolAttribute{
-				MarkdownDescription: "Disable AP SSH password login (dropbear -s). Requires a non-empty " +
-					"`ap_ssh_public_keys` list: the API rejects disable-without-keys with a 400 at apply time " +
-					"(SSH lockout guard). Unset (null/omitted) = password login enabled. A literal `false` " +
-					"cannot be held in state (the unset echo maps back to null) — write null or omit the " +
-					"attribute instead; `true` round-trips verbatim.",
-				Optional: true,
-			},
 			"id": schema.StringAttribute{
 				MarkdownDescription: "Resource id, fixed to `site-settings` (one record per controller).",
 				Computed:            true,
@@ -110,7 +102,6 @@ type siteSettingsModel struct {
 	RegulatoryCountryCode types.Int64  `tfsdk:"regulatory_country_code"`
 	APSSHPassword         types.String `tfsdk:"ap_ssh_password"`
 	APSSHPublicKeys       types.List   `tfsdk:"ap_ssh_public_keys"`
-	APSSHDisablePassword  types.Bool   `tfsdk:"ap_ssh_disable_password"`
 }
 
 func (r *siteSettingsResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -135,7 +126,7 @@ func (r *siteSettingsResource) Create(ctx context.Context, req resource.CreateRe
 	}
 
 	// Read-back makes the state match the server's view (notably the
-	// unset echo 0/""/[]/false mapping back to null — viewToModel).
+	// unset echo 0/""/[] mapping back to null — viewToModel).
 	if err := readSiteSettingsInto(ctx, r.client, &plan); err != nil {
 		resp.Diagnostics.AddError("Create site settings: post-create read", err.Error())
 		return
@@ -200,10 +191,9 @@ func (r *siteSettingsResource) Delete(ctx context.Context, req resource.DeleteRe
 	// server-side deletion. Terraform-side deletion therefore PUTs the zero
 	// document — country 0 (unset → the server renders 840/US), empty
 	// password (→ the site default "ubnt"), empty key list (→ no sshd key
-	// rows), password login re-enabled — and removes the resource from
-	// state. Like every save, this is an effective change that mints
-	// cfgversion across the provisioned devices, so adopted APs pick the
-	// defaults up at their next inform.
+	// rows) — and removes the resource from state. Like every save, this
+	// is an effective change that mints cfgversion across the provisioned
+	// devices, so adopted APs pick the defaults up at their next inform.
 	doc := siteSettings{APSSHPublicKeys: []string{}}
 	if _, err := r.client.putSiteSettings(ctx, doc); err != nil {
 		resp.Diagnostics.AddError("Delete site settings", err.Error())
@@ -227,7 +217,7 @@ func (r *siteSettingsResource) ImportState(ctx context.Context, req resource.Imp
 
 // siteSettingsFromModel converts Terraform state into the whole-document PUT
 // body. Every attribute is Optional without a schema default, so a
-// null/unknown plan value maps to the record's zero value (0, "", [], false)
+// null/unknown plan value maps to the record's zero value (0, "", [])
 // — the controller's unset semantics. The key list is preserved in slice
 // order: order-only changes re-provision APs (one harmless full
 // provisioning), mirroring the server's order-sensitive echo.
@@ -244,13 +234,10 @@ func siteSettingsFromModel(ctx context.Context, m *siteSettingsModel, d *diag.Di
 		d.Append(m.APSSHPublicKeys.ElementsAs(ctx, &keys, false)...)
 		doc.APSSHPublicKeys = keys
 	}
-	if !m.APSSHDisablePassword.IsNull() && !m.APSSHDisablePassword.IsUnknown() {
-		doc.APSSHDisablePassword = m.APSSHDisablePassword.ValueBool()
-	}
 	return doc
 }
 
-// viewToModel copies the server's read view into the model. The four
+// viewToModel copies the server's read view into the model. The
 // attributes are Optional-only (no Computed, no schema default), so the
 // unset echo must map back to null to keep an omitted config drift-free —
 // the same empty-to-null mapping applyDevice (name) and entryToModel
@@ -258,7 +245,7 @@ func siteSettingsFromModel(ctx context.Context, m *siteSettingsModel, d *diag.Di
 // equality on non-Computed optionals, and writing a concrete zero into
 // state under a null plan would diff forever. Set values pass through
 // verbatim. Mapping detail: 0→null country, ""→null password, empty
-// key list→null, false→null disable.
+// key list→null.
 func viewToModel(ctx context.Context, v *siteSettings, m *siteSettingsModel) {
 	m.ID = types.StringValue(siteSettingsID)
 	if v.RegulatoryCountryCode != 0 {
@@ -277,11 +264,6 @@ func viewToModel(ctx context.Context, v *siteSettings, m *siteSettingsModel) {
 		m.APSSHPublicKeys = list
 	} else {
 		m.APSSHPublicKeys = types.ListNull(types.StringType)
-	}
-	if v.APSSHDisablePassword {
-		m.APSSHDisablePassword = types.BoolValue(true)
-	} else {
-		m.APSSHDisablePassword = types.BoolNull()
 	}
 }
 

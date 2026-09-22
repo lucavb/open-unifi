@@ -9,9 +9,9 @@ import (
 )
 
 // TestViewToModelUnsetEchoMapsToNull pins the unset-echo mapping in
-// viewToModel. The four attributes are Optional-only (no Computed, no
+// viewToModel. The attributes are Optional-only (no Computed, no
 // schema default), so Terraform enforces plan-vs-state equality on them:
-// writing the server's concrete unset echo (0, "", [], false) into state
+// writing the server's concrete unset echo (0, "", []) into state
 // under a null plan would diff forever ("will be null" every plan). The
 // mapping mirrors applyDevice (empty name → null) and entryToModel (empty
 // passphrase → null): unset echo → null, set echo → verbatim value.
@@ -38,16 +38,12 @@ func TestViewToModelUnsetEchoMapsToNull(t *testing.T) {
 	if !m.APSSHPublicKeys.IsNull() || len(m.APSSHPublicKeys.Elements()) != 0 {
 		t.Fatalf("empty key list must map to null, got %v", m.APSSHPublicKeys)
 	}
-	if !m.APSSHDisablePassword.IsNull() {
-		t.Fatalf("disable=false must map to null, got %v", m.APSSHDisablePassword.ValueBool())
-	}
 
 	// A set view passes through verbatim, keys in slice order.
 	view := &siteSettings{
 		RegulatoryCountryCode: 840,
 		APSSHPassword:         "s3cret",
 		APSSHPublicKeys:       []string{"ssh-ed25519 AAAA a@ap", "ssh-ed25519 AAAA b@ap"},
-		APSSHDisablePassword:  true,
 	}
 	m = &siteSettingsModel{}
 	viewToModel(ctx, view, m)
@@ -62,14 +58,11 @@ func TestViewToModelUnsetEchoMapsToNull(t *testing.T) {
 	if len(keys) != 2 || keys[0] != "ssh-ed25519 AAAA a@ap" || keys[1] != "ssh-ed25519 AAAA b@ap" {
 		t.Fatalf("keys = %v, want the two lines in order", keys)
 	}
-	if !m.APSSHDisablePassword.ValueBool() {
-		t.Fatal("disable=true must map to true")
-	}
 }
 
 // TestSiteSettingsFromModelZeroMapsToZeroDocument pins the model→document
 // direction: null/unknown plan values map to the record's zero values (the
-// whole-document PUT body always carries all four fields, and the empty key
+// whole-document PUT body always carries all three fields, and the empty key
 // list marshals as [] — never null, which the strict server decode would
 // reject as a missing field).
 func TestSiteSettingsFromModelZeroMapsToZeroDocument(t *testing.T) {
@@ -79,14 +72,13 @@ func TestSiteSettingsFromModelZeroMapsToZeroDocument(t *testing.T) {
 		RegulatoryCountryCode: types.Int64Null(),
 		APSSHPassword:         types.StringNull(),
 		APSSHPublicKeys:       types.ListNull(types.StringType),
-		APSSHDisablePassword:  types.BoolNull(),
 	}
 	var diags diag.Diagnostics
 	doc := siteSettingsFromModel(ctx, m, &diags)
 	if diags.HasError() {
 		t.Fatalf("unexpected diagnostics: %v", diags)
 	}
-	if doc.RegulatoryCountryCode != 0 || doc.APSSHPassword != "" || doc.APSSHDisablePassword {
+	if doc.RegulatoryCountryCode != 0 || doc.APSSHPassword != "" {
 		t.Fatalf("zero mapping mismatch: %+v", doc)
 	}
 	if doc.APSSHPublicKeys == nil || len(doc.APSSHPublicKeys) != 0 {
@@ -98,12 +90,11 @@ func TestSiteSettingsFromModelZeroMapsToZeroDocument(t *testing.T) {
 		ID:                    types.StringValue(siteSettingsID),
 		RegulatoryCountryCode: types.Int64Value(840),
 		APSSHPassword:         types.StringValue("s3cret"),
-		APSSHDisablePassword:  types.BoolValue(true),
 	}
 	list, _ := types.ListValueFrom(ctx, types.StringType, []string{"ssh-ed25519 AAAA a@ap"})
 	m.APSSHPublicKeys = list
 	doc = siteSettingsFromModel(ctx, m, &diags)
-	if doc.RegulatoryCountryCode != 840 || doc.APSSHPassword != "s3cret" || !doc.APSSHDisablePassword ||
+	if doc.RegulatoryCountryCode != 840 || doc.APSSHPassword != "s3cret" ||
 		len(doc.APSSHPublicKeys) != 1 || doc.APSSHPublicKeys[0] != "ssh-ed25519 AAAA a@ap" {
 		t.Fatalf("set mapping mismatch: %+v", doc)
 	}
