@@ -1726,6 +1726,13 @@ official jar's conditional (javap String.txt:2746-2834) renders the same
 row, so an official controller + this fw hit the same wall. §13.2/§13.3
 updated; the WARN-string code-truth pass remains owed.
 
+**Follow-up (same day):** the disposition above was superseded — the knob
+is now REMOVED outright (record field, seed flag, admin API field/view,
+Terraform attribute, renderer branch, adoption-gate input; the renderer
+emits `sshd.auth.passwd=enabled` unconditionally), not merely fail-closed
++ gated. See §13.2/§13.3 for the removed-knob text and the remaining
+`config.system_cfg` passthrough exposure.
+
 ## Release gate summary
 
 | Gate | Result |

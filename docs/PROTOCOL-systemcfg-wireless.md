@@ -1113,16 +1113,23 @@ device-informable (site-facts definition, CONTEXT.md). The
 `--ap-ssh-key` flag / `$OPEN_UNIFI_AP_SSH_KEY` env fallback is the
 first-boot seed only; the record is the source afterwards (§13.3).
 
-### 13.2 `sshd.auth.passwd=disabled`
+### 13.2 `sshd.auth.passwd=disabled` — the password-disable knob is REMOVED (fw defect)
 
-New site fact `SSHDisablePassword` (record field `ap_ssh_disable_password`
-in the persisted site-settings record; the `--ap-ssh-disable-password` flag
-is the first-boot seed only) flips
-`sshd.auth.passwd` from the classic default `enabled` to `disabled`. Firmware
-semantics (ubntbox dropbear respawn builder): the builder assembles
-`"null::respawn:%s -F %s%s%s%s"` and appends the `"-s"` flag (disable remote
-password logins) exactly when `sshd.auth.passwd` is disabled; port comes from
-`sshd.%d.port` (`" -p %d"`) and the host keys are
+The password-disable site fact NO LONGER EXISTS: the record field
+(`ap_ssh_disable_password`), the `--ap-ssh-disable-password` first-boot
+seed flag, the admin API field/view, and the Terraform attribute were
+removed outright the same day the 2026-09-22 root-cause round byte-caught
+why its row is lethal — no supported posture sets it safely on the only
+target firmware. The renderer now emits `sshd.auth.passwd=enabled`
+unconditionally (byte-identical to the old knob-off arm); a stale client
+PUT still carrying `ap_ssh_disable_password` gets the strict-decoder
+unknown-field 400 (pinned in the adminapi and provider composition
+tests); old on-disk records carrying the field still load (every record
+decoder is lenient). Firmware semantics of the row the knob used to
+render (ubntbox dropbear respawn builder): the builder assembles
+`"null::respawn:%s -F %s%s%s%s"` and appends the `"-s"` flag (disable
+remote password logins) exactly when `sshd.auth.passwd` is disabled; port
+comes from `sshd.%d.port` (`" -p %d"`) and the host keys are
 `-r /var/run/dropbear_rsa_host_key` / `-r /var/run/dropbear_ed25519_host_key`.
 LIVE-CAUGHT DEFECT (2026-09-22 root-cause round,
 WLAN-ACCEPTANCE-6.8.2.15592.md §2026-09-22): on fw 6.8.2.15592 the
@@ -1139,26 +1146,23 @@ renders correct (empty `-s` slot — the double-space byte form), so the
 defect is the disabled branch's adjacent `%s%s` slots with no separator
 before `-s`; the SAME broken line is built by BOTH assembly paths
 (apply-time and boot-rebuild — the row persists across reboot and the
-fresh boot reproduces the outage, so reboot is NOT a recovery).
-The controller-side guard is fail-closed at every writer an admin can
-reach: the admin API's pre-backend fence AND the app save verb both reject
-a disable-without-keys save (400), and the cmd first-boot seed path
-(`validateSSHDisableSeed`) refuses the same flag combo — the next boot's
-cfg-row rebuild would otherwise leave an empty `authorized_keys` and dropbear
-would start with `-s`, risking a locked-out SSH. Recovery, even then, does
-NOT need SSH: an effective admin device save re-provisions the record on
-the next inform (the controller channel), re-rendering the sshd rows. LIVE
-(2026-09-21): the disabled row's push settled but the dropbear listener
-never returned on fw 6.8.2.15592 — the outage and the controller-channel
-recovery are recorded in §13.3, and the outage's on-device root cause was
-byte-caught by the 2026-09-22 round (the glued `-p br0:22-s` above —
-reboot does NOT help). One
-neutral caveat: the admin `config.system_cfg.<idx>` passthrough rows render
-AFTER the site-fact sshd rows, so a conflicting admin-supplied row's
-duplicate-resolution on the device (`sshd.auth.key` is an indexed family —
-sorted-key row semantics) is unvalidated.
+fresh boot reproduces the outage, so reboot is NOT a recovery). History:
+the 2026-09-21 round's `disabled` push settled and the listener never
+returned; the outage and the controller-channel recovery are recorded in
+§13.3, and the root cause was byte-caught by the 2026-09-22 round.
 
-### 13.3 Live-validation status (apply-validated keys; live-broken knob)
+REMAINING EXPOSURE (sharp edge): the admin `config.system_cfg.<idx>`
+passthrough rows render AFTER the site-fact sshd rows, so an admin can
+still inject a literal `sshd.auth.passwd=disabled` row through the
+passthrough — same fw defect, same outage. The removal closed the named
+knob, not the arbitrary-row escape hatch (a conflicting admin-supplied
+row's duplicate-resolution on the device — `sshd.auth.key` is an indexed
+family, sorted-key row semantics — is unvalidated). Recovery needs no
+SSH in that case either: an effective admin device save re-provisions
+the record on the next inform (the controller channel), re-rendering the
+sshd rows.
+
+### 13.3 Live-validation status (apply-validated keys; REMOVED knob)
 
 Both row families are FIRMWARE-DERIVED from the ubntbox evidence above.
 Live-bench status after the 2026-09-21 site-settings round
@@ -1169,22 +1173,22 @@ the device rebuilt `/etc/dropbear/authorized_keys` FROM the rows, and a
 BatchMode key login worked — but BOOT-REBUILD SURVIVAL is still OWED
 (the round applied, it did not reboot; the pre-lane evidence is that
 boot wipes manually-installed keys, so the row-driven boot path is
-untested). The DISABLE knob is live-BROKEN on the one firmware, ROOT-CAUSED
-by the 2026-09-22 round (WLAN-ACCEPTANCE-6.8.2.15592.md §2026-09-22): the
-row's fw-side respawn line is broken at the source (`-p br0:22-s`, §13.2),
-so the knob kills SSH ENTIRELY — password AND key lanes RST-refused at
-apply AND after a fresh boot (branch C of the reboot discriminator; no
-OPEN flicker, dropbear exit-256 respawn loop with 60 s backoff) until a
-controller-channel revert. Reboot is NOT a recovery; row-key boot survival
-(the owed claim) is UNREACHABLE through the knob on this firmware — no
-branch of the discriminator could test it. The
-LIVE-PROVISIONING GATE therefore STAYS for both sshd facts, now with
-live evidence it is right to refuse them:
+untested). The DISABLE knob is GONE, not merely gated: the 2026-09-22
+root-cause round (WLAN-ACCEPTANCE-6.8.2.15592.md §2026-09-22) proved the
+row's fw-side respawn line is broken at the source (`-p br0:22-s`,
+§13.2) — the knob kills SSH ENTIRELY (password AND key lanes RST-refused
+at apply AND after a fresh boot: branch C of the reboot discriminator, no
+OPEN flicker, dropbear exit-256 respawn loop with 60 s backoff), so it
+was removed from every writer outright (§13.2). Reboot was never a
+recovery, and row-key boot survival was UNREACHABLE through the knob —
+no branch of the discriminator could test it. The LIVE-PROVISIONING
+GATE therefore STAYS for the sshd fact that remains, with live evidence
+it is right to refuse it:
 the adoption engine's fail-closed U7PG2/6.8.2.15592 choke point also rejects
-any full provisioning whose site facts carry key rows or the disable
-knob, lifted by the same `--allow-gated-live-wlan` opt-in (the engine
-reads the distilled sshd scalars LIVE at gate time — `Deps.SSHSiteFacts
-func() (keyRows, disable)`, sourced from the persisted record, not frozen
+any full provisioning whose site facts carry key rows, lifted by the same
+`--allow-gated-live-wlan` opt-in (the engine
+reads the distilled sshd scalar LIVE at gate time — `Deps.SSHSiteFacts
+func() (keyRows int)`, sourced from the persisted record, not frozen
 at construction). Coverage note: the gate's model/firmware predicate
 trusts the device-reported values, absorbed verbatim from the inform body
 under record absorption — a device naming another model (or another
@@ -1214,7 +1218,7 @@ resource) applies the persisted record and — on effective change — mints
 `cfgversion` across every device record carrying a cfgversion intent;
 each device's next inform then full-provisions carrying the new sshd
 rows (pinned E2E — save → mint → inform → `setparam` — in
-internal/server/lifecycle_test.go). The record is the source of the four
+internal/server/lifecycle_test.go). The record is the source of the three
 AP-intent facts; the cmd flags are first-boot seeds only, ignored
 whenever the record file exists. A no-change save mints nothing — a
 settled device with an unchanged cfgversion noop. And the sshd rows are

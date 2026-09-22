@@ -56,8 +56,6 @@ a loud startup warning — env fallback `OPEN_UNIFI_ADMIN_TOKEN`), `--ap-ssh-pas
 empty = site default `ubnt`), `--ap-ssh-key` (repeatable; env
 `OPEN_UNIFI_AP_SSH_KEY`; one authorized_keys line per occurrence, provisioned as
 `sshd.auth.key.<n>` rows — LAB ONLY, live pushes behind `--allow-gated-live-wlan`),
-`--ap-ssh-disable-password` (render `sshd.auth.passwd=disabled`, dropbear `-s`;
-requires at least one provisioned key — LAB ONLY),
 `--allow-plaintext-inform` (reject by default, like the real controller),
 `--log-level`, `--log-format` (logging is human-readable TEXT by default;
 `--log-format json` / env `OPEN_UNIFI_LOG_FORMAT=json` opts into one-JSON-object-per-line
@@ -71,16 +69,16 @@ log lines carry `trace_id`/`span_id` (see `docs/alloy-openunifi.example.alloy` f
 Grafana Alloy example wiring OTLP into Tempo and the controller log into Loki). A corrupt
 `wireless.json` refuses startup rather than silently provisioning the AP with zero WLANs.
 
-The four AP-intent settings above (`--regulatory-country-code`,
-`--ap-ssh-password`, `--ap-ssh-key`, `--ap-ssh-disable-password`) are
+The AP-intent settings above (`--regulatory-country-code`,
+`--ap-ssh-password`, `--ap-ssh-key`) are
 first-boot seeds: they initialize `<data-dir>/site-settings.json` only when
 that file does not exist yet. After that the persisted record is the single
 source of truth — manage it through `PUT /api/v1/site-settings` or Terraform
 (`open-unifi_site_settings`, below); a save that changes the record mints
 `cfgversion` and every adopted AP picks the new sshd rows up at its next
 inform. Caveat on default-gated deployments (U7PG2 firmware 6.8.2.15592):
-a save that carries the provisioned SSH public keys or the password-disable
-knob still returns 200 — but every subsequent full provisioning, including
+a save that carries provisioned SSH public keys still returns 200 — but
+every subsequent full provisioning, including
 the delivery of future WLAN changes, is rejected with the typed 501
 live-provisioning gate until the sshd facts are cleared (an effective
 site-settings save of the defaults) or the controller restarts with
@@ -88,7 +86,7 @@ site-settings save of the defaults) or the controller restarts with
 gate). The rejected inform aborts its whole store cycle, so record
 absorption freezes too — affected devices go stale in the console (they
 look dead, not gated). See `docs/PROTOCOL-systemcfg-wireless.md` §13.
-Supplying any of the four when the record already exists logs a
+Supplying any of the three when the record already exists logs a
 startup warning and the record wins (the deployment-input flags like
 `--controller-url` are unaffected).
 
@@ -122,7 +120,7 @@ POST          /api/v1/devices/{mac}/factory-reset   arm remote factory reset
 GET           /api/v1/pending           unadopted devices heard so far
 POST          /api/v1/pending/{mac}/adopt
 GET/PUT       /api/v1/wireless          whole-doc WLAN config ({"wlans":[…]})
-GET/PUT       /api/v1/site-settings     the four AP-intent site facts (whole-doc PUT)
+GET/PUT       /api/v1/site-settings     the AP-intent site facts (whole-doc PUT)
 GET           /api/v1/devices/{mac}/radios          per-radio echo + admin intent
 PUT/DELETE    /api/v1/devices/{mac}/radios/{radio} set / clear per-radio intent
 GET           /api/v1/whoami
@@ -194,19 +192,18 @@ resource "open-unifi_site_settings" "site" {
   regulatory_country_code = 840
   ap_ssh_password         = "s3cret-ap-passphrase"
   ap_ssh_public_keys      = ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI… admin@workstation"]
-  ap_ssh_disable_password = true
 }
 ```
 
 `open-unifi_site_settings` is a singleton (one record per controller,
-id `site-settings`) managing the four AP-intent site facts — the
-regulatory country code, the AP SSH password, the provisioned
+id `site-settings`) managing the AP-intent site facts — the
+regulatory country code, the AP SSH password, and the provisioned
 authorized_keys lines (ordered; one `sshd.auth.key.<n>` row family per
-line), and the SSH password-login disable knob. A change to any of them
+line). A change to any of them
 re-provisions every adopted AP at its next inform. Deleting the resource
 restores the controller defaults. Watch the live gate before combining
-these fields: the example above (`ap_ssh_public_keys` plus
-`ap_ssh_disable_password = true`) is exactly the combination the gate
+these fields: the example above (provisioned `ap_ssh_public_keys`) is
+exactly the sshd provisioning the gate
 blocks on the supported hardware (U7PG2 firmware 6.8.2.15592) — the apply
 succeeds, but every subsequent full provisioning returns the typed 501
 until the sshd facts are cleared (an effective save of the defaults) or
@@ -223,7 +220,7 @@ Live WLAN provisioning is unsupported/gated pending an official-controller
 differential fixture. On U7PG2 firmware 6.8.2.15592 the gate fails closed
 with a typed status and never emits `system_cfg`, on EITHER trigger: any
 nonempty managed WLAN, OR site-fact sshd provisioning (provisioned SSH
-public keys or the password-login disable knob). The startup-only
+public keys). The startup-only
 `--allow-gated-live-wlan` flag lifts it for sanctioned bench pushes.
 
 ## Protocol documentation
