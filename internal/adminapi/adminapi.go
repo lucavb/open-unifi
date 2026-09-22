@@ -318,8 +318,8 @@ type RadioView struct {
 }
 
 // SiteSettingsDocument is the whole-document site-settings request: the
-// four AP-intent facts (regulatory country code, AP SSH password, ordered
-// SSH authorized_keys lines, SSH password-login disable). PUT replaces the
+// three AP-intent facts (regulatory country code, AP SSH password, ordered
+// SSH authorized_keys lines). PUT replaces the
 // record WHOLESALE (the wireless-envelope doctrine) — every field is
 // required and an absent list is an empty list, never null. The document
 // shape is ALSO the on-disk shape of <data-dir>/site-settings.json, so a
@@ -329,12 +329,11 @@ type RadioView struct {
 // pre-validates the same rules): country code 0 = unset (server-side
 // default) or 1..999; every key line must be a valid RFC 4253
 // authorized_keys line (the fail-closed systemcfg parser is the single
-// validator); disabling password login requires at least one key line.
+// validator).
 type SiteSettingsDocument struct {
 	RegulatoryCountryCode int      `json:"regulatory_country_code"`
 	APSSHPassword         string   `json:"ap_ssh_password"`
 	APSSHPublicKeys       []string `json:"ap_ssh_public_keys"`
-	APSSHDisablePassword  bool     `json:"ap_ssh_disable_password"`
 }
 
 // SiteSettingsView is the read model of the site-settings record. The
@@ -344,7 +343,6 @@ type SiteSettingsView struct {
 	RegulatoryCountryCode int      `json:"regulatory_country_code"`
 	APSSHPassword         string   `json:"ap_ssh_password"`
 	APSSHPublicKeys       []string `json:"ap_ssh_public_keys"`
-	APSSHDisablePassword  bool     `json:"ap_ssh_disable_password"`
 }
 
 // siteSettingsPutBody is the strict decode shape of the PUT
@@ -357,7 +355,6 @@ type siteSettingsPutBody struct {
 	RegulatoryCountryCode *int      `json:"regulatory_country_code"`
 	APSSHPassword         *string   `json:"ap_ssh_password"`
 	APSSHPublicKeys       *[]string `json:"ap_ssh_public_keys"`
-	APSSHDisablePassword  *bool     `json:"ap_ssh_disable_password"`
 }
 
 // missingField returns the JSON name of the first REQUIRED field absent
@@ -370,8 +367,6 @@ func (b *siteSettingsPutBody) missingField() string {
 		return "ap_ssh_password"
 	case b.APSSHPublicKeys == nil:
 		return "ap_ssh_public_keys"
-	case b.APSSHDisablePassword == nil:
-		return "ap_ssh_disable_password"
 	}
 	return ""
 }
@@ -384,7 +379,6 @@ func (b *siteSettingsPutBody) toDocument() SiteSettingsDocument {
 		RegulatoryCountryCode: *b.RegulatoryCountryCode,
 		APSSHPassword:         *b.APSSHPassword,
 		APSSHPublicKeys:       *b.APSSHPublicKeys,
-		APSSHDisablePassword:  *b.APSSHDisablePassword,
 	}
 }
 
@@ -464,7 +458,7 @@ type Backend interface {
 	GetWlan(ctx context.Context, name string) (Wlan, error)
 	UpdateWlan(ctx context.Context, name string, wlan Wlan) (Wlan, error)
 	DeleteWlan(ctx context.Context, name string) error
-	// GetSiteSettings returns the site-settings read view — the four
+	// GetSiteSettings returns the site-settings read view — the
 	// AP-intent facts (controller-level record, site_settings file), read
 	// from the Backend's cache. The Backend's error is reserved for its
 	// New-time load problem (an unreadable/corrupt/invalid settings file).
@@ -478,7 +472,7 @@ type Backend interface {
 	// inform full-provisions the new AP-intent facts; a save that changes
 	// nothing mints nothing. Validation failures wrap ErrInvalid (HTTP
 	// 400): country code 0/unset or 001..999, every authorized_keys line
-	// through the fail-closed parser, disable-without-keys rejected.
+	// through the fail-closed parser.
 	PutSiteSettings(ctx context.Context, doc SiteSettingsDocument) (SiteSettingsView, error)
 	// ListDeviceRadios returns the per-radio view (device echo + admin
 	// intent) in radio_table name order. Unknown MACs are ErrNotFound.

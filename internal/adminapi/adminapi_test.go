@@ -69,7 +69,6 @@ func newFakeBackend() *fakeBackend {
 			RegulatoryCountryCode: 840,
 			APSSHPassword:         "hunter2",
 			APSSHPublicKeys:       []string{testKeyEd25519Line},
-			APSSHDisablePassword:  false,
 		},
 	}
 }
@@ -2347,7 +2346,6 @@ func siteSettingsBody(missing string) string {
 		"regulatory_country_code": 840,
 		"ap_ssh_password":         "hunter2",
 		"ap_ssh_public_keys":      []string{testKeyEd25519Line, testKeyRSALine},
-		"ap_ssh_disable_password": false,
 	}
 	if missing != "" {
 		delete(m, missing)
@@ -2369,7 +2367,7 @@ func TestSiteSettingsGetHappy(t *testing.T) {
 		checks: func(t *testing.T, _ *fakeBackend, rec *httptest.ResponseRecorder) {
 			t.Helper()
 			want := `{"regulatory_country_code":840,"ap_ssh_password":"hunter2","ap_ssh_public_keys":["` +
-				testKeyEd25519Line + `"],"ap_ssh_disable_password":false}` + "\n"
+				testKeyEd25519Line + `"]}` + "\n"
 			if rec.Body.String() != want {
 				t.Fatalf("body = %q, want %q", rec.Body.String(), want)
 			}
@@ -2377,7 +2375,7 @@ func TestSiteSettingsGetHappy(t *testing.T) {
 	})
 }
 
-// TestSiteSettingsPutHappy pins the whole-document PUT: all four fields
+// TestSiteSettingsPutHappy pins the whole-document PUT: all three fields
 // decode verbatim into the Backend document and the response echoes the
 // projected view.
 func TestSiteSettingsPutHappy(t *testing.T) {
@@ -2390,12 +2388,11 @@ func TestSiteSettingsPutHappy(t *testing.T) {
 			got := be.lastSiteSettingsPut
 			if got.RegulatoryCountryCode != 840 || got.APSSHPassword != "hunter2" ||
 				len(got.APSSHPublicKeys) != 2 || got.APSSHPublicKeys[0] != testKeyEd25519Line ||
-				got.APSSHPublicKeys[1] != testKeyRSALine || got.APSSHDisablePassword {
+				got.APSSHPublicKeys[1] != testKeyRSALine {
 				t.Fatalf("backend document: %+v", got)
 			}
 			m := decodeJSON(t, rec)
-			if m["regulatory_country_code"] != float64(840) || m["ap_ssh_password"] != "hunter2" ||
-				m["ap_ssh_disable_password"] != false {
+			if m["regulatory_country_code"] != float64(840) || m["ap_ssh_password"] != "hunter2" {
 				t.Fatalf("view body: %v", m)
 			}
 			keys, ok := m["ap_ssh_public_keys"].([]any)
@@ -2410,7 +2407,7 @@ func TestSiteSettingsPutHappy(t *testing.T) {
 // field is required; a partial body 400s with "missing field <name>"
 // BEFORE the Backend runs (never an implicit zero write).
 func TestSiteSettingsPutMissingField(t *testing.T) {
-	for _, missing := range []string{"regulatory_country_code", "ap_ssh_password", "ap_ssh_public_keys", "ap_ssh_disable_password"} {
+	for _, missing := range []string{"regulatory_country_code", "ap_ssh_password", "ap_ssh_public_keys"} {
 		run(t, testCase{
 			name: "PUT site settings missing " + missing, method: "PUT", path: "/api/v1/site-settings",
 			body: siteSettingsBody(missing),
@@ -2439,22 +2436,17 @@ func TestSiteSettingsPutValidation(t *testing.T) {
 	}{
 		{
 			name:    "invalid key line",
-			body:    `{"regulatory_country_code":840,"ap_ssh_password":"pw","ap_ssh_public_keys":["not-a-key-line"],"ap_ssh_disable_password":false}`,
+			body:    `{"regulatory_country_code":840,"ap_ssh_password":"pw","ap_ssh_public_keys":["not-a-key-line"]}`,
 			wantMsg: "invalid AP SSH public key #1",
 		},
 		{
-			name:    "disable without keys",
-			body:    `{"regulatory_country_code":840,"ap_ssh_password":"pw","ap_ssh_public_keys":[],"ap_ssh_disable_password":true}`,
-			wantMsg: "AP SSH password auth cannot be disabled without a provisioned public key",
-		},
-		{
 			name:    "country out of range high",
-			body:    `{"regulatory_country_code":1000,"ap_ssh_password":"","ap_ssh_public_keys":[],"ap_ssh_disable_password":false}`,
+			body:    `{"regulatory_country_code":1000,"ap_ssh_password":"","ap_ssh_public_keys":[]}`,
 			wantMsg: "regulatory country code must be an ISO 3166-1 numeric code from 001 to 999",
 		},
 		{
 			name:    "country out of range low",
-			body:    `{"regulatory_country_code":-7,"ap_ssh_password":"","ap_ssh_public_keys":[],"ap_ssh_disable_password":false}`,
+			body:    `{"regulatory_country_code":-7,"ap_ssh_password":"","ap_ssh_public_keys":[]}`,
 			wantMsg: "regulatory country code must be an ISO 3166-1 numeric code from 001 to 999",
 		},
 	}
@@ -2487,9 +2479,9 @@ func TestSiteSettingsPutBadBody(t *testing.T) {
 		body string
 	}{
 		{name: "malformed JSON", body: `{"regulatory_country_code": 840`},
-		{name: "unknown field", body: `{"regulatory_country_code":840,"ap_ssh_password":"","ap_ssh_public_keys":[],"ap_ssh_disable_password":false,"extra":1}`},
+		{name: "unknown field", body: `{"regulatory_country_code":840,"ap_ssh_password":"","ap_ssh_public_keys":[],"extra":1}`},
 		{name: "trailing data", body: siteSettingsBody("") + ` {}`},
-		{name: "null field counts as missing", body: `{"regulatory_country_code":null,"ap_ssh_password":"","ap_ssh_public_keys":[],"ap_ssh_disable_password":false}`},
+		{name: "null field counts as missing", body: `{"regulatory_country_code":null,"ap_ssh_password":"","ap_ssh_public_keys":[]}`},
 	}
 	for _, tc := range cases {
 		run(t, testCase{
@@ -2543,5 +2535,5 @@ func TestSiteSettingsRoutesRequireToken(t *testing.T) {
 // default zero document) — the "backend NOT called" pin of the rejection
 // tests.
 func siteSettingsDocZero(d SiteSettingsDocument) bool {
-	return d.RegulatoryCountryCode == 0 && d.APSSHPassword == "" && d.APSSHPublicKeys == nil && !d.APSSHDisablePassword
+	return d.RegulatoryCountryCode == 0 && d.APSSHPassword == "" && d.APSSHPublicKeys == nil
 }

@@ -133,10 +133,7 @@ func requireToken(cfg Config, next http.HandlerFunc) http.HandlerFunc {
 //     itself in the 400. There is deliberately no list-size cap: the
 //     renderer emits one sshd.auth.key.<n> row family per line in slice
 //     order with no jar-cited bound (the RADIUS 4-slot cap has a wire
-//     reason; this list does not);
-//   - ap_ssh_disable_password == true requires at least one provisioned
-//     key line — the next cfg rebuild would otherwise leave dropbear with
-//     -s and an empty authorized_keys (SSH lockout).
+//     reason; this list does not).
 func ValidateSiteSettings(doc *SiteSettingsDocument) string {
 	if code := doc.RegulatoryCountryCode; code != 0 && (code < 1 || code > 999) {
 		return fmt.Sprintf("regulatory country code must be an ISO 3166-1 numeric code from 001 to 999 (or 0 = unset), got %d", code)
@@ -145,9 +142,6 @@ func ValidateSiteSettings(doc *SiteSettingsDocument) string {
 		if _, err := systemcfg.ParsePublicKey(line); err != nil {
 			return fmt.Sprintf("invalid AP SSH public key #%d: %v", i+1, err)
 		}
-	}
-	if doc.APSSHDisablePassword && len(doc.APSSHPublicKeys) == 0 {
-		return "AP SSH password auth cannot be disabled without a provisioned public key; add an authorized_keys line or SSH access will be locked out"
 	}
 	return ""
 }
