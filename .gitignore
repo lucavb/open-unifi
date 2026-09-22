@@ -15,4 +15,10 @@ dist/
 .slim/worktrees/
 .slim/worktrees.json
 # END oh-my-opencode-slim worktrees
+.slim/deepwork/
 .orca/worktrees
+
+# local build artifacts and bench material — never commit
+/openunifi
+/openunifi.linux
+/id_ed25519.pub
