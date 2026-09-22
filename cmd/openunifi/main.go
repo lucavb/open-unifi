@@ -52,8 +52,6 @@ func run() error {
 		"SSH password for adopted APs (required on first boot — the seed; falls back to $OPEN_UNIFI_AP_SSH_PASSWORD); first-boot seed only — managed at runtime via the site-settings API")
 	apSSHKeys := &keyList{}
 	flag.Var(apSSHKeys, "ap-ssh-key", "LAB ONLY: SSH authorized public key for adopted APs, one authorized_keys line per flag (repeatable; falls back to a single $OPEN_UNIFI_AP_SSH_KEY); first-boot seed only — managed at runtime via the site-settings API. Parsed and validated fail-closed at startup; provisioned as sshd.auth.key.<n>.* rows — firmware-derived but NOT yet live-bench-validated, pushes gated behind --allow-gated-live-wlan (docs/PROTOCOL-systemcfg-wireless.md §13)")
-	apSSHDisablePassword := flag.Bool("ap-ssh-disable-password", false,
-		"LAB ONLY: render sshd.auth.passwd=disabled (dropbear -s: no remote password logins); requires at least one --ap-ssh-key; first-boot seed only — managed at runtime via the site-settings API. Applies at adoption or the next config push; flipping it alone does not re-provision adopted devices (docs/PROTOCOL-systemcfg-wireless.md §13)")
 	allowDefaultAPSSH := flag.Bool("allow-default-ap-ssh-password", false, "LAB ONLY: permit the insecure AP SSH password \"ubnt\" when --ap-ssh-password is empty")
 	// Default from the provider's token env var; --admin-token overrides it.
 	adminToken := flag.String("admin-token", os.Getenv("OPEN_UNIFI_ADMIN_TOKEN"),
@@ -86,30 +84,18 @@ func run() error {
 	settingsExisted := settingsStatErr == nil
 	// Seed-flag validation posture: on FIRST BOOT (!settingsExisted) the
 	// seed flags are validated fail-closed — the key lines by app.New's
-	// seed validation (the single parser), the disable-without-keys combo
-	// by the cmd guard below, an explicit --regulatory-country-code 0 by
-	// the guard further down. Once the record exists the flags are dead
+	// seed validation (the single parser), an explicit
+	// --regulatory-country-code 0 by the guard further down. Once the
+	// record exists the flags are dead
 	// seeds: warned as ignored (below), never validated — one consistent
 	// posture for every equally-dead input (the password guard above
 	// narrows the same way). app's seed validation applies the same
-	// save-verb rule (it rejects the combo too — the seed is admin
-	// intent); the deliberately-accepting rule is the DISK-LOAD one, so
-	// a hand-edited record cannot brick startup. The cmd guard is the
-	// one the CLI boot honors.
+	// save-verb rule (the seed is admin intent).
 	if !settingsExisted && *apSSHPassword == "" && !*allowDefaultAPSSH {
 		return errors.New("AP SSH password is required; set --ap-ssh-password or explicitly opt in with --allow-default-ap-ssh-password for lab use")
 	}
-	// Fail-closed guard: disabling password auth without a provisioned
-	// public key risks locking SSH out — the next boot's cfg rebuild
-	// leaves no authorized_keys entry and dropbear starts with -s.
-	// Recovery, even then, does NOT need SSH: an effective admin device
-	// save re-provisions the record on the next inform (the controller
-	// channel), re-rendering the sshd rows.
 	sshSeedKeys := effectiveSSHKeyLines(apSSHKeys.keys, os.Getenv("OPEN_UNIFI_AP_SSH_KEY"))
 	if !settingsExisted {
-		if err := validateSSHDisableSeed(sshSeedKeys, *apSSHDisablePassword); err != nil {
-			return err
-		}
 		// The flag default is nonzero, so a zero here can only come from an
 		// explicitly supplied --regulatory-country-code 0. Reject it before the
 		// server-side coercion silently maps 0 to the 840 default. Once the
@@ -168,7 +154,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("open device store: %w", err)
 	}
-	ap := app.New(st, filepath.Join(*dataDir, "wireless.json"), filepath.Join(*dataDir, "site-settings.json"), siteSettingsSeed(*regulatoryCountryCode, *apSSHPassword, sshSeedKeys, *apSSHDisablePassword), logger)
+	ap := app.New(st, filepath.Join(*dataDir, "wireless.json"), filepath.Join(*dataDir, "site-settings.json"), siteSettingsSeed(*regulatoryCountryCode, *apSSHPassword, sshSeedKeys), logger)
 	// The wireless document is loaded ONCE in app.New; a corrupt
 	// wireless.json must refuse startup here (same as a corrupt
 	// devices.json already does) — otherwise the provisioning side would
@@ -188,14 +174,14 @@ func run() error {
 	if serr != nil {
 		return fmt.Errorf("site settings: %w", serr)
 	}
-	// The four AP-intent inputs are first-boot seeds only. Warn that they
+	// The AP-intent inputs are first-boot seeds only. Warn that they
 	// were ignored ONLY when a record existed before this boot (the pre-New
 	// settingsExisted determination — after app.New the file always exists,
 	// because the call seeds and persists it) AND at least one flag was
 	// actually supplied. On the seeding first boot the flags were honored:
 	// the default flow is the happy path, not a warning.
 	if apIntentSupplied() && settingsExisted {
-		logger.Warn("site settings exist; --regulatory-country-code/--ap-ssh-password/--ap-ssh-key/--ap-ssh-disable-password ignored (first-boot seeds only — managed at runtime via the site-settings API)")
+		logger.Warn("site settings exist; --regulatory-country-code/--ap-ssh-password/--ap-ssh-key ignored (first-boot seeds only — managed at runtime via the site-settings API)")
 	}
 	adminH := adminapi.New(adminapi.Config{AdminToken: *adminToken}, ap)
 
@@ -251,7 +237,7 @@ func run() error {
 	}
 
 	// SiteSettingsSource feeds the app's site-settings record into inform-
-	// side provisioning (the four managed AP-intent facts) and into the
+	// side provisioning (the managed AP-intent facts) and into the
 	// adoption engine's live-provisioning gate. The record stores RAW
 	// authorized_keys lines; this seam is where the parse lands — every
 	// line through the single fail-closed parser (systemcfg.ParsePublicKey),
@@ -278,10 +264,9 @@ func run() error {
 			keys = append(keys, k)
 		}
 		return server.SiteSettings{
-			CountryCode:        rec.CountryCode,
-			SSHPassword:        rec.SSHPassword,
-			SSHPublicKeys:      keys,
-			SSHDisablePassword: rec.SSHDisablePassword,
+			CountryCode:   rec.CountryCode,
+			SSHPassword:   rec.SSHPassword,
+			SSHPublicKeys: keys,
 		}, nil
 	}
 
@@ -304,16 +289,16 @@ func run() error {
 		logger.Warn("live WLAN provisioning gate LIFTED for U7PG2 6.8.2.15592 (--allow-gated-live-wlan): live WLAN pushes are enabled — bench use only, candidate must be pre-cleared by the offline minimal-diff harness")
 	}
 	// Source the condition from the RECORD (the loaded siteSettings, the
-	// single source of truth for the four facts — not the seed flags,
+	// single source of truth for the facts — not the seed flags,
 	// which are ignored whenever the record file exists): the warn's
 	// operative content is "live pushes stay gated", and that depends on
 	// the facts the gate will actually read.
-	if len(siteSettings.SSHPublicKeys) > 0 || siteSettings.SSHDisablePassword {
+	if len(siteSettings.SSHPublicKeys) > 0 {
 		// Prominent, not debug: the sshd site facts are already gated
 		// behind the same live-WLAN opt-in at the engine choke point, but
 		// an admin with provisioned sshd facts in the record must SEE
 		// that pushes will not go live until the bench validation lands.
-		logger.Warn("ssh site facts configured in the site-settings record: the sshd.auth.key rows and auth.passwd knob are firmware-derived but NOT yet live-bench-validated — live pushes stay gated behind --allow-gated-live-wlan (docs/PROTOCOL-systemcfg-wireless.md §13, bench use only)")
+		logger.Warn("ssh site facts configured in the site-settings record: the sshd.auth.key rows are firmware-derived but NOT yet live-bench-validated — live pushes stay gated behind --allow-gated-live-wlan (docs/PROTOCOL-systemcfg-wireless.md §13, bench use only)")
 	}
 	// The SSH set-inform push lane (internal/app/setinform.go): armed here
 	// so the console Adopt action can hand never-informed factory pending
@@ -425,7 +410,6 @@ func run() error {
 		// first boot and are ignored thereafter).
 		"ssh_password_configured", siteSettings.SSHPassword != "",
 		"ssh_public_keys", len(siteSettings.SSHPublicKeys),
-		"ssh_disable_password", siteSettings.SSHDisablePassword,
 		"auth", *adminToken != "",
 		"plaintext_inform", *allowPlainText,
 		"controller_url", *controllerURL,
@@ -518,21 +502,20 @@ func (l *keyList) Set(v string) error {
 	return nil
 }
 
-// siteSettingsSeed builds the first-boot site-settings seed from the four
+// siteSettingsSeed builds the first-boot site-settings seed from the
 // AP-intent flags. The key lines are passed RAW (the composition ran above
 // through effectiveSSHKeyLines; app.New runs the single fail-closed parser;
 // nothing is pre-parsed here). The saved record preserves what the flags
 // say, verbatim: on the first-boot path main's pre-New seed-flag guards
-// (password guard, disable-without-keys guard, explicit-0 country
-// rejection) and app.New's seed validation (the save-verb rule, key parse
-// among them) already gated this boot. Once the record exists the flags
-// are dead seeds and this value is ignored by app.New anyway.
-func siteSettingsSeed(countryCode int, password string, keys []string, disablePassword bool) app.SiteSettings {
+// (password guard, explicit-0 country rejection) and app.New's seed
+// validation (the save-verb rule, key parse among them) already gated this
+// boot. Once the record exists the flags are dead seeds and this value is
+// ignored by app.New anyway.
+func siteSettingsSeed(countryCode int, password string, keys []string) app.SiteSettings {
 	return app.SiteSettings{
-		CountryCode:        countryCode,
-		SSHPassword:        password,
-		SSHPublicKeys:      keys,
-		SSHDisablePassword: disablePassword,
+		CountryCode:   countryCode,
+		SSHPassword:   password,
+		SSHPublicKeys: keys,
 	}
 }
 
@@ -549,9 +532,9 @@ func effectiveSSHKeyLines(flagKeys []string, envValue string) []string {
 	return keys
 }
 
-// apIntentSupplied reports whether at least one of the four AP-intent
+// apIntentSupplied reports whether at least one of the AP-intent
 // inputs was explicitly supplied — the seed the "site settings exist"
-// warning actually refers to. Two sources count: flag.Visit over the four
+// warning actually refers to. Two sources count: flag.Visit over the
 // flag names (explicit occurrences on the command line), and the env
 // fallbacks OPEN_UNIFI_AP_SSH_PASSWORD / OPEN_UNIFI_AP_SSH_KEY — those feed
 // the flag DEFAULTS, so flag.Visit alone misses them. Must run AFTER
@@ -561,7 +544,6 @@ func apIntentSupplied() bool {
 		"regulatory-country-code": true,
 		"ap-ssh-password":         true,
 		"ap-ssh-key":              true,
-		"ap-ssh-disable-password": true,
 	}
 	supplied := false
 	flag.Visit(func(f *flag.Flag) {
@@ -573,30 +555,6 @@ func apIntentSupplied() bool {
 		supplied = true
 	}
 	return supplied
-}
-
-// validateSSHDisableSeed is the fail-closed disable-without-keys guard
-// for the first-boot seed (the pre-lane cmd-layer semantics, restored
-// verbatim): disabling password auth without a provisioned public key
-// risks locking SSH out — the next boot's cfg rebuild leaves no
-// authorized_keys entry and dropbear starts with -s. Recovery, even then,
-// does NOT need SSH: an effective admin device save re-provisions the
-// record on the next inform (the controller channel), re-rendering the
-// sshd rows. This guard and app's seed rule (the save-verb rule — the
-// seed is admin intent) both reject the combo; the deliberately
-// accepting rule is the DISK-LOAD one (a hand-edited record cannot
-// brick startup — the API is the validator going forward). The engine's live
-// gate is NOT a fail-closed backstop for this combo: it is scoped to
-// U7PG2 firmware 6.8.2.15592 ONLY, and other models/firmware deliver the
-// combo ungated. The honest invariant is that every admin-reachable
-// WRITER rejects the combo (the API fence, the app save verb, app's seed
-// validation for the CLI seed path); a hand-edited disk file deliberately
-// still boots, and recovery goes through an API PUT — no SSH needed.
-func validateSSHDisableSeed(keys []string, disablePassword bool) error {
-	if disablePassword && len(keys) == 0 {
-		return errors.New("AP SSH password auth cannot be disabled without a provisioned public key; set --ap-ssh-key (or $OPEN_UNIFI_AP_SSH_KEY) or SSH access will be locked out")
-	}
-	return nil
 }
 
 // drainShutdown tears both HTTP servers down with a fresh 5s deadline.

@@ -127,37 +127,3 @@ func TestEffectiveSSHKeyLines(t *testing.T) {
 		}
 	}
 }
-
-// validateSSHDisableSeed table: the fail-closed disable-without-keys
-// startup guard, restored verbatim from the pre-lane cmd-layer resolver
-// (both arms — the refusal message and the pass-through) and pinned like
-// the composition above, so the lane's deletion of the guard can never
-// regress silently again.
-func TestValidateSSHDisableSeed(t *testing.T) {
-	cases := []struct {
-		name            string
-		keys            []string
-		disablePassword bool
-		wantErr         string // substring; "" = must pass
-	}{
-		{name: "disable-without-keys", keys: nil, disablePassword: true, wantErr: "cannot be disabled without a provisioned public key"},
-		{name: "disable-with-keys", keys: []string{"ssh-rsa AAAAflag first@ap"}, disablePassword: true},
-		{name: "keys-without-disable", keys: []string{"ssh-rsa AAAAflag first@ap"}},
-		{name: "neither"},
-	}
-	for _, c := range cases {
-		err := validateSSHDisableSeed(c.keys, c.disablePassword)
-		if c.wantErr == "" {
-			if err != nil {
-				t.Fatalf("%s: unexpected err %v", c.name, err)
-			}
-			continue
-		}
-		if err == nil {
-			t.Fatalf("%s: unexpectedly succeeded", c.name)
-		}
-		if !strings.Contains(err.Error(), c.wantErr) {
-			t.Fatalf("%s: err %v, want substring %q", c.name, err, c.wantErr)
-		}
-	}
-}
