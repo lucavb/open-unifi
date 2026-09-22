@@ -1124,6 +1124,22 @@ semantics (ubntbox dropbear respawn builder): the builder assembles
 password logins) exactly when `sshd.auth.passwd` is disabled; port comes from
 `sshd.%d.port` (`" -p %d"`) and the host keys are
 `-r /var/run/dropbear_rsa_host_key` / `-r /var/run/dropbear_ed25519_host_key`.
+LIVE-CAUGHT DEFECT (2026-09-22 root-cause round,
+WLAN-ACCEPTANCE-6.8.2.15592.md §2026-09-22): on fw 6.8.2.15592 the
+disabled branch's slot packing is BROKEN — the `-s` string is GLUED onto
+the port argument. procd's live respawn line, caught in RAM-backed
+`/var/log/messages`:
+`/usr/sbin/dropbear -F -r /var/run/dropbear_rsa_host_key -p br0:22-s`
+(the disabled line also drops the ed25519 `-r`). dropbear then logs
+`Failed listening on '22-s': Error resolving: Unrecognized service` and
+`Early exit: No listening ports available`, exits 256, and procd
+respawns it into the same death (dropbear's own 60 s sleep backoff hides
+the loop from cadence probes) — no listener, ever. The enabled branch
+renders correct (empty `-s` slot — the double-space byte form), so the
+defect is the disabled branch's adjacent `%s%s` slots with no separator
+before `-s`; the SAME broken line is built by BOTH assembly paths
+(apply-time and boot-rebuild — the row persists across reboot and the
+fresh boot reproduces the outage, so reboot is NOT a recovery).
 The controller-side guard is fail-closed at every writer an admin can
 reach: the admin API's pre-backend fence AND the app save verb both reject
 a disable-without-keys save (400), and the cmd first-boot seed path
@@ -1134,7 +1150,9 @@ NOT need SSH: an effective admin device save re-provisions the record on
 the next inform (the controller channel), re-rendering the sshd rows. LIVE
 (2026-09-21): the disabled row's push settled but the dropbear listener
 never returned on fw 6.8.2.15592 — the outage and the controller-channel
-recovery are recorded in §13.3. One
+recovery are recorded in §13.3, and the outage's on-device root cause was
+byte-caught by the 2026-09-22 round (the glued `-p br0:22-s` above —
+reboot does NOT help). One
 neutral caveat: the admin `config.system_cfg.<idx>` passthrough rows render
 AFTER the site-fact sshd rows, so a conflicting admin-supplied row's
 duplicate-resolution on the device (`sshd.auth.key` is an indexed family —
@@ -1151,10 +1169,15 @@ the device rebuilt `/etc/dropbear/authorized_keys` FROM the rows, and a
 BatchMode key login worked — but BOOT-REBUILD SURVIVAL is still OWED
 (the round applied, it did not reboot; the pre-lane evidence is that
 boot wipes manually-installed keys, so the row-driven boot path is
-untested). The DISABLE knob is live-BROKEN on the one firmware: the
-round's `sshd.auth.passwd=disabled` push settled, and the dropbear
-listener never returned (port 22 RST-refused ~10 min while informs
-flowed; recovery via the controller channel worked). The
+untested). The DISABLE knob is live-BROKEN on the one firmware, ROOT-CAUSED
+by the 2026-09-22 round (WLAN-ACCEPTANCE-6.8.2.15592.md §2026-09-22): the
+row's fw-side respawn line is broken at the source (`-p br0:22-s`, §13.2),
+so the knob kills SSH ENTIRELY — password AND key lanes RST-refused at
+apply AND after a fresh boot (branch C of the reboot discriminator; no
+OPEN flicker, dropbear exit-256 respawn loop with 60 s backoff) until a
+controller-channel revert. Reboot is NOT a recovery; row-key boot survival
+(the owed claim) is UNREACHABLE through the knob on this firmware — no
+branch of the discriminator could test it. The
 LIVE-PROVISIONING GATE therefore STAYS for both sshd facts, now with
 live evidence it is right to refuse them:
 the adoption engine's fail-closed U7PG2/6.8.2.15592 choke point also rejects

@@ -1644,6 +1644,88 @@ live-bench-validated") are now half-stale — the key rows ARE
 apply-validated — flagged for a code-truth pass. (4) The H3 two-read
 gate residual stands as recorded.
 
+### 2026-09-22 disable-knob root-cause round — E1 reboot discriminator + E2 outage probes: Branch C, the fw respawn line is `-p br0:22-s` (no deploy — binary `8475be053e27…` unchanged)
+
+**Scope:** 2026-09-21 owed item (2) — the on-device root cause of the
+`sshd.auth.passwd=disabled` listener outage, via one scripted live round on
+bench AP-1 (`aabbccddee02`, U7PG2, 6.8.2.15592), 08:19–08:41 CEST, no deploy
+(binary `8475be053e27…` unchanged). Driver `tmpwork/round-20260922/round.sh`
+(sha `a9ab36db156d0330`), detached, EXIT-trap restore; artifacts in
+`tmpwork/round-20260922/artifacts/` (`round.log` is the transcript; bench
+backups `data/*.preround-20260922-knob`). Attempt 1 aborted PRE-FLIP
+silently — the launch sent stderr to /dev/null, and bash 5.3 expands a
+declaration command's argument words BEFORE binding them, so
+`local p=$1 f="$OUT/$p…"` under `set -u` exits `p: unbound variable`
+(shellcheck SC2318; transcript `round-attempt1-bash-local-bug.log`); split
+into two statements, relaunch ran clean (stderr 0 bytes).
+
+**Design:** E1 reboot discriminator — flip knob true → observe outage →
+POST /reboot → re-observe → branch A (key login + port back: apply-time
+fault, row-keys boot-proven) / B (port back, keys refused) / C (still dead:
+the line itself) / N (not reproduced). E2: 2 s port-22 prober on lab-bench
+(OPEN[banner]/REFUSED/FILTERED), controller-channel-only recovery, and the
+RAM-backed `/var/log/messages` grabbed the moment a lane returns (procd
+respawn bookkeeping decides H1 vs H3). Settles are two-tick (flip:
+echo==desired across two informs; reboot: last_seen advance + state 3, then
+one more advance) so the branch cannot fire while the AP is dark.
+
+**Baseline + outage (E2):** knob false, lab-bench key, in_sync, echo
+`63731814a4892b6d`, applied sha `11cb0472…`; key + password lanes live,
+banner `SSH-2.0-dropbear_2024.86`. PUT disable=true → 200, mint
+`0ef81e9dd86ed9bd` → setparam → SETTLED across two informs. Prober: last
+OPEN 08:29:31, FILTERED 08:29:33–08:29:53 (the apply transition), REFUSED
+(active RST) from 08:29:58 — the listener died with the row's apply and
+stayed dead through the 180 s window while ping ran 0.200/0.247/0.202 ms
+and informs flowed noop on the new echo; key lane refused. The full probe
+log ends 274 REFUSED vs 32 OPEN lines.
+
+**Reboot (E1):** POST /reboot consumed at the 06:34:30Z inform (pending
+cleared), dark ~3 min (controller poller state 4), recovery inform 06:37:37Z
+(`last_seen 1790058870 → 1790059057`) → **Branch C**: key login REFUSED,
+port 22 DEAD; prober all-REFUSED with NO OPEN flicker through the +120 s
+confirmation window (08:38:46–08:39:44) while informs kept flowing noop on
+`0ef81e9dd86ed9bd`.
+
+**Root cause (byte-caught):** restore flipped false (mint
+`74f3e35668e7221c`), settle SETTLED, the key lane returned, and the
+RAM-backed messages grab caught the fw's own respawn line, procd's
+bookkeeping, and dropbear's own diagnosis:
+```
+dropbear[2698]: Early exit: No listening ports available.
+procd: Process '/usr/sbin/dropbear -F -r /var/run/dropbear_rsa_host_key -p br0:22-s' exited with status 256 - scheduling for restart (… uptime: 60 … crashes: 3 …)
+dropbear[3192]: Failed listening on '22-s': Error resolving: Unrecognized service
+dropbear[3192]: dropbear sleeps 60 sec
+```
+The disabled branch's assembly GLUES `-s` onto the port argument —
+`-p br0:22-s` — so dropbear cannot resolve port "22-s", never binds, exits
+256, and procd respawns it into the same death (dropbear's 60 s sleep
+backoff is why the 2 s prober never caught an OPEN flicker). The SAME broken
+line from BOTH assembly paths — apply-time (2026-09-21) and boot-rebuild
+(this round: the row persists, the fresh boot rebuilds the identical line,
+also dropping the ed25519 `-r`) — while the enabled line renders correct
+(empty `-s` slot, the double-space byte form). H1 CONFIRMED (the disabled
+branch's slot packing, matching the decompiled
+`null::respawn:%s -F %s%s%s%s` adjacent `%s%s` slots with no separator
+before `-s`); H2 refuted (not apply state); H3's crash-loop real but a
+SYMPTOM, its backoff hiding it from cadence probes. Claim C (row-keys boot
+survival) is UNREACHABLE through the knob on this firmware — the broken
+line kills the key lane too, no branch of the discriminator could observe
+keys surviving a boot; knob-off row boot survival stays owed. Confound
+excluded: the postrecovery wevent respawn flood (706 lines,
+`wevent[…]: could not start ubnt-protocol`) is pre-existing bench noise —
+the pre-round tail already carried it (84 lines from 06:28).
+
+**End state:** port 22 OPEN again from 08:40:55 (`dropbear[4913]: Not
+backgrounding` + `set system.ssh true` at 06:40:27), password lane live at
+end, applied sha `11cb0472…` == pre-round — **byte-exact revert**; knob
+false, 1 key, in_sync, cfg==applied `74f3e35668e7221c`; fixtures unchanged
+(no re-seed needed). **Disposition:** the knob stays fail-closed + gated
+with live root-cause evidence — on U7PG2/6.8.2.15592 it bricks SSH
+(password AND key) until a controller-channel revert, reboot included; the
+official jar's conditional (javap String.txt:2746-2834) renders the same
+row, so an official controller + this fw hit the same wall. §13.2/§13.3
+updated; the WARN-string code-truth pass remains owed.
+
 ## Release gate summary
 
 | Gate | Result |
