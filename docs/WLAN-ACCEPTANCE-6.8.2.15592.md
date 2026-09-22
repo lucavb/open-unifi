@@ -1554,7 +1554,7 @@ defaults view (404 on the pre-round binary).
 the bench-safety WARN + `devices_minted=1` → full provisioning
 (`setparam`, mint `9a75134c03122c4d`) → settle confirmed. AP byte
 proof: `/tmp/system.cfg` rows `sshd.auth.key.1.status=enabled`,
-`.value=AAAAC3…MjJ`, `.type=ssh-ed25519`,
+`.value=AAAAC3…`, `.type=ssh-ed25519`,
 `.comment=admin@lab-bench` — wire-exact per the javap family — and
 `/etc/dropbear/authorized_keys` rebuilt FROM the rows (file rewritten at
 the apply; the pre-round manual `ssh-copy-id` artifact superseded).
