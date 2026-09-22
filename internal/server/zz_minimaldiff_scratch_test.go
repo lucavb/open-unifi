@@ -223,7 +223,7 @@ func zzExemptSSHKeyRows(rows []string) (out []string) {
 }
 
 // zzLiveSiteSettings loads the live site-settings record fixture
-// (live-site-settings.json, the on-disk record shape — the four
+// (live-site-settings.json, the on-disk record shape — the
 // AP-intent facts) and builds the render's SiteSettings for the live
 // gates: the record's raw authorized_keys lines parse through the
 // single fail-closed parser (the adapter-conversion seam cmd/openunifi
@@ -243,15 +243,13 @@ func zzLiveSiteSettings(t *testing.T) SiteSettings {
 		RegulatoryCountryCode int      `json:"regulatory_country_code"`
 		APSSHPassword         string   `json:"ap_ssh_password"`
 		APSSHPublicKeys       []string `json:"ap_ssh_public_keys"`
-		APSSHDisablePassword  bool     `json:"ap_ssh_disable_password"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		t.Fatalf("live site-settings.json: %v", err)
 	}
 	facts := SiteSettings{
-		CountryCode:        doc.RegulatoryCountryCode,
-		SSHPassword:        doc.APSSHPassword,
-		SSHDisablePassword: doc.APSSHDisablePassword,
+		CountryCode: doc.RegulatoryCountryCode,
+		SSHPassword: doc.APSSHPassword,
 	}
 	for _, line := range doc.APSSHPublicKeys {
 		k, perr := systemcfg.ParsePublicKey(line)

@@ -283,11 +283,11 @@ type Deps struct {
 	// every normal start.
 	AllowGatedLiveWLAN bool
 
-	// SSHSiteFacts supplies the distilled site-fact sshd scalars the gate
-	// needs (the renderer package's inputs, already resolved by the caller)
+	// SSHSiteFacts supplies the distilled site-fact sshd scalar the gate
+	// needs (the renderer package's input, already resolved by the caller)
 	// AT GATE TIME, not construction time: the count of provisioned
-	// authorized-key rows and whether sshd.auth.passwd renders disabled.
-	// Like Deps.Wireless this is a live source — a site-settings save
+	// authorized-key rows. Like Deps.Wireless this is a live source — a
+	// site-settings save
 	// between engine construction and the next inform must flip the gate on
 	// that inform. Deliberately scalars, NOT systemcfg facts/keys — the
 	// adoption engine must not depend on the renderer package (HARD RULE,
@@ -315,7 +315,7 @@ type Deps struct {
 	// the country-code re-check — to be applied before the owed
 	// live-bench validation round (docs/PROTOCOL-systemcfg-wireless.md
 	// §13.3). nil ⇒ zero facts.
-	SSHSiteFacts func() (keyRows int, disable bool)
+	SSHSiteFacts func() (keyRows int)
 }
 
 // Engine is the pure adoption decider.
@@ -328,7 +328,7 @@ type Engine struct {
 	controllerURL    string
 	informListenAddr string
 	allowGatedWLAN   bool
-	sshSiteFacts     func() (int, bool)
+	sshSiteFacts     func() int
 }
 
 // New builds an Engine. A nil logger falls back to a discarding one.
@@ -858,8 +858,8 @@ func (e *Engine) decidePlain(req Request, wls []wireless.Wlan, plan wireless.Pro
 // whose system_cfg rows have not been differentially verified against the
 // official controller — the WLAN template (the original trigger) AND, since
 // the 2026-09-20 sshd-auth lane, the firmware-derived but NOT
-// live-bench-validated sshd.auth.key.<n>.* rows / sshd.auth.passwd=disabled
-// knob when the site facts configure them (zero-value site facts keep the
+// live-bench-validated sshd.auth.key.<n>.* rows when the site facts
+// configure them (zero-value site facts keep the
 // rendered sshd block byte-identical to the pre-feature shape, so the gate
 // stays inert for them). wls is the decision's resolved WLAN envelope (the
 // caller's single snapshot for this inform), not the live source. The gate
@@ -878,7 +878,7 @@ func (e *Engine) RejectUnsupportedLiveProvisioning(d store.Device, wls []wireles
 			return ErrLiveWLANProvisioningUnsupported
 		}
 	}
-	// The sshd scalars are read AT GATE TIME (Deps.SSHSiteFacts is live):
+	// The sshd scalar is read AT GATE TIME (Deps.SSHSiteFacts is live):
 	// a site-settings save between engine construction and this inform
 	// flips the gate on it. nil/zero facts keep the gate inert (the
 	// zero-value rendered sshd block stays byte-identical to the
@@ -888,11 +888,11 @@ func (e *Engine) RejectUnsupportedLiveProvisioning(d store.Device, wls []wireles
 	// aborts, so the in-memory record writes are discarded with it) —
 	// net fail-closed (the CLI refuses startup on that error anyway, so it
 	// is embedder-only).
-	keyRows, disable := 0, false
+	keyRows := 0
 	if e.sshSiteFacts != nil {
-		keyRows, disable = e.sshSiteFacts()
+		keyRows = e.sshSiteFacts()
 	}
-	if keyRows > 0 || disable {
+	if keyRows > 0 {
 		return ErrLiveWLANProvisioningUnsupported
 	}
 	return nil

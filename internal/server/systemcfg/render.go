@@ -24,8 +24,7 @@ import (
 
 // SiteFacts are the controller-level inputs a render needs (CONTEXT.md:
 // site facts): controller URL, regulatory country code, AP SSH password,
-// the provisioned SSH public keys, the SSH password-login disable knob, and
-// the current WLANs.
+// the provisioned SSH public keys, and the current WLANs.
 type SiteFacts struct {
 	// ControllerURL is the configured controller base URL. Empty means
 	// "not overridden" (nothing in system_cfg derives from it today; it is
@@ -54,12 +53,6 @@ type SiteFacts struct {
 	// apply is owed before the rows are treated as trusted
 	// (docs/PROTOCOL-systemcfg-wireless.md §13).
 	SSHPublicKeys []PublicKey
-
-	// SSHDisablePassword sets sshd.auth.passwd=disabled: the firmware
-	// respawn builder then appends the dropbear "-s" flag (disable remote
-	// password logins) to "null::respawn:%s -F %s%s%s%s". Default false
-	// (password auth enabled) is byte-identical to the pre-feature render.
-	SSHDisablePassword bool
 
 	// WLANs is the current WLAN envelope (the engine's per-decision
 	// snapshot, so the drift hash and the rendered config always agree).
@@ -320,25 +313,7 @@ func RenderWithPlan(d store.Device, facts SiteFacts, plan wireless.ProvisioningP
 	// dev is model-specific (record pass-through Extra["mgmt_dev"] allowed
 	// as the admin escape hatch).
 	line("sshd.status", "enabled")
-	if rd.facts.SSHDisablePassword {
-		// sshd.auth.passwd=disabled → the firmware respawn builder appends
-		// dropbear's "-s" flag (disable remote password logins) to
-		// "null::respawn:%s -F %s%s%s%s" (port from sshd.%d.port, host
-		// keys -r /var/run/dropbear_rsa_host_key and
-		// -r /var/run/dropbear_ed25519_host_key). Password auth must be
-		// disabled only with an authorized key provisioned: every
-		// admin-reachable writer rejects the disable-without-keys
-		// combination fail-closed — the admin API's pre-backend fence, the
-		// app save verb, and the cmd first-boot seed guard. A hand-edited
-		// on-disk record deliberately still boots (do-not-brick doctrine);
-		// recovery there is an effective site-settings save. The inform-time
-		// live gate does not substitute for these fences: it is scoped to
-		// U7PG2 firmware 6.8.2.15592 and does not cover other models or
-		// firmware.
-		line("sshd.auth.passwd", "disabled")
-	} else {
-		line("sshd.auth.passwd", "enabled")
-	}
+	line("sshd.auth.passwd", "enabled")
 	line("sshd.1.status", "enabled")
 	line("sshd.1.ifname", mgmtDevOf(d))
 	// sshd.auth.key.<n>.* — the authorized-key row family (firmware:

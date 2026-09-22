@@ -830,34 +830,33 @@ func TestParsePublicKeyTable(t *testing.T) {
 	}
 }
 
-// R6(a): the disable-password fact flips sshd.auth.passwd to "disabled"
-// (the dropbear -s respawn arm) and leaves the unchanged sshd.1.* rows
-// (status, port, ifname) exactly as the default render emits them.
-func TestRenderSSHDisablePassword(t *testing.T) {
-	res, err := Render(renderRecord(), SiteFacts{SSHDisablePassword: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(res.Text, "sshd.auth.passwd=disabled\n") {
-		t.Fatalf("sshd.auth.passwd=disabled missing:\n%s", res.Text)
-	}
-	if strings.Contains(res.Text, "sshd.auth.passwd=enabled\n") {
-		t.Fatalf("sshd.auth.passwd=enabled emitted alongside the disable fact:\n%s", res.Text)
-	}
-	// The disable fact touches ONLY the passwd row: every other sshd.1.*
-	// row must still be present on the disabled path.
-	for _, want := range []string{"sshd.1.status=enabled\n", "sshd.1.ifname=br0\n"} {
-		if !strings.Contains(res.Text, want) {
-			t.Fatalf("sshd row missing on the disable path: %q:\n%s", want, res.Text)
+// R6(a) pin: sshd.auth.passwd renders "enabled" UNCONDITIONALLY — the
+// password-disable knob is gone (a live round proved the firmware's -s
+// respawn line bricks SSH on U7PG2 6.8.2.15592). The row must be present
+// exactly once with the enabled value whether the site facts carry keys
+// or not, byte-exact in the deleted knob test's style.
+func TestRenderSSHPasswdAlwaysEnabled(t *testing.T) {
+	for label, facts := range map[string]SiteFacts{
+		"zero facts":  {},
+		"with a key":  {SSHPublicKeys: []PublicKey{{Type: "ssh-ed25519", Value: "AAAA"}}},
+		"site passwd": {SSHPassword: "hunter2"},
+	} {
+		res, err := Render(renderRecord(), facts)
+		if err != nil {
+			t.Fatal(err)
 		}
-	}
-	// Default-fact render keeps the row enabled (byte-identical to the
-	// pre-feature contract, already pinned by the echo block test).
-	def, err := Render(renderRecord(), SiteFacts{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(def.Text, "sshd.auth.passwd=enabled\n") {
-		t.Fatalf("default facts must keep sshd.auth.passwd=enabled:\n%s", def.Text)
+		if !strings.Contains(res.Text, "sshd.auth.passwd=enabled\n") {
+			t.Fatalf("%s: sshd.auth.passwd=enabled missing:\n%s", label, res.Text)
+		}
+		if strings.Contains(res.Text, "sshd.auth.passwd=disabled") {
+			t.Fatalf("%s: disabled passwd row rendered — the removed knob leaked back:\n%s", label, res.Text)
+		}
+		// The knob touches ONLY the passwd row: every other sshd row must
+		// still be present.
+		for _, want := range []string{"sshd.status=enabled\n", "sshd.1.status=enabled\n", "sshd.1.ifname=br0\n"} {
+			if !strings.Contains(res.Text, want) {
+				t.Fatalf("%s: sshd row missing: %q:\n%s", label, want, res.Text)
+			}
+		}
 	}
 }

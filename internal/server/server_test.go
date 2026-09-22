@@ -274,13 +274,13 @@ func mustBuildSys(t *testing.T, s *Server, rec store.Device) string {
 }
 
 // Site-facts wiring pin: the SiteSettings SOURCE closure (Config no longer
-// carries the four facts as fields) MUST reach the rendered system_cfg
+// carries the facts as fields) MUST reach the rendered system_cfg
 // through the renderSystemCfg SiteFacts copy. A dropped SSHPublicKeys wire
 // would render an empty authorized_keys with -s (password auth off) ACTIVE
 // — the lane's own nightmare scenario, locked SSH on the AP — and a dropped
 // SSHPassword wire would silently render the site default "ubnt" hash with
 // zero failures (every settings E2E saves ""). The rendered blob must
-// therefore carry both key rows, the disabled passwd row, and a
+// therefore carry both key rows and a
 // users.1.password hash that verifies against "hunter2" and NOT against
 // "ubnt", judged by the renderer's own cache matcher as the in-package
 // oracle (sha512CryptMatches is unexported; the matcher path is exercised
@@ -297,7 +297,7 @@ func TestSiteFactsSSHConfigWiring(t *testing.T) {
 	// TestSiteFactsSSHPasswordSeam below against the same record shape.
 	s := New(Config{
 		SiteSettings: func() (SiteSettings, error) {
-			return SiteSettings{SSHPassword: "hunter2", SSHPublicKeys: []systemcfg.PublicKey{pk}, SSHDisablePassword: true}, nil
+			return SiteSettings{SSHPassword: "hunter2", SSHPublicKeys: []systemcfg.PublicKey{pk}}, nil
 		},
 	}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, u7pg2Record())
@@ -305,21 +305,17 @@ func TestSiteFactsSSHConfigWiring(t *testing.T) {
 		"sshd.auth.key.1.status=enabled\n",
 		"sshd.auth.key.1.value=AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB\n",
 		"sshd.auth.key.1.type=ssh-ed25519\n",
-		"sshd.auth.passwd=disabled\n",
 		"users.1.password=$6$",
 	} {
 		if !strings.Contains(sys, want) {
 			t.Fatalf("Config→SiteFacts wiring pin: missing %q:\n%s", want, sys)
 		}
 	}
-	if strings.Contains(sys, "sshd.auth.passwd=enabled\n") {
-		t.Fatalf("SSHDisablePassword=false leaked through the wiring:\n%s", sys)
-	}
 }
 
 // TestSiteFactsSSHPasswordSeam pins the facts.SSHPassword → SiteFacts copy
 // in renderSystemCfg (the one settings seam no settings E2E covers: all
-// four settings saves carry ""). The dance uses the renderer's own cache
+// settings E2E saves carry ""). The dance uses the renderer's own cache
 // matcher (sha512CryptMatches — the same oracle the systemcfg round-trip
 // tests use, reachable here because the renderer verifies the record's
 // ssh_sha512passwd cache against the CURRENT site password on every
@@ -409,7 +405,7 @@ func users1PasswordRow(t *testing.T, sys string) string {
 // of its own, and country 0 coerces to the 840 default on the way through.
 func TestSiteSettingsZeroRecordRendersByteIdentical(t *testing.T) {
 	rec := u7pg2Record()
-	// The nil source: the old flag-default path (all four facts zero).
+	// The nil source: the old flag-default path (all facts zero).
 	sysNil := mustBuildSys(t, New(Config{}, store.NewMemStore(), testLogger()), rec)
 	// The live closure over a ZERO-VALUE record: country 0 = unset, no
 	// password, no keys, password login enabled.
@@ -2426,12 +2422,12 @@ func TestPlainLaneProvisionsWirelessRows(t *testing.T) {
 		// The same live sshd-facts closure the real server wires (the
 		// gate must read the current settings at gate time even in this
 		// rebuilt engine).
-		SSHSiteFacts: func() (int, bool) {
+		SSHSiteFacts: func() (keyRows int) {
 			facts, ferr := s.currentSiteSettings()
 			if ferr != nil {
-				return 0, false
+				return 0
 			}
-			return len(facts.SSHPublicKeys), facts.SSHDisablePassword
+			return len(facts.SSHPublicKeys)
 		},
 		SystemCfg: func(d store.Device, wls []wireless.Wlan, plan wireless.ProvisioningPlan) (string, map[string]string, error) {
 			handedPlan = plan

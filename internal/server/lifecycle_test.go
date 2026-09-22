@@ -107,10 +107,9 @@ func appSettingsSource(a *app.App) func() (SiteSettings, error) {
 			keys = append(keys, k)
 		}
 		return SiteSettings{
-			CountryCode:        rec.CountryCode,
-			SSHPassword:        rec.SSHPassword,
-			SSHPublicKeys:      keys,
-			SSHDisablePassword: rec.SSHDisablePassword,
+			CountryCode:   rec.CountryCode,
+			SSHPassword:   rec.SSHPassword,
+			SSHPublicKeys: keys,
 		}, nil
 	}
 }
@@ -434,7 +433,7 @@ const (
 )
 
 // siteSettingsPutBodyJSON renders a whole-document PUT body.
-func siteSettingsPutBodyJSON(country int, password string, keys []string, disable bool) string {
+func siteSettingsPutBodyJSON(country int, password string, keys []string) string {
 	keyJSON := make([]string, 0, len(keys))
 	for _, k := range keys {
 		b, err := json.Marshal(k)
@@ -443,15 +442,15 @@ func siteSettingsPutBodyJSON(country int, password string, keys []string, disabl
 		}
 		keyJSON = append(keyJSON, string(b))
 	}
-	return fmt.Sprintf(`{"regulatory_country_code":%d,"ap_ssh_password":%q,"ap_ssh_public_keys":[%s],"ap_ssh_disable_password":%t}`,
-		country, password, strings.Join(keyJSON, ","), disable)
+	return fmt.Sprintf(`{"regulatory_country_code":%d,"ap_ssh_password":%q,"ap_ssh_public_keys":[%s]}`,
+		country, password, strings.Join(keyJSON, ","))
 }
 
 // putSiteSettings saves the document through the real admin handler.
-func putSiteSettings(t *testing.T, adminH http.Handler, country int, password string, keys []string, disable bool) {
+func putSiteSettings(t *testing.T, adminH http.Handler, country int, password string, keys []string) {
 	t.Helper()
 	rec := postAdminBody(t, adminH, http.MethodPut, "/api/v1/site-settings",
-		siteSettingsPutBodyJSON(country, password, keys, disable))
+		siteSettingsPutBodyJSON(country, password, keys))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("site settings PUT: %d %s", rec.Code, rec.Body.String())
 	}
@@ -467,7 +466,7 @@ func gateInformBody(appliedCfg string) map[string]any {
 
 // TestSiteSettingsSaveGatedByLiveGate501E2E: on an adopted U7PG2 /
 // 6.8.2.15592 device with an EMPTY WLAN envelope, a site-settings save
-// carrying keys + disable is minted by the save sweep, but the device's
+// carrying keys is minted by the save sweep, but the device's
 // next inform answers the TYPED 501 (the live-provisioning gate reads the
 // saved facts at gate time — no opt-in). The record is untouched by the
 // rejected emission: the store cycle aborted (the save's mint stands, the
@@ -479,8 +478,8 @@ func TestSiteSettingsSaveGatedByLiveGate501E2E(t *testing.T) {
 	registerAdopted(t, st, cfg, xk)
 	kx := hexKey(t, xk)
 
-	// 1. Admin saves 2 keys + password-disable through the real handler.
-	putSiteSettings(t, adminH, 840, "", []string{ssKeyLine1, ssKeyLine2}, true)
+	// 1. Admin saves 2 keys through the real handler.
+	putSiteSettings(t, adminH, 840, "", []string{ssKeyLine1, ssKeyLine2})
 
 	// 2. The save's mint sweep re-stamped the provisioned device.
 	d, err := st.Get(testMAC)
@@ -518,8 +517,8 @@ func TestSiteSettingsSaveGatedByLiveGate501E2E(t *testing.T) {
 // opt-in, the SAME save → mint → inform arc answers full provisioning whose
 // system_cfg carries the saved sshd facts — exactly 3 numbered
 // sshd.auth.key families (1..3: status/value/type, comment only when
-// non-empty, NO .0 or .4 rows), sshd.auth.passwd=disabled, the 840 country
-// coercion, and the full mgmt_cfg/blocked_sta shape.
+// non-empty, NO .0 or .4 rows), the always-enabled sshd.auth.passwd row,
+// and the full mgmt_cfg/blocked_sta shape.
 func TestSiteSettingsSaveDeliversSSHDRowsFullProvisioningE2E(t *testing.T) {
 	adminH, informH, st := siteSettingsFixture(t, app.SiteSettings{}, nil, true)
 	const cfg = "aaaabbbbccccdddd"
@@ -527,7 +526,7 @@ func TestSiteSettingsSaveDeliversSSHDRowsFullProvisioningE2E(t *testing.T) {
 	registerAdopted(t, st, cfg, xk)
 	kx := hexKey(t, xk)
 
-	putSiteSettings(t, adminH, 840, "", []string{ssKeyLine1, ssKeyLine2, ssKeyLine3}, true)
+	putSiteSettings(t, adminH, 840, "", []string{ssKeyLine1, ssKeyLine2, ssKeyLine3})
 	d, err := st.Get(testMAC)
 	if err != nil {
 		t.Fatal(err)
@@ -563,10 +562,7 @@ func TestSiteSettingsSaveDeliversSSHDRowsFullProvisioningE2E(t *testing.T) {
 		"sshd.auth.key.3.value=AAAAC3NzaC1lZDI1NTE5AAAAIHRoaXJka2V5QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJC\n",
 		"sshd.auth.key.3.type=ssh-ed25519\n",
 		"sshd.auth.key.3.comment=third@ap\n",
-		// The disable knob (radio country rows need a radio_table this bare
-		// record has none of — the country coercion is pinned at the wired
-		// seam in server_test.go).
-		"sshd.auth.passwd=disabled\n",
+		"sshd.auth.passwd=enabled\n",
 	} {
 		if !strings.Contains(sys, want) {
 			t.Fatalf("full provisioning system_cfg missing %q:\n%s", want, sys)
@@ -594,7 +590,7 @@ func TestSiteSettingsSaveUngatedForeignModelDeliversE2E(t *testing.T) {
 	registerAdopted(t, st, cfg, xk)
 	kx := hexKey(t, xk)
 
-	putSiteSettings(t, adminH, 276, "", []string{ssKeyLine1}, true)
+	putSiteSettings(t, adminH, 276, "", []string{ssKeyLine1})
 	body := infoBody("")
 	body["model"] = "UAP-AC-Pro" // NOT the gated model
 	resp := post(t, informH, encryptCBC(t, mustJSON(t, body), kx, testIV))
@@ -610,7 +606,7 @@ func TestSiteSettingsSaveUngatedForeignModelDeliversE2E(t *testing.T) {
 		"sshd.auth.key.1.status=enabled\n",
 		"sshd.auth.key.1.value=AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB\n",
 		"sshd.auth.key.1.type=ssh-ed25519\n",
-		"sshd.auth.passwd=disabled\n",
+		"sshd.auth.passwd=enabled\n",
 	} {
 		if !strings.Contains(sys, want) {
 			t.Fatalf("ungated full provisioning missing %q:\n%s", want, sys)
@@ -689,7 +685,7 @@ func TestSiteSettingsSaveEscapesExhaustedWLANDeliveryE2E(t *testing.T) {
 
 	// 2. The settings save: an effective change → the mint sweep stamps a
 	// fresh cfgversion on the provisioned device (M2 ≠ the offered one).
-	putSiteSettings(t, adminH, 840, "", []string{ssKeyLine1}, true)
+	putSiteSettings(t, adminH, 840, "", []string{ssKeyLine1})
 	d, err := st.Get(testMAC)
 	if err != nil {
 		t.Fatal(err)
@@ -717,7 +713,7 @@ func TestSiteSettingsSaveEscapesExhaustedWLANDeliveryE2E(t *testing.T) {
 	for _, want := range []string{
 		"aaa.1.ssid=pendingnet\n",          // the pending envelope rode the same push
 		"sshd.auth.key.1.status=enabled\n", // the new sshd facts rode the same push
-		"sshd.auth.passwd=disabled\n",
+		"sshd.auth.passwd=enabled\n",
 	} {
 		if !strings.Contains(sys, want) {
 			t.Fatalf("escape offer missing %q:\n%s", want, sys)
@@ -767,9 +763,9 @@ func TestSiteSettingsPutConcurrentWithInformsNoDeadlock(t *testing.T) {
 	// in the common interleaving, so the PUT keeps minting through the
 	// store instead of resting on the no-change early return.
 	docs := []string{
-		siteSettingsPutBodyJSON(840, "", []string{ssKeyLine1}, true),
-		siteSettingsPutBodyJSON(276, "", []string{ssKeyLine1}, true),
-		siteSettingsPutBodyJSON(0, "", []string{ssKeyLine2}, true),
+		siteSettingsPutBodyJSON(840, "", []string{ssKeyLine1}),
+		siteSettingsPutBodyJSON(276, "", []string{ssKeyLine1}),
+		siteSettingsPutBodyJSON(0, "", []string{ssKeyLine2}),
 	}
 
 	var (

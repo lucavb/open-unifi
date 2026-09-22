@@ -62,12 +62,12 @@ type Config struct {
 	// e.g. "http://10.0.0.5:8080".
 	ControllerURL string
 
-	// SiteSettings supplies the CURRENT site-settings record — the four
+	// SiteSettings supplies the CURRENT site-settings record — the
 	// managed AP-intent facts — at use time (the WirelessSource precedent:
 	// a live source closure, read per decision). The adoption engine's
 	// live-provisioning gate and renderSystemCfg both call it per inform,
 	// so a site-settings save is visible on the device's NEXT inform with
-	// no wiring refresh. nil ⇒ zero facts (the four rendering defaults).
+	// no wiring refresh. nil ⇒ zero facts (the rendering defaults).
 	// The returned error is REAL (a present-but-unreadable/corrupt/invalid
 	// site-settings file retained by the app): renderSystemCfg propagates
 	// it as a render failure — no record mutation, no emission; the gate
@@ -108,14 +108,14 @@ type Config struct {
 	OnSessionEvents func(deviceMAC string, connects, disconnects int)
 }
 
-// SiteSettings carries the four MANAGED AP-intent site facts the server
+// SiteSettings carries the MANAGED AP-intent site facts the server
 // renders into system_cfg and the adoption engine's live-provisioning gate
 // reads: the regulatory country code (0 = unset → the server-side 840
 // default at renderSystemCfg), the AP SSH password ("" = site default
-// "ubnt", renderer semantics), the PARSED authorized public keys, and the
-// SSH password-login disable knob. It mirrors the app site-settings record
-// (whose SSHPublicKeys are raw lines); the raw→parsed conversion belongs to
-// the adapter closure, not the record. The four facts are managed content
+// "ubnt", renderer semantics), and the PARSED authorized public keys. It
+// mirrors the app site-settings record (whose SSHPublicKeys are raw lines);
+// the raw→parsed conversion belongs to
+// the adapter closure, not the record. The facts are managed content
 // (admin intent via the site-settings API); ControllerURL is NOT among them
 // — it stays a deployment input wired from Config.ControllerURL.
 type SiteSettings struct {
@@ -134,9 +134,6 @@ type SiteSettings struct {
 	// from these rows on every boot/apply). Parsed from the record's raw
 	// lines by the settings-source closure (fail-closed single parser).
 	SSHPublicKeys []systemcfg.PublicKey
-	// SSHDisablePassword renders sshd.auth.passwd=disabled (the dropbear
-	// "-s" respawn flag — remote password logins off). Default false.
-	SSHDisablePassword bool
 }
 
 const DefaultRegulatoryCountryCode = 840
@@ -221,12 +218,12 @@ func New(cfg Config, st store.DeviceStore, lg *slog.Logger) *Server {
 		// cycle aborts, so the in-memory record writes are discarded with
 		// it): net fail-closed (the CLI refuses startup on that error
 		// anyway, so it is embedder-only).
-		SSHSiteFacts: func() (int, bool) {
+		SSHSiteFacts: func() (keyRows int) {
 			facts, ferr := s.currentSiteSettings()
 			if ferr != nil {
-				return 0, false
+				return 0
 			}
-			return len(facts.SSHPublicKeys), facts.SSHDisablePassword
+			return len(facts.SSHPublicKeys)
 		},
 	})
 	return s
@@ -886,7 +883,7 @@ func (s *Server) absorbInform(rec *store.Device, body map[string]any, now time.T
 
 // renderSystemCfg is the adapter's wiring of the pure systemcfg renderer
 // (the D5 producer shape): it assembles SiteFacts from the CURRENT
-// site-settings record (the four managed facts — read per decision, the
+// site-settings record (the managed facts — read per decision, the
 // WirelessSource precedent) plus the deployment inputs, validates the
 // deployment config exactly like the former render path did, and performs
 // the render's observability here —
@@ -902,8 +899,8 @@ func (s *Server) absorbInform(rec *store.Device, body map[string]any, now time.T
 //
 // Deployment input vs managed content: ControllerURL keeps flowing from
 // s.cfg.ControllerURL (the vehicle's own address — NEVER record-sourced);
-// the four managed facts (country, SSH password, SSH public keys, sshd
-// disable knob) come from the SiteSettings source. A settings load error
+// the managed facts (country, SSH password, SSH public keys) come from the
+// SiteSettings source. A settings load error
 // fails the render — the engine outcome error path propagates it and the
 // store cycle aborts with NO record mutation (assignedKeyFlow runs the gate
 // first and the render before any record write, so the abort happens before
@@ -926,12 +923,11 @@ func (s *Server) renderSystemCfg(d store.Device, wls []wireless.Wlan, plan wirel
 		country = DefaultRegulatoryCountryCode
 	}
 	res, err := systemcfg.RenderWithPlan(d, systemcfg.SiteFacts{
-		ControllerURL:      s.cfg.ControllerURL,
-		CountryCode:        country,
-		SSHPassword:        facts.SSHPassword,
-		SSHPublicKeys:      facts.SSHPublicKeys,
-		SSHDisablePassword: facts.SSHDisablePassword,
-		WLANs:              wls,
+		ControllerURL: s.cfg.ControllerURL,
+		CountryCode:   country,
+		SSHPassword:   facts.SSHPassword,
+		SSHPublicKeys: facts.SSHPublicKeys,
+		WLANs:         wls,
 	}, plan)
 	if err != nil {
 		return "", nil, err
