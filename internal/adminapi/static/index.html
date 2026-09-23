@@ -71,6 +71,9 @@
   td.radius-cell input, td.radius-cell select { display: block; margin: 2px 0; }
   td.led-cell { min-width: 130px; }
   td.led-cell input, td.led-cell button { display: block; margin: 2px 0; width: 110px; }
+  td.ssh-cell { min-width: 170px; }
+  td.ssh-cell input, td.ssh-cell button { display: block; margin: 2px 0; width: 145px; }
+  td.ssh-cell .sub { display: block; margin: 2px 0; }
   .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
   .badge {
     display: inline-block; padding: 2px 9px; border-radius: 999px;
@@ -119,9 +122,9 @@
 
   <section class="card" id="devSection">
     <h2>Devices</h2>
-    <p class="hint">Polled every 5&nbsp;s. State: pending &rarr; adopting &rarr; adopted (green &ldquo;live&rdquo; badge) &rarr; lost. &ldquo;Clients&rdquo; expands a device's client sessions (connected state and last seen, from full informs). LED bar (adopted only): brightness 0&ndash;100 (empty&nbsp;=&nbsp;keep), color verbatim, e.g. #ff8c00 (empty&nbsp;=&nbsp;default blue).</p>
+    <p class="hint">Polled every 5&nbsp;s. State: pending &rarr; adopting &rarr; adopted (green &ldquo;live&rdquo; badge) &rarr; lost. &ldquo;Clients&rdquo; expands a device's client sessions (connected state and last seen, from full informs). LED bar (adopted only): brightness 0&ndash;100 (empty&nbsp;=&nbsp;keep), color verbatim, e.g. #ff8c00 (empty&nbsp;=&nbsp;default blue). SSH password (adopted only): type a new password and Save (empty&nbsp;=&nbsp;keep), or confirm Stop managing to stop pushing it.</p>
     <table aria-label="Devices">
-      <thead><tr><th>MAC</th><th>Name</th><th>Model</th><th>IP</th><th>State</th><th>Power</th><th>LED bar</th><th></th></tr></thead>
+      <thead><tr><th>MAC</th><th>Name</th><th>Model</th><th>IP</th><th>State</th><th>Power</th><th>LED bar</th><th>SSH password</th><th></th></tr></thead>
       <tbody id="devRows"></tbody>
     </table>
     <span class="pill" id="devError" hidden></span>
@@ -188,6 +191,11 @@
   // every 5 s poll and re-expands the open rows (updateOpenClients).
   var openClients = {};
   var lastDevices = [];
+  // A device refresh must not discard an in-progress password entry. This is
+  // only a render gate: the password itself is never copied into controller
+  // state. Explicit password actions set this once so their normal refresh
+  // can replace the row after the request completes.
+  var forceDeviceRender = false;
 
   var tokenInput = document.getElementById("token");
   var tokenBox = document.getElementById("tokenbox");
@@ -263,8 +271,17 @@
   function renderDevices(devices) {
     lastDevices = devices;
     var tbody = document.getElementById("devRows");
+    if (!forceDeviceRender) {
+      var active = document.activeElement;
+      var editing = Array.prototype.some.call(tbody.querySelectorAll("tr[data-devrow]"), function (tr) {
+        var input = tr.querySelector("[name=ssh_password]");
+        return input && (input.value !== "" || input === active);
+      });
+      if (editing) { return; }
+    }
+    forceDeviceRender = false;
     if (!devices.length) {
-      tbody.innerHTML = '<tr><td colspan="8" class="empty">no devices registered</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="9" class="empty">no devices registered</td></tr>';
       return;
     }
     var rows = [];
@@ -287,16 +304,31 @@
       } else {
         led = '<td class="sub">&ndash;</td>';
       }
+      // SSH password is intentionally not round-tripped into the DOM. The
+      // blank password input means "leave unchanged"; clearing management is
+      // a separate, confirmed action below.
+      var ssh;
+      if (d.state === 3) {
+        var sshSet = Object.prototype.hasOwnProperty.call(d, "ssh_password") && d.ssh_password !== "";
+        ssh = '<td class="ssh-cell">' +
+          '<span class="sub">' + (sshSet ? "password set" : "no password managed") + "</span>" +
+          '<input name="ssh_password" type="password" placeholder="new password" autocomplete="new-password">' +
+          '<button type="button" class="btn-ghost btn-small" data-ssh="' + esc(d.mac) + '">Save</button>' +
+          '<button type="button" class="btn-ghost btn-small" data-ssh-clear="' + esc(d.mac) + '">Stop managing</button></td>';
+      } else {
+        ssh = '<td class="sub">&ndash;</td>';
+      }
       rows.push(
         '<tr data-devrow="' + esc(d.mac) + '">' +
         '<td class="mono">' + esc(d.mac) + "</td>" +
         "<td>" + esc(d.name || "") + "</td>" +
         "<td>" + esc(d.model || "") + "</td>" +
         '<td class="mono">' + esc(d.ip || "") + "</td>" +
-        "<td>" + badgeFor(d.state) + "</td>" +
-        "<td>" + power + "</td>" +
-        led +
-        '<td class="actions-cell">' +
+         "<td>" + badgeFor(d.state) + "</td>" +
+         "<td>" + power + "</td>" +
+         led +
+         ssh +
+         '<td class="actions-cell">' +
         '<button type="button" class="btn-ghost btn-small" data-clients="' + esc(d.mac) + '">' +
         (openClients[d.mac] ? "Hide clients" : "Clients") + "</button>&nbsp; " +
         '<button type="button" class="btn-ghost btn-small" data-del="' + esc(d.mac) + '">Forget</button></td></tr>'
@@ -346,6 +378,37 @@
           .catch(function (e) { setError("devError", "LED bar save failed: " + e.message); });
       });
     });
+    tbody.querySelectorAll("button[data-ssh]").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        setError("devError", "");
+        var tr = btn.closest("tr");
+        var password = tr.querySelector("[name=ssh_password]").value;
+        var body = {};
+        // An empty input is deliberately omitted: it means "leave unchanged",
+        // never "stop managing".
+        if (password !== "") { body.ssh_password = password; }
+        api("/api/v1/devices/" + encodeURIComponent(btn.getAttribute("data-ssh")), {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body)
+        })
+          .then(function () { forceDeviceRender = true; return refreshAll(); })
+          .catch(function (e) { setError("devError", "SSH password save failed: " + e.message); });
+      });
+    });
+    tbody.querySelectorAll("button[data-ssh-clear]").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        if (!window.confirm("Stop managing this device's SSH password? The device will keep its current password.")) { return; }
+        setError("devError", "");
+        api("/api/v1/devices/" + encodeURIComponent(btn.getAttribute("data-ssh-clear")), {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ssh_password: "" })
+        })
+          .then(function () { forceDeviceRender = true; return refreshAll(); })
+          .catch(function (e) { setError("devError", "stop managing SSH password failed: " + e.message); });
+      });
+    });
     updateOpenClients();
   }
 
@@ -360,7 +423,7 @@
   // vocabulary (live = connected, state-unknown = disconnected).
   function clientsSubRow(clients) {
     if (!clients.length) {
-      return '<tr class="clients-row"><td colspan="8"><div class="empty">no client sessions recorded</div></td></tr>';
+      return '<tr class="clients-row"><td colspan="9"><div class="empty">no client sessions recorded</div></td></tr>';
     }
     var rows = ['<table class="clients-table"><thead><tr><th>Client</th><th>State</th><th>Last seen</th></tr></thead><tbody>'];
     clients.forEach(function (c) {
@@ -374,7 +437,7 @@
       );
     });
     rows.push("</tbody></table>");
-    return '<tr class="clients-row"><td colspan="8">' + rows.join("") + "</td></tr>";
+    return '<tr class="clients-row"><td colspan="9">' + rows.join("") + "</td></tr>";
   }
 
   // updateOpenClients refreshes the expansion rows: every open device
