@@ -1,0 +1,27 @@
+# Docs and git metadata are not needed to build the image.
+.git
+*.md
+.env
+docs/
+
+# Source directories that are not compiled into the controller binary.
+acceptance/
+
+# Local artifacts, firmware, and bench material (mirrors .gitignore).
+data/
+dist/
+tmp/
+tmpwork/
+f730-*
+ghidra.rep/
+ghidra.lock
+ghidra.lock~
+ghidra.gpr
+*.deb
+*.bin
+*.jar
+*.class
+openunifi
+openunifi.linux
+id_ed25519.pub
+.DS_Store

@@ -90,6 +90,34 @@ Supplying any of the three when the record already exists logs a
 startup warning and the record wins (the deployment-input flags like
 `--controller-url` are unaffected).
 
+## Container
+
+```
+docker build -t open-unifi:local .
+```
+
+Images are published to GHCR on every push to `main` (tagged by commit SHA):
+
+```
+docker run -d \
+  -e OPEN_UNIFI_ADMIN_TOKEN=<secret> \
+  -e OPEN_UNIFI_AP_SSH_PASSWORD=<secret> \
+  -v openunifi-data:/data \
+  -p 8080:8080 -p 10001:10001/udp \
+  ghcr.io/lucavb/open-unifi:sha-<commit> \
+  --controller-url http://<this-host>:8080
+```
+
+The JSON store lives in `/data` — baked into the entrypoint, so mount a
+volume there. Flags after the image name are passed to `openunifi` and may
+repeat any flag (last one wins). The admin API/console/metrics bind
+`127.0.0.1:8443` *inside* the container: reach them via `--network host`
+(drop the `-p` flags), or publish with
+`--listen-admin 0.0.0.0:8443 --allow-insecure-admin` — a lab-only
+plaintext bind; restrict access to it. Bind mounts need
+`chown 65532:65532` on the host (the image runs as distroless nonroot);
+named volumes work as-is.
+
 ## Onboarding a factory AP
 
 1. Start the controller on a host the AP can reach.
