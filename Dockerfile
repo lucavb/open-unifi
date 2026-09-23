@@ -25,8 +25,9 @@ USER nonroot:nonroot
 EXPOSE 8080 8443 10001/udp
 # Everything else is flag/env passthrough: OPEN_UNIFI_ADMIN_TOKEN is
 # required (the startup admin check fails on an empty token unless
-# --allow-anonymous-admin is passed), OPEN_UNIFI_AP_SSH_PASSWORD seeds
-# SSH on first boot, and --controller-url must point back at this
-# container's published :8080. Args after the image name are appended
+# --allow-anonymous-admin is passed), OPEN_UNIFI_DEVICE_SSH_KEY seeds the
+# provisioned SSH public keys on first boot, and --controller-url must
+# point back at this container's published :8080. Args after the image
+# name are appended
 # and may repeat any flag (last one wins).
 ENTRYPOINT ["/openunifi", "--data-dir", "/data"]

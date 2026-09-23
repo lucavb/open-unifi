@@ -1015,9 +1015,23 @@ fallback (no fw_caps bit, non-AP fw): "$1$" 8 char alpha salt… or 13-char DES 
 First fix-7 assumption ("plain hex SHA-512") is **wrong in format but identical in
 spirit**: both are SHA-512-based, but the wire format is glibc `$6$salt$hash`. 
 
+> **open-unifi divergence (recorded 2026-09-23) — users.1.password source.**
+> jar: the password is SITE-WIDE — `mgmt.x_ssh_password` (default `ubnt`),
+> cached in the same site setting (`x_ssh_sha512passwd`). open-unifi: the
+> password is a PER-DEVICE record field (`store.Device.SSHPassword`, admin
+> intent via PATCH `/api/v1/devices/{mac}`); the wire row mechanics are the
+> jar's own. An EMPTY record password = stop managing: the render reuses the
+> last controller-pushed well-formed cache row VERBATIM (a byte-stability
+> device, exactly like the jar's `x_ssh_sha512passwd` cache self-check) — a
+> device whose actual password diverged (factory reset, out-of-band change)
+> re-acquires the last controller-pushed password at its next full
+> provisioning; no cache ⇒ factory-default `ubnt` row (fresh salt, converges
+> byte-stably after the delta applies). The jar-cited claims above are
+> untouched.
+
 ## 11. Firmware-side acceptance gate — mcad (live-confirmed 2026-09-16)
 
-The AP does not blindly apply the `system_cfg` it receives: the inform-reporting
+The device does not blindly apply the `system_cfg` it receives: the inform-reporting
 daemon `mcad` (`/usr/bin/mcad`, U7PG2 fw 6.8.2.15592) runs a VALIDATION GATE
 before promoting the file (reverse-engineered in Ghidra; full record:
 docs/AP-FIRMWARE-APPLY-PATH.md).
@@ -1110,7 +1124,7 @@ own type name and parsing as clean length-prefixed fields — a structure
 check, NOT cryptographic validation) fed
 from the persisted site-settings record — a new site fact, never
 device-informable (site-facts definition, CONTEXT.md). The
-`--ap-ssh-key` flag / `$OPEN_UNIFI_AP_SSH_KEY` env fallback is the
+`--device-ssh-key` flag / `$OPEN_UNIFI_DEVICE_SSH_KEY` env fallback is the
 first-boot seed only; the record is the source afterwards (§13.3).
 
 ### 13.2 `sshd.auth.passwd=disabled` — the password-disable knob is REMOVED (fw defect)
@@ -1219,7 +1233,7 @@ resource) applies the persisted record and — on effective change — mints
 each device's next inform then full-provisions carrying the new sshd
 rows (pinned E2E — save → mint → inform → `setparam` — in
 internal/server/lifecycle_test.go). The record is the source of the three
-AP-intent facts; the cmd flags are first-boot seeds only, ignored
+device-intent facts; the cmd flags are first-boot seeds only, ignored
 whenever the record file exists. A no-change save mints nothing — a
 settled device with an unchanged cfgversion noop. And the sshd rows are
 NOT inform-observable (the vap_table/echo reports carry no sshd keys), so

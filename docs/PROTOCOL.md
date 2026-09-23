@@ -142,18 +142,18 @@ Response (controller → device) is one of:
 | `cmd` | one-shot tasks | `cmd` = adopt|reboot|restart|setdefault|upgrade|set-inform etc., plus cmd-specific fields |
 | `heartbeat` | – | `interval` |
 
-Adoption handshake (factory AP pointing at controller, verified paths):
+Adoption handshake (factory device pointing at controller, verified paths):
 
-1. AP POSTs first inform (default key, state 1). Controller has no device record →
-   HTTP 404 is FINE for the AP (it keeps retrying).
+1. The device POSTs first inform (default key, state 1). Controller has no device record →
+   HTTP 404 is FINE for the device (it keeps retrying).
 2. Admin registers the MAC (UI/API/terraform) → device record with
    `state=1 (PENDING)`, `default` key accepted.
-3. AP inform (state 1, default key) → controller responds `setparam` with:
+3. Device inform (state 1, default key) → controller responds `setparam` with:
    - `mgmt_cfg` ONLY (adoption push — PROTOCOL-mgmt.md §6.2 rows c/f): the 10-line
      blob of §2 (PROTOCOL-mgmt.md §2) with a fresh 16-hex `cfgversion=` line and
      `authkey=<new x_authkey>`
    - (response encrypted with default key)
-4. AP applies mgmt config, now uses `x_authkey` (32 hex), re-informs. If a second
+4. The device applies mgmt config, now uses `x_authkey` (32 hex), re-informs. If a second
    inform arrives still encrypted with the default key, rotate `x_authkey` +
    cfgversion again and re-push (the "send non-default authkey" path,
    PROTOCOL-mgmt.md §6.2 row f).
@@ -240,7 +240,7 @@ WLAN is rejected with a typed status and no `system_cfg`.
 - `mgmt_cfg`: 10-line text blob (exact line order + the conditional `authkey=` rule):
   **PROTOCOL-mgmt.md §2** (bytecode-cited from the B-writer decompile). Historical
   `unifi.*`-prefixed spellings are superseded.
-- `system_cfg`: full AP system config text — sections `# unifi`, `# system`, `# users`,
+- `system_cfg`: full device system config text — sections `# unifi`, `# system`, `# users`,
   the wireless compound (`# wlans (radio)`, `radio.<n>.*`, `aaa.<n>.*`,
   `wireless.<n>.*`, `# vlan`, `# bridge`, `# netconf`, `# dhcpc`), `# sshd`, `# misc`:
   **PROTOCOL-mgmt.md §3** for the frame and **PROTOCOL-systemcfg-wireless.md** for the
@@ -276,15 +276,22 @@ record is absent); `Get` returns a deep copy. `Device` fields as implemented: MA
 (controller-side lifecycle: 1=pending, 2=adopting, 3=adopted, 4=lost), IP, InformURL,
 LastSeen, FirstSeen, CfgVersion, AppliedCfg, Authkeys (assigned-key history, newest
 last, capped at 2 — the factory default key is NEVER stored here), XAuthkey, AESGCM,
-LastUps, Extra (inform-body passthrough; controller-owned `wlan_cfg_sha`/
-`ssh_sha512passwd` and admin-owned keys — `wlan_cfg_*`, `radio_intent` — are
-preserved/protected across informs).
+LastUps, Extra (inform-body passthrough; controller-owned `wlan_cfg_*` rows
+and admin-owned keys — `wlan_cfg_*` overrides, `radio_intent`, the typed
+`ssh_password` field's twin, and the `ssh_sha512passwd`/`ssh_md5passwd`
+password caches — are preserved/protected across informs).
 
 Trust-policy asymmetries (mirror the classic controller's observed behavior;
 recorded so they read as fidelity, not oversight):
-- `ssh_md5passwd` is not controller-owned: unlike its sha512 sibling, the
-  device may overwrite the md5 password cache through an inform. Only
-  `ssh_sha512passwd` rides the protection list.
+- `ssh_sha512passwd`/`ssh_md5passwd` are admin-owned (2026-09-23,
+  prev-or-delete): they hold the LAST password hash the controller pushed
+  for THAT DEVICE (the per-device unset render reuses that row verbatim —
+  a byte-stability device), so the same shape as `blocked_sta_sha` applies
+  to both: a device body can clobber-neither, wipe-neither, nor
+  introduce either; the only writer is the controller's own credential
+  delta. Historically only the sha512 cache was protected and the md5
+  twin was open (an adapter-era behavior that died with the unset
+  branch: under verbatim reuse, a device-introduced cache WOULD ship).
 - `Extra["watching"]` is device-writable: nothing protects it, and the noop
   scheduler honors a truthy value with the 5-second watching cadence, so a
   device can select its own fast cadence.
@@ -327,7 +334,7 @@ Web UI (lane D): static page at `/`:
   VLAN id; save → PUT /api/v1/wireless (whole-document envelope, adminapi shape).
 
 Package `provider` (lane E, at provider/ dir + cmd/tfprovider):
-resources `open-unifi_access_point` (adopt, by MAC + controller URL/token),
+resources `open-unifi_device` (adopt, by MAC + controller URL/token),
 `open-unifi_wlan` (ssid, security, passphrase, vlan), data source `open-unifi_devices`.
 Provider `Configure` accepts `url`, `token` (honest: token required unless server
 started without --admin-token).

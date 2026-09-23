@@ -127,7 +127,7 @@ Verified live values from behavior:
 
 "Command not yet supported." trace covers everything else.
 
-### 2.3 Device → controller beacon (what the AP broadcasts)
+### 2.3 Device → controller beacon (what the device broadcasts)
 
 Emulator class `com.ubnt.net.o0OO` (md5 `06e4f7354dea`, decompiled verbatim)
 shows exactly what a UAP gen2 advertises; `oooO(6,2)` = V2 cmd 6 sent to
@@ -335,7 +335,7 @@ on three independent grounds**:
    is a pure outbound responder to discovery-tool requests.
 
 ⇒ The reply emitter (PROTOCOL.md:199 TODO) is protocol-completeness only — it can
-never cause an inform from this AP. The ONLY lane that delivers an inform URL on
+never cause an inform from this device. The ONLY lane that delivers an inform URL on
 this firmware is the SSH set-inform channel (docs/PROTOCOL-mgmt.md §7), exactly as
 §3 concluded. Adoption UX (the console "accept" action) must therefore drive a
 controller-side SSH set-inform push. Consistency note: the 2026-09-20 round-2

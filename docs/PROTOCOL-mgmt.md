@@ -180,7 +180,7 @@ head order verified at javap int.txt:17208-17221 — the unifi writer
 5. WLANs: `cfr_renamed_1(sb, device, …)` — `wireless.<n>.…`/`aaa.<n>…`/`rmon` lines (config_int §530-etc, `aaa.<n>` has `driver=madwifi`, wpa group_rekey, p2p, proxy_arp, …)
 6. vWire/`cfr_renamed_1(... setting ...)` guest controls; `# vlan`, `# bridge`, `# bonding` (`cfr_renamed_0`)
 7. `cfr_renamed_1(builder, device, _Oo2 = Stringnew._Oo qos plan)` → `# bandsteering`, `# airtime`, `# mesh`, `# stamgr`, `# qos`, `# mac`/`# connectivity` overrides
-8. `# linkcheck echo server` (UDM-family only), `# syslog` + `syslog.remote` + `netconsole` (config_String §207-247), `baresip`, `snmp` (`\u00f800000` → SNMP community `cfr_renamed_1(builder, device, "", "community", 256)`), `# no`-section (`\u00d600000`, no-op for AP), `sshd` (`\u00d400000` — `sshd.status`, `sshd.auth.key.<n>.*` from `mgmt.x_ssh_keys`, `sshd.1.status/ifname`)
+8. `# linkcheck echo server` (UDM-family only), `# syslog` + `syslog.remote` + `netconsole` (config_String §207-247), `baresip`, `snmp` (`\u00f800000` → SNMP community `cfr_renamed_1(builder, device, "", "community", 256)`), `# no`-section (`\u00d600000`, no-op for the device), `sshd` (`\u00d400000` — `sshd.status`, `sshd.auth.key.<n>.*` from `mgmt.x_ssh_keys`, `sshd.1.status/ifname`)
 9. `# resolv` + `# route` + `# iptables`(mark-based) + `# cron` + `# ntpclient`
 10. Appendix: `# misc` then site override lines:
     ```java
@@ -518,7 +518,7 @@ else                      this.oo\u00d4000.o00000(mac, type, ip, port, user, pas
 - `unifi.cfgcap_info` bitmask meaning (int §2106-2120 helper) — corresponds to
   device *capability* check list, needed only if we choose to fake the mgmt_cfg
   capability list per-model.
-- Device-side interpretation (`syswrapper.sh set-adopt` / what exact file the AP
+- Device-side interpretation (`syswrapper.sh set-adopt` / what exact file the device
   writes (`/etc/init.d/… unifi config`)) is firmware behavior, not present in
   ace.jar.
 - `users.1.password` transform: the hashing helper class (referenced from

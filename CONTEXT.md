@@ -1,6 +1,7 @@
 # open-unifi
 
-A self-contained UniFi control plane for the UAP-AC-Pro-Gen2 (`U7PG2`): an
+A self-contained UniFi control plane for UniFi devices — currently the
+UAP-AC-Pro-Gen2 (`U7PG2`), built to grow to further device classes: an
 inform/adoption protocol server, admin REST API + web console, Prometheus
 metrics, and a Terraform provider. Wire behavior is reverse-engineered
 byte-for-byte from the official controller's bytecode.
@@ -72,8 +73,8 @@ _Avoid_: retransmit (nothing is resent at the transport level).
 ### Trust policy
 
 **Controller-owned keys**: record fields the controller preserves verbatim
-against device overwrite (the wlan_cfg_* bookkeeping, the ssh_sha512
-password cache).
+against device overwrite (the wlan_cfg_* bookkeeping, the client-session
+family).
 _Avoid_: protected fields.
 
 **Device-refreshable caps**: record fields only the device can supply
@@ -82,8 +83,11 @@ preserved across sparse heartbeats, refreshable by a full inform.
 _Avoid_: device attributes.
 
 **Admin-owned rows**: record fields only an admin can set or change
-(system_cfg_extra_lines, mgmt_dev, anonymous ids). A device can neither
-write nor introduce them.
+(system_cfg_extra_lines, mgmt_dev, anonymous ids, the per-device ssh
+password and its ssh_sha512/md5 caches — the caches hold the LAST password
+hash the controller pushed for that device, so an unset render reuses the
+row verbatim, byte-stable). A device can neither write nor introduce any of
+them.
 
 **Record absorption**: the single merge that folds a decoded inform body
 into a device record under the trust policy — the only way device data
@@ -118,9 +122,10 @@ the WLANs, and site facts. It reads nothing else and mutates nothing.
 _Avoid_: builder, emitter.
 
 **Site facts**: the controller-level inputs a render needs: controller URL,
-regulatory country code, AP SSH password, the provisioned SSH public keys,
-and the current WLANs. The three
-AP-intent facts are record-sourced — persisted in the admin-owned
+regulatory country code, the provisioned SSH public keys, and the current
+WLANs. (The site-level SSH password is REMOVED — the per-device SSH
+password rides the device record itself, not a site fact.) The two
+device-intent facts are record-sourced — persisted in the admin-owned
 site-settings record (keys as an ordered list of authorized_keys lines);
 controller URL and the WLANs stay outside it.
 _Avoid_: flag-sourced site facts (the flags are first-boot seeds only),

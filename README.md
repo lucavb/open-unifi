@@ -1,18 +1,19 @@
 # open-unifi
 
-A minimal, self-contained UniFi control plane for the UAP-AC-Pro-Gen2 (`U7PG2`):
-inform/adoption protocol server, admin REST API + web console, Prometheus
-metrics, and a Terraform provider. Wire behavior was reverse-engineered
-byte-for-byte from the official controller's bytecode — see `docs/`.
+A minimal, self-contained UniFi control plane for UniFi devices — currently
+targeting the UAP-AC-Pro-Gen2 (`U7PG2`): inform/adoption protocol server,
+admin REST API + web console, Prometheus metrics, and a Terraform provider.
+Wire behavior was reverse-engineered byte-for-byte from the official
+controller's bytecode — see `docs/`.
 
-Not a firmware replacement: the AP keeps its stock firmware and is managed
+Not a firmware replacement: the device keeps its stock firmware and is managed
 over the standard inform channel.
 
 ## Layout
 
 - `cmd/openunifi/` — controller binary (inform server, UDP discovery, admin API, metrics).
 - `cmd/tfprovider/` — Terraform provider binary (terraform-plugin-framework, protocol 6).
-- `provider/` — provider implementation (client, `access_point`/`wlan` resources, `devices` data source).
+- `provider/` — provider implementation (client, `device`/`wlan` resources, `devices` data source).
 - `internal/inform/` — inform packet codec: 40-byte header, AES-128-CBC, AES-GCM (header-bound AAD), zlib.
 - `internal/server/` — inform handler, adoption state machine, `mgmt_cfg`/`system_cfg` builders, UDP :10001 discovery listener.
 - `internal/store/` — device persistence (JSON-file backed, atomic writes).
@@ -51,10 +52,8 @@ announce listener), `--data-dir` (devices.json, wireless.json, site-settings.jso
 configuration; defaults to 840/US and is not a claim of regulatory approval),
 `--admin-token`
 (bearer auth for `/api/v1/*` AND `/metrics`; empty disables auth entirely and logs
-a loud startup warning — env fallback `OPEN_UNIFI_ADMIN_TOKEN`), `--ap-ssh-password`
-(env `OPEN_UNIFI_AP_SSH_PASSWORD`; SSH password provisioned onto adopted APs;
-empty = site default `ubnt`), `--ap-ssh-key` (repeatable; env
-`OPEN_UNIFI_AP_SSH_KEY`; one authorized_keys line per occurrence, provisioned as
+a loud startup warning — env fallback `OPEN_UNIFI_ADMIN_TOKEN`), `--device-ssh-key` (repeatable; env
+`OPEN_UNIFI_DEVICE_SSH_KEY`; one authorized_keys line per occurrence, provisioned as
 `sshd.auth.key.<n>` rows — LAB ONLY, live pushes behind `--allow-gated-live-wlan`),
 `--allow-plaintext-inform` (reject by default, like the real controller),
 `--log-level`, `--log-format` (logging is human-readable TEXT by default;
@@ -67,15 +66,15 @@ off unless `OTEL_EXPORTER_OTLP_ENDPOINT(_TRACES)` is set; `http://` = plaintext 
 `OTEL_RESOURCE_ATTRIBUTES` are honored natively by the SDK). When tracing is on, JSON
 log lines carry `trace_id`/`span_id` (see `docs/alloy-openunifi.example.alloy` for a
 Grafana Alloy example wiring OTLP into Tempo and the controller log into Loki). A corrupt
-`wireless.json` refuses startup rather than silently provisioning the AP with zero WLANs.
+`wireless.json` refuses startup rather than silently provisioning the device with zero WLANs.
 
-The AP-intent settings above (`--regulatory-country-code`,
-`--ap-ssh-password`, `--ap-ssh-key`) are
+The device-intent settings above (`--regulatory-country-code`,
+`--device-ssh-key`) are
 first-boot seeds: they initialize `<data-dir>/site-settings.json` only when
 that file does not exist yet. After that the persisted record is the single
 source of truth — manage it through `PUT /api/v1/site-settings` or Terraform
 (`open-unifi_site_settings`, below); a save that changes the record mints
-`cfgversion` and every adopted AP picks the new sshd rows up at its next
+`cfgversion` and every adopted device picks the new sshd rows up at its next
 inform. Caveat on default-gated deployments (U7PG2 firmware 6.8.2.15592):
 a save that carries provisioned SSH public keys still returns 200 — but
 every subsequent full provisioning, including
@@ -101,7 +100,6 @@ Images are published to GHCR on every push to `main` (tagged by commit SHA):
 ```
 docker run -d \
   -e OPEN_UNIFI_ADMIN_TOKEN=<secret> \
-  -e OPEN_UNIFI_AP_SSH_PASSWORD=<secret> \
   -v openunifi-data:/data \
   -p 8080:8080 -p 10001:10001/udp \
   ghcr.io/lucavb/open-unifi:sha-<commit> \
@@ -118,14 +116,14 @@ plaintext bind; restrict access to it. Bind mounts need
 `chown 65532:65532` on the host (the image runs as distroless nonroot);
 named volumes work as-is.
 
-## Onboarding a factory AP
+## Onboarding a factory device
 
-1. Start the controller on a host the AP can reach.
-2. On the AP (SSH, factory creds): `set-inform http://<controller-host>:8080/inform`.
-3. The AP's first inform appears in the console's *Adopt candidates* (or
+1. Start the controller on a host the device can reach.
+2. On the device (SSH, factory creds): `set-inform http://<controller-host>:8080/inform`.
+3. The device's first inform appears in the console's *Adopt candidates* (or
    `POST /api/v1/pending/<mac>/adopt`).
 4. The controller pushes `mgmt_cfg` with a fresh per-device `x_authkey`;
-   the AP re-keys automatically and reports back. Full provisioning
+   the device re-keys automatically and reports back. Full provisioning
    (`cfgversion` + `system_cfg` + `blocked_sta` + `mgmt_cfg`) follows,
    carrying the WLAN/VLAN configuration.
 5. Heartbeats settle into `noop` responses with a 15 s interval; state,
@@ -148,7 +146,7 @@ POST          /api/v1/devices/{mac}/factory-reset   arm remote factory reset
 GET           /api/v1/pending           unadopted devices heard so far
 POST          /api/v1/pending/{mac}/adopt
 GET/PUT       /api/v1/wireless          whole-doc WLAN config ({"wlans":[…]})
-GET/PUT       /api/v1/site-settings     the AP-intent site facts (whole-doc PUT)
+GET/PUT       /api/v1/site-settings     the device-intent site facts (whole-doc PUT)
 GET           /api/v1/devices/{mac}/radios          per-radio echo + admin intent
 PUT/DELETE    /api/v1/devices/{mac}/radios/{radio} set / clear per-radio intent
 GET           /api/v1/whoami
@@ -166,7 +164,7 @@ The response is the updated device view.
 Blocking a client takes effect on the device's next inform: the controller
 delivers the blocked list inside the same `setparam` that carries
 `system_cfg` (the `blocked_sta` field), exactly like a WLAN change — a
-fresh `cfgversion` is minted and the AP confirms it by echoing the new
+fresh `cfgversion` is minted and the device confirms it by echoing the new
 version back.
 
 Wireless fields per WLAN: `name`, `ssid`, `security` (`open` | `wpa-p` |
@@ -203,7 +201,7 @@ provider "open-unifi" {
   token = var.admin_token
 }
 
-resource "open-unifi_access_point" "ap" {
+resource "open-unifi_device" "ap" {
   mac  = "f0:9f:c2:84:8f:2a"
   name = "office-ap"
 }
@@ -218,19 +216,18 @@ resource "open-unifi_wlan" "corp" {
 
 resource "open-unifi_site_settings" "site" {
   regulatory_country_code = 840
-  ap_ssh_password         = "s3cret-ap-passphrase"
-  ap_ssh_public_keys      = ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI… admin@workstation"]
+  device_ssh_public_keys  = ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI… admin@workstation"]
 }
 ```
 
 `open-unifi_site_settings` is a singleton (one record per controller,
-id `site-settings`) managing the AP-intent site facts — the
-regulatory country code, the AP SSH password, and the provisioned
+id `site-settings`) managing the device-intent site facts — the
+regulatory country code and the provisioned
 authorized_keys lines (ordered; one `sshd.auth.key.<n>` row family per
-line). A change to any of them
-re-provisions every adopted AP at its next inform. Deleting the resource
+line). A change to either of them
+re-provisions every adopted device at its next inform. Deleting the resource
 restores the controller defaults. Watch the live gate before combining
-these fields: the example above (provisioned `ap_ssh_public_keys`) is
+these fields: the example above (provisioned `device_ssh_public_keys`) is
 exactly the sshd provisioning the gate
 blocks on the supported hardware (U7PG2 firmware 6.8.2.15592) — the apply
 succeeds, but every subsequent full provisioning returns the typed 501
@@ -271,8 +268,8 @@ Operational security: the admin listener defaults to `127.0.0.1:8443` and
 requires a nonempty bearer token. For remote administration, place it behind
 an HTTPS reverse proxy; native admin TLS is intentionally not provided, and
 non-loopback plaintext requires the explicit lab-only `--allow-insecure-admin`.
-`--allow-anonymous-admin` and `--allow-default-ap-ssh-password` are likewise
-explicit lab-only exceptions. Use the proxy's HTTPS URL for controller and
+`--allow-anonymous-admin` is likewise an
+explicit lab-only exception. Use the proxy's HTTPS URL for controller and
 Terraform provider access.
 
 The inform protocol has no device certificates: pre-adoption identity is the
