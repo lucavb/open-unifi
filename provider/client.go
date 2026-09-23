@@ -93,7 +93,7 @@ func (c *apiClient) do(ctx context.Context, method, path string, body any, out a
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// Read at most 4 MB: a server is never expected to return more, and a
 	// hostile/broken peer handing us an unbounded stream must not balloon

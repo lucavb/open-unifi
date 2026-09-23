@@ -89,10 +89,12 @@ type Packet struct {
 // Error messages matching classic controller semantics. Exported-style
 // capitalization is kept deliberately (reverse-engineered strings).
 var (
-	errBadMagic  = errors.New("Bad packet magic")
-	errTooShort  = errors.New("Header is too short")
-	errBadLength = errors.New("Bad data length")
+	errBadMagic  = controllerError("Bad packet magic")
+	errTooShort  = controllerError("Header is too short")
+	errBadLength = controllerError("Bad data length")
 )
+
+func controllerError(message string) error { return errors.New(message) }
 
 // ParsePacket decodes and validates an inform packet body.
 //
@@ -103,10 +105,10 @@ var (
 // version. Error strings match the controller wording.
 func ParsePacket(body []byte) (*Packet, error) {
 	if len(body) < 8 {
-		return nil, errors.New("Content too short")
+		return nil, controllerError("Content too short")
 	}
 	if len(body) > MaxBodySize {
-		return nil, errors.New("Content too long")
+		return nil, controllerError("Content too long")
 	}
 	if magic := binary.BigEndian.Uint32(body[0:4]); magic != Magic {
 		return nil, errBadMagic
@@ -120,7 +122,7 @@ func ParsePacket(body []byte) (*Packet, error) {
 	}
 	dv := binary.BigEndian.Uint32(body[32:36])
 	if dv != DataVersion {
-		return nil, fmt.Errorf("Data version %d is not supported", dv)
+		return nil, controllerError(fmt.Sprintf("Data version %d is not supported", dv))
 	}
 
 	p := &Packet{
@@ -192,7 +194,7 @@ func DecodeKeyHex(hexKey string) ([]byte, error) {
 	}
 	for i := 0; i < len(hexKey); i++ {
 		c := hexKey[i]
-		if !('0' <= c && c <= '9' || 'a' <= c && c <= 'f') {
+		if c < '0' || c > '9' && c < 'a' || c > 'f' {
 			return nil, fmt.Errorf("inform: key hex must be 32 lowercase hex characters")
 		}
 	}
@@ -299,7 +301,7 @@ func inflateZlib(body []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("inform: zlib: %w", err)
 	}
-	defer zr.Close()
+	defer func() { _ = zr.Close() }()
 	out, err := io.ReadAll(io.LimitReader(zr, MaxBodySize+1))
 	if err != nil {
 		return nil, fmt.Errorf("inform: zlib: %w", err)

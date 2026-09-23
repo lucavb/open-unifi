@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"reflect"
 	"sort"
 	"strconv"
@@ -293,17 +292,6 @@ func clientFor(fb *fakeBackend, token string) *apiClient {
 	})
 	return (&apiClient{baseURL: "http://fake", token: token}).
 		withHTTPClient(&http.Client{Transport: tripper})
-}
-
-// clientForURL behaves like clientFor but lets tests assert base-url
-// joining with a configurable (fake) base URL.
-func clientForURL(fb *fakeBackend, rawURL, token string) *apiClient {
-	c := clientFor(fb, token)
-	u, err := url.Parse(rawURL)
-	if err == nil && u.Host == "fake" {
-		c.baseURL = strings.TrimRight(rawURL, "/")
-	}
-	return c
 }
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)

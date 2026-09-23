@@ -61,7 +61,7 @@ func TestCBCZlibRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !(len(wire) > HeaderLen) {
+	if len(wire) <= HeaderLen {
 		t.Fatal("wire too short")
 	}
 

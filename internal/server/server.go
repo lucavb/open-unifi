@@ -172,7 +172,6 @@ type Server struct {
 	// lives there; this type is the transport adapter around it.
 	engine *adoption.Engine
 
-	seenMu sync.Mutex
 	seenAt map[string]time.Time // discovery dedupe per MAC
 
 	noopMu     sync.Mutex
