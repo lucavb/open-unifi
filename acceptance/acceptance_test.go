@@ -194,7 +194,7 @@ func startController(t *testing.T, binary, addr, data, token string) *controller
 	// Discovery is disabled, but the controller still validates its port
 	// argument. Use a valid, otherwise unused port instead of :0 (the flag
 	// deliberately rejects zero).
-	c.cmd = exec.Command(binary, "--listen-inform", "127.0.0.1:0", "--listen-admin", addr, "--listen-discovery", "127.0.0.1:10001", "--discovery=false", "--data-dir", data, "--admin-token", token, "--allow-default-ap-ssh-password", "--allow-plaintext-inform")
+	c.cmd = exec.Command(binary, "--listen-inform", "127.0.0.1:0", "--listen-admin", addr, "--listen-discovery", "127.0.0.1:10001", "--discovery=false", "--data-dir", data, "--admin-token", token, "--allow-plaintext-inform")
 	c.cmd.Stdout, c.cmd.Stderr = &lockedWriter{c: c}, &lockedWriter{c: c}
 	if err := c.cmd.Start(); err != nil {
 		t.Fatalf("start controller: %v", err)
