@@ -303,8 +303,10 @@ are rejected unless `--allow-plaintext-inform` (and the plaintext path never
 rotates keys or initiates adoption), a two-key rotation window (stale keys
 stop decrypting after one re-key hop), device inform bodies can never inject
 `system_cfg` rows, and per-MAC read-modify-write serialization in the store.
-**Run the inform and admin ports on a trusted L2 segment** — the admin port
-is plain HTTP with bearer auth only.
+**Run the inform port on a trusted L2 segment.** The admin listener remains
+plain HTTP with bearer auth only; do not expose it directly to an untrusted
+network. For remote administration, terminate HTTPS in a reverse proxy as
+described above.
 
 `data/devices.json` holds live per-device keys (chmod 0600, gitignored);
 `data/wireless.json` holds WLAN passphrases. Treat both as credentials.
@@ -360,7 +362,10 @@ Still open (classic behavior vs open-unifi):
   and factory-reset/re-adoption remain release-gated. Use the repeatable
   evidence matrix in `docs/WLAN-ACCEPTANCE-6.8.2.15592.md`; do not describe
   unrun rows as passed.
-- Admin port is plain HTTP (token auth) — TLS is a TODO; run on a trusted LAN.
+- Admin listener remains plain HTTP (token auth); native admin TLS will not be
+  implemented. Use an HTTPS reverse proxy when the admin API must be reached
+  remotely, and keep the direct listener on a trusted network when it is
+  exposed at all.
 
 ### Limitations
 

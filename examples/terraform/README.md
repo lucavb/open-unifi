@@ -47,11 +47,12 @@ querying the registry.
 Set `url` (Required), optionally `token` (keep secrets out of .tf — prefer
 the `OPEN_UNIFI_ADMIN_TOKEN` env var, which `provider.Configure` reads when
 `token` is unset). The controller serves **plain HTTP** on its admin port
-(default `:8443`); there is no TLS yet, so use `url = "http://<host>:8443"` —
-self-signed-certificate guidance does not apply. If you need TLS today,
-front-load it with a reverse proxy that terminates HTTPS and forwards to the
-plain-HTTP admin listener. (`insecure_skip_verify` only affects `https://`
-URLs and can stay unset.)
+(default `:8443`); native admin TLS is not implemented, so use
+`url = "http://<host>:8443"` when connecting directly — self-signed-certificate
+guidance does not apply. If you need HTTPS, put the controller behind a
+reverse proxy that terminates HTTPS and forwards to the plain-HTTP admin
+listener, then use the proxy's `https://` URL. (`insecure_skip_verify` only
+affects `https://` URLs and can stay unset.)
 
 ## 4. Run
 
