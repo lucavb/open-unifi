@@ -22,3 +22,5 @@ dist/
 /openunifi
 /openunifi.linux
 /id_ed25519.pub
+# local scratch space (reference clones, throwaway checkouts) — never commit
+/tmp/
