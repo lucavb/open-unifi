@@ -17,8 +17,11 @@ provider-build:
 	$(GO) build -o dist/openunifi-tfprovider ./cmd/tfprovider
 
 # The module gate: everything CI (and the morning acceptance checklist) runs.
+# Format only the tracked sources: a bare `gofmt -l .` also walks gitignored
+# scratch state (worktree caches and the like) and trips on third-party
+# generated files that are not part of the module.
 check:
-	@out=$$(gofmt -l .); if [ -n "$$out" ]; then \
+	@out=$$(gofmt -l $$(git ls-files '*.go')); if [ -n "$$out" ]; then \
 		echo "gofmt needed on:"; echo "$$out"; exit 1; \
 	fi
 	$(GO) vet ./...
