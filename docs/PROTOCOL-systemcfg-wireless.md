@@ -1028,6 +1028,12 @@ spirit**: both are SHA-512-based, but the wire format is glibc `$6$salt$hash`.
 > provisioning; no cache ⇒ factory-default `ubnt` row (fresh salt, converges
 > byte-stably after the delta applies). The jar-cited claims above are
 > untouched.
+>
+> REST PATCH semantics are exact: absent `ssh_password` leaves intent unchanged,
+> `""` stops managing it, and a nonempty value sets it. The Terraform
+> `open-unifi_device.ssh_password` attribute is Optional and Sensitive; null or
+> absent reconciles to the explicit API clear. Password changes remain
+> bench/live-round owed, not live-proven.
 
 ## 11. Firmware-side acceptance gate — mcad (live-confirmed 2026-09-16)
 

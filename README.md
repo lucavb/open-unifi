@@ -88,6 +88,10 @@ look dead, not gated). See `docs/PROTOCOL-systemcfg-wireless.md` §13.
 Supplying any of the three when the record already exists logs a
 startup warning and the record wins (the deployment-input flags like
 `--controller-url` are unaffected).
+There is no site-wide SSH-password flag or environment-variable replacement:
+passwords are optional per-device admin intent. `--device-ssh-key` and
+`OPEN_UNIFI_DEVICE_SSH_KEY` remain first-boot public-key seeds only; they do not
+set a device password.
 
 ## Container
 
@@ -159,7 +163,11 @@ Device PATCH fields (strict body, unknown fields rejected): `name`
 (1–64 chars, `A–Z a–z 0–9 . _ -`, leading alphanumeric), and
 `led_override` (`"on"` | `"off"` | `"default"`, where `"default"` clears
 the override back to the site default). Omitted fields are left unchanged.
-The response is the updated device view.
+`ssh_password` is optional: omitted leaves it unchanged, explicit `""` stops
+managing it (does not reset the device password), and nonempty sets it. After
+management is cleared, future full provisioning reuses the last
+controller-pushed password cache when available, rather than erasing device
+credentials. The response is the updated device view.
 
 Blocking a client takes effect on the device's next inform: the controller
 delivers the blocked list inside the same `setparam` that carries
@@ -204,6 +212,7 @@ provider "open-unifi" {
 resource "open-unifi_device" "ap" {
   mac  = "f0:9f:c2:84:8f:2a"
   name = "office-ap"
+  ssh_password = var.device_ssh_password # optional, sensitive
 }
 
 resource "open-unifi_wlan" "corp" {
@@ -235,6 +244,16 @@ until the sshd facts are cleared (an effective save of the defaults) or
 the controller restarts with `--allow-gated-live-wlan` (startup-only),
 and blocked devices then go stale in the console; see
 `docs/PROTOCOL-systemcfg-wireless.md` §13.
+`open-unifi_device` manages a device by MAC. Its `ssh_password` attribute is
+Optional and Sensitive; Terraform null/absent reconciles to an explicit API
+clear/stop-managing operation. The site-settings resource exposes
+`device_ssh_public_keys`.
+
+**Breaking migration:** `open-unifi_access_point` was renamed to
+`open-unifi_device` with no state migration or alias. Update configuration and
+remove/import or recreate state as appropriate. `ap_ssh_public_keys`,
+`ap_ssh_password`, and `ap_ssh_disable_password` are removed; those names are
+retained only as labelled historical acceptance evidence.
 
 See `examples/terraform/` (includes filesystem-mirror dev overrides so
 `terraform init` isn't needed during development).
@@ -247,6 +266,9 @@ with a typed status and never emits `system_cfg`, on EITHER trigger: any
 nonempty managed WLAN, OR site-fact sshd provisioning (provisioned SSH
 public keys). The startup-only
 `--allow-gated-live-wlan` flag lifts it for sanctioned bench pushes.
+Per-device SSH-password changes are bench/live-round owed, not live-proven.
+This is a limitation in the same sense as the gated WLAN status above; see
+`docs/PROTOCOL-systemcfg-wireless.md` §13.3.
 
 ## Protocol documentation
 

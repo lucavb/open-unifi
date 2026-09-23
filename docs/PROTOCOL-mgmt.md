@@ -523,6 +523,8 @@ else                      this.oo\u00d4000.o00000(mac, type, ip, port, user, pas
   ace.jar.
 - `users.1.password` transform: the hashing helper class (referenced from
   `config_String.java` as `com/ubnt/service/system/whilesuper`) is not yet
-  decompiled. The Go builder (`internal/server.buildSystemCfg`) currently emits
-  the plain hex SHA-512 of the site ssh password — confirm whether the real
-  controller emits a `$6$`-crypt string before relying on device SSH working.
+  decompiled. The current open-unifi implementation is per-device and uses the
+  renderer's crypt/cache behavior; it does not emit a plain hex SHA-512 of a
+  site-wide password. The plain-hex statement was a stale CURRENT claim. The
+  jar observations above are historical evidence only; see
+  `PROTOCOL-systemcfg-wireless.md` §10 for the current divergence.

@@ -1233,7 +1233,8 @@ device's reported cfgversion (== the mint `46733c22476f0d95`) proves
 application. The controller-owned ssh_sha512 cache re-minted with a
 fresh crypt salt — same underlying site default password
 (`ssh_password_configured=false` at startup; no `--ap-ssh-password`
-configured).
+configured). The flag spelling is historical and obsolete: current password
+intent is per-device, not site-wide.
 
 **Gates + harness re-seed:** `live-devices.json` re-seeded from the
 post-round record (state 3, cfg `46733c22476f0d95`, rotated key;
@@ -1530,6 +1531,14 @@ no dark, surviving client never dropped). The C1/D1 VLAN sub-criteria are
 closed by this round. Release gate row 1 (all A–F rows `PROVEN`) is met;
 the human review sign-off remains the only open gate class.
 
+### Current SSH-password validation status
+
+The historical site-settings/provider round below is not validation of current
+per-device SSH-password changes. The current `open-unifi_device.ssh_password`
+API/provider contract is bench/live-round owed, not live-proven. Historical
+names and commands such as `ap_ssh_password`, `ap_ssh_disable_password`, and
+`--ap-ssh-password` are retained below as obsolete pre-rename/removed evidence.
+
 ### 2026-09-21 site-settings live round — sshd-facts provisioning, disable-knob outage, 501 gate proof (controller `3757061` → binary `8475be053e27`)
 
 **Scope:** live verification of the twelve-commit site-settings lane
@@ -1604,7 +1613,8 @@ the workstation's Go dialer cannot route 10.10.10.10 directly while
 curl/ssh can; recorded as a bench-access quirk, not a provider defect).
 The first apply tripped Terraform's sensitive-attribute consistency
 check because the test HCL wrote the documented-unwritable literals
-(`ap_ssh_password = ""`, `ap_ssh_disable_password = false` — the schema
+(`ap_ssh_password = ""`, `ap_ssh_disable_password = false` — obsolete,
+removed historical site-settings names; the schema
 says the unset echo maps them to null; write null or omit): config-side
 error, not a provider bug, but it TAINTED the resource so the corrected
 apply exercised Delete (zero-doc PUT → defaults) AND Create 11 ms apart

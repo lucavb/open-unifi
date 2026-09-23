@@ -308,7 +308,8 @@ Package `internal/adminapi`: REST over JSON at the `--listen-admin` addr:
 GET    /api/v1/devices            (list; state/last_seen are JSON numbers)
 POST   /api/v1/devices            {mac, name?, site_id?}  -> idempotent upsert, PENDING record
 DELETE /api/v1/devices/{mac}
-GET    /api/v1/devices/{mac}
+    GET    /api/v1/devices/{mac}
+    PATCH  /api/v1/devices/{mac}    name, site_id, led_override, ssh_password
 GET    /api/v1/pending            (discovery-found candidates)
 POST   /api/v1/pending/{mac}/adopt
 GET    /api/v1/wireless           (whole-document WLAN envelope)
@@ -338,6 +339,13 @@ resources `open-unifi_device` (adopt, by MAC + controller URL/token),
 `open-unifi_wlan` (ssid, security, passphrase, vlan), data source `open-unifi_devices`.
 Provider `Configure` accepts `url`, `token` (honest: token required unless server
 started without --admin-token).
+The device resource is `open-unifi_device`; `ssh_password` is Optional and
+Sensitive. A PATCH omitting `ssh_password` leaves the intent unchanged; an
+explicit empty string stops managing the device password, and a nonempty string
+sets it. Terraform null/absent reconciles to that explicit clear/stop-managing
+PATCH. This is per-device intent, not a site-wide password setting. The
+site-settings resource uses `device_ssh_public_keys` for ordered public-key
+seeded site facts.
 
 ## 7. Carry-list — closed by live acceptance (2026-09-16)
 
