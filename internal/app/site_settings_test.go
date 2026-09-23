@@ -57,7 +57,6 @@ func readSettingsDoc(t *testing.T, path string) adminapi.SiteSettingsDocument {
 func TestFirstBootSeedPersistsThenFileWins(t *testing.T) {
 	seed := SiteSettings{
 		CountryCode:   276,
-		SSHPassword:   "first-boot-password",
 		SSHPublicKeys: []string{testKeyEd25519Line},
 	}
 	a, _, spath := testSettingsApp(t, seed)
@@ -66,28 +65,28 @@ func TestFirstBootSeedPersistsThenFileWins(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get after seed: %v", err)
 	}
-	if got.RegulatoryCountryCode != 276 || got.APSSHPassword != "first-boot-password" ||
-		len(got.APSSHPublicKeys) != 1 || got.APSSHPublicKeys[0] != testKeyEd25519Line {
+	if got.RegulatoryCountryCode != 276 ||
+		len(got.DeviceSSHPublicKeys) != 1 || got.DeviceSSHPublicKeys[0] != testKeyEd25519Line {
 		t.Fatalf("seed not served: %+v", got)
 	}
 	doc := readSettingsDoc(t, spath)
-	if doc.RegulatoryCountryCode != 276 || doc.APSSHPassword != "first-boot-password" ||
-		len(doc.APSSHPublicKeys) != 1 || doc.APSSHPublicKeys[0] != testKeyEd25519Line {
+	if doc.RegulatoryCountryCode != 276 ||
+		len(doc.DeviceSSHPublicKeys) != 1 || doc.DeviceSSHPublicKeys[0] != testKeyEd25519Line {
 		t.Fatalf("seed not persisted: %+v", doc)
 	}
 
 	// Reopen over the same file with a DIFFERENT seed: the file wins.
-	reseed := SiteSettings{CountryCode: 840, SSHPassword: "ignored-seed"}
+	reseed := SiteSettings{CountryCode: 840}
 	a2 := New(store.NewMemStore(), filepath.Join(t.TempDir(), "wireless.json"), spath, reseed, quietLogger())
 	got2, err := a2.GetSiteSettings(context.Background())
 	if err != nil {
 		t.Fatalf("get after reopen: %v", err)
 	}
-	if got2.RegulatoryCountryCode != 276 || got2.APSSHPassword != "first-boot-password" ||
-		len(got2.APSSHPublicKeys) != 1 {
+	if got2.RegulatoryCountryCode != 276 ||
+		len(got2.DeviceSSHPublicKeys) != 1 {
 		t.Fatalf("file did not win over seed: %+v", got2)
 	}
-	if doc2 := readSettingsDoc(t, spath); doc2.APSSHPassword != "first-boot-password" {
+	if doc2 := readSettingsDoc(t, spath); doc2.DeviceSSHPublicKeys[0] != testKeyEd25519Line {
 		t.Fatalf("reopen rewrote the file: %+v", doc2)
 	}
 }
@@ -112,16 +111,15 @@ func TestPutSiteSettingsMintsProvisionedOnly(t *testing.T) {
 
 	doc := adminapi.SiteSettingsDocument{
 		RegulatoryCountryCode: 276,
-		APSSHPassword:         "changed-password",
-		APSSHPublicKeys:       []string{testKeyEd25519Line},
+		DeviceSSHPublicKeys:   []string{testKeyEd25519Line},
 	}
 	before := map[string]string{"aabbccddeeff": "aaaa1111bbbb2222", "112233445566": "cccc3333dddd4444"}
 	view, err := a.PutSiteSettings(context.Background(), doc)
 	if err != nil {
 		t.Fatalf("put: %v", err)
 	}
-	if view.RegulatoryCountryCode != 276 || view.APSSHPassword != "changed-password" ||
-		len(view.APSSHPublicKeys) != 1 {
+	if view.RegulatoryCountryCode != 276 ||
+		len(view.DeviceSSHPublicKeys) != 1 {
 		t.Fatalf("view: %+v", view)
 	}
 	for mac, old := range before {
@@ -141,7 +139,7 @@ func TestPutSiteSettingsMintsProvisionedOnly(t *testing.T) {
 		t.Fatalf("unprovisioned device got a cfgversion: %q", d.CfgVersion)
 	}
 	// Disk document equals what was applied.
-	if doc2 := readSettingsDoc(t, spath); doc2.RegulatoryCountryCode != 276 || doc2.APSSHPassword != "changed-password" {
+	if doc2 := readSettingsDoc(t, spath); doc2.RegulatoryCountryCode != 276 || len(doc2.DeviceSSHPublicKeys) != 1 {
 		t.Fatalf("disk doc: %+v", doc2)
 	}
 }
@@ -152,13 +150,12 @@ func TestPutSiteSettingsMintsProvisionedOnly(t *testing.T) {
 func TestPutSiteSettingsNoOpMintsNothing(t *testing.T) {
 	seed := SiteSettings{
 		CountryCode:   840,
-		SSHPassword:   "pw",
 		SSHPublicKeys: []string{testKeyEd25519Line, testKeyRSALine},
 	}
 	a, st, _ := testSettingsApp(t, seed)
 
 	docs := []adminapi.SiteSettingsDocument{
-		{RegulatoryCountryCode: 840, APSSHPassword: "pw", APSSHPublicKeys: []string{testKeyEd25519Line, testKeyRSALine}},
+		{RegulatoryCountryCode: 840, DeviceSSHPublicKeys: []string{testKeyEd25519Line, testKeyRSALine}},
 	}
 	if err := st.Put(store.Device{MAC: "aabbccddeeff", State: store.StateAdopted, CfgVersion: "aaaa1111bbbb2222"}); err != nil {
 		t.Fatal(err)
@@ -192,7 +189,7 @@ func TestPutSiteSettingsOrderOnlyDiffMints(t *testing.T) {
 	}
 
 	if _, err := a.PutSiteSettings(context.Background(), adminapi.SiteSettingsDocument{
-		APSSHPublicKeys: []string{testKeyRSALine, testKeyEd25519Line},
+		DeviceSSHPublicKeys: []string{testKeyRSALine, testKeyEd25519Line},
 	}); err != nil {
 		t.Fatalf("put: %v", err)
 	}
@@ -222,14 +219,14 @@ func TestPutSiteSettingsValidation(t *testing.T) {
 			name: "malformed key line",
 			doc: adminapi.SiteSettingsDocument{
 				RegulatoryCountryCode: 840,
-				APSSHPublicKeys:       []string{testKeyEd25519Line, "AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB"},
+				DeviceSSHPublicKeys:   []string{testKeyEd25519Line, "AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB"},
 			},
 		},
 		{
 			name: "bad key type token",
 			doc: adminapi.SiteSettingsDocument{
 				RegulatoryCountryCode: 840,
-				APSSHPublicKeys:       []string{"opendir3 " + "AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB"},
+				DeviceSSHPublicKeys:   []string{"opendir3 " + "AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB"},
 			},
 		},
 		{
@@ -274,29 +271,26 @@ func TestSiteSettingsRuleEquivalenceAcrossLayers(t *testing.T) {
 			name: "valid document",
 			doc: adminapi.SiteSettingsDocument{
 				RegulatoryCountryCode: 840,
-				APSSHPassword:         "pw",
-				APSSHPublicKeys:       []string{testKeyEd25519Line, testKeyRSALine},
+				DeviceSSHPublicKeys:   []string{testKeyEd25519Line, testKeyRSALine},
 			},
 		},
 		{
 			name: "valid document, empty keys accepted",
 			doc: adminapi.SiteSettingsDocument{
 				RegulatoryCountryCode: 276,
-				APSSHPassword:         "pw",
 			},
 		},
 		{
 			name: "valid document, country unset (0)",
 			doc: adminapi.SiteSettingsDocument{
-				APSSHPassword:   "pw",
-				APSSHPublicKeys: []string{testKeyEd25519Line},
+				DeviceSSHPublicKeys: []string{testKeyEd25519Line},
 			},
 		},
 		{
 			name: "invalid second key line names #2",
 			doc: adminapi.SiteSettingsDocument{
 				RegulatoryCountryCode: 840,
-				APSSHPublicKeys: []string{
+				DeviceSSHPublicKeys: []string{
 					testKeyEd25519Line,
 					// render_test.go TestParsePublicKeyTable: a typeless
 					// line (no type token) is a malformed authorized_keys
@@ -345,7 +339,6 @@ func TestSiteSettingsRuleEquivalenceAcrossLayers(t *testing.T) {
 func TestRecordAbsorptionCannotTouchSiteSettings(t *testing.T) {
 	seed := SiteSettings{
 		CountryCode:   840,
-		SSHPassword:   "seed-password",
 		SSHPublicKeys: []string{testKeyEd25519Line},
 	}
 	a, st, spath := testSettingsApp(t, seed)
@@ -364,8 +357,8 @@ func TestRecordAbsorptionCannotTouchSiteSettings(t *testing.T) {
 	body := map[string]any{
 		"ip":                      "10.0.0.9",
 		"regulatory_country_code": float64(1),
-		"ap_ssh_password":         "poison-password",
-		"ap_ssh_public_keys":      []any{"ssh-rsa AAAA poison"},
+		"device_ssh_password":     "poison-password",
+		"device_ssh_public_keys":  []any{"ssh-rsa AAAA poison"},
 	}
 	err = st.UpdateExisting("aabbccddeeff", func(d *store.Device) error {
 		d.Absorb(body, time.Now(), true)
@@ -396,7 +389,6 @@ func TestRecordAbsorptionCannotTouchSiteSettings(t *testing.T) {
 // the cache (the wireless cloneWireless rule, shape-for-shape).
 func TestGetSiteSettingsIsDetachedCopy(t *testing.T) {
 	seed := SiteSettings{
-		SSHPassword:   "pw",
 		SSHPublicKeys: []string{testKeyEd25519Line},
 	}
 	a, _, _ := testSettingsApp(t, seed)
@@ -405,17 +397,17 @@ func TestGetSiteSettingsIsDetachedCopy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(v.APSSHPublicKeys) != 1 {
+	if len(v.DeviceSSHPublicKeys) != 1 {
 		t.Fatalf("seed view: %+v", v)
 	}
-	v.APSSHPublicKeys[0] = "mutated-line"
-	v.APSSHPublicKeys = append(v.APSSHPublicKeys, "extra-line")
+	v.DeviceSSHPublicKeys[0] = "mutated-line"
+	v.DeviceSSHPublicKeys = append(v.DeviceSSHPublicKeys, "extra-line")
 
 	v2, err := a.GetSiteSettings(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(v2.APSSHPublicKeys) != 1 || v2.APSSHPublicKeys[0] != testKeyEd25519Line {
+	if len(v2.DeviceSSHPublicKeys) != 1 || v2.DeviceSSHPublicKeys[0] != testKeyEd25519Line {
 		t.Fatalf("view mutated the cache: %+v", v2)
 	}
 }
@@ -436,7 +428,6 @@ func TestSiteSettingsLoadAndSeedErrorRefusal(t *testing.T) {
 	corruptBytes := []byte(`{"regulatory_country_code": 840`)
 	validSeed := SiteSettings{
 		CountryCode:   840,
-		SSHPassword:   "pw",
 		SSHPublicKeys: []string{testKeyEd25519Line},
 	}
 	badSeed := SiteSettings{SSHPublicKeys: []string{"not-a-key-line"}}
@@ -495,8 +486,7 @@ func TestSiteSettingsLoadAndSeedErrorRefusal(t *testing.T) {
 	// A valid effective document for the PUT-refusal assertions.
 	putDoc := adminapi.SiteSettingsDocument{
 		RegulatoryCountryCode: 276,
-		APSSHPassword:         "changed",
-		APSSHPublicKeys:       []string{testKeyEd25519Line},
+		DeviceSSHPublicKeys:   []string{testKeyEd25519Line},
 	}
 	ctx := context.Background()
 
@@ -567,8 +557,7 @@ func TestPutSiteSettingsSweepFailureRetryResweeps(t *testing.T) {
 
 	doc := adminapi.SiteSettingsDocument{
 		RegulatoryCountryCode: 276,
-		APSSHPassword:         "changed-password",
-		APSSHPublicKeys:       []string{testKeyEd25519Line},
+		DeviceSSHPublicKeys:   []string{testKeyEd25519Line},
 	}
 	ctx := context.Background()
 
@@ -581,7 +570,7 @@ func TestPutSiteSettingsSweepFailureRetryResweeps(t *testing.T) {
 	if st.injected != 1 {
 		t.Fatalf("injected failures = %d, want 1", st.injected)
 	}
-	if d := readSettingsDoc(t, spath); d.RegulatoryCountryCode != 276 || d.APSSHPassword != "changed-password" {
+	if d := readSettingsDoc(t, spath); d.RegulatoryCountryCode != 276 || len(d.DeviceSSHPublicKeys) != 1 {
 		t.Fatalf("failed sweep did not commit the record: %+v", d)
 	}
 	if d, err := base.Get("aabbccddeeff"); err != nil || d.CfgVersion != "aaaa1111bbbb2222" {
@@ -630,8 +619,7 @@ func TestPutSiteSettingsWarnsOnSSHFactSave(t *testing.T) {
 
 	doc := adminapi.SiteSettingsDocument{
 		RegulatoryCountryCode: 840,
-		APSSHPassword:         "pw",
-		APSSHPublicKeys:       []string{testKeyEd25519Line},
+		DeviceSSHPublicKeys:   []string{testKeyEd25519Line},
 	}
 	if _, err := a.PutSiteSettings(context.Background(), doc); err != nil {
 		t.Fatalf("put: %v", err)

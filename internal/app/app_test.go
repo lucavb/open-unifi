@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/lucavb/open-unifi/internal/adminapi"
+	"github.com/lucavb/open-unifi/internal/server/systemcfg"
 	"github.com/lucavb/open-unifi/internal/store"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
@@ -224,7 +225,6 @@ func TestPatchDeviceLEDBarKnobs(t *testing.T) {
 		len(rec.CfgVersion) != 16 || rec.CfgVersion == "aaaa" {
 		t.Fatalf("effective brightness change must mint: %+v", rec)
 	}
-	bumped := rec.CfgVersion
 	if dv, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{LEDOverrideColorBrightness: brightPtr(0)}); err != nil ||
 		dv.LEDOverrideColorBrightness == nil || *dv.LEDOverrideColorBrightness != 0 {
 		t.Fatalf("explicit 0 must round-trip (not read as unset): %+v err=%v", dv, err)
@@ -234,7 +234,7 @@ func TestPatchDeviceLEDBarKnobs(t *testing.T) {
 	if rec, err = st.Get("aabbccddeeff"); err != nil {
 		t.Fatal(err)
 	}
-	bumped = rec.CfgVersion
+	bumped := rec.CfgVersion
 	// Idempotent re-save of 0: no further mint.
 	if _, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{LEDOverrideColorBrightness: brightPtr(0)}); err != nil {
 		t.Fatal(err)
@@ -285,6 +285,112 @@ func TestPatchDeviceLEDBarKnobs(t *testing.T) {
 	}
 	if rec, err = st.Get("aabbccddeeff"); err != nil || rec.CfgVersion != bumped {
 		t.Fatalf("idempotent color save minted: %q -> %q", bumped, rec.CfgVersion)
+	}
+}
+
+// TestPatchDeviceSSHPassword pins the real adapter's per-device SSH
+// password write path (installed alongside the site-level password's
+// removal): nil = untouched, a non-empty set = effective change (mints
+// cfgversion, the view echoes the record), "" = the explicit clear = STOP
+// MANAGING (also minting — the intent stamp flaps with the record value),
+// and the render-after-clear contract: the renderer reuses the device's
+// last controller-pushed cache row verbatim, so the AP's actual password
+// never changes (locked per-device semantics, store.Device.SSHPassword
+// docblock).
+func TestPatchDeviceSSHPassword(t *testing.T) {
+	a, st, _ := testApp(t)
+	ctx := context.Background()
+	// fw_caps 0x400: the real U7PG2 SHA-512 password capability bit
+	// (supportsSha512Password, Default-0 semantics), so the
+	// render-after-clear section exercises the sha512 family arm — the
+	// family of the cache row it seeds below.
+	if err := st.Put(store.Device{MAC: "aabbccddeeff", State: store.StateAdopted, CfgVersion: "aaaa1111bbbb2222",
+		Extra: store.JSONMap{"fw_caps": 1024.0}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// nil → no change, no mint.
+	if _, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{Name: deviceNamePtr("renamed")}); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := st.Get("aabbccddeeff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.SSHPassword != "" || rec.CfgVersion != "aaaa1111bbbb2222" {
+		t.Fatalf("nil-password patch changed the record: %+v", rec)
+	}
+	if dv := a.ListDevices(ctx)[0]; dv.SSHPassword != "" {
+		t.Fatalf("nil-password patch echoed a password: %+v", dv)
+	}
+
+	// set → record updated + mint + view echo.
+	dv, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{SSHPassword: deviceNamePtr("pw1")})
+	if err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	if dv.SSHPassword != "pw1" {
+		t.Fatalf("set view echo: %+v", dv)
+	}
+	minted := dv.CfgVersion
+	if rec, err = st.Get("aabbccddeeff"); err != nil || rec.SSHPassword != "pw1" || rec.CfgVersion != minted ||
+		rec.CfgVersion == "aaaa1111bbbb2222" {
+		t.Fatalf("set record: %+v err=%v", rec, err)
+	}
+
+	// Instructing the render with the same value mints nothing:
+	// save-vs-save idempotence, the LED-knob rule.
+	if _, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{SSHPassword: deviceNamePtr("pw1")}); err != nil {
+		t.Fatal(err)
+	}
+	if rec, _ = st.Get("aabbccddeeff"); rec.CfgVersion != minted {
+		t.Fatalf("idempotent password save minted: %q -> %q", minted, rec.CfgVersion)
+	}
+
+	// Seed the record cache as the SERVER's credential delta would (a
+	// well-formed, deliberately non-ubnt $6$ row standing in for
+	// sha512Crypt("pw1") — format-only; the render's cache reuse is
+	// verbatim by contract): the device now runs pw1, whose hash row C the
+	// controller pushed last.
+	const cacheRow = "$6$0Vt2Ue1V$cZ7N8BjYvOhq2jbFLYMyiJC8t1j3QroXfPzolNy0KhHypWV4OQqLPTerxeYg4LjtLpHzdXH2QCxaOmB2Pup0cz"
+	if err := st.UpdateExisting("aabbccddeeff", func(d *store.Device) error {
+		if d.Extra == nil {
+			d.Extra = store.JSONMap{}
+		}
+		d.Extra["ssh_sha512passwd"] = cacheRow
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// clear → "" + mint (stop managing: the AP keeps pw1).
+	dv, err = a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{SSHPassword: deviceNamePtr("")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dv.SSHPassword != "" {
+		t.Fatalf("clear view echo: %+v", dv)
+	}
+	if rec, _ = st.Get("aabbccddeeff"); rec.SSHPassword != "" || rec.CfgVersion == minted {
+		t.Fatalf("clear record: %+v (mint %q)", rec, minted)
+	}
+
+	// render-after-clear: the unset record reuses the last
+	// controller-pushed row VERBATIM — the device stays on pw1; an
+	// unchanged-device pin (the stop-managing semantics live here, not in
+	// a warn).
+	asserted, rerr := systemcfg.Render(rec, systemcfg.SiteFacts{})
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	row := ""
+	for _, ln := range strings.Split(asserted.Text, "\n") {
+		if after, ok := strings.CutPrefix(ln, "users.1.password="); ok {
+			row = after
+		}
+	}
+	if row != cacheRow {
+		t.Fatalf("render after clear must reuse the cached row verbatim: %q, want %q", row, cacheRow)
 	}
 }
 
@@ -1150,7 +1256,7 @@ func wirelessFixture() adminapi.WlansEnvelope {
 // discipline: UpdateWlan used to write the new wlan into the SHARED backing
 // array of a.cachedWireless BEFORE validate/persist, so a rejected edit or
 // a failed persist left the rejected state live in the cache that
-// CurrentWireless serves to AP provisioning. Mirror of
+// CurrentWireless serves to device provisioning. Mirror of
 // TestPutWirelessFailureLeavesCacheUntouched.
 func TestUpdateWlanFailureLeavesCacheUntouched(t *testing.T) {
 	ctx := context.Background()
@@ -1216,7 +1322,7 @@ func TestUpdateWlanFailureLeavesCacheUntouched(t *testing.T) {
 // TestDeleteWlanFailureLeavesCacheUntouched pins the same invariant for
 // DeleteWlan: the old in-place compaction (Wlans[:0]) left the cache at
 // [b,b] over disk [a,b] when persist failed — duplicate entries in the
-// cache that AP provisioning would then serve.
+// cache that device provisioning would then serve.
 func TestDeleteWlanFailureLeavesCacheUntouched(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

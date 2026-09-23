@@ -20,7 +20,7 @@ package server
 // eth0, radio_table wifi0/wifi1, vap_table factory essid) with the
 // gate-check both-band open WLAN, parse-diffs it against the FACTORY
 // BASELINE (ap-forensics/tmp/system.cfg, fetched from the factory-reset
-// AP 2026-09-17) and enforces the minimal-diff invariant:
+// device 2026-09-17) and enforces the minimal-diff invariant:
 //
 //	permitted diffs (intended-managed sections):
 //	  unifi.* (new)  users.* (ubnt/nobody vs ui/ubnt)  sshd.* (new)
@@ -34,11 +34,11 @@ package server
 // is the SYNTHETIC night reference (sha256
 // 48dbb631f05d9ff4… — the zzHarnessRecord + gate-check open-WLAN render,
 // regenerated 2026-09-19 with the post-is_default-fix generator); the
-// live AP's device-verified running bytes live separately in
+// live device's device-verified running bytes live separately in
 // live-applied-sys.txt (sha256 11cb0472…, re-seeded by the 2026-09-21
-// site-settings round, whose key-rows full-provisioning render the AP
+// site-settings round, whose key-rows full-provisioning render the device
 // confirmed byte-identical; earlier re-seeds: the 2026-09-20
-// factory-window set-inform round at ad41cdad…, whose render the AP
+// factory-window set-inform round at ad41cdad…, whose render the device
 // confirmed byte-identical — the 2026-09-19 A2 round proved
 // the 3da7ce3e… bytes retained row-for-row across a raw reboot). Each
 // next-push candidate — both-band open
@@ -84,7 +84,7 @@ const (
 	// fw 6.8.2 boot path (/lib/preinit/99_21_ubnt_ubntconf do_ubntconf)
 	// greps the MTD-restored blob text for `mgmt.is_default=true` and
 	// replaces it with the factory template — the pre-fix factory-echo
-	// carried the row, so every reboot of a provisioned AP
+	// carried the row, so every reboot of a provisioned device
 	// factory-reset the WLAN text while mgmt/authkey survived via the
 	// tar part (WLAN-ACCEPTANCE A2). Baselines captured before the fix
 	// still contain the row; its removal is intended. Any OTHER mgmt.*
@@ -94,7 +94,7 @@ const (
 
 // zzHarnessRecord mirrors harness devices.json (mac aabbccddeeff):
 // live-record-shaped passthrough tables so ethPortNames/storedRadios
-// resolve exactly like the adopted AP's record does. The
+// resolve exactly like the adopted device's record does. The
 // ssh_sha512passwd seed is the cache value the accepted 2026-09-17 push
 // minted into the live record (usersPasswordHash reuses the cached hash
 // on every later render, server.go:1145-1156), so successive-push
@@ -181,7 +181,7 @@ func zzExemptIsDefaultMigration(rows []string) (out []string) {
 
 // zzExemptSSHReMint filters the known one-time record-change delta
 // (users.1.password, the 2026-09-20 factory-window re-adoption): the
-// console set-inform push lane's live round factory-reset the AP
+// console set-inform push lane's live round factory-reset the device
 // (setdefault), Forget removed the round-2 record, and the fresh
 // state-0 seed re-minted the controller-owned ssh_sha512 password
 // cache with a fresh crypt salt — same underlying site password, new
@@ -224,15 +224,18 @@ func zzExemptSSHKeyRows(rows []string) (out []string) {
 
 // zzLiveSiteSettings loads the live site-settings record fixture
 // (live-site-settings.json, the on-disk record shape — the
-// AP-intent facts) and builds the render's SiteSettings for the live
+// device-intent facts) and builds the render's SiteSettings for the live
 // gates: the record's raw authorized_keys lines parse through the
 // single fail-closed parser (the adapter-conversion seam cmd/openunifi
 // uses), so every candidate gate renders the CURRENT live sshd rows
 // exactly as the running controller does — without this fixture the
-// applied baseline's key rows would read as drift. Skips when the
-// fixture is absent (the harness lives only on this workstation); a
-// present-but-invalid line fails the gate — the fixture must be a
-// fetch of the live record, never hand input.
+// applied baseline's key rows would read as drift. A stale record may
+// still carry the REMOVED device_ssh_password key: json tolerates unknown
+// keys, the site password concept is gone (the per-device record field
+// carries it now), and the render reuses the device's cached password
+// hash. Skips when the fixture is absent (the harness lives only on this
+// workstation); a present-but-invalid line fails the gate — the fixture
+// must be a fetch of the live record, never hand input.
 func zzLiveSiteSettings(t *testing.T) SiteSettings {
 	t.Helper()
 	raw, err := os.ReadFile(zzHarnessDir + "/live-site-settings.json")
@@ -241,17 +244,32 @@ func zzLiveSiteSettings(t *testing.T) SiteSettings {
 	}
 	var doc struct {
 		RegulatoryCountryCode int      `json:"regulatory_country_code"`
-		APSSHPassword         string   `json:"ap_ssh_password"`
-		APSSHPublicKeys       []string `json:"ap_ssh_public_keys"`
+		DeviceSSHPublicKeys   []string `json:"device_ssh_public_keys"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		t.Fatalf("live site-settings.json: %v", err)
 	}
+	// keys tolerates the PRE-RENAME wire spelling ap_ssh_public_keys as
+	// well as the current device_ssh_public_keys: the checked-in fixture
+	// is a bench fetch of the live record whose latest capture predates
+	// the site-settings key rename. Both spellings mean the same content;
+	// the next live re-fetch will carry the current spelling and this
+	// fallback can go away — it exists ONLY here in the bench harness,
+	// never on any shipped wire path.
+	keys := doc.DeviceSSHPublicKeys
+	if keys == nil {
+		var legacy struct {
+			APSSHPublicKeys []string `json:"ap_ssh_public_keys"`
+		}
+		if err := json.Unmarshal(raw, &legacy); err != nil {
+			t.Fatalf("live site-settings.json: %v", err)
+		}
+		keys = legacy.APSSHPublicKeys
+	}
 	facts := SiteSettings{
 		CountryCode: doc.RegulatoryCountryCode,
-		SSHPassword: doc.APSSHPassword,
 	}
-	for _, line := range doc.APSSHPublicKeys {
+	for _, line := range keys {
 		k, perr := systemcfg.ParsePublicKey(line)
 		if perr != nil {
 			t.Fatalf("live site-settings key line does not parse (the fixture must be a fetch of the live record): %v", perr)
@@ -368,7 +386,7 @@ func TestZZMinimalDiffGate(t *testing.T) {
 
 // TestZZMinimalDiffGateLiveRecord — the same gate on the REAL live record
 // fetched from lab-bench (harness live-devices.json, store file shape).
-// This verifies the EXACT system_cfg bytes the live AP would receive on
+// This verifies the EXACT system_cfg bytes the live device would receive on
 // the gate-check push, before anything is deployed or pushed. Skips when
 // the fetched record is absent.
 // zzRecordFacts echoes the record's eth inventory and mgmt dev for the gate
@@ -413,7 +431,7 @@ func TestZZMinimalDiffGateLiveRecord(t *testing.T) {
 	}
 	rec, ok := file.Devices["aabbccddee02"]
 	if !ok {
-		t.Fatalf("live AP aa:bb:cc:dd:ee:02 absent from fetched record: %d devices", len(file.Devices))
+		t.Fatalf("live device aa:bb:cc:dd:ee:02 absent from fetched record: %d devices", len(file.Devices))
 	}
 	ports, mgmt := zzRecordFacts(rec)
 	fmt.Printf("[minimal-diff gate:live] eth inventory %v, radios %d, mgmt dev %q, vap rows %d\n",
@@ -482,7 +500,7 @@ func TestZZLiveIntentVsApplied(t *testing.T) {
 	}
 	rec, ok := file.Devices["aabbccddee02"]
 	if !ok {
-		t.Fatalf("live AP aa:bb:cc:dd:ee:02 absent from fetched record: %d devices", len(file.Devices))
+		t.Fatalf("live device aa:bb:cc:dd:ee:02 absent from fetched record: %d devices", len(file.Devices))
 	}
 	var envFile struct {
 		Wlans []Wlan `json:"wlans"`
@@ -528,9 +546,9 @@ const zzLiveWpaPSK = "openunifi-fake-c1-psk-20260918"
 // TestZZLiveWpaCandidateVsApplied — the push gate that pre-cleared the
 // 2026-09-18 C1 round: the live record + the live envelope (id preserved
 // verbatim) mutated to wpa-p, rendered and diffed against the RUNNING
-// config. The round EXECUTED and the AP verified: /tmp/system.cfg
+// config. The round EXECUTED and the device verified: /tmp/system.cfg
 // reproduced the candidate at sha256 9891d9ff… byte-for-byte, wpa rows
-// present, AP reachable through the {wireless, aaa} restart. Kept as the
+// present, device reachable through the {wireless, aaa} restart. Kept as the
 // template for the next candidate gate (any future push shape: mutate the
 // envelope here, enforce zero deltas outside the intended sections,
 // ABORT on anything else). Enforced: zero deltas outside the managed
@@ -558,7 +576,7 @@ func TestZZLiveWpaCandidateVsApplied(t *testing.T) {
 	}
 	rec, ok := file.Devices["aabbccddee02"]
 	if !ok {
-		t.Fatalf("live AP aa:bb:cc:dd:ee:02 absent from fetched record: %d devices", len(file.Devices))
+		t.Fatalf("live device aa:bb:cc:dd:ee:02 absent from fetched record: %d devices", len(file.Devices))
 	}
 	var envFile struct {
 		Wlans []Wlan `json:"wlans"`
@@ -605,7 +623,7 @@ func TestZZLiveWpaCandidateVsApplied(t *testing.T) {
 }
 
 // TestZZSuccessivePushControlVsApplied — the both-band open control
-// re-renders the exact envelope the AP already runs and must reproduce
+// re-renders the exact envelope the device already runs and must reproduce
 // the APPLIED bytes row-for-row: zero intended, zero violations. Any
 // nonzero diff is generator drift since the accepted push and must be
 // investigated before the next live push.

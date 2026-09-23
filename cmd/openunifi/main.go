@@ -1,6 +1,6 @@
 // Command openunifi is an open-source UniFi controller replacement.
 //
-// It serves the UniFi inform protocol for AP adoption (POST /inform),
+// It serves the UniFi inform protocol for device adoption (POST /inform),
 // a UDP :10001 discovery listener, the admin HTTP API + web console,
 // and Prometheus metrics.
 package main
@@ -45,14 +45,11 @@ func run() error {
 	listenAdmin := flag.String("listen-admin", "127.0.0.1:8443", "listen address for the admin API server")
 	listenDiscovery := flag.String("listen-discovery", ":10001", "UDP listen address for discovery")
 	discovery := flag.Bool("discovery", true, "enable the UDP discovery listener")
-	dataDir := flag.String("data-dir", "data", "directory for devices.json / wireless.json")
+	dataDir := flag.String("data-dir", "data", "directory for devices.json / wireless.json / site-settings.json")
 	controllerURL := flag.String("controller-url", "", "base URL devices are pointed at during adoption (e.g. http://10.0.0.5:8080)")
 	regulatoryCountryCode := flag.Int("regulatory-country-code", server.DefaultRegulatoryCountryCode, "ISO 3166-1 numeric regulatory country code (001-999); first-boot seed only — managed at runtime via the site-settings API")
-	apSSHPassword := flag.String("ap-ssh-password", os.Getenv("OPEN_UNIFI_AP_SSH_PASSWORD"),
-		"SSH password for adopted APs (required on first boot — the seed; falls back to $OPEN_UNIFI_AP_SSH_PASSWORD); first-boot seed only — managed at runtime via the site-settings API")
-	apSSHKeys := &keyList{}
-	flag.Var(apSSHKeys, "ap-ssh-key", "LAB ONLY: SSH authorized public key for adopted APs, one authorized_keys line per flag (repeatable; falls back to a single $OPEN_UNIFI_AP_SSH_KEY); first-boot seed only — managed at runtime via the site-settings API. Parsed and validated fail-closed at startup; provisioned as sshd.auth.key.<n>.* rows — firmware-derived but NOT yet live-bench-validated, pushes gated behind --allow-gated-live-wlan (docs/PROTOCOL-systemcfg-wireless.md §13)")
-	allowDefaultAPSSH := flag.Bool("allow-default-ap-ssh-password", false, "LAB ONLY: permit the insecure AP SSH password \"ubnt\" when --ap-ssh-password is empty")
+	deviceSSHKeys := &keyList{}
+	flag.Var(deviceSSHKeys, "device-ssh-key", "LAB ONLY: SSH authorized public key for adopted devices, one authorized_keys line per flag (repeatable; falls back to a single $OPEN_UNIFI_DEVICE_SSH_KEY); first-boot seed only — managed at runtime via the site-settings API. Parsed and validated fail-closed at startup; provisioned as sshd.auth.key.<n>.* rows — firmware-derived but NOT yet live-bench-validated, pushes gated behind --allow-gated-live-wlan (docs/PROTOCOL-systemcfg-wireless.md §13)")
 	// Default from the provider's token env var; --admin-token overrides it.
 	adminToken := flag.String("admin-token", os.Getenv("OPEN_UNIFI_ADMIN_TOKEN"),
 		"admin API bearer token (required; defaults to $OPEN_UNIFI_ADMIN_TOKEN)")
@@ -88,13 +85,9 @@ func run() error {
 	// --regulatory-country-code 0 by the guard further down. Once the
 	// record exists the flags are dead
 	// seeds: warned as ignored (below), never validated — one consistent
-	// posture for every equally-dead input (the password guard above
-	// narrows the same way). app's seed validation applies the same
-	// save-verb rule (the seed is admin intent).
-	if !settingsExisted && *apSSHPassword == "" && !*allowDefaultAPSSH {
-		return errors.New("AP SSH password is required; set --ap-ssh-password or explicitly opt in with --allow-default-ap-ssh-password for lab use")
-	}
-	sshSeedKeys := effectiveSSHKeyLines(apSSHKeys.keys, os.Getenv("OPEN_UNIFI_AP_SSH_KEY"))
+	// posture for every equally-dead input. app's seed validation applies
+	// the same save-verb rule (the seed is admin intent).
+	sshSeedKeys := effectiveSSHKeyLines(deviceSSHKeys.keys, os.Getenv("OPEN_UNIFI_DEVICE_SSH_KEY"))
 	if !settingsExisted {
 		// The flag default is nonzero, so a zero here can only come from an
 		// explicitly supplied --regulatory-country-code 0. Reject it before the
@@ -154,13 +147,13 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("open device store: %w", err)
 	}
-	ap := app.New(st, filepath.Join(*dataDir, "wireless.json"), filepath.Join(*dataDir, "site-settings.json"), siteSettingsSeed(*regulatoryCountryCode, *apSSHPassword, sshSeedKeys), logger)
+	backend := app.New(st, filepath.Join(*dataDir, "wireless.json"), filepath.Join(*dataDir, "site-settings.json"), siteSettingsSeed(*regulatoryCountryCode, sshSeedKeys), logger)
 	// The wireless document is loaded ONCE in app.New; a corrupt
 	// wireless.json must refuse startup here (same as a corrupt
 	// devices.json already does) — otherwise the provisioning side would
 	// degrade to zero WLANs and, on the next TF plan PUT, wipe every other
-	// WLAN off every AP.
-	if _, err := ap.CurrentWireless(); err != nil {
+	// WLAN off every device.
+	if _, err := backend.CurrentWireless(); err != nil {
 		return fmt.Errorf("wireless config: %w", err)
 	}
 	// Same discipline for the site-settings record: a present-but-bad
@@ -170,20 +163,28 @@ func run() error {
 	// above, so this check is the belt to their suspenders. The loaded
 	// record is also the single source of truth for the startup log and
 	// the sshd-facts warn below (the flags are seeds only).
-	siteSettings, serr := ap.CurrentSiteSettings()
+	siteSettings, serr := backend.CurrentSiteSettings()
 	if serr != nil {
 		return fmt.Errorf("site settings: %w", serr)
 	}
-	// The AP-intent inputs are first-boot seeds only. Warn that they
+	// One-time warn on the REMOVED password env — the HISTORICAL name
+	// (GHCR-era deploys export it; OPEN_UNIFI_DEVICE_SSH_PASSWORD never
+	// existed): a deployer still exporting the dead site password env must
+	// learn where the knob went. The per-device SSH password has no env at
+	// all — it is per-device admin intent via PATCH /api/v1/devices/{mac}.
+	if os.Getenv("OPEN_UNIFI_AP_SSH_PASSWORD") != "" {
+		logger.Warn("OPEN_UNIFI_AP_SSH_PASSWORD is no longer read; per-device SSH passwords are set via PATCH /api/v1/devices/{mac} (Terraform open-unifi_access_point)")
+	}
+	// The device-intent inputs are first-boot seeds only. Warn that they
 	// were ignored ONLY when a record existed before this boot (the pre-New
 	// settingsExisted determination — after app.New the file always exists,
 	// because the call seeds and persists it) AND at least one flag was
 	// actually supplied. On the seeding first boot the flags were honored:
 	// the default flow is the happy path, not a warning.
-	if apIntentSupplied() && settingsExisted {
-		logger.Warn("site settings exist; --regulatory-country-code/--ap-ssh-password/--ap-ssh-key ignored (first-boot seeds only — managed at runtime via the site-settings API)")
+	if siteIntentSupplied() && settingsExisted {
+		logger.Warn("site settings exist; --regulatory-country-code/--device-ssh-key ignored (first-boot seeds only — managed at runtime via the site-settings API)")
 	}
-	adminH := adminapi.New(adminapi.Config{AdminToken: *adminToken}, ap)
+	adminH := adminapi.New(adminapi.Config{AdminToken: *adminToken}, backend)
 
 	if *allowAnonymousAdmin {
 		// Prominent, not debug: without a token any LAN peer can read WLAN
@@ -198,7 +199,7 @@ func run() error {
 	// the envelope is served from App's cache, which cannot fail — but it
 	// stays as the documented behavior before startup.
 	wirelessSource := func() []server.Wlan {
-		env, err := ap.CurrentWireless()
+		env, err := backend.CurrentWireless()
 		if err != nil {
 			logger.Warn("wireless envelope read failed; provisioning without wlans", "err", err)
 			return nil
@@ -237,7 +238,7 @@ func run() error {
 	}
 
 	// SiteSettingsSource feeds the app's site-settings record into inform-
-	// side provisioning (the managed AP-intent facts) and into the
+	// side provisioning (the managed device-intent facts) and into the
 	// adoption engine's live-provisioning gate. The record stores RAW
 	// authorized_keys lines; this seam is where the parse lands — every
 	// line through the single fail-closed parser (systemcfg.ParsePublicKey),
@@ -251,7 +252,7 @@ func run() error {
 	// (net fail-closed — startup already refused on this error, so it is
 	// embedder-only).
 	siteSettingsSource := func() (server.SiteSettings, error) {
-		rec, err := ap.CurrentSiteSettings()
+		rec, err := backend.CurrentSiteSettings()
 		if err != nil {
 			return server.SiteSettings{}, err
 		}
@@ -259,13 +260,12 @@ func run() error {
 		for i, line := range rec.SSHPublicKeys {
 			k, perr := systemcfg.ParsePublicKey(line)
 			if perr != nil {
-				return server.SiteSettings{}, fmt.Errorf("invalid AP SSH public key #%d: %w", i+1, perr)
+				return server.SiteSettings{}, fmt.Errorf("invalid Device SSH public key #%d: %w", i+1, perr)
 			}
 			keys = append(keys, k)
 		}
 		return server.SiteSettings{
 			CountryCode:   rec.CountryCode,
-			SSHPassword:   rec.SSHPassword,
 			SSHPublicKeys: keys,
 		}, nil
 	}
@@ -306,7 +306,7 @@ func run() error {
 	// when no inform URL is derivable (empty or hostless --controller-url):
 	// fail fast like the other flag validations, before any listener binds.
 	if *allowSSHSetInformPush {
-		if err := ap.EnableSetInformPush(*controllerURL, *listenInform); err != nil {
+		if err := backend.EnableSetInformPush(*controllerURL, *listenInform); err != nil {
 			return fmt.Errorf("--allow-ssh-set-inform-push: %w", err)
 		}
 		logger.Warn("ssh set-inform push lane ARMED (LAB ONLY): console Adopt on a factory announce candidate pushes mca-cli-op set-inform over SSH with factory default credentials")
@@ -407,8 +407,9 @@ func run() error {
 		"discovery_port", dport,
 		"data_dir", *dataDir,
 		// The site facts are the RECORD's values now (the flags seeded it on
-		// first boot and are ignored thereafter).
-		"ssh_password_configured", siteSettings.SSHPassword != "",
+		// first boot and are ignored thereafter). (The per-device SSH
+		// password left the site record — no site-level
+		// ssh_password_configured signal exists anymore.)
 		"ssh_public_keys", len(siteSettings.SSHPublicKeys),
 		"auth", *adminToken != "",
 		"plaintext_inform", *allowPlainText,
@@ -450,7 +451,7 @@ func run() error {
 	}()
 	pollDone := make(chan struct{})
 	go func() {
-		ap.RunPoller(ctx, 15*time.Second)
+		backend.RunPoller(ctx, 15*time.Second)
 		close(pollDone)
 	}()
 
@@ -485,12 +486,12 @@ func shutdownCtx() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), 5*time.Second)
 }
 
-// keyList is a REPEATABLE flag.Value: every --ap-ssh-key occurrence appends
-// one authorized_keys line. The env fallback ($OPEN_UNIFI_AP_SSH_KEY, a
+// keyList is a REPEATABLE flag.Value: every --device-ssh-key occurrence appends
+// one authorized_keys line. The env fallback ($OPEN_UNIFI_DEVICE_SSH_KEY, a
 // single key) consults the environment — passed in by run() AFTER
-// flag.Parse so this stays pure — only when the flag never appeared, the
-// --ap-ssh-password/env fallback pattern, so an explicitly supplied flag
-// wins over the environment.
+// flag.Parse so this stays pure — only when the flag never appeared, so an
+// explicitly supplied flag wins over the environment (the same posture as
+// every other seed flag).
 type keyList struct {
 	keys []string
 }
@@ -503,27 +504,26 @@ func (l *keyList) Set(v string) error {
 }
 
 // siteSettingsSeed builds the first-boot site-settings seed from the
-// AP-intent flags. The key lines are passed RAW (the composition ran above
+// device-intent flags. The key lines are passed RAW (the composition ran above
 // through effectiveSSHKeyLines; app.New runs the single fail-closed parser;
 // nothing is pre-parsed here). The saved record preserves what the flags
 // say, verbatim: on the first-boot path main's pre-New seed-flag guards
-// (password guard, explicit-0 country rejection) and app.New's seed
-// validation (the save-verb rule, key parse among them) already gated this
-// boot. Once the record exists the flags are dead seeds and this value is
-// ignored by app.New anyway.
-func siteSettingsSeed(countryCode int, password string, keys []string) app.SiteSettings {
+// (explicit-0 country rejection) and app.New's seed validation (the
+// save-verb rule, key parse among them) already gated this boot. Once the
+// record exists the flags are dead seeds and this value is ignored by
+// app.New anyway.
+func siteSettingsSeed(countryCode int, keys []string) app.SiteSettings {
 	return app.SiteSettings{
 		CountryCode:   countryCode,
-		SSHPassword:   password,
 		SSHPublicKeys: keys,
 	}
 }
 
 // effectiveSSHKeyLines is the flag/env source composition feeding the
 // first-boot SSH key seed (its single consumer): the flag occurrences win;
-// the env fallback ($OPEN_UNIFI_AP_SSH_KEY, a single key line) supplies
-// only when the flag never appeared — the --ap-ssh-password/env fallback
-// pattern, so an explicitly supplied flag wins over the environment.
+// the env fallback ($OPEN_UNIFI_DEVICE_SSH_KEY, a single key line) supplies
+// only when the flag never appeared — an explicitly supplied flag wins
+// over the environment.
 func effectiveSSHKeyLines(flagKeys []string, envValue string) []string {
 	keys := flagKeys
 	if len(keys) == 0 && envValue != "" {
@@ -532,18 +532,17 @@ func effectiveSSHKeyLines(flagKeys []string, envValue string) []string {
 	return keys
 }
 
-// apIntentSupplied reports whether at least one of the AP-intent
+// siteIntentSupplied reports whether at least one of the device-intent
 // inputs was explicitly supplied — the seed the "site settings exist"
 // warning actually refers to. Two sources count: flag.Visit over the
 // flag names (explicit occurrences on the command line), and the env
-// fallbacks OPEN_UNIFI_AP_SSH_PASSWORD / OPEN_UNIFI_AP_SSH_KEY — those feed
+// fallback $OPEN_UNIFI_DEVICE_SSH_KEY — those feed
 // the flag DEFAULTS, so flag.Visit alone misses them. Must run AFTER
 // flag.Parse (flag.Visit walks parsed flags).
-func apIntentSupplied() bool {
+func siteIntentSupplied() bool {
 	names := map[string]bool{
 		"regulatory-country-code": true,
-		"ap-ssh-password":         true,
-		"ap-ssh-key":              true,
+		"device-ssh-key":          true,
 	}
 	supplied := false
 	flag.Visit(func(f *flag.Flag) {
@@ -551,7 +550,7 @@ func apIntentSupplied() bool {
 			supplied = true
 		}
 	})
-	if os.Getenv("OPEN_UNIFI_AP_SSH_PASSWORD") != "" || os.Getenv("OPEN_UNIFI_AP_SSH_KEY") != "" {
+	if os.Getenv("OPEN_UNIFI_DEVICE_SSH_KEY") != "" {
 		supplied = true
 	}
 	return supplied

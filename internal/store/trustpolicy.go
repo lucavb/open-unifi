@@ -3,8 +3,7 @@
 //
 //	controller-owned keys: the controller preserves the record's value
 //	             verbatim against any device-supplied body (the wlan_cfg_*
-//	             delivery bookkeeping, the client-session family, the SSH
-//	             password cache);
+//	             bookkeeping, the client-session family);
 //	device-refreshable caps: only the device can supply them
 //	             (radio_table, wifi_caps, fw_caps, if_table,
 //	             ethernet_table, uplink, has_eth1) — a sparse heartbeat
@@ -12,8 +11,9 @@
 //	admin-owned rows: only an admin can set or change them — a device
 //	             body can neither write nor introduce them (the
 //	             system_cfg/site-fact rows, the armed lifecycle rows, the
-//	             typed LED record fields' Extra twins, the blocked-client
-//	             set and its delivery baseline, the per-radio channel
+//	             typed LED/SSH record fields' Extra twins, the blocked-client
+//	             set and its delivery baseline, the per-device SSH
+//	             password caches, the per-radio channel
 //	             intent, the §6.3 stored task).
 //
 // This file is the single declaration site for every class (Absorb guards
@@ -27,17 +27,19 @@ package store
 import "time"
 
 const (
-	// SSHSha512PasswdKey is the Extra row caching the $6$ crypt of the
-	// site's AP SSH password (the systemcfg renderer's credential delta; a
-	// stale match re-derives the identical value). Controller-owned: a
-	// device body can neither clobber it nor wipe it, or every heartbeat
-	// between provisioning rounds would re-emit the credential delta.
-	// The md5 twin (ssh_md5passwd, the $1$ branch in
-	// internal/server/systemcfg/render.go) is deliberately UNCLASSED —
-	// adapter-era behavior, and byte-identity forbids classing it; on
-	// md5-branch devices a clobbered cache self-heals via the next
-	// render's credential delta.
+	// SSHSha512PasswdKey / SSHMd5PasswdKey are the two Extra rows caching
+	// the LAST password hash the controller pushed for this device (the
+	// $6$ / $1$ crypts produced by the systemcfg renderer's credential
+	// delta). ADMIN-OWNED as prev-or-delete (the same shape as
+	// blocked_sta_sha, a controller-written admin-owned row): a device
+	// body can neither clobber, wipe, nor INTRODUCE either cache — under
+	// the renderer's verbatim unset reuse a device-introduced cache WOULD
+	// ship (a forged pre-adoption inform could seed the password a device
+	// then keeps), and the only legitimate writer is the controller's own
+	// credential delta, applied by the adapter in the applyOutcome dict
+	// loop.
 	SSHSha512PasswdKey = "ssh_sha512passwd"
+	SSHMd5PasswdKey    = "ssh_md5passwd"
 
 	// SystemCfgExtraLinesKey holds the admin's raw extra system_cfg lines
 	// (sorted []any of strings).
@@ -71,10 +73,9 @@ const (
 )
 
 // controllerOwnedKeys is the record's controller-owned Extra key class
-// (single source): the wlan_cfg_* WLAN delivery bookkeeping, the
-// client-session family, and the SSH password cache. Package-private by
-// design (the sealed surface: Absorb is the only reader); nothing outside
-// this file may copy it.
+// (single source): the wlan_cfg_* WLAN delivery bookkeeping and the
+// client-session family. Package-private by design (the sealed surface:
+// Absorb is the only reader); nothing outside this file may copy it.
 var controllerOwnedKeys = []string{
 	"wlan_cfg_sha", "wlan_cfg_pending_sha", "wlan_cfg_pending_wlans",
 	"wlan_cfg_pending_old_wlans", "wlan_cfg_applied_wlans",
@@ -82,7 +83,6 @@ var controllerOwnedKeys = []string{
 	"wlan_cfg_last_attempt", "wlan_cfg_delivery_status",
 	"wlan_cfg_not_running_misses", "wlan_cfg_offered_cfgversion",
 	SessionsExtraKey, SessionDisconnectEventExtraKey,
-	SSHSha512PasswdKey,
 }
 
 // deviceRefreshableKeys is the device-refreshable caps class: fields only
@@ -102,11 +102,17 @@ var deviceRefreshableKeys = []string{
 // led_override_color_* entries are the Extra twins of the typed Device
 // fields above (the classic controller reads all four rows from its own DB,
 // never the wire) — a body echo is dropped so it can neither shadow the
-// typed value nor introduce a copy. blocked_sta (the admin-owned
+// typed value nor introduce a copy. "ssh_password" is the same twin for the
+// typed per-device SSH password field. blocked_sta (the admin-owned
 // blocked-client set) and blocked_sta_sha (the delivery baseline) get the
 // prev-or-delete rule too: prev-owns alone would let a body INTRODUCE the
 // baseline, and a forged baseline matching a forged set would suppress
-// delivery — only the engine's own emission ever writes it.
+// delivery — only the engine's own emission ever writes it. The two SSH
+// password caches (SSHSha512PasswdKey/SSHMd5PasswdKey) ride the SAME
+// prev-or-delete rule: they hold the DEVICE's last controller-pushed
+// password hash (the renderer's unset branch reuses that row verbatim, so a
+// device-introduced cache would ship verbatim), and the only legitimate
+// writer is the controller's own credential delta.
 // Package-private by design (the sealed surface: Absorb is the only
 // reader); nothing outside this file may copy it.
 var adminOwnedKeys = []string{
@@ -114,8 +120,9 @@ var adminOwnedKeys = []string{
 	AnonymousControllerIDKey, AnonymousSiteIDKey,
 	FlagRebootOnConnect, FlagSetdefaultArmed,
 	BlockedStaExtraKey, BlockedStaShaExtraKey,
+	SSHSha512PasswdKey, SSHMd5PasswdKey,
 	"led_override", "disabled", "led_override_color_brightness",
-	"led_override_color",
+	"led_override_color", "ssh_password",
 	RadioIntentExtraKey, CmdTaskKey,
 }
 
@@ -123,10 +130,12 @@ var adminOwnedKeys = []string{
 // §6.6 factory-reset demotion clears: the PER-DEVICE controller state whose
 // staleness cannot survive a reset (a stale wlan_cfg_sha would let the
 // re-adopted device settle into connected noops while running factory
-// config). SSHSha512PasswdKey is deliberately excluded: it caches a SITE
-// fact — the AP SSH password — which the first post-reset provisioning
-// re-derives verbatim, and the demoted record's shape must not drift from
-// what the inform-path seam has always left behind. Derived from
+// config). SSHSha512PasswdKey is deliberately excluded — and the same
+// survival now holds by CLASS membership, not just by this exclude: both
+// password caches are admin-owned (they hold the DEVICE's last
+// controller-pushed password and deliberately survive factory
+// reset/setdefault demotion; the exclude keeps that survival even if the
+// keys ever move classes again). Derived from
 // controllerOwnedKeys, so the sweep can never fall out of sync with the
 // class it clears. TREAT AS IMMUTABLE (do not append or reorder; it holds
 // the registry's own defensive copy — excludeKey built it fresh).

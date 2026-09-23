@@ -198,6 +198,11 @@ type device struct {
 	LEDOverrideColorBrightness *int   `json:"led_override_color_brightness,omitempty"`
 	LEDOverrideColor           string `json:"led_override_color,omitempty"`
 	PendingCommand             string `json:"pending_command,omitempty"`
+	// SSHPassword mirrors the admin API's per-device SSH login password
+	// echo ("" = unmanaged). Wire-decode only for now: the schema
+	// attribute lands with the provider device-rename phase; parity with
+	// the server structs is the only contract (TestDeviceStructParity).
+	SSHPassword string `json:"ssh_password,omitempty"`
 }
 
 // stateNames maps the server's numeric device states (internal/store
@@ -289,16 +294,20 @@ func (c *apiClient) deleteWireless(ctx context.Context, name string) error {
 }
 
 // siteSettings is the wire shape of GET/PUT /api/v1/site-settings
-// (adminapi.SiteSettingsDocument/SiteSettingsView). All three fields are
-// ALWAYS on the wire, so none carries omitempty: PUT is whole-document
+// (adminapi.SiteSettingsDocument/SiteSettingsView). Both fields are
+// ALWAYS on the wire, so neither carries omitempty: PUT is whole-document
 // (the strict server decode rejects a missing/null field with a 400
-// "missing field <name>") and the GET view echoes all three. An empty
-// ap_ssh_public_keys marshals as [] — never null (a JSON null decodes to a
-// nil pointer server-side and trips the same missing-field 400).
+// "missing field <name>") and the GET view echoes both. An empty
+// device_ssh_public_keys marshals as [] — never null (a JSON null decodes
+// to a nil pointer server-side and trips the same missing-field 400).
+// (The historical `ap_ssh_password` field is OFF this wire: the site-level
+// password is removed server-side; the per-device SSH password rides the
+// device record instead — the schema attribute's removal/rename rides the
+// next provider phase, so a configured value simply stops reaching the
+// wire and read-back reads null.)
 type siteSettings struct {
 	RegulatoryCountryCode int      `json:"regulatory_country_code"`
-	APSSHPassword         string   `json:"ap_ssh_password"`
-	APSSHPublicKeys       []string `json:"ap_ssh_public_keys"`
+	DeviceSSHPublicKeys   []string `json:"device_ssh_public_keys"`
 }
 
 // getSiteSettings GETs /api/v1/site-settings. The controller carries

@@ -631,7 +631,7 @@ func (rd *render) emitVlanBlocks(b *strings.Builder, d store.Device, vaps []wire
 // factoryMgmtIP / factoryMgmtNetmask are the factory-baseline management
 // netconf values for this firmware lane (U7PG2 / 6.8.2.15592): the
 // firmware's fallback STATIC address, as carried by /tmp/system.cfg on the
-// factory-reset AP (/tmp/harness/ap-forensics/tmp/system.cfg:58-60, fetched
+// factory-reset device (/tmp/harness/ap-forensics/tmp/system.cfg:58-60, fetched
 // 2026-09-17). Runtime addressing is owned by udhcpc — the dhcpc.1=br0
 // section we push stays byte-identical to the factory one, so DHCP keeps
 // running and these rows never take effect while adopted.
@@ -647,11 +647,11 @@ const (
 // WHY an echo and not the real builder's render: the real controller
 // renders netconf from its site-networks model (intsuper javap offsets
 // 627-676: the mgmt instance is patched with the config_network ip/netmask —
-// type "dhcp" → ip 0.0.0.0, no netmask row), which on a factory-reset AP
+// type "dhcp" → ip 0.0.0.0, no netmask row), which on a factory-reset device
 // CHANGES netconf.1.ip (192.168.1.20 → 0.0.0.0) and restarts the `net`
 // plugin (/etc/sysinit/net.conf, fetched 2026-09-17: plugin_stop =
 // `ifconfig br0/eth0/ath0/ath1 down` + `killall dropbear`; plugin_start =
-// HARDCODED factory bootstrap br0=192.168.1.20/24). Real APs survive that
+// HARDCODED factory bootstrap br0=192.168.1.20/24). Real devices survive that
 // restart via the udhcpc inittab respawn; OUR two live first-pushes
 // (2026-09-16 09:43 both-band sha 11fddde5…, 13:54 2g-only sha f77521e8…)
 // did NOT recover — the pushed system_cfg is a FULL-CONFIG REPLACEMENT and

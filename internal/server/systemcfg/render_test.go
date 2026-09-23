@@ -63,8 +63,9 @@ func renderUsers1Password(t *testing.T, sys string) string {
 // facts a DIFFERENT envelope while handing the SAME plan must produce the
 // byte-identical text — the renderer's wireless rows come from the plan,
 // never from facts.WLANs. Only facts.WLANs is varied here deliberately:
-// CountryCode and SSHPassword still render into rows (countrycode and the
-// users.1 hash), so varying them would double as unrelated-fixture churn
+// CountryCode still renders into rows (the countrycode block), and the
+// users.1 hash comes from the device record itself, so varying facts
+// doubles as unrelated-fixture churn
 // rather than an independence pin.
 func TestRenderWithPlanIgnoresFactsWLAN(t *testing.T) {
 	d := renderRecord()
@@ -362,11 +363,14 @@ func TestRenderWarnings(t *testing.T) {
 	}
 }
 
-// R4(c): SiteFacts.SSHPassword overrides the hashed password — the users.1
-// row self-checks against the override and NOT the default ("ubnt"); the
-// sshd rows are untouched by the password choice.
+// R4(c): the DEVICE record's SSHPassword (the admin-set per-device field)
+// overrides the hashed password — the users.1 row self-checks against the
+// override and NOT the default ("ubnt"); the sshd rows are untouched by
+// the password choice.
 func TestRenderSSHPasswordOverride(t *testing.T) {
-	res, err := Render(renderRecord(), SiteFacts{SSHPassword: "hunter2"})
+	rec := renderRecord()
+	rec.SSHPassword = "hunter2"
+	res, err := Render(rec, SiteFacts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -429,6 +433,124 @@ func TestRenderStaleMD5CacheIgnored(t *testing.T) {
 	}
 	if len(res.CredentialDeltas) != 1 || res.CredentialDeltas["ssh_sha512passwd"] != pw {
 		t.Fatalf("deltas = %v, want exactly ssh_sha512passwd (md5 cache ignored)", res.CredentialDeltas)
+	}
+}
+
+// The md5-arm mirror of TestRenderStaleMD5CacheIgnored: a SET password on
+// an md5-family device ignores a stray ssh_sha512passwd cache row — the
+// output is $1$ and the deltas carry ONLY ssh_md5passwd (the sha512 cache
+// is not the md5 one; the unset path's cross-family stray tolerance is
+// pinned in TestRenderUnsetReusesWellFormedCacheVerbatim, this closes the
+// set path).
+func TestRenderStaleSha512CacheIgnored(t *testing.T) {
+	rec := renderRecord()
+	rec.Extra["fw_caps"] = 0.0 // md5 branch
+	rec.SSHPassword = "setpw"
+	stray := "$6$0Vt2Ue1V$cZ7N8BjYvOhq2jbFLYMyiJC8t1j3QroXfPzolNy0KhHypWV4OQqLPTerxeYg4LjtLpHzdXH2QCxaOmB2Pup0cz"
+	if !sha512CacheFormatRx.MatchString(stray) {
+		t.Fatalf("fixture must be well-formed per the reuse gate: %q", stray)
+	}
+	rec.Extra["ssh_sha512passwd"] = stray // stray sha512 row must be ignored
+	res, err := Render(rec, SiteFacts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pw := renderUsers1Password(t, res.Text)
+	if !strings.HasPrefix(pw, "$1$") {
+		t.Fatalf("stray sha512 cache must not pin the md5 output, got %q", pw)
+	}
+	if len(res.CredentialDeltas) != 1 || res.CredentialDeltas["ssh_md5passwd"] != pw {
+		t.Fatalf("deltas = %v, want exactly ssh_md5passwd (sha512 cache ignored)", res.CredentialDeltas)
+	}
+}
+
+// The locked UNSET contract (per-device SSH password, render.go
+// usersPasswordHash docblock): an EMPTY record password = stop managing —
+// a well-formed cache row of the record's own family is reused VERBATIM
+// with NO credential delta (no match against any password is attempted;
+// even a hash of an unnameable password ships as-is), and a MALFORMED
+// cache falls through to the factory-default path (fresh ubnt hash +
+// delta). The unset branch lives INSIDE each family arm: only the family's
+// own cache row can pin the render (TestRenderStaleMD5CacheIgnored holds).
+func TestRenderUnsetReusesWellFormedCacheVerbatim(t *testing.T) {
+	// sha512 arm: a well-formed $6$ row that matches NO password at all.
+	rec := renderRecord() // fw_caps 0x400 → sha512 branch
+	stray, err := md5Crypt("nope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.Extra["ssh_md5passwd"] = stray // stray md5 row must be ignored
+	cached := "$6$0Vt2Ue1V$cZ7N8BjYvOhq2jbFLYMyiJC8t1j3QroXfPzolNy0KhHypWV4OQqLPTerxeYg4LjtLpHzdXH2QCxaOmB2Pup0cz"
+	if !sha512CacheFormatRx.MatchString(cached) {
+		t.Fatalf("fixture must be well-formed per the reuse gate: %q", cached)
+	}
+	rec.Extra[store.SSHSha512PasswdKey] = cached
+	res, err := Render(rec, SiteFacts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := renderUsers1Password(t, res.Text); got != cached {
+		t.Fatalf("unset render must reuse the sha512 cache verbatim: %q, want %q", got, cached)
+	}
+	if len(res.CredentialDeltas) != 0 {
+		t.Fatalf("unset verbatim reuse must emit no deltas, got %v", res.CredentialDeltas)
+	}
+
+	// md5 branch (fw_caps 0): identical shape with the $1$ gate.
+	recMD5 := renderRecord()
+	recMD5.Extra["fw_caps"] = 0.0
+	recMD5.Extra["ssh_sha512passwd"] = cached // stray sha512 row must be ignored
+	md5Cached := "$1$ZXcvbnQ5$c/UnYH6CXpAcGqJZvMHTV/"
+	if !md5CacheFormatRx.MatchString(md5Cached) {
+		t.Fatalf("fixture must be well-formed per the md5 reuse gate: %q", md5Cached)
+	}
+	recMD5.Extra[store.SSHMd5PasswdKey] = md5Cached
+	resMD5, err := Render(recMD5, SiteFacts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := renderUsers1Password(t, resMD5.Text); got != md5Cached {
+		t.Fatalf("unset render must reuse the md5 cache verbatim: %q, want %q", got, md5Cached)
+	}
+	if len(resMD5.CredentialDeltas) != 0 {
+		t.Fatalf("unset md5 verbatim reuse must emit no deltas, got %v", resMD5.CredentialDeltas)
+	}
+}
+
+// The unset contract's fall-through: a MALFORMED cache (not a well-formed
+// crypt string of the family) is never reused verbatim — the factory
+// default ubnt row is freshly hashed and written back as a delta, both
+// arms.
+func TestRenderUnsetMalformedCacheFallsToDefault(t *testing.T) {
+	// sha512 arm.
+	rec := renderRecord()
+	rec.Extra[store.SSHSha512PasswdKey] = "cached-not-crypt"
+	res, err := Render(rec, SiteFacts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pw := renderUsers1Password(t, res.Text)
+	if !sha512CryptMatches(defaultSSHPassword, pw) {
+		t.Fatalf("malformed sha512 cache must fall through to a fresh ubnt row: %q", pw)
+	}
+	if len(res.CredentialDeltas) != 1 || res.CredentialDeltas[store.SSHSha512PasswdKey] != pw {
+		t.Fatalf("fall-through render deltas = %v, want exactly the fresh ssh_sha512passwd", res.CredentialDeltas)
+	}
+
+	// md5 arm.
+	recMD5 := renderRecord()
+	recMD5.Extra["fw_caps"] = 0.0
+	recMD5.Extra[store.SSHMd5PasswdKey] = "$1$short"
+	resMD5, err := Render(recMD5, SiteFacts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pwMD5 := renderUsers1Password(t, resMD5.Text)
+	if !md5CryptMatches(defaultSSHPassword, pwMD5) {
+		t.Fatalf("malformed md5 cache must fall through to a fresh ubnt row: %q", pwMD5)
+	}
+	if len(resMD5.CredentialDeltas) != 1 || resMD5.CredentialDeltas[store.SSHMd5PasswdKey] != pwMD5 {
+		t.Fatalf("fall-through md5 deltas = %v, want exactly the fresh ssh_md5passwd", resMD5.CredentialDeltas)
 	}
 }
 
@@ -833,15 +955,21 @@ func TestParsePublicKeyTable(t *testing.T) {
 // R6(a) pin: sshd.auth.passwd renders "enabled" UNCONDITIONALLY — the
 // password-disable knob is gone (a live round proved the firmware's -s
 // respawn line bricks SSH on U7PG2 6.8.2.15592). The row must be present
-// exactly once with the enabled value whether the site facts carry keys
-// or not, byte-exact in the deleted knob test's style.
+// exactly once with the enabled value whether the device record carries a
+// password or not, byte-exact in the deleted knob test's style.
 func TestRenderSSHPasswdAlwaysEnabled(t *testing.T) {
-	for label, facts := range map[string]SiteFacts{
-		"zero facts":  {},
-		"with a key":  {SSHPublicKeys: []PublicKey{{Type: "ssh-ed25519", Value: "AAAA"}}},
-		"site passwd": {SSHPassword: "hunter2"},
+	for label, pw := range map[string]string{
+		"unset record":  "",
+		"set record":    "hunter2",
+		"record w/ key": "",
 	} {
-		res, err := Render(renderRecord(), facts)
+		rec := renderRecord()
+		rec.SSHPassword = pw
+		var facts SiteFacts
+		if label == "record w/ key" {
+			facts.SSHPublicKeys = []PublicKey{{Type: "ssh-ed25519", Value: "AAAA"}}
+		}
+		res, err := Render(rec, facts)
 		if err != nil {
 			t.Fatal(err)
 		}

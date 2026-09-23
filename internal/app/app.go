@@ -109,7 +109,7 @@ var _ adminapi.Backend = (*App)(nil)
 // here: a missing file yields the empty default (first boot), an unreadable
 // or JSON-corrupt file is retained in loadErr — callers must check
 // CurrentWireless at startup (cmd/openunifi refuses to launch) instead of
-// silently provisioning APs with zero WLANs.
+// silently provisioning devices with zero WLANs.
 //
 // settingsPath + seed carry the site-settings record (site_settings.go),
 // the wireless-envelope precedent for a controller-level whole-document
@@ -121,7 +121,9 @@ func New(st store.DeviceStore, wirelessPath, settingsPath string, seed SiteSetti
 		lg = slog.Default()
 	}
 	env, err := loadWirelessFile(wirelessPath)
-	settings, loaded, serr := loadSettingsFile(settingsPath)
+	// The logger is available before New returns: the loader warns once on
+	// a stale removed key (the device_ssh_password peek) through it.
+	settings, loaded, serr := loadSettingsFile(settingsPath, lg)
 	settingsErr := serr
 	if !loaded {
 		// First boot: the seed (cmd/openunifi's startup flags, or the
@@ -298,6 +300,7 @@ func (a *App) view(d store.Device) adminapi.DeviceView {
 		// and the verbatim color string.
 		LEDOverrideColorBrightness: d.LEDOverrideColorBrightness,
 		LEDOverrideColor:           d.LEDOverrideColor,
+		SSHPassword:                d.SSHPassword,
 		PendingCommand:             armedCommand(d),
 		Actions:                    []string{"delete"},
 	}
@@ -373,7 +376,7 @@ func int64Extra(m store.JSONMap, key string) int64 {
 // served on every inform. Missing runtime evidence is unknown (nil), while
 // an observed table that lacks a desired RUN SSID is false.
 //
-// The vap_table wire keys are firmware-verified: APs report "essid" (not
+// The vap_table wire keys are firmware-verified: devices report "essid" (not
 // "ssid") and "state" (not "status"). The alternate spellings are tolerated
 // defensively, but "essid"/"state" are the primaries.
 func runtimeInSync(d store.Device, desired []adminapi.Wlan) *bool {
@@ -424,7 +427,8 @@ func runtimeInSync(d store.Device, desired []adminapi.Wlan) *bool {
 // PatchDevice applies the admin's device-name/site/knob rows as one
 // admin-intent save (see saveIntent): the fence validates every supplied
 // row, the RMW cycle applies them, and an EFFECTIVE change — one of the
-// provisioning-carried LED rows — mints a fresh cfgversion; name/site_id
+// provisioning-carried LED rows or the per-device SSH password — mints a
+// fresh cfgversion; name/site_id
 // are bookkeeping rows the device is never provisioned from, so they mint
 // nothing.
 func (a *App) PatchDevice(_ context.Context, mac string, patch adminapi.DevicePatch) (adminapi.DeviceView, error) {
@@ -505,6 +509,23 @@ func (a *App) PatchDevice(_ context.Context, mac string, patch adminapi.DevicePa
 					effective = true
 				}
 				d.LEDOverrideColor = *patch.LEDOverrideColor
+			}
+			if patch.SSHPassword != nil {
+				// Pointer semantics mirror LEDOverrideColor: nil =
+				// untouched; non-nil "" = STOP MANAGING (the render
+				// reuses the last controller-pushed password hash, so
+				// the device keeps its current password); non-empty = set.
+				// "" is the explicit clear AT THE BACKEND door (the
+				// route note rides adminapi.DevicePatch.SSHPassword).
+				// Effective = the value differs: a set mints cfgversion
+				// so the next deliverable provisioning carries the new
+				// hashed row; a clear mints too (the pushed row changes
+				// only when the keyed render would differ, but the
+				// intent stamp flaps with the record value either way).
+				if *patch.SSHPassword != d.SSHPassword {
+					effective = true
+				}
+				d.SSHPassword = *patch.SSHPassword
 			}
 			return effective, nil
 		},
@@ -1216,7 +1237,7 @@ func (a *App) GetWireless(_ context.Context) adminapi.WlansEnvelope {
 // error — first boot). cmd/openunifi checks it immediately after New and
 // refuses to launch, so a corrupt wireless.json becomes a visible startup
 // failure (matching store.NewJSONStore's corrupt-file behavior) instead of a
-// silent future deconfiguration of adopted APs.
+// silent future deconfiguration of adopted devices.
 func (a *App) CurrentWireless() (adminapi.WlansEnvelope, error) {
 	a.wmu.RLock()
 	defer a.wmu.RUnlock()
@@ -1394,7 +1415,7 @@ func (a *App) UpdateWlan(_ context.Context, name string, wlan adminapi.Wlan) (ad
 	// Clone BEFORE any mutation: a shallow copy shares the backing array of
 	// a.cachedWireless, so writing env.Wlans[i] here would leak the new
 	// (possibly rejected) wlan into the live cache that CurrentWireless
-	// serves to AP provisioning before validateWlans/persistWirelessLocked
+	// serves to device provisioning before validateWlans/persistWirelessLocked
 	// have a say. persistWirelessLocked swaps the clone in on success.
 	env := cloneWireless(a.cachedWireless)
 	if msg := adminapi.ValidateWlanName(name); msg != "" {

@@ -69,7 +69,7 @@ type DeviceView struct {
 	// view is served on every inform. nil means runtime evidence is absent.
 	InSync *bool `json:"in_sync,omitempty"`
 	// WLAN delivery is controller-side bookkeeping. It is independent of
-	// cfgversion, which is not proof that the AP applied system_cfg.
+	// cfgversion, which is not proof that the device applied system_cfg.
 	WLANDeliveryStatus string `json:"wlan_delivery_status,omitempty"`
 	WLANDeliveryCount  int    `json:"wlan_delivery_count,omitempty"`
 	WLANLastAttempt    int64  `json:"wlan_last_attempt,omitempty"`
@@ -93,6 +93,15 @@ type DeviceView struct {
 	// on #0000ff, per the packet), so the API does not second-guess it.
 	// Read-only here.
 	LEDOverrideColor string `json:"led_override_color,omitempty"`
+	// SSHPassword is the admin-set per-device SSH login password (the
+	// typed store.Device field's read-back). "" (omitted) = stop
+	// managing: the render reuses the last controller-pushed password
+	// hash, so the device keeps its current password; an explicit non-empty
+	// set changes it. The password IS echoed — the SiteSettingsView
+	// doctrine: this is the admin's own surface (the record's admin
+	// owner), and the Terraform open-unifi_access_point provider needs
+	// the plaintext read-back for its drift detection. Read-only here.
+	SSHPassword string `json:"ssh_password,omitempty"`
 	// PendingCommand is the read-only armed remote-command state: "reboot"
 	// when the armed §6.5 reboot flag is set, "factory-reset" when the
 	// armed §6.6 setdefault flag is set (outranking reboot, matching the
@@ -128,6 +137,16 @@ type DevicePatch struct {
 	// any string here. nil = leave unchanged; "" = the explicit clear
 	// back to the jar default.
 	LEDOverrideColor *string `json:"led_override_color,omitempty"`
+	// SSHPassword sets/stops managing the per-device SSH password (the
+	// typed store.Device field; the site-wide Device SSH password is
+	// REMOVED). nil = leave unchanged; a non-empty value sets the
+	// password (an effective change — cfgversion mints); "" = the
+	// explicit clear = stop managing (the device keeps its current password;
+	// the render reuses the last controller-pushed hash). "" is ALLOWED
+	// through REST as the clear route (route-note: pre-validation polish
+	// hosts no further checks in this phase — the handler passes any
+	// string through, exactly like the verbatim LEDOverrideColor knob).
+	SSHPassword *string `json:"ssh_password,omitempty"`
 }
 
 // DeviceUpsert is the request body for manual device registration ("adopt
@@ -318,12 +337,16 @@ type RadioView struct {
 }
 
 // SiteSettingsDocument is the whole-document site-settings request: the
-// three AP-intent facts (regulatory country code, AP SSH password, ordered
-// SSH authorized_keys lines). PUT replaces the
+// two device-intent facts (regulatory country code, ordered SSH authorized_keys
+// lines). PUT replaces the
 // record WHOLESALE (the wireless-envelope doctrine) — every field is
 // required and an absent list is an empty list, never null. The document
 // shape is ALSO the on-disk shape of <data-dir>/site-settings.json, so a
 // round-trip through the API is byte-representable on disk.
+// (The historical site-wide `ap_ssh_password` wire field is REMOVED
+// 2026-09-23: the site password concept is gone — per-device SSH passwords
+// are set via PATCH /api/v1/devices/{mac}; the strict decoder rejects the
+// stale wire name as an unknown field.)
 //
 // Validation semantics (the Backend verb enforces them; the API layer
 // pre-validates the same rules): country code 0 = unset (server-side
@@ -332,17 +355,15 @@ type RadioView struct {
 // validator).
 type SiteSettingsDocument struct {
 	RegulatoryCountryCode int      `json:"regulatory_country_code"`
-	APSSHPassword         string   `json:"ap_ssh_password"`
-	APSSHPublicKeys       []string `json:"ap_ssh_public_keys"`
+	DeviceSSHPublicKeys   []string `json:"device_ssh_public_keys"`
 }
 
-// SiteSettingsView is the read model of the site-settings record. The
-// password IS echoed: this is the admin's own surface (the record's admin
+// SiteSettingsView is the read model of the site-settings record. The key
+// list IS echoed: this is the admin's own surface (the record's admin
 // owner), and the Terraform provider needs the read-back to detect drift.
 type SiteSettingsView struct {
 	RegulatoryCountryCode int      `json:"regulatory_country_code"`
-	APSSHPassword         string   `json:"ap_ssh_password"`
-	APSSHPublicKeys       []string `json:"ap_ssh_public_keys"`
+	DeviceSSHPublicKeys   []string `json:"device_ssh_public_keys"`
 }
 
 // siteSettingsPutBody is the strict decode shape of the PUT
@@ -350,11 +371,12 @@ type SiteSettingsView struct {
 // tell an absent field from a zero one. PUT is whole-document (the
 // wireless-envelope doctrine): a partial body must never silently zero a
 // fact, so any missing field is a 400 BEFORE the backend runs — never an
-// implicit zero write.
+// implicit zero write. (The removed site password's wire name
+// `device_ssh_password` is deliberately ABSENT: DisallowUnknownFields turns a
+// stale client's PUT carrying it into a 400 before the Backend runs.)
 type siteSettingsPutBody struct {
 	RegulatoryCountryCode *int      `json:"regulatory_country_code"`
-	APSSHPassword         *string   `json:"ap_ssh_password"`
-	APSSHPublicKeys       *[]string `json:"ap_ssh_public_keys"`
+	DeviceSSHPublicKeys   *[]string `json:"device_ssh_public_keys"`
 }
 
 // missingField returns the JSON name of the first REQUIRED field absent
@@ -363,10 +385,8 @@ func (b *siteSettingsPutBody) missingField() string {
 	switch {
 	case b.RegulatoryCountryCode == nil:
 		return "regulatory_country_code"
-	case b.APSSHPassword == nil:
-		return "ap_ssh_password"
-	case b.APSSHPublicKeys == nil:
-		return "ap_ssh_public_keys"
+	case b.DeviceSSHPublicKeys == nil:
+		return "device_ssh_public_keys"
 	}
 	return ""
 }
@@ -377,8 +397,7 @@ func (b *siteSettingsPutBody) missingField() string {
 func (b *siteSettingsPutBody) toDocument() SiteSettingsDocument {
 	return SiteSettingsDocument{
 		RegulatoryCountryCode: *b.RegulatoryCountryCode,
-		APSSHPassword:         *b.APSSHPassword,
-		APSSHPublicKeys:       *b.APSSHPublicKeys,
+		DeviceSSHPublicKeys:   *b.DeviceSSHPublicKeys,
 	}
 }
 
@@ -459,7 +478,7 @@ type Backend interface {
 	UpdateWlan(ctx context.Context, name string, wlan Wlan) (Wlan, error)
 	DeleteWlan(ctx context.Context, name string) error
 	// GetSiteSettings returns the site-settings read view — the
-	// AP-intent facts (controller-level record, site_settings file), read
+	// device-intent facts (controller-level record, site_settings file), read
 	// from the Backend's cache. The Backend's error is reserved for its
 	// New-time load problem (an unreadable/corrupt/invalid settings file).
 	// Like every other Backend method it takes a context (implementations
@@ -469,7 +488,7 @@ type Backend interface {
 	// (the wireless-envelope doctrine) and returns the read view. An
 	// EFFECTIVE change re-stamps cfgversion across the provisioned devices
 	// (the operator-save trigger — settings mint ON SAVE), so the next
-	// inform full-provisions the new AP-intent facts; a save that changes
+	// inform full-provisions the new device-intent facts; a save that changes
 	// nothing mints nothing. Validation failures wrap ErrInvalid (HTTP
 	// 400): country code 0/unset or 001..999, every authorized_keys line
 	// through the fail-closed parser.

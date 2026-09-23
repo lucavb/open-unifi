@@ -505,7 +505,7 @@ func TestRunSetInformSSHAuthRejects(t *testing.T) {
 
 // TestRunSetInformSSHFactoryCredentialsAccepted proves the runner cannot
 // pass auth with anything OTHER than the factory pair (it is hardwired;
-// the site --ap-ssh-password must not leak into the factory lane).
+// no provisioned device SSH password must leak into the factory lane).
 func TestRunSetInformSSHFactoryCredentialsAccepted(t *testing.T) {
 	if !loopbackConnectable(t) {
 		t.Skip("sandbox denies loopback connect (EPERM); TCP SSH tests need a socket-enabled environment")

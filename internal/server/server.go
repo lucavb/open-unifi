@@ -63,7 +63,7 @@ type Config struct {
 	ControllerURL string
 
 	// SiteSettings supplies the CURRENT site-settings record — the
-	// managed AP-intent facts — at use time (the WirelessSource precedent:
+	// managed device-intent facts — at use time (the WirelessSource precedent:
 	// a live source closure, read per decision). The adoption engine's
 	// live-provisioning gate and renderSystemCfg both call it per inform,
 	// so a site-settings save is visible on the device's NEXT inform with
@@ -94,7 +94,7 @@ type Config struct {
 	// gated"). Default false: live WLAN provisioning for that exact
 	// model+firmware stays rejected unless a sanctioned live round
 	// explicitly opts in — the offline minimal-diff harness gates the
-	// push candidate separately, before any bytes reach the AP.
+	// push candidate separately, before any bytes reach the device.
 	AllowGatedLiveWLAN bool
 
 	// OnSessionEvents, when non-nil, receives the client-session
@@ -108,29 +108,24 @@ type Config struct {
 	OnSessionEvents func(deviceMAC string, connects, disconnects int)
 }
 
-// SiteSettings carries the MANAGED AP-intent site facts the server
+// SiteSettings carries the MANAGED device-intent site facts the server
 // renders into system_cfg and the adoption engine's live-provisioning gate
 // reads: the regulatory country code (0 = unset → the server-side 840
-// default at renderSystemCfg), the AP SSH password ("" = site default
-// "ubnt", renderer semantics), and the PARSED authorized public keys. It
+// default at renderSystemCfg) and the PARSED authorized public keys. It
 // mirrors the app site-settings record (whose SSHPublicKeys are raw lines);
 // the raw→parsed conversion belongs to
-// the adapter closure, not the record. The facts are managed content
+// the adapter closure, not the record. The per-device SSH password is NOT
+// among them — it rides the device record itself (store.Device.SSHPassword;
+// the renderer reads the field directly). The facts are managed content
 // (admin intent via the site-settings API); ControllerURL is NOT among them
 // — it stays a deployment input wired from Config.ControllerURL.
 type SiteSettings struct {
 	// CountryCode is the ISO 3166-1 numeric regulatory country code; 0 =
 	// unset (renders as the 840 default).
 	CountryCode int
-	// SSHPassword overrides the default SSH password ("ubnt") hashed into
-	// system_cfg users.1. SECURITY NOTE: this string lives in server
-	// memory and, by protocol design, travels VERBATIM (hashed) inside the
-	// provisioned config; the passphrase itself never appears in mgmt_cfg.
-	// Treat records/config containing the hash as credentials.
-	SSHPassword string
 	// SSHPublicKeys are the parsed authorized public keys rendered into
 	// the sshd.auth.key.<n>.* rows (site fact; see systemcfg.PublicKey for
-	// the firmware evidence — the AP rebuilds /etc/dropbear/authorized_keys
+	// the firmware evidence — the device rebuilds /etc/dropbear/authorized_keys
 	// from these rows on every boot/apply). Parsed from the record's raw
 	// lines by the settings-source closure (fail-closed single parser).
 	SSHPublicKeys []systemcfg.PublicKey
@@ -167,7 +162,7 @@ func validateBaseURL(raw, label string) error {
 	return nil
 }
 
-// Server serves the UniFi inform protocol used for AP adoption.
+// Server serves the UniFi inform protocol used for device adoption.
 type Server struct {
 	cfg Config
 	st  store.DeviceStore
@@ -899,8 +894,10 @@ func (s *Server) absorbInform(rec *store.Device, body map[string]any, now time.T
 //
 // Deployment input vs managed content: ControllerURL keeps flowing from
 // s.cfg.ControllerURL (the vehicle's own address — NEVER record-sourced);
-// the managed facts (country, SSH password, SSH public keys) come from the
-// SiteSettings source. A settings load error
+// the managed facts (country, SSH public keys) come from the SiteSettings
+// source; the per-device SSH password comes from the device record itself
+// (store.Device.SSHPassword — Render reads the field directly), never from
+// the site record. A settings load error
 // fails the render — the engine outcome error path propagates it and the
 // store cycle aborts with NO record mutation (assignedKeyFlow runs the gate
 // first and the render before any record write, so the abort happens before
@@ -925,7 +922,6 @@ func (s *Server) renderSystemCfg(d store.Device, wls []wireless.Wlan, plan wirel
 	res, err := systemcfg.RenderWithPlan(d, systemcfg.SiteFacts{
 		ControllerURL: s.cfg.ControllerURL,
 		CountryCode:   country,
-		SSHPassword:   facts.SSHPassword,
 		SSHPublicKeys: facts.SSHPublicKeys,
 		WLANs:         wls,
 	}, plan)

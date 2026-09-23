@@ -19,7 +19,7 @@ import (
 // "ssh-rsa", and the bare ".value" suffix at 0x0064ec8c; the key line is
 // written with format "%s %s %s\n" (type, value, comment) to
 // "/etc/dropbear/authorized_keys" @0x0063f19c. So a key only survives on
-// the AP when its Type/Value/Comment are carried as cfg rows.
+// the device when its Type/Value/Comment are carried as cfg rows.
 type PublicKey struct {
 	// Type is the key-type token as it appears in an authorized_keys line
 	// ("ssh-rsa", "ssh-ed25519", "ecdsa-sha2-nistp256", ...).

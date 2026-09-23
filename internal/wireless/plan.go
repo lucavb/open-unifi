@@ -210,7 +210,7 @@ func PlanVaps(d store.Device, wls []Wlan) ([]VapPlan, []RadioRow) {
 	// NOTE: device vap_table devname reuse was considered (seeding the ath
 	// counter from the device's reported vaps) and REJECTED as dead code —
 	// the wire key is `name`/`radio_name`, not `devname`, so the block never
-	// matched anything on a real AP. Revisit only with a capture-derived
+	// matched anything on a real device. Revisit only with a capture-derived
 	// fixture; do not re-key it without live evidence.
 	ath := 0
 	for i, r := range radios {
@@ -403,7 +403,7 @@ func WlanListHash(wls []Wlan) string {
 		// envelope, so on a record without the bit a das flip mints a
 		// fresh sha over a byte-identical render — bounded to one
 		// idempotent full provisioning; the model set {U7PG2} carries
-		// the bit (bench AP fw_caps 0xE7FD3F3F).
+		// the bit (bench device fw_caps 0xE7FD3F3F).
 		if w.AccountingEnabled {
 			e["accounting_enabled"] = true
 			acct := make([]map[string]any, 0, len(w.AcctServers))

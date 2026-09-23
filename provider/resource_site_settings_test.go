@@ -39,19 +39,20 @@ func TestViewToModelUnsetEchoMapsToNull(t *testing.T) {
 		t.Fatalf("empty key list must map to null, got %v", m.APSSHPublicKeys)
 	}
 
-	// A set view passes through verbatim, keys in slice order.
+	// A set view passes through verbatim, keys in slice order. (The
+	// password is off the site wire server-side — the attribute read-back
+	// is interim null; see resource_site_settings.go viewToModel.)
 	view := &siteSettings{
 		RegulatoryCountryCode: 840,
-		APSSHPassword:         "s3cret",
-		APSSHPublicKeys:       []string{"ssh-ed25519 AAAA a@ap", "ssh-ed25519 AAAA b@ap"},
+		DeviceSSHPublicKeys:   []string{"ssh-ed25519 AAAA a@ap", "ssh-ed25519 AAAA b@ap"},
 	}
 	m = &siteSettingsModel{}
 	viewToModel(ctx, view, m)
 	if m.RegulatoryCountryCode.ValueInt64() != 840 {
 		t.Fatalf("country = %d, want 840", m.RegulatoryCountryCode.ValueInt64())
 	}
-	if m.APSSHPassword.ValueString() != "s3cret" {
-		t.Fatalf("password = %q, want s3cret", m.APSSHPassword.ValueString())
+	if !m.APSSHPassword.IsNull() {
+		t.Fatalf("interim password read-back must be null (the site password is off the wire), got %q", m.APSSHPassword.ValueString())
 	}
 	var keys []string
 	m.APSSHPublicKeys.ElementsAs(ctx, &keys, false)
@@ -62,9 +63,10 @@ func TestViewToModelUnsetEchoMapsToNull(t *testing.T) {
 
 // TestSiteSettingsFromModelZeroMapsToZeroDocument pins the model→document
 // direction: null/unknown plan values map to the record's zero values (the
-// whole-document PUT body always carries all three fields, and the empty key
+// whole-document PUT body always carries both fields, and the empty key
 // list marshals as [] — never null, which the strict server decode would
-// reject as a missing field).
+// reject as a missing field). The ap_ssh_password attribute is interim
+// inert: it maps to nothing on the wire (see resource_site_settings.go).
 func TestSiteSettingsFromModelZeroMapsToZeroDocument(t *testing.T) {
 	ctx := context.Background()
 	m := &siteSettingsModel{
@@ -78,11 +80,11 @@ func TestSiteSettingsFromModelZeroMapsToZeroDocument(t *testing.T) {
 	if diags.HasError() {
 		t.Fatalf("unexpected diagnostics: %v", diags)
 	}
-	if doc.RegulatoryCountryCode != 0 || doc.APSSHPassword != "" {
+	if doc.RegulatoryCountryCode != 0 {
 		t.Fatalf("zero mapping mismatch: %+v", doc)
 	}
-	if doc.APSSHPublicKeys == nil || len(doc.APSSHPublicKeys) != 0 {
-		t.Fatalf("empty key list must marshal as [], got %#v", doc.APSSHPublicKeys)
+	if doc.DeviceSSHPublicKeys == nil || len(doc.DeviceSSHPublicKeys) != 0 {
+		t.Fatalf("empty key list must marshal as [], got %#v", doc.DeviceSSHPublicKeys)
 	}
 
 	// Set values pass through verbatim.
@@ -94,8 +96,8 @@ func TestSiteSettingsFromModelZeroMapsToZeroDocument(t *testing.T) {
 	list, _ := types.ListValueFrom(ctx, types.StringType, []string{"ssh-ed25519 AAAA a@ap"})
 	m.APSSHPublicKeys = list
 	doc = siteSettingsFromModel(ctx, m, &diags)
-	if doc.RegulatoryCountryCode != 840 || doc.APSSHPassword != "s3cret" ||
-		len(doc.APSSHPublicKeys) != 1 || doc.APSSHPublicKeys[0] != "ssh-ed25519 AAAA a@ap" {
+	if doc.RegulatoryCountryCode != 840 ||
+		len(doc.DeviceSSHPublicKeys) != 1 || doc.DeviceSSHPublicKeys[0] != "ssh-ed25519 AAAA a@ap" {
 		t.Fatalf("set mapping mismatch: %+v", doc)
 	}
 }

@@ -23,8 +23,10 @@ import (
 )
 
 // SiteFacts are the controller-level inputs a render needs (CONTEXT.md:
-// site facts): controller URL, regulatory country code, AP SSH password,
-// the provisioned SSH public keys, and the current WLANs.
+// site facts): controller URL, regulatory country code, the provisioned
+// SSH public keys, and the current WLANs. The per-device SSH password is
+// NOT a site fact — it rides the device record itself (store.Device
+// .SSHPassword, the admin-owned typed field).
 type SiteFacts struct {
 	// ControllerURL is the configured controller base URL. Empty means
 	// "not overridden" (nothing in system_cfg derives from it today; it is
@@ -36,13 +38,6 @@ type SiteFacts struct {
 	// caller maps its configured zero to the compatibility default before
 	// building the facts).
 	CountryCode int
-
-	// SSHPassword overrides the default SSH password ("ubnt") hashed into
-	// system_cfg users.1. SECURITY NOTE: this string lives in server memory
-	// and, by protocol design, travels VERBATIM (hashed) inside the
-	// provisioned config; the passphrase itself never appears in mgmt_cfg.
-	// Treat records/config containing the hash as credentials.
-	SSHPassword string
 
 	// SSHPublicKeys are the site's authorized public keys, rendered as the
 	// sshd.auth.key.<n>.* rows (1-based, slice order, no dedup). Zero keys
@@ -130,14 +125,6 @@ func (rd *render) lineWriter(b *strings.Builder, where string) func(k, v string)
 	}, b, where)
 }
 
-// sshPassword is the effective SSH password ("ubnt" default, facts override).
-func (rd *render) sshPassword() string {
-	if rd.facts.SSHPassword != "" {
-		return rd.facts.SSHPassword
-	}
-	return defaultSSHPassword
-}
-
 // Render produces the system_cfg text for the device record from the site
 // facts alone: it computes the provisioning plan from (d, facts.WLANs) —
 // the same one constructor every other consumer uses — and renders from it.
@@ -207,7 +194,7 @@ func RenderWithPlan(d store.Device, facts SiteFacts, plan wireless.ProvisioningP
 	// iconst_1, i.e. Setting.is("unifi_idp_enabled", true) — the JAR DEFAULT
 	// is ENABLED (which also emits the unifi.mcip/unifi.key rows that we do
 	// not carry). We deliberately emit `disabled` anyway: we have no IDP
-	// feature, and the AP validator ignores the row. This is a RECORDED
+	// feature, and the device validator ignores the row. This is a RECORDED
 	// DEVIATION from the real builder (docs agent tracks it in the §12
 	// deviation table); do not "fix" it back to enabled silently.
 	line("unifi.idp", "disabled")
@@ -219,7 +206,7 @@ func RenderWithPlan(d store.Device, facts SiteFacts, plan wireless.ProvisioningP
 	// placeholder "0.1.0-dev", which would compute 0x0 — deliberately NOT
 	// derived from it: we emit the literal 0x7 matching every modern real
 	// controller (v3.3+, the only value this firmware has ever been paired
-	// with). ubntconf reads it on the AP via
+	// with). ubntconf reads it on the device via
 	// get_uint32(cfg, 0, "unifi.cfgcap_info") — absent/0 can zero the
 	// plugin layer's capability gating
 	// (docs/AP-FIRMWARE-APPLY-PATH.md §6).
@@ -235,7 +222,7 @@ func RenderWithPlan(d store.Device, facts SiteFacts, plan wireless.ProvisioningP
 	//    Minimal-diff policy: /tmp/harness/minimal-diff-spec.md.
 
 	// 3. # users — config_String.java §197-206 / PROTOCOL-systemcfg-Config.
-	//    Real AP order (int.txt:17208-17216): unifi → system → users.
+	//    Real device order (int.txt:17208-17216): unifi → system → users.
 	users1pw, uerr := rd.usersPasswordHash(d)
 	if uerr != nil {
 		return Result{}, uerr
@@ -272,11 +259,11 @@ func RenderWithPlan(d store.Device, facts SiteFacts, plan wireless.ProvisioningP
 	// parsed tree CHANGES — including changes caused by ROW DELETION
 	// when the controller's render omits a section the running config
 	// carries. The two fatal live pushes (2026-09-16 09:43/13:54) proved
-	// the mechanism (net plugin restart → ifconfig br0/eth0 down → AP
+	// the mechanism (net plugin restart → ifconfig br0/eth0 down → device
 	// dark; /etc/sysinit/net.conf fetched 2026-09-17). The rows below
 	// therefore ECHO the running factory baseline
 	// (/tmp/harness/ap-forensics/tmp/system.cfg, fetched from the
-	// factory-reset AP 2026-09-17) so those parsed sections stay
+	// factory-reset device 2026-09-17) so those parsed sections stay
 	// IDENTICAL and no plugin restarts fire. Section order follows the
 	// real builder where it emits these (PROTOCOL-mgmt.md §3 steps
 	// 7-9). These are device-class baseline constants, NOT controller
@@ -359,7 +346,7 @@ func RenderWithPlan(d store.Device, facts SiteFacts, plan wireless.ProvisioningP
 	// ebtables row is the EAPOL broute rule on the first vap slot.
 	// Factory echo = zero parsed diff = zero plugin restarts.
 	//
-	// EXCEPT mgmt.is_default: never echo it in any value. The AP boot
+	// EXCEPT mgmt.is_default: never echo it in any value. The device boot
 	// path (/lib/preinit/99_21_ubnt_ubntconf do_ubntconf, fw 6.8.2)
 	// restores the MTD blob text via `cfgmtd -r`, then greps it for
 	// `mgmt.is_default=true` — a hit replaces the restored text with the
@@ -368,7 +355,7 @@ func RenderWithPlan(d store.Device, facts SiteFacts, plan wireless.ProvisioningP
 	// provisioned WLANs while the tar part still restores mgmt/authkey
 	// (retained-key echo + watchdog re-provision ≈49 s). The real
 	// controller emits no mgmt.is_default row at all (no writer in
-	// config_String/int), so absence is the byte-exact form. AP boot
+	// config_String/int), so absence is the byte-exact form. device boot
 	// evidence 2026-09-18: /tmp/system.cfg line 258 carried
 	// mgmt.is_default=true from this echo; WLAN-ACCEPTANCE A2.
 	b.WriteString("# ebtables\n")
@@ -385,7 +372,7 @@ func RenderWithPlan(d store.Device, facts SiteFacts, plan wireless.ProvisioningP
 	// int): the factory baseline carries none of those rows either, so
 	// omitting them keeps the parsed diff empty under the full-config
 	// replacement semantics. Adding any row requires a live-validated
-	// apply first (two AP resets already consumed 2026-09-16). The ONE
+	// apply first (two device resets already consumed 2026-09-16). The ONE
 	// deliberate addition since that policy: the site-fact
 	// sshd.auth.key.<n>.* rows (when keys are configured) — firmware-
 	// derived but still OWED a live-validated apply (docs §13).
@@ -419,22 +406,56 @@ func RenderWithPlan(d store.Device, facts SiteFacts, plan wireless.ProvisioningP
 // supportsSha512Password() = hasCapability(1024) — `(fw_caps & n) == n`
 // with a 0 default when the record doesn't report fw_caps (Device.java) —
 // or the UDM/firewall device type, which we don't model (flagged: no
-// device-type table in this MVP). A freshly generated hash is returned as a
-// CREDENTIAL DELTA (the jar writes x_ssh_sha512passwd/x_ssh_md5passwd into
-// the site mgmt setting so repeated pushes are byte-identical); the renderer
-// never mutates the record — the adapter applies the delta inside its
-// read-modify-write cycle.
+// device-type table in this MVP).
+//
+// LOCKED CONTRACT (per-device SSH password, store.Device.SSHPassword):
+// Empty record password = stop managing. The render reuses the last hash
+// the controller pushed — a byte-stability device, exactly like the
+// official controller's x_ssh_sha512passwd cache. A device whose actual
+// password diverged (factory reset, out-of-band change) re-acquires the
+// last controller-pushed password at its next full provisioning. No cache
+// ⇒ factory-default ubnt row (fresh salt, converges byte-stably after the
+// delta applies). A non-empty record password follows the classic rules:
+// reuse the cached crypt iff it matches the effective password, else a
+// fresh hash plus a CREDENTIAL DELTA (the jar writes
+// x_ssh_sha512passwd/x_ssh_md5passwd into its site setting so repeated
+// pushes are byte-identical). Verbatim reuse is format-GATED: only a
+// well-formed crypt string of that family (sha512CacheFormatRx /
+// md5CacheFormatRx) is trusted unwritten — anything else falls through to
+// the no-cache path. The unset branch lives INSIDE each family arm: a
+// sha512 device must never be pinned by a stray md5 cache (and vice
+// versa). The renderer never mutates the record — the adapter applies the
+// delta inside its read-modify-write cycle.
 // FID-23: generation failure or an empty value fails the whole call — the
 // classic Crypt.crypt exceptions propagate out of the config build, and a
 // degraded/empty row must never ship silently.
 func (rd *render) usersPasswordHash(d store.Device) (string, error) {
-	pw := rd.sshPassword()
 	if !supportsSha512Password(d) {
-		cached, _ := d.Extra["ssh_md5passwd"].(string)
-		if cached != "" && md5CryptMatches(pw, cached) {
+		cached, _ := d.Extra[store.SSHMd5PasswdKey].(string)
+		if d.SSHPassword == "" {
+			// Unset = stop managing: reuse the last controller-pushed
+			// md5 row verbatim when it is well-formed; otherwise the
+			// no-cache path (fresh factory-default ubnt hash + delta).
+			if md5CacheFormatRx.MatchString(cached) {
+				return cached, nil
+			}
+			fresh, err := md5Crypt(defaultSSHPassword)
+			if err != nil {
+				return "", fmt.Errorf("users.1 md5 password: %w", err)
+			}
+			if fresh == "" {
+				return "", errors.New("users.1 md5 password generated empty")
+			}
+			if rd.deltas == nil {
+				rd.deltas = map[string]string{}
+			}
+			rd.deltas[store.SSHMd5PasswdKey] = fresh
+			return fresh, nil
+		}
+		if cached != "" && md5CryptMatches(d.SSHPassword, cached) {
 			return cached, nil
 		}
-		fresh, err := md5Crypt(pw)
+		fresh, err := md5Crypt(d.SSHPassword)
 		if err != nil {
 			return "", fmt.Errorf("users.1 md5 password: %w", err)
 		}
@@ -444,14 +465,34 @@ func (rd *render) usersPasswordHash(d store.Device) (string, error) {
 		if rd.deltas == nil {
 			rd.deltas = map[string]string{}
 		}
-		rd.deltas["ssh_md5passwd"] = fresh
+		rd.deltas[store.SSHMd5PasswdKey] = fresh
 		return fresh, nil
 	}
 	cached, _ := d.Extra[store.SSHSha512PasswdKey].(string)
-	if cached != "" && sha512CryptMatches(pw, cached) {
+	if d.SSHPassword == "" {
+		// Unset = stop managing: reuse the last controller-pushed sha512
+		// row verbatim when it is well-formed; otherwise the no-cache
+		// path (fresh factory-default ubnt hash + delta).
+		if sha512CacheFormatRx.MatchString(cached) {
+			return cached, nil
+		}
+		fresh, err := sha512Crypt(defaultSSHPassword)
+		if err != nil {
+			return "", fmt.Errorf("users.1 sha512 password: %w", err)
+		}
+		if fresh == "" {
+			return "", errors.New("users.1 sha512 password generated empty")
+		}
+		if rd.deltas == nil {
+			rd.deltas = map[string]string{}
+		}
+		rd.deltas[store.SSHSha512PasswdKey] = fresh
+		return fresh, nil
+	}
+	if cached != "" && sha512CryptMatches(d.SSHPassword, cached) {
 		return cached, nil
 	}
-	fresh, err := sha512Crypt(pw)
+	fresh, err := sha512Crypt(d.SSHPassword)
 	if err != nil {
 		return "", fmt.Errorf("users.1 sha512 password: %w", err)
 	}

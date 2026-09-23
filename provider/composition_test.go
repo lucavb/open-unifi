@@ -242,7 +242,10 @@ func TestRealServer404AndIDRoundTrip(t *testing.T) {
 // line, missing field). These pin the provider↔API
 // contract end to end: the provider's siteSettings wire struct must decode
 // exactly what adminapi emits and encode exactly what its strict PUT decode
-// accepts.
+// accepts. (The site password is OFF the site wire since Phase A —
+// PUT bodies and views carry both remaining fields only; the HISTORICAL
+// `ap_ssh_password` name stays in the stale-key pins because that is what
+// GHCR-era deployed records and old client binaries actually carry.)
 func TestProviderDecodesRealServerSiteSettings(t *testing.T) {
 	c, _, status := composeAPI(t)
 	ctx := context.Background()
@@ -252,10 +255,11 @@ func TestProviderDecodesRealServerSiteSettings(t *testing.T) {
 	key2 := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB second@ap"
 	doc := siteSettings{
 		RegulatoryCountryCode: 276,
-		APSSHPassword:         "s3cret",
-		APSSHPublicKeys:       []string{key1, key2},
+		DeviceSSHPublicKeys:   []string{key1, key2},
 	}
 
+	// PUT goes through the provider's own wire struct (the real handler's
+	// strict decode accepts the two-field wholesale document).
 	view, err := c.putSiteSettings(ctx, doc)
 	if err != nil {
 		t.Fatalf("real PUT /api/v1/site-settings: %v", err)
@@ -268,7 +272,8 @@ func TestProviderDecodesRealServerSiteSettings(t *testing.T) {
 	}
 
 	// GET roundtrip: all fields verbatim, keys in slice order (the
-	// order-sensitive echo the provider's drift detection relies on).
+	// order-sensitive echo the provider's drift detection relies on); the
+	// removed password field must not decode onto anything.
 	got, err := c.getSiteSettings(ctx)
 	if err != nil {
 		t.Fatalf("real GET /api/v1/site-settings: %v", err)
@@ -276,14 +281,14 @@ func TestProviderDecodesRealServerSiteSettings(t *testing.T) {
 	if !reflect.DeepEqual(*got, doc) {
 		t.Fatalf("GET roundtrip = %+v, want %+v", *got, doc)
 	}
-	if got.APSSHPublicKeys[0] != key1 || got.APSSHPublicKeys[1] != key2 {
-		t.Fatalf("key order not preserved: %q, %q", got.APSSHPublicKeys[0], got.APSSHPublicKeys[1])
+	if got.DeviceSSHPublicKeys[0] != key1 || got.DeviceSSHPublicKeys[1] != key2 {
+		t.Fatalf("key order not preserved: %q, %q", got.DeviceSSHPublicKeys[0], got.DeviceSSHPublicKeys[1])
 	}
 
 	// PUT with an invalid key line → 400, the FIRST failing line named in
-	// the message.
+	// the message (the server's user-facing wording).
 	bad := doc
-	bad.APSSHPublicKeys = []string{key1, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXk!!!"}
+	bad.DeviceSSHPublicKeys = []string{key1, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXk!!!"}
 	if view, err := c.putSiteSettings(ctx, bad); err == nil {
 		t.Fatalf("invalid key line accepted: %+v", view)
 	} else {
@@ -291,51 +296,55 @@ func TestProviderDecodesRealServerSiteSettings(t *testing.T) {
 		if !errors.As(err, &ae) || ae.status != http.StatusBadRequest {
 			t.Fatalf("invalid key line: expected typed 400, got %v", err)
 		}
-		if !strings.Contains(err.Error(), "invalid AP SSH public key #2") {
+		if !strings.Contains(err.Error(), "invalid Device SSH public key #2") {
 			t.Fatalf("invalid key line message = %q, want the #2 line named", err.Error())
 		}
 	}
 
 	// PUT an unknown field → 400 (the strict decoder's
-	// DisallowUnknownFields): a stale client still carrying the removed
-	// disable knob's wire name is rejected before the Backend runs.
-	stale := map[string]any{
-		"regulatory_country_code": 0,
-		"ap_ssh_password":         "",
-		"ap_ssh_public_keys":      []string{},
+	// DisallowUnknownFields): a stale client still carrying a HISTORICAL
+	// removed wire name (the disable knob, the removed site password) is
+	// rejected before the Backend runs.
+	for staleName, staleVal := range map[string]any{
 		"ap_ssh_disable_password": false,
-	}
-	err = c.do(ctx, http.MethodPut, "/api/v1/site-settings", stale, nil)
-	if err == nil {
-		t.Fatal("unknown-field PUT accepted")
-	}
-	var ae *apiError
-	if !errors.As(err, &ae) || ae.status != http.StatusBadRequest {
-		t.Fatalf("unknown field: expected typed 400, got %v", err)
+		"ap_ssh_password":         "s3cret",
+	} {
+		stale := map[string]any{
+			"regulatory_country_code": 0,
+			"device_ssh_public_keys":  []string{},
+			staleName:                 staleVal,
+		}
+		err = c.do(ctx, http.MethodPut, "/api/v1/site-settings", stale, nil)
+		if err == nil {
+			t.Fatalf("unknown-field PUT accepted (%s)", staleName)
+		}
+		var ae *apiError
+		if !errors.As(err, &ae) || ae.status != http.StatusBadRequest {
+			t.Fatalf("unknown field %s: expected typed 400, got %v", staleName, err)
+		}
 	}
 
 	// PUT missing a field → 400 "missing field <name>" (the provider's wire
-	// struct always emits all three; a hand-rolled partial body must not).
+	// struct always emits both; a hand-rolled partial body must not).
 	partial := map[string]any{
 		"regulatory_country_code": 0,
-		"ap_ssh_public_keys":      []string{},
 	}
 	err = c.do(ctx, http.MethodPut, "/api/v1/site-settings", partial, nil)
 	if err == nil {
 		t.Fatal("partial PUT accepted")
 	}
-	ae = nil
+	var ae *apiError
 	if !errors.As(err, &ae) || ae.status != http.StatusBadRequest {
 		t.Fatalf("missing field: expected typed 400, got %v", err)
 	}
 
 	// Zero-document PUT (Delete's restore-defaults body,
-	// resource_site_settings.go): ALL THREE fields present with zero values —
-	// country 0, empty password, [] (a PRESENT field, not a missing/null
+	// resource_site_settings.go): BOTH fields present with zero values —
+	// country 0, [] (a PRESENT field, not a missing/null
 	// one) — through the provider's own wire struct against
 	// the real server's strict decode. This pins that zero VALUES alone
 	// never read as missing.
-	zero := siteSettings{APSSHPublicKeys: []string{}}
+	zero := siteSettings{DeviceSSHPublicKeys: []string{}}
 	viewZ, err := c.putSiteSettings(ctx, zero)
 	if err != nil {
 		t.Fatalf("zero-doc PUT rejected: %v", err)

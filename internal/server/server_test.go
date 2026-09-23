@@ -275,110 +275,108 @@ func mustBuildSys(t *testing.T, s *Server, rec store.Device) string {
 
 // Site-facts wiring pin: the SiteSettings SOURCE closure (Config no longer
 // carries the facts as fields) MUST reach the rendered system_cfg
-// through the renderSystemCfg SiteFacts copy. A dropped SSHPublicKeys wire
-// would render an empty authorized_keys with -s (password auth off) ACTIVE
-// — the lane's own nightmare scenario, locked SSH on the AP — and a dropped
-// SSHPassword wire would silently render the site default "ubnt" hash with
-// zero failures (every settings E2E saves ""). The rendered blob must
-// therefore carry both key rows and a
-// users.1.password hash that verifies against "hunter2" and NOT against
-// "ubnt", judged by the renderer's own cache matcher as the in-package
-// oracle (sha512CryptMatches is unexported; the matcher path is exercised
-// below — see TestSiteFactsSSHPasswordSeam's cache dance). (Synthetic key:
-// the same marker'd RFC 4253 blob the systemcfg package tests use — never
-// a real key.)
+// through the renderSystemCfg SiteFacts copy, and the per-device SSH
+// password MUST reach it from the device record. A dropped SSHPublicKeys
+// wire would render an empty authorized_keys with -s (password auth off)
+// ACTIVE — the lane's own nightmare scenario, locked SSH on the device — and a
+// dropped SSHPassword record read would silently render the default "ubnt"
+// hash with zero failures (every default render produces a byte shape). The
+// rendered blob must therefore carry both key rows and a
+// users.1.password hash that self-checks against "hunter2" and NOT against
+// "ubnt" — proved by the cache-dance below (see
+// TestDeviceSSHPasswordRecordSource: the first render caches the default
+// hash, the record-password render must regenerate rather than reuse it).
+// (Synthetic key: the same marker'd RFC 4253 blob the systemcfg package
+// tests use — never a real key.)
 func TestSiteFactsSSHConfigWiring(t *testing.T) {
 	pk, err := systemcfg.ParsePublicKey(
 		"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB test@ap")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// hunter2 in the source facts; the empty-password row is rendered by
-	// TestSiteFactsSSHPasswordSeam below against the same record shape.
 	s := New(Config{
 		SiteSettings: func() (SiteSettings, error) {
-			return SiteSettings{SSHPassword: "hunter2", SSHPublicKeys: []systemcfg.PublicKey{pk}}, nil
+			return SiteSettings{SSHPublicKeys: []systemcfg.PublicKey{pk}}, nil
 		},
 	}, store.NewMemStore(), testLogger())
-	sys := mustBuildSys(t, s, u7pg2Record())
+	// 1. unset-password render: the default row D, cached by the delta
+	// (mustBuildSys applies the deltas — the adapter stand-in).
+	rec := u7pg2Record()
+	rowD := users1PasswordRow(t, mustBuildSys(t, s, rec))
+	// 2. the record-password render: hunter2 must NOT self-verify against
+	// the default cache row, so the row regenerates — an identical row
+	// would mean the device-record password read is dropped.
+	rec.SSHPassword = "hunter2"
+	row2 := users1PasswordRow(t, mustBuildSys(t, s, rec))
+	if row2 == rowD {
+		t.Fatalf("device SSHPassword %q rendered the default-cache row %q — the record password never reached the render:\n%s",
+			"hunter2", rowD, row2)
+	}
 	for _, want := range []string{
 		"sshd.auth.key.1.status=enabled\n",
 		"sshd.auth.key.1.value=AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB\n",
 		"sshd.auth.key.1.type=ssh-ed25519\n",
-		"users.1.password=$6$",
 	} {
-		if !strings.Contains(sys, want) {
-			t.Fatalf("Config→SiteFacts wiring pin: missing %q:\n%s", want, sys)
+		if !strings.Contains(mustBuildSys(t, s, rec), want) {
+			t.Fatal("Config→SiteFacts key wiring dropped")
 		}
 	}
 }
 
-// TestSiteFactsSSHPasswordSeam pins the facts.SSHPassword → SiteFacts copy
-// in renderSystemCfg (the one settings seam no settings E2E covers: all
-// settings E2E saves carry ""). The dance uses the renderer's own cache
-// matcher (sha512CryptMatches — the same oracle the systemcfg round-trip
-// tests use, reachable here because the renderer verifies the record's
-// ssh_sha512passwd cache against the CURRENT site password on every
-// render):
+// TestDeviceSSHPasswordRecordSource pins the per-device SSH password
+// source at the adapter seam: the rendered users.1.password flows from the
+// DEVICE record's SSHPassword field (store.Device — the site-settings
+// source carries no password anymore). The dance reuses the original
+// seam's cache-oracle mechanics through mustBuildSys:
 //
-//  1. render with EMPTY password → the default-row hash D rides into the
-//     record cache as the ssh_sha512passwd delta (mustBuildSys applies
-//     deltas, the direct-call stand-in for the adapter);
-//  2. render with SSHPassword "hunter2" → the row must NOT be D: the
-//     cached hash self-verifies against "ubnt" only, so under the real
-//     seam the render regenerates — a row identical to D means the copy
-//     was dropped and hunter2 rendered the default-"ubnt" hash;
-//  3. render AGAIN with hunter2 → the row byte-identically REUSES step
-//     2's row (a positive self-check: the rendered hash verifies against
-//     hunter2 itself, not merely differs from D's salt draw).
-//
-// Reverting the facts.SSHPassword copy (server.go:931) makes step 2 reuse
-// D verbatim (the "hunter2" render's site password falls back to "ubnt",
-// which self-checks against the cached D) and steps 2/3 collapse — the
-// test fails. Random salts do not perturb the shape: step 2's fresh draw
-// deterministically differs from the cached D only because the matcher
-// rejected it (an equal draw is probability ≈ 0 bug-noise, and under the
-// revert its reuse is EXACT), and step 3's reuse is exact.
-func TestSiteFactsSSHPasswordSeam(t *testing.T) {
+//  1. render with the record password unset, no cache → the fresh
+//     default-row hash D rides into the record cache as the
+//     ssh_sha512passwd delta (mustBuildSys applies deltas, the
+//     direct-call stand-in for the adapter);
+//  2. set d.SSHPassword "hunter2" → the row must NOT be D: the cached
+//     hash self-verifies against "ubnt" only, so the render regenerates —
+//     a row identical to D means the record source is dropped and
+//     hunter2 rendered the default-"ubnt" hash;
+//  3. clear d.SSHPassword "" → the last controller-pushed row must be
+//     reused VERBATIM (the locked unset contract: stop managing; the
+//     record cache is well-formed) and MINT NO FRESH DELTA (Extra
+//     unchanged) — a dropped record read here would fall through to a
+//     fresh ubnt row instead of the memory of the pushed row.
+func TestDeviceSSHPasswordRecordSource(t *testing.T) {
 	rec := u7pg2Record()
-	serverWith := func(pw string) *Server {
-		return New(Config{
-			SiteSettings: func() (SiteSettings, error) {
-				return SiteSettings{SSHPassword: pw}, nil
-			},
-		}, store.NewMemStore(), testLogger())
-	}
+	s := New(Config{}, store.NewMemStore(), testLogger())
 
 	// 1. default-password row D, cached into the record by the delta.
-	rowD := users1PasswordRow(t, mustBuildSys(t, serverWith(""), rec))
+	rowD := users1PasswordRow(t, mustBuildSys(t, s, rec))
 	if _, ok := rec.Extra[store.SSHSha512PasswdKey]; !ok {
 		t.Fatalf("default render wrote no ssh_sha512passwd cache — the delta seam moved:\n%v", rec.Extra)
 	}
 
 	// 2. hunter2 must NOT self-verify against the default cache row.
-	row2 := users1PasswordRow(t, mustBuildSys(t, serverWith("hunter2"), rec))
+	rec.SSHPassword = "hunter2"
+	row2 := users1PasswordRow(t, mustBuildSys(t, s, rec))
 	if row2 == rowD {
-		t.Fatalf("SSHPassword %q rendered the default-cache row %q — the facts→SiteFacts copy is dropped:\n%s",
+		t.Fatalf("device SSHPassword %q rendered the default-cache row %q — the record source is dropped:\n%s",
 			"hunter2", rowD, row2)
 	}
 
-	// 3. the positive oracle: the same facts render again must reuse step
-	// 2's row byte-identically (matcher self-check against hunter2) and
-	// mint no fresh delta.
+	// 3. the record no longer names the row's password — the last
+	// controller-pushed row survives verbatim, with no fresh delta.
+	rec.SSHPassword = ""
 	before, err := json.Marshal(rec.Extra)
 	if err != nil {
 		t.Fatal(err)
 	}
-	row3 := users1PasswordRow(t, mustBuildSys(t, serverWith("hunter2"), rec))
+	row3 := users1PasswordRow(t, mustBuildSys(t, s, rec))
 	after, err := json.Marshal(rec.Extra)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if row3 != row2 {
-		t.Fatalf("rendered users.1.password %q did not self-check against hunter2 (fresh draw %q)", row2, row3)
+		t.Fatalf("unset render must reuse the last controller-pushed row verbatim: %q, want %q", row3, row2)
 	}
 	if string(before) != string(after) {
-		t.Fatalf("hunter2 self-check render minted a delta (Extra changed): %s → %s", before, after)
+		t.Fatalf("unset reuse minted a credential delta (Extra changed): %s → %s", before, after)
 	}
 }
 
@@ -399,8 +397,12 @@ func users1PasswordRow(t *testing.T, sys string) string {
 // Adapter-level byte-identity pin: the zero-value site-settings record
 // (the first-boot seed with no flags, and the empty-on-disk shape) renders
 // BYTE-IDENTICALLY to the old flag-default render (the nil settings source
-// — the pre-swap Config{} shape, whose only site-fact inputs were the four
-// zero-valued flags). The renderer's own goldens pin the factory-echo block
+// — the pre-swap Config{} shape). The mechanism: the SSH password rides
+// the device record, not the settings document, and an unset record
+// password with no cache hashes the factory-default "ubnt" (the renderer's
+// no-cache path) — the same row shape the empty-facts render produced
+// before the per-device swap. The renderer's own goldens pin the
+// factory-echo block
 // shape; this pins the SEAM: the live settings source introduces no bytes
 // of its own, and country 0 coerces to the 840 default on the way through.
 func TestSiteSettingsZeroRecordRendersByteIdentical(t *testing.T) {
@@ -408,7 +410,9 @@ func TestSiteSettingsZeroRecordRendersByteIdentical(t *testing.T) {
 	// The nil source: the old flag-default path (all facts zero).
 	sysNil := mustBuildSys(t, New(Config{}, store.NewMemStore(), testLogger()), rec)
 	// The live closure over a ZERO-VALUE record: country 0 = unset, no
-	// password, no keys, password login enabled.
+	// keys, password login enabled; the zero record carries no ssh
+	// password (the per-device field), so the users.1 hash is the fresh
+	// factory-default "ubnt" row on both sides of the comparison.
 	sysZero := mustBuildSys(t, New(Config{
 		SiteSettings: func() (SiteSettings, error) { return SiteSettings{}, nil },
 	}, store.NewMemStore(), testLogger()), rec)
@@ -980,7 +984,7 @@ func TestVlanWiringStatusRowsAlwaysOn(t *testing.T) {
 }
 
 // Regression gate for the mcad validator keys (the root-cause fix behind
-// the netconf.1 emission in emitNetconfSection): the AP firmware's mcad
+// the netconf.1 emission in emitNetconfSection): the device firmware's mcad
 // daemon (fw 6.8.2.15592, Ghidra 0x0040a924 renamed
 // mcad_validate_system_cfg) hard-rejects any system_cfg whose parsed tree
 // lacks `users.1.status`, `netconf.1.status` or `sshd.status` — it logs
@@ -1468,7 +1472,7 @@ func TestAdoptionDoesNotSeedBaseline(t *testing.T) {
 // forced push or mismatches via the minted cfgversion. The baseline is
 // captured exclusively by settle, after delivery is proven on the wire.
 func TestAdoptionEchoThenEnvelopeDrift(t *testing.T) {
-	env := []Wlan{} // the live AP adopted with an empty wireless config
+	env := []Wlan{} // the live device adopted with an empty wireless config
 	st := store.NewMemStore()
 	if err := st.Put(store.Device{MAC: testMAC, State: store.StatePending}); err != nil {
 		t.Fatal(err)
@@ -1739,7 +1743,7 @@ func TestMultiVLANContiguousNumbering(t *testing.T) {
 // connected-noop with no stored baseline — the controller mints a fresh
 // cfgversion (forcing exactly one full provisioning on the next inform)
 // instead of silently never detecting drift again. This exact state was
-// left behind on the live AP by the pre-fix binary.
+// left behind on the live device by the pre-fix binary.
 func TestMissingBaselineForcesProvisioning(t *testing.T) {
 	env := workedEnvelope()
 	st := store.NewMemStore()
@@ -1820,7 +1824,7 @@ func intExtra(extra store.JSONMap, key string) (int, bool) {
 
 // Settled-state regression (live 2026-09-18 F-row round, A2 finding) with
 // the two-consecutive-miss arming (2026-09-19 boot-race finding): a
-// rebooted AP re-materializes factory config while still echoing the
+// rebooted device re-materializes factory config while still echoing the
 // provisioned cfgversion — the engine re-arms delivery only on the SECOND
 // consecutive not-running proof (mint → forced full provisioning →
 // settle), recording the first as controller-owned bookkeeping. That

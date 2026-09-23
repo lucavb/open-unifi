@@ -1,7 +1,9 @@
-// Site settings are the controller-level AP-intent document: the three
-// AP-intent site facts that used to live only in startup flags — the
-// regulatory country code, the AP SSH password, and the ordered SSH
-// authorized_keys lines.
+// Site settings are the controller-level device-intent document: the two
+// device-intent site facts that used to live only in startup flags — the
+// regulatory country code and the ordered SSH authorized_keys lines. (The
+// Device SSH password used to be the third: the site-wide concept is REMOVED —
+// the per-device SSH password rides the device record itself,
+// store.Device.SSHPassword, set via PATCH /api/v1/devices/{mac}.)
 //
 // It follows the wireless-envelope precedent exactly: an app-owned JSON
 // file (`<data-dir>/site-settings.json`) loaded EXACTLY ONCE in New,
@@ -17,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -26,18 +29,14 @@ import (
 	"github.com/lucavb/open-unifi/internal/store"
 )
 
-// SiteSettings is the persisted controller-level AP-intent record. The
+// SiteSettings is the persisted controller-level device-intent record. The
 // zero value carries exactly the semantics of the old flag defaults:
-// CountryCode 0 renders as the 840 default at the server seam, an empty
-// SSHPassword renders as the site default ("ubnt", renderer semantics,
-// unchanged), and no keys render as no sshd.auth.key rows.
+// CountryCode 0 renders as the 840 default at the server seam, and no keys
+// render as no sshd.auth.key rows.
 type SiteSettings struct {
 	// CountryCode is the ISO 3166-1 numeric regulatory country code.
 	// 0 = unset (renders as the default 840 at the server seam).
 	CountryCode int
-	// SSHPassword is the SSH password for adopted APs; "" = site default
-	// "ubnt" (renderer semantics, unchanged).
-	SSHPassword string
 	// SSHPublicKeys are the ordered authorized_keys lines, each a
 	// validated RFC 4253 line, stored VERBATIM (raw lines, not parsed
 	// structs — parsing belongs to the render seam). The order is the
@@ -58,8 +57,7 @@ func (s SiteSettings) toDocument() adminapi.SiteSettingsDocument {
 	}
 	return adminapi.SiteSettingsDocument{
 		RegulatoryCountryCode: s.CountryCode,
-		APSSHPassword:         s.SSHPassword,
-		APSSHPublicKeys:       keys,
+		DeviceSSHPublicKeys:   keys,
 	}
 }
 
@@ -67,13 +65,12 @@ func (s SiteSettings) toDocument() adminapi.SiteSettingsDocument {
 // key list becomes an empty (never nil) list so cached records always hold
 // usable slices.
 func siteSettingsFromDoc(doc adminapi.SiteSettingsDocument) SiteSettings {
-	keys := doc.APSSHPublicKeys
+	keys := doc.DeviceSSHPublicKeys
 	if keys == nil {
 		keys = []string{}
 	}
 	return SiteSettings{
 		CountryCode:   doc.RegulatoryCountryCode,
-		SSHPassword:   doc.APSSHPassword,
 		SSHPublicKeys: keys,
 	}
 }
@@ -88,8 +85,7 @@ func projectSettingsView(s SiteSettings) adminapi.SiteSettingsView {
 	}
 	return adminapi.SiteSettingsView{
 		RegulatoryCountryCode: s.CountryCode,
-		APSSHPassword:         s.SSHPassword,
-		APSSHPublicKeys:       keys,
+		DeviceSSHPublicKeys:   keys,
 	}
 }
 
@@ -107,7 +103,7 @@ func validateSiteSettingsChange(s SiteSettings) error {
 	}
 	for i, line := range s.SSHPublicKeys {
 		if _, err := systemcfg.ParsePublicKey(line); err != nil {
-			return fmt.Errorf("%w: invalid AP SSH public key #%d: %v", adminapi.ErrInvalid, i+1, err)
+			return fmt.Errorf("%w: invalid Device SSH public key #%d: %v", adminapi.ErrInvalid, i+1, err)
 		}
 	}
 	return nil
@@ -124,7 +120,7 @@ func validateSettingsSyntax(s SiteSettings) error {
 	}
 	for i, line := range s.SSHPublicKeys {
 		if _, err := systemcfg.ParsePublicKey(line); err != nil {
-			return fmt.Errorf("invalid AP SSH public key #%d: %w", i+1, err)
+			return fmt.Errorf("invalid Device SSH public key #%d: %w", i+1, err)
 		}
 	}
 	return nil
@@ -138,13 +134,29 @@ func validateSettingsSyntax(s SiteSettings) error {
 // refuses to launch (loaded=true: the file EXISTS, the seed must not
 // silently overwrite it). A present file WINS over the seed: the startup
 // flags are first-boot seeds only.
-func loadSettingsFile(path string) (SiteSettings, bool, error) {
+func loadSettingsFile(path string, lg *slog.Logger) (SiteSettings, bool, error) {
 	raw, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return SiteSettings{}, false, nil
 	}
 	if err != nil {
 		return SiteSettings{}, true, fmt.Errorf("site settings file unreadable %s: %w", path, err)
+	}
+	// Stale-key peek: the struct decode below silently DROPs the removed
+	// site password key (no field to land in), so a deployer-carrying
+	// site-settings.json would fold it away with zero diagnostics. Peek
+	// the RAW bytes and warn once when the HISTORICAL key is present —
+	// the removed site-level field `ap_ssh_password` is what GHCR-era
+	// deployed site-settings.json files actually carry ("device_ssh_password"
+	// never existed on disk), and old-client names live only here, in
+	// migration contexts. Ignored, with NO value migration (a migration
+	// would resurrect site semantics under a per-device name: the
+	// per-device password must be set explicitly per device instead).
+	var peek map[string]any
+	if jsonErr := json.Unmarshal(raw, &peek); jsonErr == nil {
+		if _, stale := peek["ap_ssh_password"]; stale {
+			lg.Warn("site settings: the removed \"ap_ssh_password\" key is ignored — no value migration; per-device SSH passwords are set via PATCH /api/v1/devices/{mac} (Terraform open-unifi_access_point)")
+		}
 	}
 	var doc adminapi.SiteSettingsDocument
 	if err := json.Unmarshal(raw, &doc); err != nil {
@@ -159,9 +171,9 @@ func loadSettingsFile(path string) (SiteSettings, bool, error) {
 
 // persistSettingsFile atomically writes the settings document (temp file +
 // fsync + rename + directory fsync — the same durability contract as the
-// wireless persist). The temp file is created with 0600: unlike the
-// wireless file the document carries an SSH password, so it is never
-// world-readable on disk, not even between rename and chmod-sweep.
+// wireless persist). The temp file is created with 0600: the document is
+// controller-level admin content, so it is never world-readable on disk,
+// not even between rename and chmod-sweep.
 func persistSettingsFile(path string, s SiteSettings) error {
 	blob, err := json.MarshalIndent(s.toDocument(), "", "  ")
 	if err != nil {
@@ -227,7 +239,7 @@ func (a *App) currentSiteSettings() (SiteSettings, error) {
 }
 
 // CurrentSiteSettings exposes the cached record without the Backend
-// shape, for wiring-side use (the server sources the AP-intent site
+// shape, for wiring-side use (the server sources the device-intent site
 // facts from here — including from inside the engine's decision
 // path, which is exactly why smu must stay a leaf lock: this reader takes
 // smu while the caller may already hold a per-MAC store lock). Mirrors
@@ -238,14 +250,13 @@ func (a *App) CurrentSiteSettings() (SiteSettings, error) {
 }
 
 // siteSettingsChanged reports an EFFECTIVE change under the save verb's
-// doctrine: any difference in the three facts. The key list comparison is
+// doctrine: any difference in the two facts. The key list comparison is
 // ORDER-SENSITIVE — the list is provisioned as sshd.auth.key.<n> rows in
 // order, so a reorder IS a different intended config. An order-only diff
 // therefore mints one harmless re-provisioning (idempotent content, the
 // device echoes the new cfgversion and noops thereafter; pinned by test).
 func siteSettingsChanged(before, after SiteSettings) bool {
 	return before.CountryCode != after.CountryCode ||
-		before.SSHPassword != after.SSHPassword ||
 		!slices.Equal(before.SSHPublicKeys, after.SSHPublicKeys)
 }
 

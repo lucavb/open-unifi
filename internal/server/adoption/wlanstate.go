@@ -183,7 +183,7 @@ func (st *wlanCfgState) settle() {
 	// the record, so use the current source for positive proof and only require
 	// old names to be absent when they are no longer desired.
 	//
-	// Wire keys: the AP's real vap_table uses essid/state/radio_name/name
+	// Wire keys: the device's real vap_table uses essid/state/radio_name/name
 	// (firmware-verified, mcad FUN_0041cecc; corroborated by the live log
 	// "vap_table reports state RUN", docs/PROTOCOL.md:388;
 	// docs/AP-FIRMWARE-APPLY-PATH.md). The ssid/status/parent spellings only
@@ -260,7 +260,7 @@ const (
 
 // notRunningEvidence classifies THIS inform's vap_table evidence about the
 // applied WLAN set. Live evidence (2026-09-18 F-row round, A2): a rebooted
-// AP re-materializes factory config while still echoing the provisioned
+// device re-materializes factory config while still echoing the provisioned
 // cfgversion — settle's one-shot watchdog must be backed by a continuous
 // check or that regression noops forever; the 2026-09-19 A2 re-run then
 // proved the complementary hazard (the boot race: the first post-boot

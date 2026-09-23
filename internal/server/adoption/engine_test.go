@@ -445,7 +445,7 @@ func TestSettledRegressionRearms(t *testing.T) {
 }
 
 // Boot-race (2026-09-19 A2 re-run finding, WLAN-ACCEPTANCE 6.8.2.15592):
-// a rebooted AP's first re-inform can carry a present, non-empty
+// a rebooted device's first re-inform can carry a present, non-empty
 // vap_table whose radios are still in bring-up — the applied SSID not yet
 // RUN is the race, not genuine factory regression. miss → later RUN = NO
 // fire, the RUN proof resets the window, and the reset window re-arms

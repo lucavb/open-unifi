@@ -9,7 +9,7 @@ package server
 // the CURRENT live fixtures (live-devices.json + live-wireless.json) and
 // parse-diffs its candidate against the DEVICE-VERIFIED applied bytes
 // (live-applied-sys.txt, sha256 11cb0472… — re-seeded by the 2026-09-21
-// site-settings round, whose key-rows full-provisioning render the AP
+// site-settings round, whose key-rows full-provisioning render the device
 // confirmed byte-identical; earlier re-seeds: the 2026-09-20
 // factory-window set-inform round, sha ad41cdad…. The 2026-09-20
 // DAS/DAD round's das-state push is archived row-for-row in
@@ -42,7 +42,7 @@ package server
 // zzExemptIsDefaultMigration filter: the live applied bytes were captured
 // POST-fix, so a renderer that ever emits mgmt.is_default again must
 // FAIL here (the fw 6.8.2 boot path would factory-reset the WLAN text on
-// the next AP reboot — see the zzZZAllowPrefix comment). Since the
+// the next device reboot — see the zzZZAllowPrefix comment). Since the
 // 2026-09-20 re-seed they also do NOT apply zzExemptLedBarMigration: the
 // live applied capture is POST-ledbar, so a ledbar.* drift must FAIL here
 // too (the filter stays only at the synthetic-baseline gates, whose
@@ -88,7 +88,7 @@ func zzLiveFixtures(t *testing.T) (rec store.Device, env []Wlan, appliedRaw []by
 	var ok bool
 	rec, ok = file.Devices["aabbccddee02"]
 	if !ok {
-		t.Fatalf("live AP aa:bb:cc:dd:ee:02 absent from fetched record: %d devices", len(file.Devices))
+		t.Fatalf("live device aa:bb:cc:dd:ee:02 absent from fetched record: %d devices", len(file.Devices))
 	}
 	var envFile struct {
 		Wlans []Wlan `json:"wlans"`
@@ -105,12 +105,12 @@ func zzLiveFixtures(t *testing.T) (rec store.Device, env []Wlan, appliedRaw []by
 // zzFailIsDefaultRegression trips when a render against the post-fix live
 // applied bytes emits the mgmt.is_default row anyway — that is not an
 // exempted migration here, it is the boot-guard regression that would
-// factory-reset the WLAN text on the next AP reboot.
+// factory-reset the WLAN text on the next device reboot.
 func zzFailIsDefaultRegression(t *testing.T, intended []string) {
 	t.Helper()
 	for _, r := range intended {
 		if strings.HasPrefix(r, "mgmt.is_default:") {
-			t.Fatalf("renderer emitted mgmt.is_default against the post-fix applied bytes — the 2026-09-19 boot-guard fix regressed (the fw 6.8.2 boot path would factory-reset the WLAN text on the next AP reboot); ABORT: %s", r)
+			t.Fatalf("renderer emitted mgmt.is_default against the post-fix applied bytes — the 2026-09-19 boot-guard fix regressed (the fw 6.8.2 boot path would factory-reset the WLAN text on the next device reboot); ABORT: %s", r)
 		}
 	}
 }
@@ -275,7 +275,7 @@ const zzLiveDasSecret = "openunifi-fake-radius-20260920"
 // radius_das_enabled — rendered and checked two ways:
 //
 //  1. against the DEVICE-VERIFIED das-state capture (live-das-applied-sys.txt,
-//     the AP's /tmp/system.cfg during the accepted push, sha256 f60d458e…):
+//     the device's /tmp/system.cfg during the accepted push, sha256 f60d458e…):
 //     the render must reproduce it exactly — parse-level zero-diff — and
 //     must preserve the jar's duplicate aaa.<n>.radius.dad.status row in
 //     the raw emission (the once-per-render dad block re-emits dad.status

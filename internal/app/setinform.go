@@ -42,11 +42,12 @@ const (
 	// factorySSHUser / factorySSHPassword are the FACTORY default
 	// credentials of a factory-state device (docs/PROTOCOL-mgmt.md §7: site
 	// mgmt x_ssh_password defaults to "ubnt"; the device has never received
-	// a rendered config, so no site-wide --ap-ssh-password value can have
-	// reached it yet). Deliberately NOT the --ap-ssh-password site knob:
-	// that knob hashes into system_cfg for ADOPTED devices, while this
-	// push targets a candidate that has never been provisioned. The whole
-	// lane is --allow-ssh-set-inform-push gated for that reason.
+	// a rendered config, so no provisioned SSH password can have reached
+	// it yet). Deliberately NOT the per-device ssh_password row
+	// (store.Device.SSHPassword): that row hashes into system_cfg for
+	// ADOPTED devices, while this push targets a candidate that has never
+	// been provisioned. The whole lane is --allow-ssh-set-inform-push
+	// gated for that reason.
 	factorySSHUser     = "ubnt"
 	factorySSHPassword = "ubnt"
 )

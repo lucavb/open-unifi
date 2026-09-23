@@ -58,7 +58,7 @@ func newFakeBackend(token string) *fakeBackend {
 		wireless: map[string]string{},
 		// The zero view: exactly what the real API echoes for an untouched
 		// controller (all fields present, empty key list as []).
-		siteSettings: `{"regulatory_country_code":0,"ap_ssh_password":"","ap_ssh_public_keys":[]}`,
+		siteSettings: `{"regulatory_country_code":0,"device_ssh_public_keys":[]}`,
 	}
 	return fb
 }
@@ -199,7 +199,7 @@ func (fb *fakeBackend) handler() http.Handler {
 				writeFakeErr(w, http.StatusBadRequest, "invalid JSON body")
 				return
 			}
-			for _, field := range []string{"regulatory_country_code", "ap_ssh_password", "ap_ssh_public_keys"} {
+			for _, field := range []string{"regulatory_country_code", "device_ssh_public_keys"} {
 				if _, ok := raw[field]; !ok {
 					writeFakeErr(w, http.StatusBadRequest, "missing field "+field)
 					return
@@ -669,23 +669,23 @@ func TestSiteSettingsGetEcho(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getSiteSettings zero view: %v", err)
 	}
-	if got.RegulatoryCountryCode != 0 || got.APSSHPassword != "" || len(got.APSSHPublicKeys) != 0 {
+	if got.RegulatoryCountryCode != 0 || len(got.DeviceSSHPublicKeys) != 0 {
 		t.Fatalf("zero view decode mismatch: %+v", got)
 	}
 
 	// A populated view must decode verbatim, keys in order. The removed
-	// disable knob's wire name must not map onto anything (it is not in
-	// the wire struct; the record is gone).
+	// site password / disable knob's HISTORICAL wire names (what GHCR-era
+	// servers echo and old binaries send) must not map onto anything —
+	// neither the password (Phase A removed it) nor the disable knob.
 	fb.siteSettings = `{"regulatory_country_code":276,"ap_ssh_password":"s3cret",` +
-		`"ap_ssh_public_keys":["ssh-ed25519 AAAA a@ap","ssh-rsa AAAA b@ap"]}`
+		`"device_ssh_public_keys":["ssh-ed25519 AAAA a@ap","ssh-rsa AAAA b@ap"]}`
 	got, err = c.getSiteSettings(ctx)
 	if err != nil {
 		t.Fatalf("getSiteSettings populated view: %v", err)
 	}
 	want := siteSettings{
 		RegulatoryCountryCode: 276,
-		APSSHPassword:         "s3cret",
-		APSSHPublicKeys:       []string{"ssh-ed25519 AAAA a@ap", "ssh-rsa AAAA b@ap"},
+		DeviceSSHPublicKeys:   []string{"ssh-ed25519 AAAA a@ap", "ssh-rsa AAAA b@ap"},
 	}
 	if !reflect.DeepEqual(*got, want) {
 		t.Fatalf("populated view decode: got %+v, want %+v", *got, want)
@@ -693,7 +693,7 @@ func TestSiteSettingsGetEcho(t *testing.T) {
 }
 
 // TestSiteSettingsPutRoundTrip pins the PUT contract: the whole document
-// goes out with all three fields (the strict server decode would 400 on a
+// goes out with both fields (the strict server decode would 400 on a
 // missing one) and the returned view is the server's echo of it, which the
 // subsequent GET confirms.
 func TestSiteSettingsPutRoundTrip(t *testing.T) {
@@ -703,8 +703,7 @@ func TestSiteSettingsPutRoundTrip(t *testing.T) {
 
 	doc := siteSettings{
 		RegulatoryCountryCode: 840,
-		APSSHPassword:         "s3cret",
-		APSSHPublicKeys:       []string{"ssh-ed25519 AAAA a@ap", "ssh-ed25519 AAAA b@ap"},
+		DeviceSSHPublicKeys:   []string{"ssh-ed25519 AAAA a@ap", "ssh-ed25519 AAAA b@ap"},
 	}
 	view, err := c.putSiteSettings(ctx, doc)
 	if err != nil {
@@ -728,9 +727,9 @@ func TestSiteSettingsPutRoundTrip(t *testing.T) {
 // (an invalid authorized_keys line is the canonical case).
 func TestSiteSettingsPutError(t *testing.T) {
 	fb := newFakeBackend("")
-	fb.siteSettingsErr = "invalid AP SSH public key #1: want exactly 2 or 3 fields (type value [comment]), got 1"
+	fb.siteSettingsErr = "invalid Device SSH public key #1: want exactly 2 or 3 fields (type value [comment]), got 1"
 	c := clientFor(fb, "")
-	_, err := c.putSiteSettings(context.Background(), siteSettings{APSSHPublicKeys: []string{"not-a-key-line"}})
+	_, err := c.putSiteSettings(context.Background(), siteSettings{DeviceSSHPublicKeys: []string{"not-a-key-line"}})
 	if err == nil {
 		t.Fatal("expected 400 error, got nil")
 	}
@@ -741,7 +740,7 @@ func TestSiteSettingsPutError(t *testing.T) {
 	if ae.status != http.StatusBadRequest {
 		t.Fatalf("expected status 400, got %d", ae.status)
 	}
-	if want := "http 400: invalid AP SSH public key #1: want exactly 2 or 3 fields (type value [comment]), got 1"; err.Error() != want {
+	if want := "http 400: invalid Device SSH public key #1: want exactly 2 or 3 fields (type value [comment]), got 1"; err.Error() != want {
 		t.Fatalf("error message = %q, want %q", err.Error(), want)
 	}
 }

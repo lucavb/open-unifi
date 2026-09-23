@@ -18,14 +18,14 @@ func absorbFixture() Device {
 		LastSeen: 1699999999, FirstSeen: 1690000000, AppliedCfg: "old-cfg",
 		AESGCM: true,
 		Extra: JSONMap{
-			// controller-owned: wlan bookkeeping + the ssh password cache
-			"wlan_cfg_sha":     "prev-sha",
-			"ssh_sha512passwd": "$6$prev-hash$",
-			"client_sessions":  JSONMap{"aabbccddeeff": JSONMap{"connected": true}},
+			// controller-owned: wlan bookkeeping + the client-session family
+			"wlan_cfg_sha":    "prev-sha",
+			"client_sessions": JSONMap{"aabbccddeeff": JSONMap{"connected": true}},
 			// device-refreshable caps
 			"radio_table": []any{JSONMap{"name": "ra0"}},
 			"wifi_caps":   7,
-			// admin-owned rows
+			// admin-owned rows (incl. the per-device SSH password twin and
+			// the two last-controller-pushed password-hash caches)
 			"system_cfg_extra_lines":        []any{"set XMII=no"},
 			"mgmt_dev":                      "br0",
 			"reboot_on_connect":             true,
@@ -34,6 +34,9 @@ func absorbFixture() Device {
 			"led_override_color_brightness": 42.0,
 			"blocked_sta":                   []any{"112233445566"},
 			"cmd_task":                      JSONMap{"cmd": "restart"},
+			"ssh_password":                  "prev-pw",
+			"ssh_sha512passwd":              "$6$prev-hash$",
+			"ssh_md5passwd":                 "$1$prev-hash$",
 		},
 	}
 }
@@ -53,7 +56,6 @@ func absorbBody() map[string]any {
 		"wifi_caps":   9.0,
 		// forged device copies of every guarded class
 		"wlan_cfg_sha":                  "forged-sha",
-		"ssh_sha512passwd":              "$6$forged$",
 		"client_sessions":               "forged",
 		"system_cfg_extra_lines":        []any{"echo pwned"},
 		"mgmt_dev":                      "eth9",
@@ -63,16 +65,19 @@ func absorbBody() map[string]any {
 		"led_override_color_brightness": 99.0,
 		"blocked_sta":                   "forged",
 		"cmd_task":                      "forged",
+		"ssh_password":                  "forged-pw",
+		"ssh_sha512passwd":              "$6$forged$",
+		"ssh_md5passwd":                 "$1$forged$",
 	}
 }
 
 // TestAbsorbControllerOwnedPrevWins pins the controller-owned class across
-// the wholesale Extra swap — including the ssh_sha512passwd cache, whose
-// registry membership is the reason the policy lives in the store now.
+// the wholesale Extra swap (the wlan delivery bookkeeping and the
+// client-session family).
 func TestAbsorbControllerOwnedPrevWins(t *testing.T) {
 	rec := absorbFixture()
 	rec.Absorb(absorbBody(), absorbNow, false)
-	for _, k := range []string{"wlan_cfg_sha", "ssh_sha512passwd", "client_sessions"} {
+	for _, k := range []string{"wlan_cfg_sha", "client_sessions"} {
 		if got, want := rec.Extra[k], absorbFixture().Extra[k]; !reflect.DeepEqual(got, want) {
 			t.Fatalf("controller-owned %q missing after absorption: got %v, want %v", k, got, want)
 		}
@@ -99,7 +104,8 @@ func TestAbsorbControllerOwnedRestoresOnlyFromTheRecord(t *testing.T) {
 		}
 	}
 	// And even with the transport flag set the restoration still takes the
-	// record's cache value, not the forged body copy.
+	// record's value, not the forged body copy (the sha512 cache is
+	// admin-owned now — prev-or-delete).
 	rec = Device{MAC: "aabbccddeeff", Extra: JSONMap{SSHSha512PasswdKey: "$6$prev-hash$"}}
 	rec.Absorb(absorbBody(), absorbNow, true)
 	if got, want := rec.Extra[SSHSha512PasswdKey], "$6$prev-hash$"; got != want {
@@ -158,19 +164,21 @@ func TestAbsorbAdminOwnedPrevOrDelete(t *testing.T) {
 
 // TestAbsorbFactoryResetSweepExcludesSiteCache pins the demotion sweep's
 // shape: it clears exactly the per-device controller state and never the
-// site-fact ssh password cache (the first post-reset provisioning
-// re-derives that verbatim).
+// per-device SSH password caches (they hold the DEVICE's last
+// controller-pushed password and deliberately survive the demotion — the
+// exclude keeps that survival; both caches are admin-owned, so the class
+// itself cannot land in the sweep either).
 func TestAbsorbFactoryResetSweepExcludesSiteCache(t *testing.T) {
 	for _, k := range FactoryResetSweepKeys {
-		if k == SSHSha512PasswdKey {
-			t.Fatal("the demotion sweep must not clear the site ssh password cache")
+		if k == SSHSha512PasswdKey || k == SSHMd5PasswdKey {
+			t.Fatal("the demotion sweep must not clear the per-device ssh password caches")
 		}
 		if !containsKey(controllerOwnedKeys, k) {
 			t.Fatalf("sweep key %q is not controller-owned", k)
 		}
 	}
-	if !containsKey(controllerOwnedKeys, SSHSha512PasswdKey) {
-		t.Fatal("ssh_sha512passwd is not declared controller-owned")
+	if containsKey(controllerOwnedKeys, SSHSha512PasswdKey) || containsKey(controllerOwnedKeys, SSHMd5PasswdKey) {
+		t.Fatal("the ssh password caches must be admin-owned")
 	}
 }
 
@@ -249,7 +257,6 @@ func TestTrustRegistrySnapshot(t *testing.T) {
 		"wlan_cfg_last_attempt", "wlan_cfg_delivery_status",
 		"wlan_cfg_not_running_misses", "wlan_cfg_offered_cfgversion",
 		"client_sessions", "client_disconnect_pending",
-		"ssh_sha512passwd",
 	}
 	deviceRefreshable := []string{
 		"radio_table", "wifi_caps", "fw_caps", "if_table", "ethernet_table",
@@ -260,8 +267,9 @@ func TestTrustRegistrySnapshot(t *testing.T) {
 		"anonymous_controller_id", "anonymous_site_id",
 		"reboot_on_connect", "setdefault_armed",
 		"blocked_sta", "blocked_sta_sha",
+		"ssh_sha512passwd", "ssh_md5passwd",
 		"led_override", "disabled", "led_override_color_brightness",
-		"led_override_color",
+		"led_override_color", "ssh_password",
 		"radio_intent", "cmd_task",
 	}
 	sweep := []string{
@@ -288,11 +296,14 @@ func TestTrustRegistrySnapshot(t *testing.T) {
 		}
 	}
 	// The sweep must be exactly controller-owned minus the ssh password
-	// cache — no other exclusion is licensed.
-	if !containsKey(controllerOwnedKeys, SSHSha512PasswdKey) {
-		t.Error("ssh_sha512passwd left the controller-owned class")
-	}
-	if containsKey(FactoryResetSweepKeys, SSHSha512PasswdKey) {
-		t.Error("the sweep must spare the site ssh password cache")
+	// caches — no other exclusion is licensed, and the caches are
+	// admin-owned so they cannot be swept by class either.
+	for _, k := range []string{SSHSha512PasswdKey, SSHMd5PasswdKey} {
+		if containsKey(controllerOwnedKeys, k) {
+			t.Error("ssh password cache left the admin-owned class")
+		}
+		if containsKey(FactoryResetSweepKeys, k) {
+			t.Error("the sweep must spare the per-device ssh password caches")
+		}
 	}
 }

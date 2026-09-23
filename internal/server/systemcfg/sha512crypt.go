@@ -214,3 +214,12 @@ func sha512CryptMatches(key, stored string) bool {
 	}
 	return sha512CryptRaw([]byte(key), []byte(m[1])) == stored
 }
+
+// sha512CacheFormatRx is the VERBATIM-REUSE format gate (the per-device
+// unset branch in render.go, the locked contract): only a well-formed
+// $6$ crypt string of this controller's own output shape — "$6$" + 8
+// chars of [./0-9A-Za-z] + "$" + 86 chars, mirroring the jar's
+// SALT_PATTERN family (docs/PROTOCOL-systemcfg-wireless.md §10.7) — may be
+// reused unwritten on an unset-password render; anything else falls
+// through to the factory-default fresh-hash path.
+var sha512CacheFormatRx = regexp.MustCompile(`^\$6\$[./0-9A-Za-z]{8}\$[./0-9A-Za-z]{86}$`)

@@ -123,6 +123,11 @@ type apDevice struct {
 	LEDOverrideColorBrightness *int   `json:"led_override_color_brightness,omitempty"`
 	LEDOverrideColor           string `json:"led_override_color,omitempty"`
 	PendingCommand             string `json:"pending_command,omitempty"`
+	// SSHPassword mirrors the admin API's per-device SSH login password
+	// echo ("" = unmanaged). Wire-decode only for now: the schema
+	// attribute lands with the provider device-rename phase; parity with
+	// the server structs is the only contract (TestDeviceStructParity).
+	SSHPassword string `json:"ssh_password,omitempty"`
 }
 
 func (r *accessPointResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {

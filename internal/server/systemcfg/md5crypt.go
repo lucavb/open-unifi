@@ -3,6 +3,7 @@ package systemcfg
 import (
 	"crypto/md5"
 	"crypto/rand"
+	"regexp"
 	"strings"
 )
 
@@ -122,6 +123,17 @@ func md5CryptMatches(key, stored string) bool {
 	}
 	return md5CryptRaw([]byte(key), []byte(salt)) == string(rest[len(salt)+1:])
 }
+
+// md5CacheFormatRx is the VERBATIM-REUSE format gate (the per-device unset
+// branch in render.go, the locked contract): only a well-formed $1$ crypt
+// string of this controller's own output shape — "$1$" + 8 chars of
+// [./0-9A-Za-z] + "$" + 22 chars — may be reused unwritten on an
+// unset-password render; anything else falls through to the
+// factory-default fresh-hash path. This package's own md5Crypt output is
+// randAlphaSalt's 8 letters + the 22-char to64 digest (verified against
+// `openssl passwd -1`), so the gate admits exactly what this controller
+// ever writes.
+var md5CacheFormatRx = regexp.MustCompile(`^\$1\$[./0-9A-Za-z]{8}\$[./0-9A-Za-z]{22}$`)
 
 // randAlphaSalt mirrors RandomStringUtils.randomAlphabetic(n) over
 // crypto/rand (the jar's md5-branch salt generator, commons-codec B64 set

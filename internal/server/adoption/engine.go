@@ -491,8 +491,10 @@ func (e *Engine) armedLifecycle(d *store.Device) (Outcome, bool) {
 		// connected noops while running factory config. The baseline is
 		// re-captured by the post-adoption self-heal + drift settle,
 		// exactly like a fresh adoption (which deliberately seeds no
-		// baseline). The site SSH password cache is deliberately NOT
-		// swept (it re-derives verbatim from the site fact).
+		// baseline). The ssh password caches are deliberately NOT
+		// swept: they hold the DEVICE's last controller-pushed password
+		// and deliberately survive factory reset/setdefault demotion;
+		// the exclude keeps that survival.
 		for _, k := range store.FactoryResetSweepKeys {
 			delete(d.Extra, k)
 		}
@@ -757,7 +759,7 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 		}
 		// Settled-state regression (2026-09-18 F-row live round, A2
 		// finding): a device can echo a matching cfgversion while running
-		// something else — a rebooted AP re-materializes factory config
+		// something else — a rebooted device re-materializes factory config
 		// yet still reports the provisioned stamp, and the settle
 		// watchdog is one-shot. A PRESENT vap_table that disproves the
 		// applied WLANs re-arms delivery the same way the self-heal
@@ -953,8 +955,8 @@ func (e *Engine) assignedKeyFlow(d *store.Device, now time.Time, wls []wireless.
 	}
 	cur := plan.DriftHash
 	// Do not mark the configuration applied merely because system_cfg was
-	// sent.  Keep the desired snapshot as delivery evidence for the next AP
-	// inform (including deletions, where absence must be observed).
+	// sent.  Keep the desired snapshot as delivery evidence for the next
+	// device inform (including deletions, where absence must be observed).
 	placements := plan.Placements
 	st := loadWlanCfgState(d.Extra)
 	st.applyProvisioning(cur, now.Unix(), wls, placements, d.CfgVersion)

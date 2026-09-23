@@ -91,6 +91,25 @@ type Device struct {
 	// record semantics. ADMIN-OWNED (CONTEXT.md trust policy): the
 	// device can neither write nor introduce it.
 	LEDOverrideColor string `json:"led_override_color,omitempty"`
+
+	// SSHPassword is the admin-set per-device SSH login password — the
+	// classic controller has NO per-device field for this (its §10 sink is
+	// the site-wide mgmt setting x_ssh_password), so this is open-unifi's
+	// extension over the official row mechanics. Values: "" (UNSET = STOP
+	// MANAGING — the render reuses the last password hash the controller
+	// pushed for this device, so the device's actual SSH password never
+	// changes), or a non-empty password to set. Only an explicit non-empty
+	// set ever changes the device's password; an unset render with no cache
+	// falls back to the factory-default "ubnt" row. ADMIN-OWNED (CONTEXT.md
+	// trust policy): the device can neither write nor introduce it —
+	// Absorb never touches typed fields, and the trust policy drops a
+	// device-supplied Extra["ssh_password"] copy (see the adminOwnedKeys
+	// registry in trustpolicy.go). PLAINTEXT at rest is deliberate:
+	// devices.json persists 0600 (store.go 0600 temp-file discipline), and
+	// echo-based Terraform drift detection needs the plaintext read-back —
+	// the same precedent as the removed site-level field before it and the
+	// WLAN passphrase.
+	SSHPassword string `json:"ssh_password,omitempty"`
 }
 
 // JSONMap is a loosely-typed JSON object (statistics passthrough etc.).
