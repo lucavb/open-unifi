@@ -105,10 +105,10 @@ func TestTerraformAcceptance(t *testing.T) {
 	controller.waitReady(t)
 	tf.run("refresh", "-input=false")
 
-	// Import both an AP and WLAN into a clean state file. This also covers the
-	// normalization of AP import IDs and WLAN's name-as-ID contract.
-	tf.run("state", "rm", "open-unifi_access_point.lab", "open-unifi_wlan.main")
-	tf.run("import", "open-unifi_access_point.lab", "AA:BB:CC:DD:EE:01")
+	// Import both a device and WLAN into a clean state file. This also covers the
+	// normalization of device import IDs and WLAN's name-as-ID contract.
+	tf.run("state", "rm", "open-unifi_device.lab", "open-unifi_wlan.main")
+	tf.run("import", "open-unifi_device.lab", "AA:BB:CC:DD:EE:01")
 	tf.run("import", "open-unifi_wlan.main", "main")
 	tf.run("plan", "-input=false")
 
@@ -330,7 +330,7 @@ provider "open-unifi" {
   url = %q
 }
 
-resource "open-unifi_access_point" "lab" {
+resource "open-unifi_device" "lab" {
   mac  = "aa:bb:cc:dd:ee:01"
   name = "lab-ap"
 }

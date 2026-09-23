@@ -155,7 +155,7 @@ func loadSettingsFile(path string, lg *slog.Logger) (SiteSettings, bool, error) 
 	var peek map[string]any
 	if jsonErr := json.Unmarshal(raw, &peek); jsonErr == nil {
 		if _, stale := peek["ap_ssh_password"]; stale {
-			lg.Warn("site settings: the removed \"ap_ssh_password\" key is ignored — no value migration; per-device SSH passwords are set via PATCH /api/v1/devices/{mac} (Terraform open-unifi_access_point)")
+			lg.Warn("site settings: the removed \"ap_ssh_password\" key is ignored — no value migration; per-device SSH passwords are set via PATCH /api/v1/devices/{mac} (Terraform open-unifi_device)")
 		}
 	}
 	var doc adminapi.SiteSettingsDocument

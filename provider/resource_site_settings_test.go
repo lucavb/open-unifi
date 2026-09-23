@@ -32,16 +32,12 @@ func TestViewToModelUnsetEchoMapsToNull(t *testing.T) {
 	if !m.RegulatoryCountryCode.IsNull() {
 		t.Fatalf("country 0 must map to null, got %d", m.RegulatoryCountryCode.ValueInt64())
 	}
-	if !m.APSSHPassword.IsNull() {
-		t.Fatalf("empty password must map to null, got %q", m.APSSHPassword.ValueString())
-	}
-	if !m.APSSHPublicKeys.IsNull() || len(m.APSSHPublicKeys.Elements()) != 0 {
-		t.Fatalf("empty key list must map to null, got %v", m.APSSHPublicKeys)
+	if !m.DeviceSSHPublicKeys.IsNull() || len(m.DeviceSSHPublicKeys.Elements()) != 0 {
+		t.Fatalf("empty key list must map to null, got %v", m.DeviceSSHPublicKeys)
 	}
 
 	// A set view passes through verbatim, keys in slice order. (The
-	// password is off the site wire server-side — the attribute read-back
-	// is interim null; see resource_site_settings.go viewToModel.)
+
 	view := &siteSettings{
 		RegulatoryCountryCode: 840,
 		DeviceSSHPublicKeys:   []string{"ssh-ed25519 AAAA a@ap", "ssh-ed25519 AAAA b@ap"},
@@ -51,11 +47,8 @@ func TestViewToModelUnsetEchoMapsToNull(t *testing.T) {
 	if m.RegulatoryCountryCode.ValueInt64() != 840 {
 		t.Fatalf("country = %d, want 840", m.RegulatoryCountryCode.ValueInt64())
 	}
-	if !m.APSSHPassword.IsNull() {
-		t.Fatalf("interim password read-back must be null (the site password is off the wire), got %q", m.APSSHPassword.ValueString())
-	}
 	var keys []string
-	m.APSSHPublicKeys.ElementsAs(ctx, &keys, false)
+	m.DeviceSSHPublicKeys.ElementsAs(ctx, &keys, false)
 	if len(keys) != 2 || keys[0] != "ssh-ed25519 AAAA a@ap" || keys[1] != "ssh-ed25519 AAAA b@ap" {
 		t.Fatalf("keys = %v, want the two lines in order", keys)
 	}
@@ -65,15 +58,14 @@ func TestViewToModelUnsetEchoMapsToNull(t *testing.T) {
 // direction: null/unknown plan values map to the record's zero values (the
 // whole-document PUT body always carries both fields, and the empty key
 // list marshals as [] — never null, which the strict server decode would
-// reject as a missing field). The ap_ssh_password attribute is interim
+// reject as a missing field). The historical ap_ssh_password wire name is
 // inert: it maps to nothing on the wire (see resource_site_settings.go).
 func TestSiteSettingsFromModelZeroMapsToZeroDocument(t *testing.T) {
 	ctx := context.Background()
 	m := &siteSettingsModel{
 		ID:                    types.StringValue(siteSettingsID),
 		RegulatoryCountryCode: types.Int64Null(),
-		APSSHPassword:         types.StringNull(),
-		APSSHPublicKeys:       types.ListNull(types.StringType),
+		DeviceSSHPublicKeys:   types.ListNull(types.StringType),
 	}
 	var diags diag.Diagnostics
 	doc := siteSettingsFromModel(ctx, m, &diags)
@@ -91,10 +83,9 @@ func TestSiteSettingsFromModelZeroMapsToZeroDocument(t *testing.T) {
 	m = &siteSettingsModel{
 		ID:                    types.StringValue(siteSettingsID),
 		RegulatoryCountryCode: types.Int64Value(840),
-		APSSHPassword:         types.StringValue("s3cret"),
 	}
 	list, _ := types.ListValueFrom(ctx, types.StringType, []string{"ssh-ed25519 AAAA a@ap"})
-	m.APSSHPublicKeys = list
+	m.DeviceSSHPublicKeys = list
 	doc = siteSettingsFromModel(ctx, m, &diags)
 	if doc.RegulatoryCountryCode != 840 ||
 		len(doc.DeviceSSHPublicKeys) != 1 || doc.DeviceSSHPublicKeys[0] != "ssh-ed25519 AAAA a@ap" {

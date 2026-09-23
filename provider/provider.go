@@ -131,7 +131,7 @@ func (p *openUnifiProvider) Configure(ctx context.Context, req provider.Configur
 
 func (p *openUnifiProvider) Resources(_ context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
-		func() resource.Resource { return &accessPointResource{} },
+		func() resource.Resource { return &deviceResource{} },
 		func() resource.Resource { return &wlanResource{} },
 		func() resource.Resource { return &siteSettingsResource{} },
 	}

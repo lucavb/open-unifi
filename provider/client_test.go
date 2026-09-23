@@ -46,6 +46,8 @@ type fakeBackend struct {
 	siteSettings    string
 	siteSettingsErr string
 	lastAuth        string // observed Authorization header of the last request
+	deviceEvents    []string
+	deviceBodies    []map[string]json.RawMessage
 }
 
 // lastSeenFixture is a fixed unix timestamp used in device fixtures.
@@ -99,6 +101,17 @@ func (fb *fakeBackend) handler() http.Handler {
 				writeFakeErr(w, http.StatusBadRequest, "invalid JSON body")
 				return
 			}
+			for field := range body {
+				if field != "mac" && field != "name" && field != "site_id" {
+					writeFakeErr(w, http.StatusBadRequest, "unknown field "+field)
+					return
+				}
+			}
+			postBytes, _ := json.Marshal(body)
+			var postRaw map[string]json.RawMessage
+			_ = json.Unmarshal(postBytes, &postRaw)
+			fb.deviceBodies = append(fb.deviceBodies, postRaw)
+			fb.deviceEvents = append(fb.deviceEvents, "POST")
 			mac := strings.ToLower(strings.ReplaceAll(body["mac"], ":", ""))
 			if len(mac) != 12 {
 				writeFakeErr(w, http.StatusBadRequest, "invalid mac")
@@ -117,6 +130,7 @@ func (fb *fakeBackend) handler() http.Handler {
 		dev, ok := fb.devices[mac]
 		switch r.Method {
 		case http.MethodGet:
+			fb.deviceEvents = append(fb.deviceEvents, "GET")
 			if !ok {
 				writeFakeErr(w, http.StatusNotFound, "device not found")
 				return
@@ -129,6 +143,40 @@ func (fb *fakeBackend) handler() http.Handler {
 			}
 			delete(fb.devices, mac)
 			_, _ = w.Write([]byte(`{"status":"deleted","mac":"` + mac + `"}` + "\n"))
+		case http.MethodPatch:
+			if !ok {
+				writeFakeErr(w, http.StatusNotFound, "device not found")
+				return
+			}
+			var patch map[string]json.RawMessage
+			if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+				writeFakeErr(w, http.StatusBadRequest, "invalid JSON body")
+				return
+			}
+			for field := range patch {
+				if field != "ssh_password" && field != "name" && field != "site_id" {
+					writeFakeErr(w, http.StatusBadRequest, "unknown field "+field)
+					return
+				}
+			}
+			fb.deviceBodies = append(fb.deviceBodies, patch)
+			var view map[string]any
+			if err := json.Unmarshal([]byte(dev), &view); err != nil {
+				writeFakeErr(w, http.StatusInternalServerError, "invalid stored device")
+				return
+			}
+			if raw, ok := patch["ssh_password"]; ok {
+				var value string
+				if err := json.Unmarshal(raw, &value); err != nil {
+					writeFakeErr(w, 400, "ssh_password must be string")
+					return
+				}
+				view["ssh_password"] = value
+			}
+			buf, _ := json.Marshal(view)
+			fb.devices[mac] = string(buf)
+			fb.deviceEvents = append(fb.deviceEvents, "PATCH")
+			_, _ = w.Write(append(buf, '\n'))
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
@@ -275,6 +323,17 @@ func boolJSON(b bool) string {
 func deviceJSON(mac, name string) string {
 	return `{"mac":"` + mac + `","name":"` + name + `","model":"UAP-AC-Pro-Gen2","firmware":"6.6.55","ip":"192.168.1.50","state":1,"last_seen":` +
 		strconv.FormatInt(lastSeenFixture, 10) + `,"actions":["delete"]}`
+}
+
+func TestFakeBackendRejectsPasswordOnRegistrationPost(t *testing.T) {
+	fb := newFakeBackend("")
+	c := clientFor(fb, "")
+	err := c.do(context.Background(), http.MethodPost, "/api/v1/devices", map[string]string{
+		"mac": "78:8a:20:11:22:33", "ssh_password": "secret",
+	}, nil)
+	if err == nil {
+		t.Fatal("fake backend accepted ssh_password in strict registration POST")
+	}
 }
 
 func mapValuesSorted(m map[string]string) []string {
@@ -559,8 +618,8 @@ func TestAPIErrorTyped404(t *testing.T) {
 }
 
 // TestDeviceStructParityWithServer guards the duplicated device wire
-// structs: provider.device (client.go) and provider.apDevice
-// (resource_access_point.go) are independent copies of the
+// structs: provider.device (client.go) and provider.deviceView
+// (resource_device.go) are independent copies of the
 // adminapi.DeviceView wire shape, with no compile-time link between them
 // and the server lane. Mirroring TestWlanStructParityWithServer
 // (internal/adminapi), this reflect test catches drift: every provider
@@ -591,7 +650,7 @@ func TestDeviceStructParityWithServer(t *testing.T) {
 		typ  reflect.Type
 	}{
 		{"device", reflect.TypeOf(device{})},
-		{"apDevice", reflect.TypeOf(apDevice{})},
+		{"deviceView", reflect.TypeOf(deviceView{})},
 	} {
 		m := map[string]string{}
 		for i := 0; i < pair.typ.NumField(); i++ {
@@ -637,8 +696,8 @@ func TestDeviceStructParityWithServer(t *testing.T) {
 			if _, ok := provFields["device"][key]; !ok {
 				t.Fatalf("adminapi.DeviceView field %q missing in provider.device — decode would silently drop it; add to ALL THREE structs", key)
 			}
-			if _, ok := provFields["apDevice"][key]; !ok {
-				t.Fatalf("adminapi.DeviceView field %q missing in provider.apDevice — decode would silently drop it; add to ALL THREE structs", key)
+			if _, ok := provFields["deviceView"][key]; !ok {
+				t.Fatalf("adminapi.DeviceView field %q missing in provider.deviceView — decode would silently drop it; add to ALL THREE structs", key)
 			}
 		}
 	}
@@ -646,12 +705,12 @@ func TestDeviceStructParityWithServer(t *testing.T) {
 	// The two provider copies must stay identical to each other (they are
 	// hand-maintained mirrors; a one-sided edit is exactly the drift this
 	// test exists to catch).
-	if len(provFields["device"]) != len(provFields["apDevice"]) {
-		t.Fatalf("device (%d fields) and apDevice (%d fields) diverged", len(provFields["device"]), len(provFields["apDevice"]))
+	if len(provFields["device"]) != len(provFields["deviceView"]) {
+		t.Fatalf("device (%d fields) and deviceView (%d fields) diverged", len(provFields["device"]), len(provFields["deviceView"]))
 	}
 	for key, tag := range provFields["device"] {
-		if t2, ok := provFields["apDevice"][key]; !ok || t2 != tag {
-			t.Fatalf("device field %q (%s) missing/changed in apDevice (%q)", key, tag, t2)
+		if t2, ok := provFields["deviceView"][key]; !ok || t2 != tag {
+			t.Fatalf("device field %q (%s) missing/changed in deviceView (%q)", key, tag, t2)
 		}
 	}
 }

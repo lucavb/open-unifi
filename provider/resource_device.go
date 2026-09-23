@@ -16,23 +16,23 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
-var _ resource.Resource = (*accessPointResource)(nil)
-var _ resource.ResourceWithConfigure = (*accessPointResource)(nil)
-var _ resource.ResourceWithImportState = (*accessPointResource)(nil)
+var _ resource.Resource = (*deviceResource)(nil)
+var _ resource.ResourceWithConfigure = (*deviceResource)(nil)
+var _ resource.ResourceWithImportState = (*deviceResource)(nil)
 
-// accessPointResource manages one registered access point, keyed by MAC
+// deviceResource manages one registered device, keyed by MAC
 // address (lowercase, colon separated, e.g. "78:8a:20:00:00:01"). The MAC
 // format's lowercase form is a client-side convention documented in the
 // schema; use lowercase HCL so plan/apply stays deterministic.
-type accessPointResource struct {
+type deviceResource struct {
 	client *apiClient
 }
 
-func (r *accessPointResource) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
-	resp.TypeName = req.ProviderTypeName + "_access_point"
+func (r *deviceResource) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
+	resp.TypeName = req.ProviderTypeName + "_device"
 }
 
-func (r *accessPointResource) Configure(_ context.Context, req resource.ConfigureRequest, _ *resource.ConfigureResponse) {
+func (r *deviceResource) Configure(_ context.Context, req resource.ConfigureRequest, _ *resource.ConfigureResponse) {
 	if req.ProviderData != nil {
 		if c, ok := req.ProviderData.(*apiClient); ok {
 			r.client = c
@@ -40,9 +40,9 @@ func (r *accessPointResource) Configure(_ context.Context, req resource.Configur
 	}
 }
 
-func (r *accessPointResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
+func (r *deviceResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "An access point registered with the open-unifi control plane, identified by MAC address. " +
+		MarkdownDescription: "A device registered with the open-unifi control plane, identified by MAC address. This resource was renamed from `open-unifi_access_point`; update configurations because no state migration is provided. " +
 			"`mac` must be lowercase colon-separated (e.g. `78:8a:20:11:22:33`).",
 		Attributes: map[string]schema.Attribute{
 			"mac": schema.StringAttribute{
@@ -55,6 +55,11 @@ func (r *accessPointResource) Schema(_ context.Context, _ resource.SchemaRequest
 			"name": schema.StringAttribute{
 				MarkdownDescription: "Human-friendly device name.",
 				Optional:            true,
+			},
+			"ssh_password": schema.StringAttribute{
+				MarkdownDescription: "Optional per-device SSH password. The API echoes it for drift detection; omitting it explicitly clears the password.",
+				Optional:            true,
+				Sensitive:           true,
 			},
 			"site_id": schema.StringAttribute{
 				MarkdownDescription: "Site the device is created in. Defaults to `default`.",
@@ -86,7 +91,7 @@ func (r *accessPointResource) Schema(_ context.Context, _ resource.SchemaRequest
 				Computed:            true,
 			},
 			"in_sync": schema.BoolAttribute{
-				MarkdownDescription: "Computed runtime WLAN synchronization status. True only when the latest AP VAP report proves enabled desired WLANs are RUN and deletions are gone; null when runtime evidence is unavailable.",
+				MarkdownDescription: "Computed runtime WLAN synchronization status. True only when the latest device VAP report proves enabled desired WLANs are RUN and deletions are gone; null when runtime evidence is unavailable.",
 				Computed:            true,
 			},
 			"wlan_delivery_status": schema.StringAttribute{MarkdownDescription: "Computed WLAN delivery status: pending, exhausted, or confirmed.", Computed: true},
@@ -96,11 +101,11 @@ func (r *accessPointResource) Schema(_ context.Context, _ resource.SchemaRequest
 	}
 }
 
-// apDevice mirrors the JSON of GET /api/v1/devices/{mac}
+// deviceView mirrors the JSON of GET /api/v1/devices/{mac}
 // (adminapi.DeviceView). The server encodes `state` as a JSON number and
 // `last_seen` as a unix-seconds int64; site_id is request-only and never
 // appears in a response body, so it is deliberately absent here.
-type apDevice struct {
+type deviceView struct {
 	Mac                string `json:"mac"`
 	Name               string `json:"name"`
 	Model              string `json:"model,omitempty"`
@@ -123,19 +128,17 @@ type apDevice struct {
 	LEDOverrideColorBrightness *int   `json:"led_override_color_brightness,omitempty"`
 	LEDOverrideColor           string `json:"led_override_color,omitempty"`
 	PendingCommand             string `json:"pending_command,omitempty"`
-	// SSHPassword mirrors the admin API's per-device SSH login password
-	// echo ("" = unmanaged). Wire-decode only for now: the schema
-	// attribute lands with the provider device-rename phase; parity with
-	// the server structs is the only contract (TestDeviceStructParity).
+	// SSHPassword mirrors the admin API's per-device SSH login password echo
+	// ("" = unmanaged).
 	SSHPassword string `json:"ssh_password,omitempty"`
 }
 
-func (r *accessPointResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
+func (r *deviceResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	if r.client == nil {
 		notConfiguredErr(&resp.Diagnostics)
 		return
 	}
-	var plan apModel
+	var plan deviceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -153,7 +156,15 @@ func (r *accessPointResource) Create(ctx context.Context, req resource.CreateReq
 	// POST once; no retry (see client.go). If the create succeeded but the
 	// read below fails, the next plan/apply reconciles via the Read path.
 	if err := r.client.do(ctx, http.MethodPost, "/api/v1/devices", body, nil); err != nil {
-		resp.Diagnostics.AddError("Create access point", err.Error())
+		resp.Diagnostics.AddError("Create device", err.Error())
+		return
+	}
+	password := ""
+	if !plan.SSHPassword.IsNull() && !plan.SSHPassword.IsUnknown() {
+		password = plan.SSHPassword.ValueString()
+	}
+	if err := r.client.do(ctx, http.MethodPatch, "/api/v1/devices/"+url.PathEscape(plan.Mac.ValueString()), map[string]string{"ssh_password": password}, nil); err != nil {
+		resp.Diagnostics.AddError("Create device: set SSH password", err.Error())
 		return
 	}
 
@@ -161,19 +172,19 @@ func (r *accessPointResource) Create(ctx context.Context, req resource.CreateReq
 	// firmware, last_seen).
 	dev, err := r.client.getDevice(ctx, plan.Mac.ValueString())
 	if err != nil {
-		resp.Diagnostics.AddError("Create access point: post-create read", err.Error())
+		resp.Diagnostics.AddError("Create device: post-create read", err.Error())
 		return
 	}
 	applyDevice(&plan, dev, site)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
-func (r *accessPointResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
+func (r *deviceResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
 	if r.client == nil {
 		notConfiguredErr(&resp.Diagnostics)
 		return
 	}
-	var state apModel
+	var state deviceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -188,49 +199,49 @@ func (r *accessPointResource) Read(ctx context.Context, req resource.ReadRequest
 		resp.State.RemoveResource(ctx)
 		return
 	default:
-		resp.Diagnostics.AddError("Read access point", err.Error())
+		resp.Diagnostics.AddError("Read device", err.Error())
 		return
 	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
-func (r *accessPointResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+func (r *deviceResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
 	if r.client == nil {
 		notConfiguredErr(&resp.Diagnostics)
 		return
 	}
-	var plan apModel
+	var plan deviceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	var state apModel
+	var state deviceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	body := accessPointUpdateBody(plan, state)
+	body := deviceUpdateBody(plan, state)
 	if len(body) > 0 {
 		if err := r.client.do(ctx, http.MethodPatch, "/api/v1/devices/"+url.PathEscape(state.Mac.ValueString()), body, nil); err != nil {
-			resp.Diagnostics.AddError("Update access point", err.Error())
+			resp.Diagnostics.AddError("Update device", err.Error())
 			return
 		}
 	}
 	dev, err := r.client.getDevice(ctx, state.Mac.ValueString())
 	if err != nil {
-		resp.Diagnostics.AddError("Update access point", err.Error())
+		resp.Diagnostics.AddError("Update device", err.Error())
 		return
 	}
 	applyDevice(&state, dev, state.SiteID.ValueString())
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
-func (r *accessPointResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
+func (r *deviceResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
 	if r.client == nil {
 		notConfiguredErr(&resp.Diagnostics)
 		return
 	}
-	var state apModel
+	var state deviceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -240,16 +251,17 @@ func (r *accessPointResource) Delete(ctx context.Context, req resource.DeleteReq
 	if err := r.client.do(ctx, http.MethodDelete, "/api/v1/devices/"+url.PathEscape(state.Mac.ValueString()), nil, nil); err != nil {
 		// 404 => already gone: treat as success (deletion is idempotent).
 		if !errNotFound(err) {
-			resp.Diagnostics.AddError("Delete access point", err.Error())
+			resp.Diagnostics.AddError("Delete device", err.Error())
 			return
 		}
 	}
 }
 
-// apModel is the Terraform state shape for the access point resource.
-type apModel struct {
+// deviceModel is the Terraform state shape for the device resource.
+type deviceModel struct {
 	Mac                types.String `tfsdk:"mac"`
 	Name               types.String `tfsdk:"name"`
+	SSHPassword        types.String `tfsdk:"ssh_password"`
 	SiteID             types.String `tfsdk:"site_id"`
 	State              types.String `tfsdk:"state"`
 	IP                 types.String `tfsdk:"ip"`
@@ -274,7 +286,7 @@ func notConfiguredErr(d interface {
 // strings are tolerated (a pending/standalone device may not yet report an
 // IP). `site` is the configured/request-only site_id: the server never
 // echoes it back, so state keeps the configured value.
-func applyDevice(m *apModel, dev *apDevice, site string) {
+func applyDevice(m *deviceModel, dev *deviceView, site string) {
 	if dev.SiteID != "" {
 		site = dev.SiteID
 	}
@@ -305,6 +317,11 @@ func applyDevice(m *apModel, dev *apDevice, site string) {
 	m.WLANDeliveryStatus = types.StringValue(dev.WLANDeliveryStatus)
 	m.WLANDeliveryCount = types.Int64Value(int64(dev.WLANDeliveryCount))
 	m.WLANLastAttempt = types.Int64Value(dev.WLANLastAttempt)
+	if dev.SSHPassword == "" {
+		m.SSHPassword = types.StringNull()
+	} else {
+		m.SSHPassword = types.StringValue(dev.SSHPassword)
+	}
 	// "name" is Optional and NOT Computed (no ModifyPlan), so Terraform
 	// enforces plan-vs-state equality on it. The server omits empty names
 	// from DeviceView ("name,omitempty"), so an unset name round-trips as
@@ -322,12 +339,15 @@ func applyDevice(m *apModel, dev *apDevice, site string) {
 	}
 }
 
-func accessPointUpdateBody(plan, state apModel) map[string]string {
+func deviceUpdateBody(plan, state deviceModel) map[string]string {
 	body := map[string]string{}
 	if !plan.Name.IsUnknown() && plan.Name.ValueString() != state.Name.ValueString() {
 		// A null optional value means the configuration removed the name. The
 		// PATCH API distinguishes an omitted name from an explicit empty name.
 		body["name"] = plan.Name.ValueString()
+	}
+	if !plan.SSHPassword.IsUnknown() && plan.SSHPassword.ValueString() != state.SSHPassword.ValueString() {
+		body["ssh_password"] = plan.SSHPassword.ValueString()
 	}
 	if !plan.SiteID.IsNull() && !plan.SiteID.IsUnknown() && plan.SiteID.ValueString() != state.SiteID.ValueString() {
 		body["site_id"] = plan.SiteID.ValueString()
@@ -335,10 +355,10 @@ func accessPointUpdateBody(plan, state apModel) map[string]string {
 	return body
 }
 
-func (r *accessPointResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+func (r *deviceResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
 	mac, err := normalizeMAC(req.ID)
 	if err != nil {
-		resp.Diagnostics.AddError("Invalid access point import ID", err.Error())
+		resp.Diagnostics.AddError("Invalid device import ID", err.Error())
 		return
 	}
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("mac"), mac)...)

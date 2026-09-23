@@ -173,7 +173,7 @@ func run() error {
 	// learn where the knob went. The per-device SSH password has no env at
 	// all — it is per-device admin intent via PATCH /api/v1/devices/{mac}.
 	if os.Getenv("OPEN_UNIFI_AP_SSH_PASSWORD") != "" {
-		logger.Warn("OPEN_UNIFI_AP_SSH_PASSWORD is no longer read; per-device SSH passwords are set via PATCH /api/v1/devices/{mac} (Terraform open-unifi_access_point)")
+		logger.Warn("OPEN_UNIFI_AP_SSH_PASSWORD is no longer read; per-device SSH passwords are set via PATCH /api/v1/devices/{mac} (Terraform open-unifi_device)")
 	}
 	// The device-intent inputs are first-boot seeds only. Warn that they
 	// were ignored ONLY when a record existed before this boot (the pre-New

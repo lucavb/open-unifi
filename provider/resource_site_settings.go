@@ -27,7 +27,7 @@ const siteSettingsID = "site-settings"
 // public keys). A save replaces
 // the whole document wholesale (the wireless-envelope doctrine) and —
 // server-side — mints cfgversion across provisioned devices on effective
-// change, so adopted APs receive the new sshd rows at their next inform.
+// change, so adopted devices receive the new sshd rows at their next inform.
 type siteSettingsResource struct {
 	client *apiClient
 }
@@ -47,7 +47,7 @@ func (r *siteSettingsResource) Configure(_ context.Context, req resource.Configu
 func (r *siteSettingsResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
 		MarkdownDescription: "The singleton site-settings record of the open-unifi control plane: the " +
-			"AP-intent site facts. A change re-provisions every adopted AP at its next inform (cfgversion mint). " +
+			"Device-intent site facts. A change re-provisions every adopted device at its next inform (cfgversion mint). " +
 			"Deleting the resource restores the controller defaults. Caveat on default-gated deployments " +
 			"(U7PG2 firmware 6.8.2.15592): a save carrying SSH public keys " +
 			"succeeds, but every subsequent server-side full provisioning is rejected with the typed 501 " +
@@ -65,19 +65,10 @@ func (r *siteSettingsResource) Schema(_ context.Context, _ resource.SchemaReques
 					"plan/state equality) — write null or omit the attribute instead.",
 				Optional: true,
 			},
-			"ap_ssh_password": schema.StringAttribute{
-				MarkdownDescription: "DEPRECATED, INERT: the site-level SSH password is REMOVED from the " +
-					"controller — SSH passwords are managed PER DEVICE (PATCH /api/v1/devices/{mac}). " +
-					"A value here never reaches the controller and read-back is always null; the " +
-					"attribute is kept only so existing configurations keep parsing and is pending " +
-					"removal. Do not set it.",
-				Optional:  true,
-				Sensitive: true,
-			},
-			"ap_ssh_public_keys": schema.ListAttribute{
-				MarkdownDescription: "Provisioned AP SSH public keys, one authorized_keys line per element. ORDER " +
+			"device_ssh_public_keys": schema.ListAttribute{
+				MarkdownDescription: "Provisioned device SSH public keys, one authorized_keys line per element. ORDER " +
 					"MATTERS: system_cfg emits one `sshd.auth.key.<n>` row family per line in slice order, so an " +
-					"order-only change re-provisions every AP (one harmless full provisioning). Every line is " +
+					"order-only change re-provisions every device (one harmless full provisioning). Every line is " +
 					"validated fail-closed against RFC 4253 server-side; an invalid line is a 400 at apply time. " +
 					"This is a list, not a set — duplicates are preserved verbatim. A literal empty list " +
 					"cannot be held in state (the empty echo maps back to null); to provision zero keys " +
@@ -101,8 +92,7 @@ func (r *siteSettingsResource) Schema(_ context.Context, _ resource.SchemaReques
 type siteSettingsModel struct {
 	ID                    types.String `tfsdk:"id"`
 	RegulatoryCountryCode types.Int64  `tfsdk:"regulatory_country_code"`
-	APSSHPassword         types.String `tfsdk:"ap_ssh_password"`
-	APSSHPublicKeys       types.List   `tfsdk:"ap_ssh_public_keys"`
+	DeviceSSHPublicKeys   types.List   `tfsdk:"device_ssh_public_keys"`
 }
 
 func (r *siteSettingsResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -181,7 +171,6 @@ func (r *siteSettingsResource) Update(ctx context.Context, req resource.UpdateRe
 	// the server truth is null — null it here to mirror Create/Read and
 	// keep plan-vs-state equality for a set config value.
 	plan.ID = types.StringValue(siteSettingsID)
-	plan.APSSHPassword = types.StringNull()
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
@@ -198,7 +187,7 @@ func (r *siteSettingsResource) Delete(ctx context.Context, req resource.DeleteRe
 	// list (→ no sshd key rows) — and removes the resource from state.
 	// Like every save, this
 	// is an effective change that mints cfgversion across the provisioned
-	// devices, so adopted APs pick the defaults up at their next inform.
+	// devices, so adopted devices pick the defaults up at their next inform.
 	doc := siteSettings{DeviceSSHPublicKeys: []string{}}
 	if _, err := r.client.putSiteSettings(ctx, doc); err != nil {
 		resp.Diagnostics.AddError("Delete site settings", err.Error())
@@ -224,21 +213,16 @@ func (r *siteSettingsResource) ImportState(ctx context.Context, req resource.Imp
 // body. Every attribute is Optional without a schema default, so a
 // null/unknown plan value maps to the record's zero value (0, "", [])
 // — the controller's unset semantics. The key list is preserved in slice
-// order: order-only changes re-provision APs (one harmless full
+// order: order-only changes re-provision devices (one harmless full
 // provisioning), mirroring the server's order-sensitive echo.
 func siteSettingsFromModel(ctx context.Context, m *siteSettingsModel, d *diag.Diagnostics) siteSettings {
 	doc := siteSettings{DeviceSSHPublicKeys: []string{}}
 	if !m.RegulatoryCountryCode.IsNull() && !m.RegulatoryCountryCode.IsUnknown() {
 		doc.RegulatoryCountryCode = int(m.RegulatoryCountryCode.ValueInt64())
 	}
-	// The ap_ssh_password SCHEMA ATTRIBUTE is deliberately NOT mapped to
-	// the wire here (interim Phase A state): the site password field is
-	// off the site wire server-side, so a configured value stops reaching
-	// the controller — and read-back maps "" → null. Its full
-	// removal/rename is the next provider phase.
-	if !m.APSSHPublicKeys.IsNull() && !m.APSSHPublicKeys.IsUnknown() {
+	if !m.DeviceSSHPublicKeys.IsNull() && !m.DeviceSSHPublicKeys.IsUnknown() {
 		var keys []string
-		d.Append(m.APSSHPublicKeys.ElementsAs(ctx, &keys, false)...)
+		d.Append(m.DeviceSSHPublicKeys.ElementsAs(ctx, &keys, false)...)
 		doc.DeviceSSHPublicKeys = keys
 	}
 	return doc
@@ -260,15 +244,12 @@ func viewToModel(ctx context.Context, v *siteSettings, m *siteSettingsModel) {
 	} else {
 		m.RegulatoryCountryCode = types.Int64Null()
 	}
-	// The ap_ssh_password attribute read-back is null (the password is
-	// off the site wire server-side — see siteSettingsFromModel).
-	m.APSSHPassword = types.StringNull()
 	if len(v.DeviceSSHPublicKeys) > 0 {
 		// []string elements cannot fail conversion; diags are always empty.
 		list, _ := types.ListValueFrom(ctx, types.StringType, v.DeviceSSHPublicKeys)
-		m.APSSHPublicKeys = list
+		m.DeviceSSHPublicKeys = list
 	} else {
-		m.APSSHPublicKeys = types.ListNull(types.StringType)
+		m.DeviceSSHPublicKeys = types.ListNull(types.StringType)
 	}
 }
 

@@ -253,8 +253,8 @@ func (c *apiClient) listDevices(ctx context.Context) ([]device, error) {
 // getDevice GETs /api/v1/devices/{mac}. The MAC is path-escaped here (the
 // single place all GET-read MACs flow into a URL path) so an unvalidated
 // state value cannot add path segments.
-func (c *apiClient) getDevice(ctx context.Context, mac string) (*apDevice, error) {
-	var dev apDevice
+func (c *apiClient) getDevice(ctx context.Context, mac string) (*deviceView, error) {
+	var dev deviceView
 	if err := c.do(ctx, http.MethodGet, "/api/v1/devices/"+url.PathEscape(mac), nil, &dev); err != nil {
 		return nil, err
 	}

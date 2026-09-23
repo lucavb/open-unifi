@@ -37,11 +37,11 @@ provider "open-unifi" {
   insecure_skip_verify = false
 }
 
-# --- Adopt an access point by MAC ------------------------------------------
+# --- Adopt a device by MAC --------------------------------------------------
 # mac must be LOWERCASE colon-separated; the server normalizes, but keep
 # lowercase in HCL so plan/apply diffs stay stable. Computed fields (state,
-# ip, firmware, last_seen) fill in once the AP checks in and gets adopted.
-resource "open-unifi_access_point" "attic" {
+# ip, firmware, last_seen) fill in once the device checks in and gets adopted.
+resource "open-unifi_device" "attic" {
   mac  = "78:8a:20:11:22:33"
   name = "attic-ap"
   # site_id defaults to "default"
@@ -77,8 +77,8 @@ output "devices" {
 }
 
 output "attic_ap_state" {
-  description = "Adoption state of the attic AP."
-  value       = open-unifi_access_point.attic.state
+  description = "Adoption state of the attic device."
+  value       = open-unifi_device.attic.state
 }
 
 output "main_wlan_vlan" {

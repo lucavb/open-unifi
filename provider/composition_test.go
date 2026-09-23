@@ -91,7 +91,7 @@ func TestProviderDecodesRealServerDevices(t *testing.T) {
 	}
 
 	// applyDevice renders the full TF model from this wire truth.
-	m := &apModel{
+	m := &deviceModel{
 		Mac:      types.StringValue(mac),
 		Name:     types.StringValue("ap-lobby"),
 		SiteID:   types.StringValue("default"),
@@ -151,11 +151,11 @@ func TestProviderDecodesRealServerDevices(t *testing.T) {
 	}
 }
 
-func TestAccessPointUpdateClearsName(t *testing.T) {
-	state := apModel{Name: types.StringValue("old"), SiteID: types.StringValue("default")}
+func TestDeviceUpdateClearsName(t *testing.T) {
+	state := deviceModel{Name: types.StringValue("old"), SiteID: types.StringValue("default")}
 	plan := state
 	plan.Name = types.StringNull()
-	body := accessPointUpdateBody(plan, state)
+	body := deviceUpdateBody(plan, state)
 	if got := body["name"]; got != "" {
 		t.Fatalf("name update = %#v, want explicit empty name", body)
 	}
