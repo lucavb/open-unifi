@@ -16,7 +16,7 @@ run:
 provider-build:
 	$(GO) build -o dist/openunifi-tfprovider ./cmd/tfprovider
 
-# The module gate: everything CI (and the morning acceptance checklist) runs.
+# CI job "check" only — golangci-lint is a separate workflow job (AGENTS.md).
 # Format only the tracked sources: a bare `gofmt -l .` also walks gitignored
 # scratch state (worktree caches and the like) and trips on third-party
 # generated files that are not part of the module.

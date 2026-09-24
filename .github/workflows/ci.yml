@@ -21,7 +21,7 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # The module gate: gofmt, go vet, go test -count=1 (see Makefile).
+      # check job only — lint is a separate job (see AGENTS.md).
       - name: Module gate
         run: make check
 
@@ -46,6 +46,7 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # Not covered by make check — agents must run this locally too (AGENTS.md).
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:

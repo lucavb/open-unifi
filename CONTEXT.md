@@ -132,6 +132,10 @@ wireless envelope that carries the drift hash, the vap placements, and the
 wireless rows for system_cfg together.
 _Avoid_: wlan plan, envelope hash, render plan.
 
+## Agents
+
+CI commands and the `check` vs `lint` split: [`AGENTS.md`](AGENTS.md).
+
 ## Commits
 
 Scope commits by the package they change: `adminapi` (the REST surface),

@@ -26,8 +26,10 @@ over the standard inform channel.
 
 ## Build & run
 
+Agent / CI matrix (including golangci-lint): [`AGENTS.md`](AGENTS.md).
+
 ```
-make check          # full module gate: gofmt + vet + test
+make check          # CI check job: tracked gofmt + vet + test (not golangci-lint)
 make build          # go build ./...
 make test           # go test ./...
 make provider-build # dist/openunifi-tfprovider
