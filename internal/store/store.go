@@ -110,6 +110,16 @@ type Device struct {
 	// the same precedent as the removed site-level field before it and the
 	// WLAN passphrase.
 	SSHPassword string `json:"ssh_password,omitempty"`
+
+	// RegulatoryCountryCode is the admin-set ISO 3166-1 numeric regulatory
+	// country code for radio rows in system_cfg. 0 = unset (the server
+	// renders the 840 default at the render seam). ADMIN-OWNED.
+	RegulatoryCountryCode int `json:"regulatory_country_code,omitempty"`
+
+	// SSHPublicKeys are the admin-set ordered authorized_keys lines
+	// (sshd.auth.key.<n> row family). Stored verbatim; validated at the
+	// admin API. ADMIN-OWNED.
+	SSHPublicKeys []string `json:"ssh_public_keys,omitempty"`
 }
 
 // JSONMap is a loosely-typed JSON object (statistics passthrough etc.).

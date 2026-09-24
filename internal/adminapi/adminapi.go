@@ -9,11 +9,10 @@
 // boundary and every record write agree on canonical 12-hex; a private
 // copy here once silently split device identity between the two lanes)
 // and metrics (the /metrics handler wiring and its request instrumentation).
-// The site-settings pre-backend validator adds a THIRD, one-directional
-// edge: systemcfg (the fail-closed RFC 4253 authorized_keys parser is the
-// controller's single key validator — the app verb, the first-boot seed,
-// and this REST layer all fence through it; systemcfg does not import this
-// package, so the edge cannot cycle).
+// Device PATCH validation adds a THIRD, one-directional edge: systemcfg
+// (the fail-closed RFC 4253 authorized_keys parser is the controller's
+// single key validator — the app verb and this REST layer fence through it;
+// systemcfg does not import this package, so the edge cannot cycle).
 package adminapi
 
 import (
@@ -102,6 +101,12 @@ type DeviceView struct {
 	// owner), and the Terraform open-unifi_access_point provider needs
 	// the plaintext read-back for its drift detection. Read-only here.
 	SSHPassword string `json:"ssh_password,omitempty"`
+	// RegulatoryCountryCode is the admin-set ISO 3166-1 numeric code; 0
+	// (omitted) = unset (render default 840).
+	RegulatoryCountryCode int `json:"regulatory_country_code,omitempty"`
+	// SSHPublicKeys are the ordered authorized_keys lines managed for this
+	// device. Echoed for drift detection (not sensitive).
+	SSHPublicKeys []string `json:"ssh_public_keys,omitempty"`
 	// PendingCommand is the read-only armed remote-command state: "reboot"
 	// when the armed §6.5 reboot flag is set, "factory-reset" when the
 	// armed §6.6 setdefault flag is set (outranking reboot, matching the
@@ -147,6 +152,12 @@ type DevicePatch struct {
 	// hosts no further checks in this phase — the handler passes any
 	// string through, exactly like the verbatim LEDOverrideColor knob).
 	SSHPassword *string `json:"ssh_password,omitempty"`
+	// RegulatoryCountryCode sets/clears the per-device regulatory country.
+	// nil = leave unchanged; 0 = unset (render default 840).
+	RegulatoryCountryCode *int `json:"regulatory_country_code,omitempty"`
+	// SSHPublicKeys replaces the managed authorized_keys list. nil = leave
+	// unchanged; present (including empty) = wholesale replace.
+	SSHPublicKeys *[]string `json:"ssh_public_keys,omitempty"`
 }
 
 // DeviceUpsert is the request body for manual device registration ("adopt
@@ -336,71 +347,6 @@ type RadioView struct {
 	Txpower         *string `json:"txpower,omitempty"`
 }
 
-// SiteSettingsDocument is the whole-document site-settings request: the
-// two device-intent facts (regulatory country code, ordered SSH authorized_keys
-// lines). PUT replaces the
-// record WHOLESALE (the wireless-envelope doctrine) — every field is
-// required and an absent list is an empty list, never null. The document
-// shape is ALSO the on-disk shape of <data-dir>/site-settings.json, so a
-// round-trip through the API is byte-representable on disk.
-// (The historical site-wide `ap_ssh_password` wire field is REMOVED
-// 2026-09-23: the site password concept is gone — per-device SSH passwords
-// are set via PATCH /api/v1/devices/{mac}; the strict decoder rejects the
-// stale wire name as an unknown field.)
-//
-// Validation semantics (the Backend verb enforces them; the API layer
-// pre-validates the same rules): country code 0 = unset (server-side
-// default) or 1..999; every key line must be a valid RFC 4253
-// authorized_keys line (the fail-closed systemcfg parser is the single
-// validator).
-type SiteSettingsDocument struct {
-	RegulatoryCountryCode int      `json:"regulatory_country_code"`
-	DeviceSSHPublicKeys   []string `json:"device_ssh_public_keys"`
-}
-
-// SiteSettingsView is the read model of the site-settings record. The key
-// list IS echoed: this is the admin's own surface (the record's admin
-// owner), and the Terraform provider needs the read-back to detect drift.
-type SiteSettingsView struct {
-	RegulatoryCountryCode int      `json:"regulatory_country_code"`
-	DeviceSSHPublicKeys   []string `json:"device_ssh_public_keys"`
-}
-
-// siteSettingsPutBody is the strict decode shape of the PUT
-// /api/v1/site-settings body: every field is a POINTER so the decoder can
-// tell an absent field from a zero one. PUT is whole-document (the
-// wireless-envelope doctrine): a partial body must never silently zero a
-// fact, so any missing field is a 400 BEFORE the backend runs — never an
-// implicit zero write. (The removed site password's wire name
-// `device_ssh_password` is deliberately ABSENT: DisallowUnknownFields turns a
-// stale client's PUT carrying it into a 400 before the Backend runs.)
-type siteSettingsPutBody struct {
-	RegulatoryCountryCode *int      `json:"regulatory_country_code"`
-	DeviceSSHPublicKeys   *[]string `json:"device_ssh_public_keys"`
-}
-
-// missingField returns the JSON name of the first REQUIRED field absent
-// from the decoded body ("" when the document is complete).
-func (b *siteSettingsPutBody) missingField() string {
-	switch {
-	case b.RegulatoryCountryCode == nil:
-		return "regulatory_country_code"
-	case b.DeviceSSHPublicKeys == nil:
-		return "device_ssh_public_keys"
-	}
-	return ""
-}
-
-// toDocument builds the whole-document request from the decoded pointers
-// (every field present by construction — the route rejects missing ones
-// first).
-func (b *siteSettingsPutBody) toDocument() SiteSettingsDocument {
-	return SiteSettingsDocument{
-		RegulatoryCountryCode: *b.RegulatoryCountryCode,
-		DeviceSSHPublicKeys:   *b.DeviceSSHPublicKeys,
-	}
-}
-
 // Backend is the storage/service contract implemented by the server lane.
 type Backend interface {
 	ListDevices(ctx context.Context) []DeviceView
@@ -475,22 +421,6 @@ type Backend interface {
 	GetDeviceWlan(ctx context.Context, mac, name string) (Wlan, error)
 	UpdateDeviceWlan(ctx context.Context, mac, name string, wlan Wlan) (Wlan, error)
 	DeleteDeviceWlan(ctx context.Context, mac, name string) error
-	// GetSiteSettings returns the site-settings read view — the
-	// device-intent facts (controller-level record, site_settings file), read
-	// from the Backend's cache. The Backend's error is reserved for its
-	// New-time load problem (an unreadable/corrupt/invalid settings file).
-	// Like every other Backend method it takes a context (implementations
-	// currently ignore it — the record is an in-process cache read).
-	GetSiteSettings(ctx context.Context) (SiteSettingsView, error)
-	// PutSiteSettings replaces the whole site-settings document wholesale
-	// (the wireless-envelope doctrine) and returns the read view. An
-	// EFFECTIVE change re-stamps cfgversion across the provisioned devices
-	// (the operator-save trigger — settings mint ON SAVE), so the next
-	// inform full-provisions the new device-intent facts; a save that changes
-	// nothing mints nothing. Validation failures wrap ErrInvalid (HTTP
-	// 400): country code 0/unset or 001..999, every authorized_keys line
-	// through the fail-closed parser.
-	PutSiteSettings(ctx context.Context, doc SiteSettingsDocument) (SiteSettingsView, error)
 	// ListDeviceRadios returns the per-radio view (device echo + admin
 	// intent) in radio_table name order. Unknown MACs are ErrNotFound.
 	ListDeviceRadios(ctx context.Context, mac string) ([]RadioView, error)
@@ -526,7 +456,6 @@ const (
 	routePendingAdopt       = "/api/v1/pending/{mac}/adopt"
 	routeDeviceWireless     = "/api/v1/devices/{mac}/wireless"
 	routeDeviceWlanItem     = "/api/v1/devices/{mac}/wireless/{name}"
-	routeSiteSettings       = "/api/v1/site-settings"
 	routeWhoAmI             = "/api/v1/whoami"
 	routeOther              = "/api/other"
 	apiPrefix               = "/api/"
@@ -638,6 +567,18 @@ func New(cfg Config, be Backend) http.Handler {
 		}
 		if patch.LEDOverrideColorBrightness != nil {
 			if msg := ValidateLEDOverrideColorBrightness(*patch.LEDOverrideColorBrightness); msg != "" {
+				writeErr(w, http.StatusBadRequest, msg)
+				return
+			}
+		}
+		if patch.RegulatoryCountryCode != nil {
+			if msg := ValidateRegulatoryCountryCode(*patch.RegulatoryCountryCode); msg != "" {
+				writeErr(w, http.StatusBadRequest, msg)
+				return
+			}
+		}
+		if patch.SSHPublicKeys != nil {
+			if msg := ValidateSSHPublicKeyLines(*patch.SSHPublicKeys); msg != "" {
 				writeErr(w, http.StatusBadRequest, msg)
 				return
 			}
@@ -1006,47 +947,6 @@ func New(cfg Config, be Backend) http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "name": name})
-	}))
-	mux.HandleFunc("GET /api/v1/site-settings", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
-		out, err := be.GetSiteSettings(r.Context())
-		if err != nil {
-			handleBackendErr(w, lg, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, out)
-	}))
-	// The site-settings PUT is WHOLE-DOCUMENT (the wireless-envelope
-	// doctrine): every field is required (the strict pointer decode below
-	// rejects any missing one before the backend runs), the record is
-	// replaced wholesale, and an EFFECTIVE save re-stamps cfgversion across
-	// the provisioned devices Backend-side. The Backend verbs take a
-	// context like every other method (implementations currently ignore
-	// it — the record is an in-process cache read).
-	mux.HandleFunc("PUT /api/v1/site-settings", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
-		var raw siteSettingsPutBody
-		if err := readJSON(r, &raw); err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid JSON body")
-			return
-		}
-		if name := raw.missingField(); name != "" {
-			writeErr(w, http.StatusBadRequest, "missing field "+name)
-			return
-		}
-		doc := raw.toDocument()
-		// The same rule set the Backend verb enforces — defense-in-depth,
-		// both layers validate (a future direct caller cannot bypass the
-		// pre-backend 400s, and a hand-written Backend cannot bypass the
-		// route fence either).
-		if msg := ValidateSiteSettings(&doc); msg != "" {
-			writeErr(w, http.StatusBadRequest, msg)
-			return
-		}
-		out, err := be.PutSiteSettings(r.Context(), doc)
-		if err != nil {
-			handleBackendErr(w, lg, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, out)
 	}))
 	mux.HandleFunc("GET /api/v1/whoami", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, whoAmI{

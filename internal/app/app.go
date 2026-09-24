@@ -16,9 +16,9 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/lucavb/open-unifi/internal/adminapi"
@@ -37,42 +37,9 @@ func unknownDevice(mac string) error {
 }
 
 // App implements adminapi.Backend over the JSON device store and persists
-// site settings to its own JSON file.
 type App struct {
 	st store.DeviceStore
 	lg *slog.Logger
-
-	// settingsPath is the JSON file holding the site-settings record
-	// (site_settings.go), the wireless-envelope precedent for a
-	// controller-level whole-document record.
-	settingsPath string
-	smu          sync.Mutex // guards the settings cache (Get/Put pairs)
-	// cachedSettings is set EXACTLY ONCE by New (from the seed on first
-	// boot, from the file otherwise); the site-settings verbs serve the
-	// cache — no per-request file I/O.
-	cachedSettings SiteSettings
-	// settingsLoadErr is the error from that one eager load OR from the
-	// first-boot seed persist; missing file is NOT an error (the seed
-	// path is the happy path). Fixed at New time and surfaced by
-	// CurrentSiteSettings so startup can refuse to launch.
-	settingsLoadErr error
-	// sweepFailed marks a site-settings mint sweep that failed mid-way
-	// (site_settings.go): the record was already committed, but some
-	// provisioned devices did not get their fresh cfgversion. A retry of
-	// the SAME document must re-sweep instead of hitting the no-change
-	// early return (which would answer 200 and leave the un-swept
-	// devices nooping on stale intent until the next effective change).
-	//
-	// It is an atomic.Bool because PutSiteSettings is served
-	// concurrently: one save's sweep can fail while another reads the
-	// flag inside its smu section. An atomic read needs no lock, so the
-	// leaf-lock doctrine is untouched (no thread holds smu while
-	// acquiring a store lock, and the flag never participates in that
-	// ordering). The flag is in-memory only: a crash — or a restart after
-	// a failed sweep — loses it; the remaining recovery is the next
-	// effective change, and a persisted marker is recorded as optional
-	// future hardening (not implemented).
-	sweepFailed atomic.Bool
 
 	prevMu     sync.Mutex
 	prevStates map[string]int // MAC(file-free bare hex) -> last-observed state
@@ -87,44 +54,15 @@ type App struct {
 // Compile-time proof that App satisfies the admin API storage contract.
 var _ adminapi.Backend = (*App)(nil)
 
-// New builds the application backend. settingsPath + seed carry the
-// site-settings record (site_settings.go): the file is read EXACTLY ONCE
-// here, a present file wins over the seed (the startup flags are
-// first-boot seeds only), and an absent file seeds, validates, and
-// persists the seed immediately.
-func New(st store.DeviceStore, settingsPath string, seed SiteSettings, lg *slog.Logger) *App {
+// New builds the application backend.
+func New(st store.DeviceStore, lg *slog.Logger) *App {
 	if lg == nil {
 		lg = slog.Default()
 	}
-	// The logger is available before New returns: the loader warns once on
-	// a stale removed key (the device_ssh_password peek) through it.
-	settings, loaded, serr := loadSettingsFile(settingsPath, lg)
-	settingsErr := serr
-	if !loaded {
-		// First boot: the seed (cmd/openunifi's startup flags, or the
-		// zero record for tests/embedders) becomes the initial record.
-		// Validation is the SAVE-verb rule (validateSiteSettingsChange):
-		// the seed is admin intent — the same thing the save verb
-		// validates — so an invalid seed is rejected exactly like an
-		// equivalent API save (a rejected seed persists nothing and
-		// produces the same settingsLoadErr → startup refusal as an
-		// invalid disk file). The WEAK rule (validateSettingsSyntax)
-		// stays at the disk-load site only: a hand-edited file must never
-		// brick startup.
-		if verr := validateSiteSettingsChange(seed); verr != nil {
-			settingsErr = fmt.Errorf("first-boot site-settings seed: %w", verr)
-		} else if perr := persistSettingsFile(settingsPath, seed); perr != nil {
-			settingsErr = fmt.Errorf("site settings seed persist: %w", perr)
-		}
-		settings = seed
-	}
 	return &App{
-		st:              st,
-		lg:              lg,
-		settingsPath:    settingsPath,
-		cachedSettings:  settings,
-		settingsLoadErr: settingsErr,
-		prevStates:      map[string]int{},
+		st:         st,
+		lg:         lg,
+		prevStates: map[string]int{},
 	}
 }
 
@@ -270,6 +208,8 @@ func (a *App) view(d store.Device) adminapi.DeviceView {
 		LEDOverrideColorBrightness: d.LEDOverrideColorBrightness,
 		LEDOverrideColor:           d.LEDOverrideColor,
 		SSHPassword:                d.SSHPassword,
+		RegulatoryCountryCode:      d.RegulatoryCountryCode,
+		SSHPublicKeys:              append([]string(nil), d.SSHPublicKeys...),
 		PendingCommand:             armedCommand(d),
 		Actions:                    []string{"delete"},
 	}
@@ -495,6 +435,25 @@ func (a *App) PatchDevice(_ context.Context, mac string, patch adminapi.DevicePa
 					effective = true
 				}
 				d.SSHPassword = *patch.SSHPassword
+			}
+			if patch.RegulatoryCountryCode != nil {
+				if msg := adminapi.ValidateRegulatoryCountryCode(*patch.RegulatoryCountryCode); msg != "" {
+					return false, fmt.Errorf("%w: %s", adminapi.ErrConflict, msg)
+				}
+				if *patch.RegulatoryCountryCode != d.RegulatoryCountryCode {
+					effective = true
+				}
+				d.RegulatoryCountryCode = *patch.RegulatoryCountryCode
+			}
+			if patch.SSHPublicKeys != nil {
+				if msg := adminapi.ValidateSSHPublicKeyLines(*patch.SSHPublicKeys); msg != "" {
+					return false, fmt.Errorf("%w: %s", adminapi.ErrConflict, msg)
+				}
+				next := append([]string(nil), (*patch.SSHPublicKeys)...)
+				if !slices.Equal(next, d.SSHPublicKeys) {
+					effective = true
+				}
+				d.SSHPublicKeys = next
 			}
 			return effective, nil
 		},

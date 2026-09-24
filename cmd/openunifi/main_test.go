@@ -1,8 +1,6 @@
 package main
 
 import (
-	"reflect"
-	"strings"
 	"testing"
 )
 
@@ -28,22 +26,6 @@ func TestDiscoveryPort(t *testing.T) {
 		if _, _, err := discoveryPort(addr); err == nil {
 			t.Fatalf("unparseable spec %q must hard-fail at startup", addr)
 		}
-	}
-}
-
-func TestValidateRegulatoryCountryCode(t *testing.T) {
-	if err := validateRegulatoryCountryCode(840); err != nil {
-		t.Fatalf("validateRegulatoryCountryCode(840) = %v, want nil", err)
-	}
-	if err := validateRegulatoryCountryCode(276); err != nil {
-		t.Fatalf("validateRegulatoryCountryCode(276) = %v, want nil", err)
-	}
-	err := validateRegulatoryCountryCode(0)
-	if err == nil {
-		t.Fatal("validateRegulatoryCountryCode(0) = nil, want error")
-	}
-	if !strings.Contains(err.Error(), "omit the flag") {
-		t.Fatalf("error should tell the user to omit the flag, got: %v", err)
 	}
 }
 
@@ -96,34 +78,5 @@ func TestValidateAdminExposure(t *testing.T) {
 				t.Fatalf("validateAdminExposure(%q, ...) error = %v, wantErr %v", tc.addr, err, tc.wantErr)
 			}
 		})
-	}
-}
-
-// effectiveSSHKeyLines table: the cmd-layer ssh-key flag/env composition —
-// flag/env precedence and the one non-obvious semantic (an explicit empty
-// flag value refuses the env: the flag slice is non-empty, so the env
-// fallback never engages — the exact semantic the former cmd-layer resolver
-// carried into the seed). The key LINES themselves are validated fail-closed
-// at the app record seams (app/site_settings.go: seed + save, the single
-// systemcfg.ParsePublicKey parser) — that parse coverage lives in the
-// internal/app and internal/adminapi tests and is not duplicated here.
-func TestEffectiveSSHKeyLines(t *testing.T) {
-	cases := []struct {
-		name     string
-		flagKeys []string
-		envValue string
-		want     []string
-	}{
-		{name: "flag-only", flagKeys: []string{"ssh-rsa AAAAflag first@ap"}, want: []string{"ssh-rsa AAAAflag first@ap"}},
-		{name: "env-only", envValue: "ssh-ed25519 AAAAenv second@ap", want: []string{"ssh-ed25519 AAAAenv second@ap"}},
-		{name: "flag-wins-over-env", flagKeys: []string{"ssh-rsa AAAAflag first@ap"}, envValue: "ssh-ed25519 AAAAenv second@ap", want: []string{"ssh-rsa AAAAflag first@ap"}},
-		{name: "empty-flag-refuses-env", flagKeys: []string{""}, envValue: "ssh-ed25519 AAAAenv second@ap", want: []string{""}},
-		{name: "neither-source", want: nil},
-	}
-	for _, c := range cases {
-		got := effectiveSSHKeyLines(c.flagKeys, c.envValue)
-		if !reflect.DeepEqual(got, c.want) {
-			t.Fatalf("%s: effectiveSSHKeyLines(%q, %q) = %q, want %q", c.name, c.flagKeys, c.envValue, got, c.want)
-		}
 	}
 }

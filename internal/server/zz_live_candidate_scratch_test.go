@@ -64,9 +64,8 @@ import (
 // zzLiveFixtures loads the live record, the live envelope, the live
 // site-settings record, and the device-verified applied bytes; the gates
 // skip when any is absent.
-func zzLiveFixtures(t *testing.T) (rec store.Device, env []Wlan, appliedRaw []byte, facts SiteSettings) {
+func zzLiveFixtures(t *testing.T) (rec store.Device, env []Wlan, appliedRaw []byte) {
 	t.Helper()
-	facts = zzLiveSiteSettings(t)
 	raw, err := os.ReadFile(zzHarnessDir + "/live-devices.json")
 	if err != nil {
 		t.Skipf("live record not present (%v)", err)
@@ -99,7 +98,8 @@ func zzLiveFixtures(t *testing.T) (rec store.Device, env []Wlan, appliedRaw []by
 	if len(envFile.Wlans) == 0 {
 		t.Fatalf("live wireless envelope is empty")
 	}
-	return rec, envFile.Wlans, araw, facts
+	zzApplyLiveDeviceIntentFixture(t, &rec)
+	return rec, envFile.Wlans, araw
 }
 
 // zzFailIsDefaultRegression trips when a render against the post-fix live
@@ -123,14 +123,14 @@ func zzFailIsDefaultRegression(t *testing.T, intended []string) {
 // device-side apply must restart NO plugin. Any row delta here means the
 // blocked set leaked into system_cfg and the push is aborted.
 func TestZZLiveBlockedStaRenderUnchanged(t *testing.T) {
-	rec, env, appliedRaw, facts := zzLiveFixtures(t)
+	rec, env, appliedRaw := zzLiveFixtures(t)
 	if _, err := store.AddBlockedClient(&rec, "00:11:22:33:44:55"); err != nil {
 		t.Fatalf("seed blocked client: %v", err)
 	}
 	if got := store.BlockedClients(rec); len(got) != 1 || got[0] != "001122334455" {
 		t.Fatalf("blocked set = %v, want [001122334455]", got)
 	}
-	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return env }, SiteSettings: func() (SiteSettings, error) { return facts, nil }}, store.NewMemStore(), testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return env }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, rec)
 	intended, violations := zzRunGate(t, "live-blocked-candidate vs DEVICE-VERIFIED APPLIED bytes (must be byte-identical)", appliedRaw, sys, zzManagedAllow)
 	if len(violations) > 0 {
@@ -154,11 +154,11 @@ func TestZZLiveBlockedStaRenderUnchanged(t *testing.T) {
 // after this gate passes, and the live result is recorded in the
 // acceptance doc (radio-lane obligation).
 func TestZZLiveRadioIntentCandidateVsApplied(t *testing.T) {
-	rec, env, appliedRaw, facts := zzLiveFixtures(t)
+	rec, env, appliedRaw := zzLiveFixtures(t)
 	rec.Extra["radio_intent"] = map[string]any{
 		"wifi1": map[string]any{"channel": 36.0},
 	}
-	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return env }, SiteSettings: func() (SiteSettings, error) { return facts, nil }}, store.NewMemStore(), testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return env }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, rec)
 	if err := os.WriteFile(zzHarnessDir+"/live-radio-intent-candidate-sys.txt", []byte(sys), 0o644); err != nil {
 		t.Fatal(err)
@@ -194,7 +194,7 @@ const zzLiveEapSecret = "openunifi-fake-eap-secret-20260919"
 // baseline afterwards, so this gate stays a standing shape gate rather
 // than a completed-round skip.
 func TestZZLiveEapCandidateVsApplied(t *testing.T) {
-	rec, env, appliedRaw, facts := zzLiveFixtures(t)
+	rec, env, appliedRaw := zzLiveFixtures(t)
 	if len(env) != 1 {
 		t.Fatalf("expected exactly the one live gate-check WLAN, got %d", len(env))
 	}
@@ -209,7 +209,7 @@ func TestZZLiveEapCandidateVsApplied(t *testing.T) {
 	cand.RadiusServers = []wireless.RadiusServer{{IP: "10.10.10.10", Port: 1812}}
 	cand.RadiusSecret = zzLiveEapSecret
 	cand.RadiusVLANMode = "disabled"
-	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return []Wlan{cand} }, SiteSettings: func() (SiteSettings, error) { return facts, nil }}, store.NewMemStore(), testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return []Wlan{cand} }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, rec)
 	if err := os.WriteFile(zzHarnessDir+"/live-eap-candidate-sys.txt", []byte(sys), 0o644); err != nil {
 		t.Fatal(err)
@@ -291,7 +291,7 @@ const zzLiveDasSecret = "openunifi-fake-radius-20260920"
 // already in the das shape or when the das capture is absent (the
 // harness lives only on this workstation).
 func TestZZLiveDasCandidateVsApplied(t *testing.T) {
-	rec, env, appliedRaw, facts := zzLiveFixtures(t)
+	rec, env, appliedRaw := zzLiveFixtures(t)
 	if len(env) != 1 {
 		t.Fatalf("expected exactly the one live gate-check WLAN, got %d", len(env))
 	}
@@ -310,7 +310,7 @@ func TestZZLiveDasCandidateVsApplied(t *testing.T) {
 	cand.AcctServers = []wireless.RadiusAcctServer{{IP: "10.10.10.10", Port: 1813}}
 	cand.InterimUpdateEnabled = true
 	cand.RadiusDASEnabled = true
-	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return []Wlan{cand} }, SiteSettings: func() (SiteSettings, error) { return facts, nil }}, store.NewMemStore(), testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return []Wlan{cand} }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, rec)
 	if err := os.WriteFile(zzHarnessDir+"/live-das-candidate-sys.txt", []byte(sys), 0o644); err != nil {
 		t.Fatal(err)

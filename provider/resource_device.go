@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -60,6 +61,15 @@ func (r *deviceResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				MarkdownDescription: "Optional per-device SSH password. The API echoes it for drift detection; omitting it explicitly clears the password.",
 				Optional:            true,
 				Sensitive:           true,
+			},
+			"regulatory_country_code": schema.Int64Attribute{
+				MarkdownDescription: "Optional ISO 3166-1 numeric regulatory country code for wireless configuration on this device. `0` clears the override (render default 840).",
+				Optional:            true,
+			},
+			"ssh_public_keys": schema.ListAttribute{
+				MarkdownDescription: "Optional ordered authorized_keys lines provisioned as `sshd.auth.key.<n>` rows on this device. An empty list clears managed keys.",
+				Optional:            true,
+				ElementType:         types.StringType,
 			},
 			"site_id": schema.StringAttribute{
 				MarkdownDescription: "Site the device is created in. Defaults to `default`.",
@@ -130,7 +140,9 @@ type deviceView struct {
 	PendingCommand             string `json:"pending_command,omitempty"`
 	// SSHPassword mirrors the admin API's per-device SSH login password echo
 	// ("" = unmanaged).
-	SSHPassword string `json:"ssh_password,omitempty"`
+	SSHPassword           string   `json:"ssh_password,omitempty"`
+	RegulatoryCountryCode int      `json:"regulatory_country_code,omitempty"`
+	SSHPublicKeys         []string `json:"ssh_public_keys,omitempty"`
 }
 
 func (r *deviceResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -163,8 +175,15 @@ func (r *deviceResource) Create(ctx context.Context, req resource.CreateRequest,
 	if !plan.SSHPassword.IsNull() && !plan.SSHPassword.IsUnknown() {
 		password = plan.SSHPassword.ValueString()
 	}
-	if err := r.client.do(ctx, http.MethodPatch, "/api/v1/devices/"+url.PathEscape(plan.Mac.ValueString()), map[string]string{"ssh_password": password}, nil); err != nil {
-		resp.Diagnostics.AddError("Create device: set SSH password", err.Error())
+	patch := map[string]any{"ssh_password": password}
+	if !plan.RegulatoryCountryCode.IsNull() && !plan.RegulatoryCountryCode.IsUnknown() {
+		patch["regulatory_country_code"] = int(plan.RegulatoryCountryCode.ValueInt64())
+	}
+	if !plan.SSHPublicKeys.IsNull() && !plan.SSHPublicKeys.IsUnknown() {
+		patch["ssh_public_keys"] = tfListToStrings(plan.SSHPublicKeys)
+	}
+	if err := r.client.do(ctx, http.MethodPatch, "/api/v1/devices/"+url.PathEscape(plan.Mac.ValueString()), patch, nil); err != nil {
+		resp.Diagnostics.AddError("Create device: apply device intent", err.Error())
 		return
 	}
 
@@ -259,20 +278,22 @@ func (r *deviceResource) Delete(ctx context.Context, req resource.DeleteRequest,
 
 // deviceModel is the Terraform state shape for the device resource.
 type deviceModel struct {
-	Mac                types.String `tfsdk:"mac"`
-	Name               types.String `tfsdk:"name"`
-	SSHPassword        types.String `tfsdk:"ssh_password"`
-	SiteID             types.String `tfsdk:"site_id"`
-	State              types.String `tfsdk:"state"`
-	IP                 types.String `tfsdk:"ip"`
-	Firmware           types.String `tfsdk:"firmware"`
-	LastSeen           types.String `tfsdk:"last_seen"`
-	CfgVersion         types.String `tfsdk:"cfg_version"`
-	AppliedCfg         types.String `tfsdk:"applied_cfg"`
-	InSync             types.Bool   `tfsdk:"in_sync"`
-	WLANDeliveryStatus types.String `tfsdk:"wlan_delivery_status"`
-	WLANDeliveryCount  types.Int64  `tfsdk:"wlan_delivery_count"`
-	WLANLastAttempt    types.Int64  `tfsdk:"wlan_last_attempt"`
+	Mac                   types.String `tfsdk:"mac"`
+	Name                  types.String `tfsdk:"name"`
+	SSHPassword           types.String `tfsdk:"ssh_password"`
+	RegulatoryCountryCode types.Int64  `tfsdk:"regulatory_country_code"`
+	SSHPublicKeys         types.List   `tfsdk:"ssh_public_keys"`
+	SiteID                types.String `tfsdk:"site_id"`
+	State                 types.String `tfsdk:"state"`
+	IP                    types.String `tfsdk:"ip"`
+	Firmware              types.String `tfsdk:"firmware"`
+	LastSeen              types.String `tfsdk:"last_seen"`
+	CfgVersion            types.String `tfsdk:"cfg_version"`
+	AppliedCfg            types.String `tfsdk:"applied_cfg"`
+	InSync                types.Bool   `tfsdk:"in_sync"`
+	WLANDeliveryStatus    types.String `tfsdk:"wlan_delivery_status"`
+	WLANDeliveryCount     types.Int64  `tfsdk:"wlan_delivery_count"`
+	WLANLastAttempt       types.Int64  `tfsdk:"wlan_last_attempt"`
 }
 
 func notConfiguredErr(d interface {
@@ -322,6 +343,12 @@ func applyDevice(m *deviceModel, dev *deviceView, site string) {
 	} else {
 		m.SSHPassword = types.StringValue(dev.SSHPassword)
 	}
+	if dev.RegulatoryCountryCode == 0 {
+		m.RegulatoryCountryCode = types.Int64Null()
+	} else {
+		m.RegulatoryCountryCode = types.Int64Value(int64(dev.RegulatoryCountryCode))
+	}
+	m.SSHPublicKeys = stringSliceToTFList(dev.SSHPublicKeys)
 	// "name" is Optional and NOT Computed (no ModifyPlan), so Terraform
 	// enforces plan-vs-state equality on it. The server omits empty names
 	// from DeviceView ("name,omitempty"), so an unset name round-trips as
@@ -339,8 +366,8 @@ func applyDevice(m *deviceModel, dev *deviceView, site string) {
 	}
 }
 
-func deviceUpdateBody(plan, state deviceModel) map[string]string {
-	body := map[string]string{}
+func deviceUpdateBody(plan, state deviceModel) map[string]any {
+	body := map[string]any{}
 	if !plan.Name.IsUnknown() && plan.Name.ValueString() != state.Name.ValueString() {
 		// A null optional value means the configuration removed the name. The
 		// PATCH API distinguishes an omitted name from an explicit empty name.
@@ -349,10 +376,50 @@ func deviceUpdateBody(plan, state deviceModel) map[string]string {
 	if !plan.SSHPassword.IsUnknown() && plan.SSHPassword.ValueString() != state.SSHPassword.ValueString() {
 		body["ssh_password"] = plan.SSHPassword.ValueString()
 	}
+	if !plan.RegulatoryCountryCode.IsUnknown() && !plan.RegulatoryCountryCode.Equal(state.RegulatoryCountryCode) {
+		if plan.RegulatoryCountryCode.IsNull() {
+			body["regulatory_country_code"] = 0
+		} else {
+			body["regulatory_country_code"] = int(plan.RegulatoryCountryCode.ValueInt64())
+		}
+	}
+	if !plan.SSHPublicKeys.IsUnknown() && !sshPublicKeysListEqual(plan.SSHPublicKeys, state.SSHPublicKeys) {
+		if plan.SSHPublicKeys.IsNull() {
+			body["ssh_public_keys"] = []string{}
+		} else {
+			body["ssh_public_keys"] = tfListToStrings(plan.SSHPublicKeys)
+		}
+	}
 	if !plan.SiteID.IsNull() && !plan.SiteID.IsUnknown() && plan.SiteID.ValueString() != state.SiteID.ValueString() {
 		body["site_id"] = plan.SiteID.ValueString()
 	}
 	return body
+}
+
+func tfListToStrings(l types.List) []string {
+	if l.IsNull() || l.IsUnknown() {
+		return nil
+	}
+	out := make([]string, 0, len(l.Elements()))
+	for _, el := range l.Elements() {
+		out = append(out, el.(types.String).ValueString())
+	}
+	return out
+}
+
+func sshPublicKeysListEqual(a, b types.List) bool {
+	if a.Equal(b) {
+		return true
+	}
+	return slices.Equal(tfListToStrings(a), tfListToStrings(b))
+}
+
+func stringSliceToTFList(keys []string) types.List {
+	l, diags := types.ListValueFrom(context.Background(), types.StringType, keys)
+	if diags.HasError() {
+		return types.ListNull(types.StringType)
+	}
+	return l
 }
 
 func (r *deviceResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {

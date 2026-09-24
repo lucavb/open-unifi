@@ -118,3 +118,18 @@ func walkWireBlob(raw []byte, typ string) error {
 	}
 	return nil
 }
+
+func parseDeviceSSHPublicKeys(lines []string) ([]PublicKey, error) {
+	if len(lines) == 0 {
+		return nil, nil
+	}
+	out := make([]PublicKey, 0, len(lines))
+	for i, line := range lines {
+		k, err := ParsePublicKey(line)
+		if err != nil {
+			return nil, fmt.Errorf("invalid SSH public key #%d: %w", i+1, err)
+		}
+		out = append(out, k)
+	}
+	return out, nil
+}

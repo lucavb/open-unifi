@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -32,21 +31,14 @@ import (
 //	GET/DELETE   /api/v1/devices/{mac}
 //	POST          /api/v1/wireless
 //	GET/PUT/DELETE /api/v1/wireless/{name}
-//	GET/PUT      /api/v1/site-settings
 //	GET          /api/v1/whoami
 type fakeBackend struct {
-	token    string            // required bearer token; "" means anonymous allowed
-	devices  map[string]string // mac -> raw device JSON (DeviceView shape)
-	wireless map[string]string // name -> raw item JSON
-	// siteSettings is the raw SiteSettingsView JSON served by GET; PUT
-	// replaces it wholesale. siteSettingsErr, when non-empty, makes every
-	// PUT reply 400 {"error": siteSettingsErr} (models the API's
-	// invalid-key rejections).
-	siteSettings    string
-	siteSettingsErr string
-	lastAuth        string // observed Authorization header of the last request
-	deviceEvents    []string
-	deviceBodies    []map[string]json.RawMessage
+	token        string            // required bearer token; "" means anonymous allowed
+	devices      map[string]string // mac -> raw device JSON (DeviceView shape)
+	wireless     map[string]string // name -> raw item JSON
+	lastAuth     string            // observed Authorization header of the last request
+	deviceEvents []string
+	deviceBodies []map[string]json.RawMessage
 }
 
 // lastSeenFixture is a fixed unix timestamp used in device fixtures.
@@ -57,9 +49,6 @@ func newFakeBackend(token string) *fakeBackend {
 		token:    token,
 		devices:  map[string]string{},
 		wireless: map[string]string{},
-		// The zero view: exactly what the real API echoes for an untouched
-		// controller (all fields present, empty key list as []).
-		siteSettings: `{"regulatory_country_code":0,"device_ssh_public_keys":[]}`,
 	}
 	return fb
 }
@@ -213,7 +202,9 @@ func (fb *fakeBackend) handler() http.Handler {
 				return
 			}
 			for field := range patch {
-				if field != "ssh_password" && field != "name" && field != "site_id" {
+				switch field {
+				case "ssh_password", "name", "site_id", "regulatory_country_code", "ssh_public_keys":
+				default:
 					writeFakeErr(w, http.StatusBadRequest, "unknown field "+field)
 					return
 				}
@@ -232,50 +223,25 @@ func (fb *fakeBackend) handler() http.Handler {
 				}
 				view["ssh_password"] = value
 			}
+			if raw, ok := patch["regulatory_country_code"]; ok {
+				var value int
+				if err := json.Unmarshal(raw, &value); err != nil {
+					writeFakeErr(w, 400, "regulatory_country_code must be int")
+					return
+				}
+				view["regulatory_country_code"] = value
+			}
+			if raw, ok := patch["ssh_public_keys"]; ok {
+				var keys []string
+				if err := json.Unmarshal(raw, &keys); err != nil {
+					writeFakeErr(w, 400, "ssh_public_keys must be array")
+					return
+				}
+				view["ssh_public_keys"] = keys
+			}
 			buf, _ := json.Marshal(view)
 			fb.devices[mac] = string(buf)
 			fb.deviceEvents = append(fb.deviceEvents, "PATCH")
-			_, _ = w.Write(append(buf, '\n'))
-		default:
-			w.WriteHeader(http.StatusMethodNotAllowed)
-		}
-	}))
-
-	// Site settings: the real API is whole-document PUT (missing/null field
-	// → 400 "missing field <name>"); the fake mirrors the shape check plus
-	// the canned siteSettingsErr rejection.
-	mux.HandleFunc("/api/v1/site-settings", auth(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			_, _ = w.Write([]byte(fb.siteSettings + "\n"))
-		case http.MethodPut:
-			bodyBytes, err := io.ReadAll(r.Body)
-			if err != nil {
-				writeFakeErr(w, http.StatusBadRequest, "unreadable body")
-				return
-			}
-			var raw map[string]json.RawMessage
-			if err := json.Unmarshal(bodyBytes, &raw); err != nil {
-				writeFakeErr(w, http.StatusBadRequest, "invalid JSON body")
-				return
-			}
-			for _, field := range []string{"regulatory_country_code", "device_ssh_public_keys"} {
-				if _, ok := raw[field]; !ok {
-					writeFakeErr(w, http.StatusBadRequest, "missing field "+field)
-					return
-				}
-			}
-			if fb.siteSettingsErr != "" {
-				writeFakeErr(w, http.StatusBadRequest, fb.siteSettingsErr)
-				return
-			}
-			var doc siteSettings
-			if err := json.Unmarshal(bodyBytes, &doc); err != nil {
-				writeFakeErr(w, http.StatusBadRequest, "invalid JSON body")
-				return
-			}
-			buf, _ := json.Marshal(doc)
-			fb.siteSettings = string(buf)
 			_, _ = w.Write(append(buf, '\n'))
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -716,95 +682,6 @@ func TestDeviceStructParityWithServer(t *testing.T) {
 		if t2, ok := provFields["deviceView"][key]; !ok || t2 != tag {
 			t.Fatalf("device field %q (%s) missing/changed in deviceView (%q)", key, tag, t2)
 		}
-	}
-}
-
-// TestSiteSettingsGetEcho pins the GET decode: the fake serves the zero
-// view (all fields present, [] keys) and a set view; the client maps
-// both verbatim onto siteSettings.
-func TestSiteSettingsGetEcho(t *testing.T) {
-	ctx := context.Background()
-
-	// Zero view: the untouched controller's echo.
-	fb := newFakeBackend("")
-	c := clientFor(fb, "")
-	got, err := c.getSiteSettings(ctx)
-	if err != nil {
-		t.Fatalf("getSiteSettings zero view: %v", err)
-	}
-	if got.RegulatoryCountryCode != 0 || len(got.DeviceSSHPublicKeys) != 0 {
-		t.Fatalf("zero view decode mismatch: %+v", got)
-	}
-
-	// A populated view must decode verbatim, keys in order. The removed
-	// site password / disable knob's HISTORICAL wire names (what GHCR-era
-	// servers echo and old binaries send) must not map onto anything —
-	// neither the password (Phase A removed it) nor the disable knob.
-	fb.siteSettings = `{"regulatory_country_code":276,"ap_ssh_password":"s3cret",` +
-		`"device_ssh_public_keys":["ssh-ed25519 AAAA a@ap","ssh-rsa AAAA b@ap"]}`
-	got, err = c.getSiteSettings(ctx)
-	if err != nil {
-		t.Fatalf("getSiteSettings populated view: %v", err)
-	}
-	want := siteSettings{
-		RegulatoryCountryCode: 276,
-		DeviceSSHPublicKeys:   []string{"ssh-ed25519 AAAA a@ap", "ssh-rsa AAAA b@ap"},
-	}
-	if !reflect.DeepEqual(*got, want) {
-		t.Fatalf("populated view decode: got %+v, want %+v", *got, want)
-	}
-}
-
-// TestSiteSettingsPutRoundTrip pins the PUT contract: the whole document
-// goes out with both fields (the strict server decode would 400 on a
-// missing one) and the returned view is the server's echo of it, which the
-// subsequent GET confirms.
-func TestSiteSettingsPutRoundTrip(t *testing.T) {
-	fb := newFakeBackend("")
-	ctx := context.Background()
-	c := clientFor(fb, "")
-
-	doc := siteSettings{
-		RegulatoryCountryCode: 840,
-		DeviceSSHPublicKeys:   []string{"ssh-ed25519 AAAA a@ap", "ssh-ed25519 AAAA b@ap"},
-	}
-	view, err := c.putSiteSettings(ctx, doc)
-	if err != nil {
-		t.Fatalf("putSiteSettings: %v", err)
-	}
-	if !reflect.DeepEqual(*view, doc) {
-		t.Fatalf("PUT view = %+v, want echo of %+v", *view, doc)
-	}
-	// The stored record round-trips: a later GET returns the same view.
-	got, err := c.getSiteSettings(ctx)
-	if err != nil {
-		t.Fatalf("getSiteSettings after PUT: %v", err)
-	}
-	if !reflect.DeepEqual(*got, doc) {
-		t.Fatalf("GET after PUT = %+v, want %+v", *got, doc)
-	}
-}
-
-// TestSiteSettingsPutError pins that the API's 400 rejections surface
-// through the typed apiError machinery with the server's message extracted
-// (an invalid authorized_keys line is the canonical case).
-func TestSiteSettingsPutError(t *testing.T) {
-	fb := newFakeBackend("")
-	fb.siteSettingsErr = "invalid Device SSH public key #1: want exactly 2 or 3 fields (type value [comment]), got 1"
-	c := clientFor(fb, "")
-	_, err := c.putSiteSettings(context.Background(), siteSettings{DeviceSSHPublicKeys: []string{"not-a-key-line"}})
-	if err == nil {
-		t.Fatal("expected 400 error, got nil")
-	}
-	var ae *apiError
-	if !errors.As(err, &ae) {
-		t.Fatalf("expected typed *apiError, got %T: %v", err, err)
-	}
-	if ae.status != http.StatusBadRequest {
-		t.Fatalf("expected status 400, got %d", ae.status)
-	}
-	if want := "http 400: invalid Device SSH public key #1: want exactly 2 or 3 fields (type value [comment]), got 1"; err.Error() != want {
-		t.Fatalf("error message = %q, want %q", err.Error(), want)
 	}
 }
 

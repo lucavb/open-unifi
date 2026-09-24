@@ -222,25 +222,14 @@ func zzExemptSSHKeyRows(rows []string) (out []string) {
 	return out
 }
 
-// zzLiveSiteSettings loads the live site-settings record fixture
-// (live-site-settings.json, the on-disk record shape — the
-// device-intent facts) and builds the render's SiteSettings for the live
-// gates: the record's raw authorized_keys lines parse through the
-// single fail-closed parser (the adapter-conversion seam cmd/openunifi
-// uses), so every candidate gate renders the CURRENT live sshd rows
-// exactly as the running controller does — without this fixture the
-// applied baseline's key rows would read as drift. A stale record may
-// still carry the REMOVED device_ssh_password key: json tolerates unknown
-// keys, the site password concept is gone (the per-device record field
-// carries it now), and the render reuses the device's cached password
-// hash. Skips when the fixture is absent (the harness lives only on this
-// workstation); a present-but-invalid line fails the gate — the fixture
-// must be a fetch of the live record, never hand input.
-func zzLiveSiteSettings(t *testing.T) SiteSettings {
+// zzApplyLiveDeviceIntentFixture copies regulatory country and SSH public
+// keys from live-site-settings.json onto a device record when the bench
+// harness fixture is present (optional — absent file is a no-op).
+func zzApplyLiveDeviceIntentFixture(t *testing.T, rec *store.Device) {
 	t.Helper()
 	raw, err := os.ReadFile(zzHarnessDir + "/live-site-settings.json")
 	if err != nil {
-		t.Skipf("live site-settings record not present (%v)", err)
+		return
 	}
 	var doc struct {
 		RegulatoryCountryCode int      `json:"regulatory_country_code"`
@@ -249,13 +238,6 @@ func zzLiveSiteSettings(t *testing.T) SiteSettings {
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		t.Fatalf("live site-settings.json: %v", err)
 	}
-	// keys tolerates the PRE-RENAME wire spelling ap_ssh_public_keys as
-	// well as the current device_ssh_public_keys: the checked-in fixture
-	// is a bench fetch of the live record whose latest capture predates
-	// the site-settings key rename. Both spellings mean the same content;
-	// the next live re-fetch will carry the current spelling and this
-	// fallback can go away — it exists ONLY here in the bench harness,
-	// never on any shipped wire path.
 	keys := doc.DeviceSSHPublicKeys
 	if keys == nil {
 		var legacy struct {
@@ -266,17 +248,13 @@ func zzLiveSiteSettings(t *testing.T) SiteSettings {
 		}
 		keys = legacy.APSSHPublicKeys
 	}
-	facts := SiteSettings{
-		CountryCode: doc.RegulatoryCountryCode,
-	}
-	for _, line := range keys {
-		k, perr := systemcfg.ParsePublicKey(line)
-		if perr != nil {
-			t.Fatalf("live site-settings key line does not parse (the fixture must be a fetch of the live record): %v", perr)
+	for i, line := range keys {
+		if _, perr := systemcfg.ParsePublicKey(line); perr != nil {
+			t.Fatalf("live site-settings key line #%d does not parse: %v", i+1, perr)
 		}
-		facts.SSHPublicKeys = append(facts.SSHPublicKeys, k)
 	}
-	return facts
+	rec.RegulatoryCountryCode = doc.RegulatoryCountryCode
+	rec.SSHPublicKeys = keys
 }
 
 // zzExemptLedBarMigration filters the known renderer-evolution delta
@@ -511,8 +489,8 @@ func TestZZLiveIntentVsApplied(t *testing.T) {
 	if len(envFile.Wlans) == 0 {
 		t.Fatalf("live wireless envelope is empty")
 	}
-	facts := zzLiveSiteSettings(t)
-	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return envFile.Wlans }, SiteSettings: func() (SiteSettings, error) { return facts, nil }}, store.NewMemStore(), testLogger())
+	zzApplyLiveDeviceIntentFixture(t, &rec)
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return envFile.Wlans }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, rec)
 	if err := os.WriteFile(zzHarnessDir+"/live-intent-sys.txt", []byte(sys), 0o644); err != nil {
 		t.Fatal(err)

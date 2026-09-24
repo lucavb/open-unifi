@@ -127,6 +127,7 @@ var adminOwnedKeys = []string{
 	SSHSha512PasswdKey, SSHMd5PasswdKey,
 	"led_override", "disabled", "led_override_color_brightness",
 	"led_override_color", "ssh_password",
+	"regulatory_country_code", "ssh_public_keys",
 	RadioIntentExtraKey, DeviceWLANsExtraKey, CmdTaskKey,
 }
 

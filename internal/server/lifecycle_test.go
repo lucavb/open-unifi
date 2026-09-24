@@ -11,13 +11,10 @@ package server
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"regexp"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -25,7 +22,6 @@ import (
 	"github.com/lucavb/open-unifi/internal/app"
 	"github.com/lucavb/open-unifi/internal/inform"
 	"github.com/lucavb/open-unifi/internal/server/adoption"
-	"github.com/lucavb/open-unifi/internal/server/systemcfg"
 	"github.com/lucavb/open-unifi/internal/store"
 	"github.com/lucavb/open-unifi/internal/wireless"
 )
@@ -65,52 +61,18 @@ func decryptResponseRaw(t *testing.T, respBody []byte, keyHex []byte) (uint16, [
 // lifecycleFixture wires the real admin API (adminapi handler over App)
 // and the real inform handler over ONE store, and returns both handlers.
 func lifecycleFixture(t *testing.T) (admin, informH http.Handler, st store.DeviceStore) {
-	return siteSettingsFixture(t, app.SiteSettings{}, nil)
+	return lifecycleFixtureWLANS(t, nil)
 }
 
-// siteSettingsFixture is lifecycleFixture with a seeded site-settings
-// record, the app→server settings source wired exactly like
-// cmd/openunifi (the single raw-lines→parsed-keys seam), and an optional
-// WLAN envelope for the WirelessSource.
-func siteSettingsFixture(t *testing.T, seed app.SiteSettings, wlans []Wlan) (admin, informH http.Handler, st store.DeviceStore) {
+func lifecycleFixtureWLANS(t *testing.T, wlans []Wlan) (admin, informH http.Handler, st store.DeviceStore) {
 	t.Helper()
 	st = store.NewMemStore()
-	a := app.New(st, filepath.Join(t.TempDir(), "site-settings.json"), seed, testLogger())
-	cfg := Config{SiteSettings: appSettingsSource(a)}
+	a := app.New(st, testLogger())
+	cfg := Config{}
 	if wlans != nil {
 		cfg.WirelessForDevice = func(_ store.Device) []Wlan { return wlans }
 	}
 	return adminapi.New(adminapi.Config{}, a), New(cfg, st, testLogger()).InformHandler(), st
-}
-
-// appSettingsSource is the adapter seam cmd/openunifi uses: the app
-// record's RAW authorized_keys lines are parsed into the server's fact
-// shape at this single conversion point (the fail-closed single parser;
-// a record line that never reached the parser would be a trust-policy
-// breach, not something the server re-validates away). The closure reads
-// the record LIVE per call, so a site-settings save is visible on the
-// device's next inform. On a load error the error propagates (render
-// fails before any record mutation); the engine gate reads zero facts
-// and stays inert.
-func appSettingsSource(a *app.App) func() (SiteSettings, error) {
-	return func() (SiteSettings, error) {
-		rec, err := a.CurrentSiteSettings()
-		if err != nil {
-			return SiteSettings{}, err
-		}
-		keys := make([]systemcfg.PublicKey, 0, len(rec.SSHPublicKeys))
-		for i, line := range rec.SSHPublicKeys {
-			k, perr := systemcfg.ParsePublicKey(line)
-			if perr != nil {
-				return SiteSettings{}, fmt.Errorf("invalid Device SSH public key #%d: %w", i+1, perr)
-			}
-			keys = append(keys, k)
-		}
-		return SiteSettings{
-			CountryCode:   rec.CountryCode,
-			SSHPublicKeys: keys,
-		}, nil
-	}
 }
 
 // postAdmin issues an authenticated-free (token-less) admin API request.
@@ -432,29 +394,19 @@ const (
 	ssKeyLine3 = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRoaXJka2V5QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJC third@ap"
 )
 
-// siteSettingsPutBodyJSON renders a whole-document PUT body (the site
-// password is REMOVED — the wire document carries the two device-intent
-// facts only; the per-device password rides PATCH /api/v1/devices/{mac}).
-func siteSettingsPutBodyJSON(country int, keys []string) string {
-	keyJSON := make([]string, 0, len(keys))
-	for _, k := range keys {
-		b, err := json.Marshal(k)
-		if err != nil {
-			panic(err)
-		}
-		keyJSON = append(keyJSON, string(b))
-	}
-	return fmt.Sprintf(`{"regulatory_country_code":%d,"device_ssh_public_keys":[%s]}`,
-		country, strings.Join(keyJSON, ","))
-}
-
-// putSiteSettings saves the document through the real admin handler.
-func putSiteSettings(t *testing.T, adminH http.Handler, country int, keys []string) {
+func patchDeviceSSHIntent(t *testing.T, adminH http.Handler, mac string, country int, keys []string) {
 	t.Helper()
-	rec := postAdminBody(t, adminH, http.MethodPut, "/api/v1/site-settings",
-		siteSettingsPutBodyJSON(country, keys))
+	body := map[string]any{
+		"regulatory_country_code": country,
+		"ssh_public_keys":         keys,
+	}
+	b, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := postAdminBody(t, adminH, http.MethodPatch, "/api/v1/devices/"+mac, string(b))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("site settings PUT: %d %s", rec.Code, rec.Body.String())
+		t.Fatalf("device SSH intent PATCH: %d %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -472,14 +424,14 @@ func gateInformBody(appliedCfg string) map[string]any {
 // sshd.auth.key families (1..3: status/value/type, comment only when
 // non-empty, NO .0 or .4 rows), the always-enabled sshd.auth.passwd row,
 // and the full mgmt_cfg/blocked_sta shape.
-func TestSiteSettingsSaveDeliversSSHDRowsFullProvisioningE2E(t *testing.T) {
-	adminH, informH, st := siteSettingsFixture(t, app.SiteSettings{}, nil)
+func TestDeviceSSHKeysSaveDeliversSSHDRowsFullProvisioningE2E(t *testing.T) {
+	adminH, informH, st := lifecycleFixture(t)
 	const cfg = "aaaabbbbccccdddd"
 	const xk = "11112222333344445555666677778888"
 	registerAdopted(t, st, cfg, xk)
 	kx := hexKey(t, xk)
 
-	putSiteSettings(t, adminH, 840, []string{ssKeyLine1, ssKeyLine2, ssKeyLine3})
+	patchDeviceSSHIntent(t, adminH, store.ColonMAC(testMAC), 840, []string{ssKeyLine1, ssKeyLine2, ssKeyLine3})
 	d, err := st.Get(testMAC)
 	if err != nil {
 		t.Fatal(err)
@@ -533,14 +485,14 @@ func TestSiteSettingsSaveDeliversSSHDRowsFullProvisioningE2E(t *testing.T) {
 
 // TestSiteSettingsSaveUngatedForeignModelDeliversE2E: a site-settings save on
 // a non-U7PG2 device reaches full provisioning and carries the new sshd rows.
-func TestSiteSettingsSaveUngatedForeignModelDeliversE2E(t *testing.T) {
-	adminH, informH, st := siteSettingsFixture(t, app.SiteSettings{}, nil)
+func TestDeviceSSHKeysSaveUngatedForeignModelDeliversE2E(t *testing.T) {
+	adminH, informH, st := lifecycleFixture(t)
 	const cfg = "aaaabbbbccccdddd"
 	const xk = "11112222333344445555666677778888"
 	registerAdopted(t, st, cfg, xk)
 	kx := hexKey(t, xk)
 
-	putSiteSettings(t, adminH, 276, []string{ssKeyLine1})
+	patchDeviceSSHIntent(t, adminH, store.ColonMAC(testMAC), 276, []string{ssKeyLine1})
 	body := infoBody("")
 	body["model"] = "UAP-AC-Pro" // NOT the gated model
 	resp := post(t, informH, encryptCBC(t, mustJSON(t, body), kx, testIV))
@@ -574,10 +526,10 @@ func TestSiteSettingsSaveUngatedForeignModelDeliversE2E(t *testing.T) {
 // fresh cfgversion (M2 ≠ the offered one), and the SAME inform yields ONE
 // full provisioning carrying BOTH the pending envelope (the E2 SSID row)
 // AND the new sshd facts — not the hold.
-func TestSiteSettingsSaveEscapesExhaustedWLANDeliveryE2E(t *testing.T) {
+func TestDeviceSSHKeysSaveEscapesExhaustedWLANDeliveryE2E(t *testing.T) {
 	e1 := []Wlan{{Name: "old", SSID: "oldnet", Security: "open", Enabled: true}}
 	e2 := []Wlan{{Name: "pending", SSID: "pendingnet", Security: "open", Enabled: true}}
-	adminH, informH, st := siteSettingsFixture(t, app.SiteSettings{}, e2)
+	adminH, informH, st := lifecycleFixtureWLANS(t, e2)
 	const cfg = "aaaabbbbccccdddd"
 	const xk = "11112222333344445555666677778888"
 	// u7pg2Record() (radio_table present — the aaa.* wireless rows need it
@@ -635,7 +587,7 @@ func TestSiteSettingsSaveEscapesExhaustedWLANDeliveryE2E(t *testing.T) {
 
 	// 2. The settings save: an effective change → the mint sweep stamps a
 	// fresh cfgversion on the provisioned device (M2 ≠ the offered one).
-	putSiteSettings(t, adminH, 840, []string{ssKeyLine1})
+	patchDeviceSSHIntent(t, adminH, store.ColonMAC(testMAC), 840, []string{ssKeyLine1})
 	d, err := st.Get(testMAC)
 	if err != nil {
 		t.Fatal(err)
@@ -671,192 +623,7 @@ func TestSiteSettingsSaveEscapesExhaustedWLANDeliveryE2E(t *testing.T) {
 	}
 }
 
-// TestSiteSettingsPutConcurrentWithInformsNoDeadlock: the smu leaf-lock
-// canary. The lock graph is acyclic ONLY because PutSiteSettings releases
-// smu (the settings apply lock) BEFORE any store call, while the inform
-// path takes smu INSIDE the store's per-MAC RMW cycle (macLock → smu — the
-// render closure's CurrentSiteSettings read; internal/app site_settings.go
-// LOCK SHAPE). A refactor that moves the PUT's mint sweep (or any other
-// store work) back inside the smu apply section flips the PUT to
-// smu → macLock: a live AB-BA deadlock against every concurrent inform,
-// with no test failure anywhere else. This canary makes the invariant
-// executable: fanned-out REAL informs (the mismatch arc → full
-// provisioning, whose render reads the settings source inside the RMW)
-// race REAL effective PUTs (each candidate document mints a cfgversion
-// sweep over the store's List/UpdateExisting).
-//
-// Watchdog discipline (plain `go test`, no -race, only timing assert): the
-// fan-out runs without any panic-prone t.Fatal from worker goroutines —
-// their outcomes are COLLECTED under a mutex and judged by the test
-// goroutine — and the test goroutine owns the only time assertion, the
-// watchdog bound. Green code is deadlock-free under the acyclic lock
-// graph (every smu acquisition provably resolves), so the watchdog can
-// never fire on the committed tree; it only names the invariant when a
-// regression wedges the WaitGroup. The fan-out is looped (the mints churn
-// cfgversion; every round opens fresh interleaving) so an AB-BA-shaped
-// regression is caught within the rounds rather than by the luck of one
-// interleave.
-func TestSiteSettingsPutConcurrentWithInformsNoDeadlock(t *testing.T) {
-	adminH, informH, st := siteSettingsFixture(t, app.SiteSettings{}, nil)
-	const cfg = "aaaabbbbccccdddd"
-	const xk = "11112222333344445555666677778888"
-	registerAdopted(t, st, cfg, xk)
-	kx := hexKey(t, xk)
-
-	// Ungated shape: the fixture's model/version (U7PG2 / 6.6.55) is what
-	// the live gate does NOT cover, so each mismatched inform — an info
-	// body WITHOUT the echoed cfgversion — answers one full provisioning
-	// whose render calls the settings source inside the store's RMW.
-	informBody := encryptCBC(t, mustJSON(t, infoBody("")), kx, testIV)
-	// Three documents that all differ (country 840 ↔ 276 ↔ 0 with a
-	// different key line, valid facts each): rotating saves stay effective
-	// in the common interleaving, so the PUT keeps minting through the
-	// store instead of resting on the no-change early return.
-	docs := []string{
-		siteSettingsPutBodyJSON(840, []string{ssKeyLine1}),
-		siteSettingsPutBodyJSON(276, []string{ssKeyLine1}),
-		siteSettingsPutBodyJSON(0, []string{ssKeyLine2}),
-	}
-
-	var (
-		wg sync.WaitGroup
-		mu sync.Mutex
-		// errs carries every worker outcome failure to the test goroutine;
-		// informs/puts count the completed successes.
-		errs    []string
-		informs int
-		puts    int
-	)
-	addErr := func(format string, args ...any) {
-		mu.Lock()
-		defer mu.Unlock()
-		errs = append(errs, fmt.Sprintf(format, args...))
-	}
-
-	// Fan-out calibration (see the docblock): several dozen rounds of
-	// interleaving so an AB-BA-shaped regression is caught with negligible
-	// miss probability — the watchdog measures wall clock only, never the
-	// happy-path timing.
-	const rounds = 48
-	const informsPerRound = 6
-	const putsPerRound = 3
-	for round := 0; round < rounds; round++ {
-		for n := 0; n < informsPerRound; n++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				resp := post(t, informH, informBody)
-				if resp.Code != http.StatusOK {
-					addErr("inform: status %d body %q", resp.Code, resp.Body.String())
-					return
-				}
-				jm, derr := decodeInformResponse(resp.Body.Bytes(), kx)
-				if derr != nil {
-					addErr("inform decrypt: %v", derr)
-					return
-				}
-				// The storm's outcomes may interleave with the concurrent
-				// mints (setparam vs noop) — the canary pins the transport
-				// seam, not the planner, and BOTH shapes carry the §
-				// universal timestamp.
-				if kind := jm["_type"]; kind != "noop" && kind != "setparam" {
-					addErr("inform response type %v, want noop or setparam", kind)
-					return
-				}
-				if _, ok := jm["server_time_in_utc"]; !ok {
-					addErr("inform %v response missing server_time_in_utc", jm["_type"])
-					return
-				}
-				mu.Lock()
-				informs++
-				mu.Unlock()
-			}()
-		}
-		for m := 0; m < putsPerRound; m++ {
-			wg.Add(1)
-			go func(i int) {
-				defer wg.Done()
-				rec := postAdminBody(t, adminH, http.MethodPut, "/api/v1/site-settings", docs[i%len(docs)])
-				if rec.Code != http.StatusOK {
-					addErr("PUT: status %d body %q", rec.Code, rec.Body.String())
-					return
-				}
-				mu.Lock()
-				puts++
-				mu.Unlock()
-			}(round*putsPerRound + m)
-		}
-	}
-
-	// The watchdog: the WaitGroup releases only when every worker returns.
-	// On the committed tree each smu (and each store) acquisition is
-	// bounded by construction, so this selects the done channel in a
-	// fraction of the bound; when the PUT holds smu across a store call,
-	// one inform wedges behind one PUT and the fan-out never drains.
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(45 * time.Second):
-		t.Fatalf(`AB-BA deadlock detected in the site-settings PUT × inform fan-out (completed before the watchdog: %d informs / %d PUTs): the smu leaf-lock invariant is violated — PutSiteSettings must release the settings lock BEFORE any store call, because the inform path takes smu INSIDE the store's per-MAC RMW cycle (macLock → smu). A store call under smu flips the PUT to smu → macLock and wedges every live controller's inform traffic.`, informs, puts)
-	}
-
-	// Outcomes — all under the test goroutine: every PUT was answered 200
-	// and every inform got a well-shaped sealed response.
-	if len(errs) != 0 {
-		t.Fatalf("%d fan-out outcome failures:\n%s", len(errs), strings.Join(errs, "\n"))
-	}
-	if wantInforms, wantPuts := rounds*informsPerRound, rounds*putsPerRound; informs != wantInforms || puts != wantPuts {
-		t.Fatalf("fan-out accounting: %d informs / %d PUTs, want %d / %d (errs %v)",
-			informs, puts, wantInforms, wantPuts, errs)
-	}
-
-	// Post-storm sanity: the storm must leave the record's controller-side
-	// identity intact and its intent stamped: the per-device key survived
-	// (the absorbed informs never touch it — trust policy), the record
-	// still sits in an assigned-key-slot state (Adopting — the storm body
-	// never echoes a cfgversion, so the assigned-key re-provisioning arc
-	// owns every cycle; Adopted if a settled noop raced last), and the
-	// seed cfgversion is long minted away by the effective saves.
-	d, err := st.Get(testMAC)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if d.XAuthkey != xk {
-		t.Fatalf("post-storm per-device key disturbed: %q (seed %q)", d.XAuthkey, xk)
-	}
-	if d.State != store.StateAdopted && d.State != store.StateAdopting {
-		t.Fatalf("post-storm record state %d, want an assigned-key-slot state", d.State)
-	}
-	if d.CfgVersion == cfg || !isHex(d.CfgVersion) {
-		t.Fatalf("post-storm record cfgversion %q (seed %q) unstamped", d.CfgVersion, cfg)
-	}
-}
-
-// decodeInformResponse is decryptResponse's worker-safe twin: decrypt and
-// JSON-decode a sealed response WITHOUT t.Fatal, for use inside fan-out
-// goroutines (their outcomes are collected by the test goroutine rather
-// than asserted mid-flight).
-func decodeInformResponse(respBody []byte, keyHex []byte) (map[string]any, error) {
-	pkt, perr := inform.ParsePacket(respBody)
-	if perr != nil {
-		return nil, fmt.Errorf("framing: %w", perr)
-	}
-	plain, derr := pkt.DecryptPayload(keyHex)
-	if derr != nil {
-		return nil, fmt.Errorf("decrypt: %w", derr)
-	}
-	var jm map[string]any
-	if err := json.Unmarshal(plain, &jm); err != nil {
-		return nil, fmt.Errorf("response json: %w", err)
-	}
-	return jm, nil
-}
-
-// ---- per-device SSH password E2E (the site password is REMOVED) ------------
+// ---- per-device SSH password E2E -------------------------------------------
 //
 // The per-device SSH password rides the device record's typed field
 // (PATCH /api/v1/devices/{mac}, admin intent); the site-settings record
@@ -871,7 +638,7 @@ func decodeInformResponse(respBody []byte, keyHex []byte) (map[string]any, error
 // provisioning arc (password changes are UNGATED — the §13 gate reads
 // key rows only).
 func sshPasswordFixture(t *testing.T) (admin, informH http.Handler, st store.DeviceStore) {
-	return siteSettingsFixture(t, app.SiteSettings{}, nil)
+	return lifecycleFixture(t)
 }
 
 // patchDevicePassword saves the per-device SSH password through the real

@@ -121,15 +121,11 @@ packet parser.
 the WLANs, and site facts. It reads nothing else and mutates nothing.
 _Avoid_: builder, emitter.
 
-**Site facts**: the controller-level inputs a render needs: controller URL,
-regulatory country code, the provisioned SSH public keys, and the current
-WLANs. (The site-level SSH password is REMOVED — the per-device SSH
-password rides the device record itself, not a site fact.) The two
-device-intent facts are record-sourced — persisted in the admin-owned
-site-settings record (keys as an ordered list of authorized_keys lines);
-controller URL and the WLANs stay outside it.
-_Avoid_: flag-sourced site facts (the flags are first-boot seeds only),
-re-seeding.
+**Site facts**: the controller-level inputs a render needs: controller URL
+and the current WLANs. Per-device admin intent — regulatory country code,
+SSH public keys (ordered authorized_keys lines), and SSH password — lives
+on the device record and is merged into system_cfg for that AP only.
+_Avoid_: site-settings record, flag-sourced device intent.
 
 **Provisioning plan**: the single value computed from a device and the
 wireless envelope that carries the drift hash, the vap placements, and the

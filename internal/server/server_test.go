@@ -302,19 +302,17 @@ func mustBuildSys(t *testing.T, s *Server, rec store.Device) string {
 // (Synthetic key: the same marker'd RFC 4253 blob the systemcfg package
 // tests use — never a real key.)
 func TestSiteFactsSSHConfigWiring(t *testing.T) {
-	pk, err := systemcfg.ParsePublicKey(
-		"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB test@ap")
-	if err != nil {
+	if _, err := systemcfg.ParsePublicKey(
+		"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB test@ap"); err != nil {
 		t.Fatal(err)
 	}
-	s := New(Config{
-		SiteSettings: func() (SiteSettings, error) {
-			return SiteSettings{SSHPublicKeys: []systemcfg.PublicKey{pk}}, nil
-		},
-	}, store.NewMemStore(), testLogger())
+	s := New(Config{}, store.NewMemStore(), testLogger())
 	// 1. unset-password render: the default row D, cached by the delta
 	// (mustBuildSys applies the deltas — the adapter stand-in).
 	rec := u7pg2Record()
+	rec.SSHPublicKeys = []string{
+		"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB test@ap",
+	}
 	rowD := users1PasswordRow(t, mustBuildSys(t, s, rec))
 	// 2. the record-password render: hunter2 must NOT self-verify against
 	// the default cache row, so the row regenerates — an identical row
@@ -418,29 +416,14 @@ func users1PasswordRow(t *testing.T, sys string) string {
 // factory-echo block
 // shape; this pins the SEAM: the live settings source introduces no bytes
 // of its own, and country 0 coerces to the 840 default on the way through.
-func TestSiteSettingsZeroRecordRendersByteIdentical(t *testing.T) {
+func TestDeviceUnsetCountryCoercesTo840(t *testing.T) {
 	rec := u7pg2Record()
-	// The nil source: the old flag-default path (all facts zero).
-	sysNil := mustBuildSys(t, New(Config{}, store.NewMemStore(), testLogger()), rec)
-	// The live closure over a ZERO-VALUE record: country 0 = unset, no
-	// keys, password login enabled; the zero record carries no ssh
-	// password (the per-device field), so the users.1 hash is the fresh
-	// factory-default "ubnt" row on both sides of the comparison.
-	sysZero := mustBuildSys(t, New(Config{
-		SiteSettings: func() (SiteSettings, error) { return SiteSettings{}, nil },
-	}, store.NewMemStore(), testLogger()), rec)
-	if sysNil != sysZero {
-		t.Fatalf("zero-value settings render must be byte-identical to the old flag-default render\n--- nil source ---\n%s\n--- zero record ---\n%s", sysNil, sysZero)
-	}
-	// The factory-echo sshd block shape, through the new seam: no
-	// sshd.auth.key rows at all, password login enabled, and the
-	// country 0→840 coercion (the same echo-block rows the renderer
-	// goldens pin).
+	sysZero := mustBuildSys(t, New(Config{}, store.NewMemStore(), testLogger()), rec)
 	if strings.Contains(sysZero, "sshd.auth.key.") {
-		t.Fatalf("zero-value settings must render no sshd.auth.key rows:\n%s", sysZero)
+		t.Fatalf("unset device keys must render no sshd.auth.key rows:\n%s", sysZero)
 	}
 	if !strings.Contains(sysZero, "sshd.auth.passwd=enabled\n") {
-		t.Fatalf("zero-value settings must keep password login enabled:\n%s", sysZero)
+		t.Fatalf("unset device must keep password login enabled:\n%s", sysZero)
 	}
 	for _, want := range []string{
 		"radio.countrycode=840\n",
@@ -448,21 +431,18 @@ func TestSiteSettingsZeroRecordRendersByteIdentical(t *testing.T) {
 		"radio.2.countrycode=840\n",
 	} {
 		if !strings.Contains(sysZero, want) {
-			t.Fatalf("country 0 must coerce to the 840 default at the server seam, missing %q:\n%s", want, sysZero)
+			t.Fatalf("country 0 must coerce to the 840 default at the render seam, missing %q:\n%s", want, sysZero)
 		}
 	}
 }
 
-// Country coercion across the new seam: the record's 0 = unset coerces to
-// the 840 default; a set code passes through verbatim.
-func TestSiteSettingsCountryCoercion(t *testing.T) {
-	rec := u7pg2Record()
+// Country coercion: the device record's 0 = unset coerces to the 840 default;
+// a set code passes through verbatim.
+func TestDeviceRegulatoryCountryCoercion(t *testing.T) {
 	render := func(cc int) string {
-		return mustBuildSys(t, New(Config{
-			SiteSettings: func() (SiteSettings, error) {
-				return SiteSettings{CountryCode: cc}, nil
-			},
-		}, store.NewMemStore(), testLogger()), rec)
+		rec := u7pg2Record()
+		rec.RegulatoryCountryCode = cc
+		return mustBuildSys(t, New(Config{}, store.NewMemStore(), testLogger()), rec)
 	}
 	sys0, sys276 := render(0), render(276)
 	if !strings.Contains(sys0, "radio.countrycode=840\n") {

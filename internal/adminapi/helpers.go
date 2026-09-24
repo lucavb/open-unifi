@@ -115,32 +115,22 @@ func requireToken(cfg Config, next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// ---- site settings validation -------------------------------------------
+// ---- per-device provisioning validation ---------------------------------
 
-// ValidateSiteSettings is the pre-backend fence for the site-settings save
-// (PUT /api/v1/site-settings): the SAME rule set the app verb enforces
-// (defense-in-depth — both layers validate, one rule set). Returns ""
-// when valid, else a short human message for the 400 body. The rules:
-//
-//   - regulatory_country_code: 0 = unset (the record's canonical
-//     persisted-first-boot default; the server seam renders it as 840) or
-//     an ISO 3166-1 numeric code 001..999 — the server.ValidateConfig
-//     range semantics;
-//   - every device_ssh_public_keys line through systemcfg.ParsePublicKey, the
-//     controller's single fail-closed RFC 4253 authorized_keys parser
-//     (structure check, not cryptography — the device's dropbear rejects a
-//     well-formed wrong key at first use). The FIRST failing line names
-//     itself in the 400. There is deliberately no list-size cap: the
-//     renderer emits one sshd.auth.key.<n> row family per line in slice
-//     order with no jar-cited bound (the RADIUS 4-slot cap has a wire
-//     reason; this list does not).
-func ValidateSiteSettings(doc *SiteSettingsDocument) string {
-	if code := doc.RegulatoryCountryCode; code != 0 && (code < 1 || code > 999) {
+// ValidateRegulatoryCountryCode returns "" when valid, else a 400 message.
+// 0 = unset (render default 840); otherwise ISO 3166-1 numeric 001..999.
+func ValidateRegulatoryCountryCode(code int) string {
+	if code != 0 && (code < 1 || code > 999) {
 		return fmt.Sprintf("regulatory country code must be an ISO 3166-1 numeric code from 001 to 999 (or 0 = unset), got %d", code)
 	}
-	for i, line := range doc.DeviceSSHPublicKeys {
+	return ""
+}
+
+// ValidateSSHPublicKeyLines validates each authorized_keys line.
+func ValidateSSHPublicKeyLines(lines []string) string {
+	for i, line := range lines {
 		if _, err := systemcfg.ParsePublicKey(line); err != nil {
-			return fmt.Sprintf("invalid Device SSH public key #%d: %v", i+1, err)
+			return fmt.Sprintf("invalid SSH public key #%d: %v", i+1, err)
 		}
 	}
 	return ""

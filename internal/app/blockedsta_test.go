@@ -122,7 +122,7 @@ func TestBlockedClientsPersistAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := New(st, filepath.Join(t.TempDir(), "site-settings.json"), SiteSettings{}, quietLogger())
+	a := New(st, quietLogger())
 	ctx := context.Background()
 	if _, err := a.CreateDevice(ctx, adminapi.DeviceUpsert{MAC: "aabbccddeeff"}); err != nil {
 		t.Fatal(err)
@@ -137,7 +137,7 @@ func TestBlockedClientsPersistAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a2 := New(st2, filepath.Join(t.TempDir(), "site-settings.json"), SiteSettings{}, quietLogger())
+	a2 := New(st2, quietLogger())
 	v, err := a2.ListBlockedClients(ctx, "aabbccddeeff")
 	if err != nil || len(v.Blocked) != 1 || v.Blocked[0] != "11:22:33:44:55:66" {
 		t.Fatalf("post-reopen list: %+v err=%v", v, err)

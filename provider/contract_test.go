@@ -16,6 +16,7 @@ func TestDeviceAndSiteSettingsRegistrationContract(t *testing.T) {
 	}
 	seenDevice := false
 	seenOldDevice := false
+	seenSiteSettings := false
 	for _, r := range resources {
 		var metadata resource.MetadataResponse
 		r.Metadata(context.Background(), resource.MetadataRequest{ProviderTypeName: "open-unifi"}, &metadata)
@@ -30,22 +31,21 @@ func TestDeviceAndSiteSettingsRegistrationContract(t *testing.T) {
 			if !attr.Optional || !attr.Sensitive {
 				t.Fatalf("device ssh_password flags = optional:%v sensitive:%v", attr.Optional, attr.Sensitive)
 			}
+			if _, ok := sr.Schema.Attributes["regulatory_country_code"]; !ok {
+				t.Fatal("device lacks regulatory_country_code")
+			}
+			if _, ok := sr.Schema.Attributes["ssh_public_keys"]; !ok {
+				t.Fatal("device lacks ssh_public_keys")
+			}
 		}
 		if metadata.TypeName == "open-unifi_access_point" {
 			seenOldDevice = true
 		}
 		if metadata.TypeName == "open-unifi_site_settings" {
-			if _, ok := sr.Schema.Attributes["device_ssh_public_keys"]; !ok {
-				t.Fatal("site settings lacks device_ssh_public_keys")
-			}
-			for _, name := range []string{"ap_ssh_public_keys", "ap_ssh_password"} {
-				if _, ok := sr.Schema.Attributes[name]; ok {
-					t.Fatalf("site settings still contains removed attribute %q", name)
-				}
-			}
+			seenSiteSettings = true
 		}
 	}
-	if !seenDevice || seenOldDevice {
-		t.Fatalf("device registration: new=%v old=%v", seenDevice, seenOldDevice)
+	if !seenDevice || seenOldDevice || seenSiteSettings {
+		t.Fatalf("device registration: new=%v old=%v site_settings=%v", seenDevice, seenOldDevice, seenSiteSettings)
 	}
 }

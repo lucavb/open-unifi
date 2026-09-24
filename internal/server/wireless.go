@@ -21,15 +21,3 @@ func (s *Server) wirelessForDevice(d store.Device) []Wlan {
 	}
 	return s.cfg.WirelessForDevice(d)
 }
-
-// currentSiteSettings resolves the configured site-settings source; nil
-// source ⇒ zero facts (the rendering defaults), mirroring wirelessForDevice.
-// A non-nil error is the REAL retained settings load error (a present-but-
-// unreadable/corrupt/invalid site-settings file): the render fails on it (no
-// record mutation, no emission).
-func (s *Server) currentSiteSettings() (SiteSettings, error) {
-	if s.cfg.SiteSettings == nil {
-		return SiteSettings{}, nil
-	}
-	return s.cfg.SiteSettings()
-}

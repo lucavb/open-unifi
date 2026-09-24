@@ -37,10 +37,6 @@ type fakeBackend struct {
 	factoryResetArmed []string
 	cmdEnqueued       []cmdEnqueue
 	byMAC             map[string]DeviceView
-	// Site-settings fixture: the fixed GET view plus the last PUT body
-	// recorded for routing/decode assertions (backend-not-called pins).
-	siteSettings        SiteSettingsView
-	lastSiteSettingsPut SiteSettingsDocument
 	// Blocked-set state (device MAC -> clients in the boundary-normalized
 	// colon-hex spelling) plus call recording for routing assertions.
 	blocked        map[string][]string
@@ -72,10 +68,6 @@ func newFakeBackend() *fakeBackend {
 		wireless: WlansEnvelope{Wlans: []Wlan{
 			{ID: "wlan-1", Name: "home", SSID: "home-net", Security: "wpa-p", Passphrase: "correct-horse", VLAN: 1, Enabled: true},
 		}},
-		siteSettings: SiteSettingsView{
-			RegulatoryCountryCode: 840,
-			DeviceSSHPublicKeys:   []string{testKeyEd25519Line},
-		},
 	}
 }
 
@@ -118,6 +110,12 @@ func (f *fakeBackend) PatchDevice(_ context.Context, mac string, p DevicePatch) 
 	}
 	if p.SSHPassword != nil {
 		d.SSHPassword = *p.SSHPassword // "", non-empty both ride through — mirroring the real adapter
+	}
+	if p.RegulatoryCountryCode != nil {
+		d.RegulatoryCountryCode = *p.RegulatoryCountryCode
+	}
+	if p.SSHPublicKeys != nil {
+		d.SSHPublicKeys = *p.SSHPublicKeys
 	}
 	f.byMAC[mac] = d
 	return d, nil
@@ -311,20 +309,7 @@ func (f *fakeBackend) AdoptPending(_ context.Context, mac string) (DeviceView, e
 	return DeviceView{}, fmt.Errorf("%w: %s", ErrNotFound, mac)
 }
 
-// Site-settings fixtures: the fake carries the fixed GET view and records
-// the last PUT body so route tests can pin the decoded document verbatim
-// and that rejected requests never reach the Backend.
 const testKeyEd25519Line = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB test@ap"
-
-func (f *fakeBackend) GetSiteSettings(context.Context) (SiteSettingsView, error) {
-	return f.siteSettings, nil
-}
-
-func (f *fakeBackend) PutSiteSettings(_ context.Context, doc SiteSettingsDocument) (SiteSettingsView, error) {
-	f.lastSiteSettingsPut = doc
-	f.siteSettings = SiteSettingsView(doc)
-	return f.siteSettings, nil
-}
 
 // radioPutCall records one per-radio intent mutation for assertions.
 type radioPutCall struct {
@@ -1419,6 +1404,31 @@ func TestPatchDeviceRoute(t *testing.T) {
 	}
 }
 
+// TestPatchDeviceSSHIntentRoute covers per-device regulatory country and SSH
+// public keys on PATCH /api/v1/devices/{mac}.
+func TestPatchDeviceSSHIntentRoute(t *testing.T) {
+	be := newFakeBackend()
+	h := New(Config{}, be)
+	req := httptest.NewRequest("PATCH", "/api/v1/devices/f0:9f:c2:84:8f:2a",
+		strings.NewReader(`{"regulatory_country_code":276,"ssh_public_keys":["`+testKeyEd25519Line+`"]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("patch: %d %q", rec.Code, rec.Body.String())
+	}
+	var dv DeviceView
+	if err := json.Unmarshal(rec.Body.Bytes(), &dv); err != nil || dv.RegulatoryCountryCode != 276 || len(dv.SSHPublicKeys) != 1 {
+		t.Fatalf("response: %+v err=%v", dv, err)
+	}
+	req = httptest.NewRequest("PATCH", "/api/v1/devices/f0:9f:c2:84:8f:2a",
+		strings.NewReader(`{"ssh_public_keys":["not-a-key"]}`))
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid key: %d %q", rec.Code, rec.Body.String())
+	}
+}
+
 // TestPatchDeviceLEDOverrideRoute covers the per-device LED override on
 // PATCH /api/v1/devices/{mac}: the three §2 states round-trip ("default" is
 // the explicit clear → the view omits the field), an invalid enum value is
@@ -2379,230 +2389,4 @@ func TestDeviceClientsRoute(t *testing.T) {
 	if rec2.Code != http.StatusUnauthorized {
 		t.Fatalf("no token: %d, want 401", rec2.Code)
 	}
-}
-
-// ---- site settings routes ---------------------------------------------------
-
-const testKeyRSALine = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB second@ap"
-
-// siteSettingsBody renders a strict whole-document PUT body; a nil field
-// name drops that key (the missing-field decode cases use that).
-func siteSettingsBody(missing string) string {
-	m := map[string]any{
-		"regulatory_country_code": 840,
-		"device_ssh_public_keys":  []string{testKeyEd25519Line, testKeyRSALine},
-	}
-	if missing != "" {
-		delete(m, missing)
-	}
-	b, err := json.Marshal(m)
-	if err != nil {
-		panic(err)
-	}
-	return string(b)
-}
-
-// TestSiteSettingsGetHappy pins the GET wire shape: 200 with the exact
-// snake_case view body the Backend's read model defines (the provider's
-// drift detection decodes this document).
-func TestSiteSettingsGetHappy(t *testing.T) {
-	run(t, testCase{
-		name: "GET site settings", method: "GET", path: "/api/v1/site-settings",
-		want: http.StatusOK,
-		checks: func(t *testing.T, _ *fakeBackend, rec *httptest.ResponseRecorder) {
-			t.Helper()
-			want := `{"regulatory_country_code":840,"device_ssh_public_keys":["` +
-				testKeyEd25519Line + `"]}` + "\n"
-			if rec.Body.String() != want {
-				t.Fatalf("body = %q, want %q", rec.Body.String(), want)
-			}
-		},
-	})
-}
-
-// TestSiteSettingsPutHappy pins the whole-document PUT: all three fields
-// decode verbatim into the Backend document and the response echoes the
-// projected view.
-func TestSiteSettingsPutHappy(t *testing.T) {
-	run(t, testCase{
-		name: "PUT site settings", method: "PUT", path: "/api/v1/site-settings",
-		body: siteSettingsBody(""),
-		want: http.StatusOK,
-		checks: func(t *testing.T, be *fakeBackend, rec *httptest.ResponseRecorder) {
-			t.Helper()
-			got := be.lastSiteSettingsPut
-			if got.RegulatoryCountryCode != 840 ||
-				len(got.DeviceSSHPublicKeys) != 2 || got.DeviceSSHPublicKeys[0] != testKeyEd25519Line ||
-				got.DeviceSSHPublicKeys[1] != testKeyRSALine {
-				t.Fatalf("backend document: %+v", got)
-			}
-			m := decodeJSON(t, rec)
-			if m["regulatory_country_code"] != float64(840) {
-				t.Fatalf("view body: %v", m)
-			}
-			if _, stale := m["ap_ssh_password"]; stale {
-				t.Fatalf("removed site password field echoed back: %v", m)
-			}
-			keys, ok := m["device_ssh_public_keys"].([]any)
-			if !ok || len(keys) != 2 || keys[0] != testKeyEd25519Line {
-				t.Fatalf("view keys: %v", m["device_ssh_public_keys"])
-			}
-		},
-	})
-}
-
-// TestSiteSettingsPutMissingField pins the whole-document decode: EVERY
-// field is required; a partial body 400s with "missing field <name>"
-// BEFORE the Backend runs (never an implicit zero write).
-func TestSiteSettingsPutMissingField(t *testing.T) {
-	for _, missing := range []string{"regulatory_country_code", "device_ssh_public_keys"} {
-		run(t, testCase{
-			name: "PUT site settings missing " + missing, method: "PUT", path: "/api/v1/site-settings",
-			body: siteSettingsBody(missing),
-			want: http.StatusBadRequest,
-			checks: func(t *testing.T, be *fakeBackend, rec *httptest.ResponseRecorder) {
-				t.Helper()
-				m := decodeJSON(t, rec)
-				if m["error"] != "missing field "+missing {
-					t.Fatalf("error = %v, want missing field %s", m["error"], missing)
-				}
-				if !siteSettingsDocZero(be.lastSiteSettingsPut) {
-					t.Fatalf("backend called on missing field: %+v", be.lastSiteSettingsPut)
-				}
-			},
-		})
-	}
-}
-
-// TestSiteSettingsPutValidation pins the pre-backend fence: the same rule
-// set the app verb enforces 400s here BEFORE the Backend is called.
-func TestSiteSettingsPutValidation(t *testing.T) {
-	cases := []struct {
-		name    string
-		body    string
-		wantMsg string
-	}{
-		{
-			name:    "invalid key line",
-			body:    `{"regulatory_country_code":840,"device_ssh_public_keys":["not-a-key-line"]}`,
-			wantMsg: "invalid Device SSH public key #1",
-		},
-		{
-			name:    "country out of range high",
-			body:    `{"regulatory_country_code":1000,"device_ssh_public_keys":[]}`,
-			wantMsg: "regulatory country code must be an ISO 3166-1 numeric code from 001 to 999",
-		},
-		{
-			name:    "country out of range low",
-			body:    `{"regulatory_country_code":-7,"device_ssh_public_keys":[]}`,
-			wantMsg: "regulatory country code must be an ISO 3166-1 numeric code from 001 to 999",
-		},
-		{
-			// The removed knob's wire name must now be rejected as an
-			// unknown field (DisallowUnknownFields) — the strict decoder
-			// never lets a stale client send it.
-			name:    "removed disable knob is an unknown field",
-			body:    `{"regulatory_country_code":840,"device_ssh_public_keys":[],"ap_ssh_disable_password":false}`,
-			wantMsg: "invalid JSON body",
-		},
-		{
-			// The REMOVED SITE PASSWORD's HISTORICAL wire name must
-			// likewise be an unknown field 400 (Phase A wire removal):
-			// old provider binaries still PUTting `ap_ssh_password` (the
-			// GHCR-era site wire key; `device_ssh_password` never
-			// existed) are rejected before the Backend runs, mirroring
-			// the removed-disable-field pin at its side.
-			name:    "removed site password field is an unknown field",
-			body:    `{"regulatory_country_code":840,"device_ssh_public_keys":[],"ap_ssh_password":"s3cret"}`,
-			wantMsg: "invalid JSON body",
-		},
-	}
-	for _, tc := range cases {
-		run(t, testCase{
-			name: tc.name, method: "PUT", path: "/api/v1/site-settings",
-			body: tc.body,
-			want: http.StatusBadRequest,
-			checks: func(t *testing.T, be *fakeBackend, rec *httptest.ResponseRecorder) {
-				t.Helper()
-				m := decodeJSON(t, rec)
-				msg, _ := m["error"].(string)
-				if !strings.Contains(msg, tc.wantMsg) {
-					t.Fatalf("error = %q, want containing %q", msg, tc.wantMsg)
-				}
-				if !siteSettingsDocZero(be.lastSiteSettingsPut) {
-					t.Fatalf("backend called on invalid document: %+v", be.lastSiteSettingsPut)
-				}
-			},
-		})
-	}
-}
-
-// TestSiteSettingsPutBadBody pins the strict decode behavior: malformed
-// JSON, unknown fields, and trailing data all 400 with the same body error
-// the other routes emit (readJSON: DisallowUnknownFields + size cap).
-func TestSiteSettingsPutBadBody(t *testing.T) {
-	cases := []struct {
-		name string
-		body string
-	}{
-		{name: "malformed JSON", body: `{"regulatory_country_code": 840`},
-		{name: "unknown field", body: `{"regulatory_country_code":840,"device_ssh_public_keys":[],"extra":1}`},
-		{name: "removed disable knob is now unknown", body: `{"regulatory_country_code":840,"device_ssh_public_keys":[],"ap_ssh_disable_password":false}`},
-		{name: "removed site password field is still unknown", body: `{"regulatory_country_code":840,"device_ssh_public_keys":[],"ap_ssh_password":""}`},
-		{name: "trailing data", body: siteSettingsBody("") + ` {}`},
-		{name: "null field counts as missing", body: `{"regulatory_country_code":null,"device_ssh_public_keys":[]}`},
-	}
-	for _, tc := range cases {
-		run(t, testCase{
-			name: tc.name, method: "PUT", path: "/api/v1/site-settings",
-			body: tc.body,
-			want: http.StatusBadRequest,
-			checks: func(t *testing.T, be *fakeBackend, rec *httptest.ResponseRecorder) {
-				t.Helper()
-				m := decodeJSON(t, rec)
-				if m["error"] != "invalid JSON body" && m["error"] != "missing field regulatory_country_code" {
-					t.Fatalf("error = %v", m["error"])
-				}
-				if !siteSettingsDocZero(be.lastSiteSettingsPut) {
-					t.Fatalf("backend called on bad body: %+v", be.lastSiteSettingsPut)
-				}
-			},
-		})
-	}
-}
-
-// TestSiteSettingsRoutesRequireToken pins the auth posture: both site
-// settings routes sit behind requireToken like every other /api route
-// (GETs are NOT exempt).
-func TestSiteSettingsRoutesRequireToken(t *testing.T) {
-	for _, tc := range []struct {
-		method, path, body string
-	}{
-		{"GET", "/api/v1/site-settings", ""},
-		{"PUT", "/api/v1/site-settings", siteSettingsBody("")},
-	} {
-		run(t, testCase{
-			name: tc.method + " " + tc.path, method: tc.method, path: tc.path,
-			token: "s3cret",
-			body:  tc.body,
-			want:  http.StatusUnauthorized,
-			checks: func(t *testing.T, _ *fakeBackend, rec *httptest.ResponseRecorder) {
-				t.Helper()
-				m := decodeJSON(t, rec)
-				if m["error"] != "unauthorized" {
-					t.Fatalf("error = %v, want unauthorized", m["error"])
-				}
-				if rec.Header().Get("WWW-Authenticate") == "" {
-					t.Fatalf("missing WWW-Authenticate header")
-				}
-			},
-		})
-	}
-}
-
-// siteSettingsDocZero reports the untouched fakeBackend PUT record (the
-// default zero document) — the "backend NOT called" pin of the rejection
-// tests.
-func siteSettingsDocZero(d SiteSettingsDocument) bool {
-	return d.RegulatoryCountryCode == 0 && d.DeviceSSHPublicKeys == nil
 }

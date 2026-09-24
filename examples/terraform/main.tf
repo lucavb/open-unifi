@@ -45,6 +45,8 @@ resource "open-unifi_device" "attic" {
   mac  = "78:8a:20:11:22:33"
   name = "attic-ap"
   # site_id defaults to "default"
+  regulatory_country_code = 840
+  # ssh_public_keys = ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI… admin@workstation"]
 }
 
 # --- One secure wlan (wpa-p on a tagged vlan) ------------------------------

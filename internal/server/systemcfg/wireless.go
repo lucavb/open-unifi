@@ -100,7 +100,7 @@ func (rd *render) emitWirelessCfg(b *strings.Builder, plan wireless.Provisioning
 	// override from site settings we do not carry yet → "disabled".
 	b.WriteString("# wlans (radio)\n")
 	line("radio.status", "enabled")
-	line("radio.countrycode", strconv.Itoa(rd.facts.CountryCode))
+	line("radio.countrycode", strconv.Itoa(rd.countryCode))
 	line("aaa.status", "enabled")
 	line("wireless.status", "enabled")
 	line("radio.outdoor", "disabled")
@@ -115,7 +115,7 @@ func (rd *render) emitWirelessCfg(b *strings.Builder, plan wireless.Provisioning
 		line(prefix+"acktimeout", "64")
 		line(prefix+"ampdu.status", "enabled")
 		line(prefix+"clksel", "1")
-		line(prefix+"countrycode", strconv.Itoa(rd.facts.CountryCode))
+		line(prefix+"countrycode", strconv.Itoa(rd.countryCode))
 		line(prefix+"cwm.enable", "0")
 		line(prefix+"cwm.mode", "0")
 		line(prefix+"forbiasauto", "0")

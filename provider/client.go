@@ -202,7 +202,9 @@ type device struct {
 	// echo ("" = unmanaged). Wire-decode only for now: the schema
 	// attribute lands with the provider device-rename phase; parity with
 	// the server structs is the only contract (TestDeviceStructParity).
-	SSHPassword string `json:"ssh_password,omitempty"`
+	SSHPassword           string   `json:"ssh_password,omitempty"`
+	RegulatoryCountryCode int      `json:"regulatory_country_code,omitempty"`
+	SSHPublicKeys         []string `json:"ssh_public_keys,omitempty"`
 }
 
 // stateNames maps the server's numeric device states (internal/store
@@ -295,46 +297,6 @@ func (c *apiClient) updateWireless(ctx context.Context, mac, name string, entry 
 
 func (c *apiClient) deleteWireless(ctx context.Context, mac, name string) error {
 	return c.do(ctx, http.MethodDelete, c.deviceWirelessBase(mac)+"/"+url.PathEscape(name), nil, nil)
-}
-
-// siteSettings is the wire shape of GET/PUT /api/v1/site-settings
-// (adminapi.SiteSettingsDocument/SiteSettingsView). Both fields are
-// ALWAYS on the wire, so neither carries omitempty: PUT is whole-document
-// (the strict server decode rejects a missing/null field with a 400
-// "missing field <name>") and the GET view echoes both. An empty
-// device_ssh_public_keys marshals as [] — never null (a JSON null decodes
-// to a nil pointer server-side and trips the same missing-field 400).
-// (The historical `ap_ssh_password` field is OFF this wire: the site-level
-// password is removed server-side; the per-device SSH password rides the
-// device record instead — the schema attribute's removal/rename rides the
-// next provider phase, so a configured value simply stops reaching the
-// wire and read-back reads null.)
-type siteSettings struct {
-	RegulatoryCountryCode int      `json:"regulatory_country_code"`
-	DeviceSSHPublicKeys   []string `json:"device_ssh_public_keys"`
-}
-
-// getSiteSettings GETs /api/v1/site-settings. The controller carries
-// exactly one site-settings record and it ALWAYS serves — GET never 404s.
-func (c *apiClient) getSiteSettings(ctx context.Context) (*siteSettings, error) {
-	var out siteSettings
-	if err := c.do(ctx, http.MethodGet, "/api/v1/site-settings", nil, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
-
-// putSiteSettings PUTs the whole-document site-settings record and returns
-// the server's read view (already refreshed — an effective save re-stamps
-// cfgversion across provisioned devices Backend-side). No retry: PUT is
-// non-idempotent in effect (each effective save is a mint), per the
-// apiClient doc comment.
-func (c *apiClient) putSiteSettings(ctx context.Context, doc siteSettings) (*siteSettings, error) {
-	var out siteSettings
-	if err := c.do(ctx, http.MethodPut, "/api/v1/site-settings", doc, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
 }
 
 // whoami is a cheap health/auth probe: GET /api/v1/whoami. It always

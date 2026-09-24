@@ -16,7 +16,7 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
 FROM gcr.io/distroless/static-debian13:nonroot
 COPY --from=build /out/openunifi /openunifi
 # The JSON store lives in /data (devices.json, wireless.json,
-# site-settings.json). Pre-create it nonroot-owned so a named volume
+# devices.json). Pre-create it nonroot-owned so a named volume
 # initializes writable without a --user override; bind mounts need
 # `chown 65532:65532` on the host side.
 COPY --from=build --chown=65532:65532 /out/data /data

@@ -10,7 +10,19 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
+// deviceModelDefaults fills list/int optional attrs Terraform expects typed.
+func deviceModelDefaults(m deviceModel) deviceModel {
+	if !m.SSHPublicKeys.IsUnknown() && len(m.SSHPublicKeys.Elements()) == 0 {
+		m.SSHPublicKeys = types.ListNull(types.StringType)
+	}
+	if !m.RegulatoryCountryCode.IsUnknown() && m.RegulatoryCountryCode.IsNull() {
+		m.RegulatoryCountryCode = types.Int64Null()
+	}
+	return m
+}
+
 func deviceTestPlan(t *testing.T, m deviceModel) tfsdk.Plan {
+	m = deviceModelDefaults(m)
 	t.Helper()
 	r := &deviceResource{}
 	var sr resource.SchemaResponse
@@ -24,6 +36,7 @@ func deviceTestPlan(t *testing.T, m deviceModel) tfsdk.Plan {
 
 func deviceTestState(t *testing.T, m deviceModel) tfsdk.State {
 	t.Helper()
+	m = deviceModelDefaults(m)
 	r := &deviceResource{}
 	var sr resource.SchemaResponse
 	r.Schema(context.Background(), resource.SchemaRequest{}, &sr)

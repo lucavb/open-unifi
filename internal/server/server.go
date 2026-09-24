@@ -47,20 +47,6 @@ type Config struct {
 	// e.g. "http://10.0.0.5:8080".
 	ControllerURL string
 
-	// SiteSettings supplies the CURRENT site-settings record — the
-	// managed device-intent facts — at use time (the WirelessSource precedent:
-	// a live source closure, read per decision). renderSystemCfg calls it
-	// per inform, so a site-settings save is visible on the device's NEXT
-	// inform with no wiring refresh. nil ⇒ zero facts (the rendering
-	// defaults). The returned error is REAL (a present-but-unreadable/corrupt/invalid
-	// site-settings file retained by the app): renderSystemCfg propagates
-	// it as a render failure — no record mutation, no emission. The record stores
-	// RAW authorized_keys lines; the adapter closure parses them into
-	// SSHPublicKeys via systemcfg.ParsePublicKey at its single seam (in
-	// cmd/openunifi or the test fixtures — the server never imports the
-	// app package).
-	SiteSettings func() (SiteSettings, error)
-
 	// AllowPlainText permits unencrypted JSON inform bodies (classic
 	// controllers reject these unless pre-adoption plain text inform is on).
 	// Default false.
@@ -81,36 +67,13 @@ type Config struct {
 	OnSessionEvents func(deviceMAC string, connects, disconnects int)
 }
 
-// SiteSettings carries the MANAGED device-intent site facts the server
-// renders into system_cfg: the regulatory country code (0 = unset → the server-side 840
-// default at renderSystemCfg) and the PARSED authorized public keys. It
-// mirrors the app site-settings record (whose SSHPublicKeys are raw lines);
-// the raw→parsed conversion belongs to
-// the adapter closure, not the record. The per-device SSH password is NOT
-// among them — it rides the device record itself (store.Device.SSHPassword;
-// the renderer reads the field directly). The facts are managed content
-// (admin intent via the site-settings API); ControllerURL is NOT among them
-// — it stays a deployment input wired from Config.ControllerURL.
-type SiteSettings struct {
-	// CountryCode is the ISO 3166-1 numeric regulatory country code; 0 =
-	// unset (renders as the 840 default).
-	CountryCode int
-	// SSHPublicKeys are the parsed authorized public keys rendered into
-	// the sshd.auth.key.<n>.* rows (site fact; see systemcfg.PublicKey for
-	// the firmware evidence — the device rebuilds /etc/dropbear/authorized_keys
-	// from these rows on every boot/apply). Parsed from the record's raw
-	// lines by the settings-source closure (fail-closed single parser).
-	SSHPublicKeys []systemcfg.PublicKey
-}
-
-const DefaultRegulatoryCountryCode = 840
+// DefaultRegulatoryCountryCode is re-exported for callers that referenced
+// the server package constant; rendering uses systemcfg.DefaultRegulatoryCountryCode.
+const DefaultRegulatoryCountryCode = systemcfg.DefaultRegulatoryCountryCode
 
 // ValidateConfig validates values that affect device addressing or generated
 // configuration. ControllerURL may include a path (for deployments using a
 // reverse proxy), but must not include query, fragment, or userinfo.
-// (The regulatory country code check moved to the site-settings record:
-// app/site_settings.go validates it at save and at seed; the server coerces
-// the record's 0-unset to the 840 default at renderSystemCfg.)
 func ValidateConfig(cfg Config) error {
 	if cfg.ControllerURL != "" {
 		if err := validateBaseURL(cfg.ControllerURL, "controller URL"); err != nil {
@@ -846,23 +809,8 @@ func (s *Server) renderSystemCfg(d store.Device, wls []wireless.Wlan, plan wirel
 	if err := ValidateConfig(s.cfg); err != nil {
 		return "", nil, err
 	}
-	facts, serr := s.currentSiteSettings()
-	if serr != nil {
-		// The retained settings load error: fail the push here (FID-23
-		// doctrine — the cycle aborts, nothing was persisted), not with a
-		// silently-degraded config.
-		return "", nil, serr
-	}
-	country := facts.CountryCode
-	if country == 0 {
-		// R3: defense-in-depth — the record's 0 = unset renders as the
-		// compatibility value; the renderer takes the code verbatim.
-		country = DefaultRegulatoryCountryCode
-	}
 	res, err := systemcfg.RenderWithPlan(d, systemcfg.SiteFacts{
 		ControllerURL: s.cfg.ControllerURL,
-		CountryCode:   country,
-		SSHPublicKeys: facts.SSHPublicKeys,
 		WLANs:         wls,
 	}, plan)
 	if err != nil {

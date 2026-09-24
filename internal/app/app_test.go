@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -25,7 +24,7 @@ import (
 func testApp(t *testing.T) (*App, store.DeviceStore) {
 	t.Helper()
 	st := store.NewMemStore()
-	a := New(st, filepath.Join(t.TempDir(), "site-settings.json"), SiteSettings{}, quietLogger())
+	a := New(st, quietLogger())
 	return a, st
 }
 
@@ -388,6 +387,38 @@ func TestPatchDeviceSSHPassword(t *testing.T) {
 	}
 	if row != cacheRow {
 		t.Fatalf("render after clear must reuse the cached row verbatim: %q, want %q", row, cacheRow)
+	}
+}
+
+func TestPatchDeviceCountryAndSSHKeys(t *testing.T) {
+	a, st := testApp(t)
+	ctx := context.Background()
+	key := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB test@ap"
+	if err := st.Put(store.Device{MAC: "aabbccddeeff", State: store.StateAdopted, CfgVersion: "v1"}); err != nil {
+		t.Fatal(err)
+	}
+	cc := 276
+	dv, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{
+		RegulatoryCountryCode: chPtr(cc),
+		SSHPublicKeys:         &[]string{key},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dv.RegulatoryCountryCode != cc || len(dv.SSHPublicKeys) != 1 || dv.SSHPublicKeys[0] != key {
+		t.Fatalf("view: %+v", dv)
+	}
+	rec, err := st.Get("aabbccddeeff")
+	if err != nil || rec.RegulatoryCountryCode != cc || len(rec.SSHPublicKeys) != 1 || rec.CfgVersion == "v1" {
+		t.Fatalf("record: %+v err=%v", rec, err)
+	}
+	empty := []string{}
+	if _, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{SSHPublicKeys: &empty}); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ = st.Get("aabbccddeeff")
+	if len(rec.SSHPublicKeys) != 0 {
+		t.Fatalf("clear keys: %+v", rec.SSHPublicKeys)
 	}
 }
 

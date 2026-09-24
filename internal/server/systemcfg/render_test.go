@@ -662,7 +662,8 @@ func TestRadioIntentWinsOverEcho(t *testing.T) {
 // worked-example test through the handler).
 func TestRenderGolden(t *testing.T) {
 	rec := renderRecord()
-	res, err := Render(rec, SiteFacts{CountryCode: 840})
+	rec.RegulatoryCountryCode = 840
+	res, err := Render(rec, SiteFacts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -711,12 +712,13 @@ func TestRenderGolden(t *testing.T) {
 	for k, v := range res.CredentialDeltas {
 		recZero.Extra[k] = v
 	}
-	res0, err := Render(recZero, SiteFacts{CountryCode: 840})
+	recZero.RegulatoryCountryCode = 840
+	res0, err := Render(recZero, SiteFacts{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if res0.Text != sys {
-		t.Fatal("explicit CountryCode 840 must match the default-resolved render")
+		t.Fatal("explicit regulatory_country_code 840 must match the default-resolved render")
 	}
 	// Factory echo: connectivity/syslog/route/ntp/ebtails blocks.
 	echoBlock := "# connectivity\n" +
@@ -799,11 +801,12 @@ const (
 // row order (status/value/type per the String.txt:2849-2911 format strings,
 // comment last), 1-based index 1.
 func TestRenderSSHPublicKeySingle(t *testing.T) {
-	pk, err := ParsePublicKey(testKeyEd25519)
-	if err != nil {
+	if _, err := ParsePublicKey(testKeyEd25519); err != nil {
 		t.Fatal(err)
 	}
-	res, err := Render(renderRecord(), SiteFacts{SSHPublicKeys: []PublicKey{pk}})
+	rec := renderRecord()
+	rec.SSHPublicKeys = []string{testKeyEd25519}
+	res, err := Render(rec, SiteFacts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -824,15 +827,15 @@ func TestRenderSSHPublicKeySingle(t *testing.T) {
 
 // R5(b): two keys are numbered 1, 2 in slice order — no dedup, no resort.
 func TestRenderSSHPublicKeysTwoNumbered(t *testing.T) {
-	k1, err := ParsePublicKey(testKeyEd25519)
-	if err != nil {
+	if _, err := ParsePublicKey(testKeyEd25519); err != nil {
 		t.Fatal(err)
 	}
-	k2, err := ParsePublicKey(testKeyRSA)
-	if err != nil {
+	if _, err := ParsePublicKey(testKeyRSA); err != nil {
 		t.Fatal(err)
 	}
-	res, err := Render(renderRecord(), SiteFacts{SSHPublicKeys: []PublicKey{k1, k2}})
+	rec := renderRecord()
+	rec.SSHPublicKeys = []string{testKeyEd25519, testKeyRSA}
+	res, err := Render(rec, SiteFacts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -853,11 +856,12 @@ func TestRenderSSHPublicKeysTwoNumbered(t *testing.T) {
 // name is the index), so dedup at the controller would silently drop a
 // deliberately repeated key entry.
 func TestRenderSSHPublicKeysIdenticalNoDedup(t *testing.T) {
-	k, err := ParsePublicKey(testKeyEd25519)
-	if err != nil {
+	if _, err := ParsePublicKey(testKeyEd25519); err != nil {
 		t.Fatal(err)
 	}
-	res, err := Render(renderRecord(), SiteFacts{SSHPublicKeys: []PublicKey{k, k}})
+	rec := renderRecord()
+	rec.SSHPublicKeys = []string{testKeyEd25519, testKeyEd25519}
+	res, err := Render(rec, SiteFacts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -874,11 +878,13 @@ func TestRenderSSHPublicKeysIdenticalNoDedup(t *testing.T) {
 // R5(c): a commentless key emits NO comment row (the firmware's three-field
 // line writer only sees type+value).
 func TestRenderSSHPublicKeyNoCommentOmitsRow(t *testing.T) {
-	pk, err := ParsePublicKey("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB")
-	if err != nil {
+	commentless := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3RrZXlBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB"
+	if _, err := ParsePublicKey(commentless); err != nil {
 		t.Fatal(err)
 	}
-	res, err := Render(renderRecord(), SiteFacts{SSHPublicKeys: []PublicKey{pk}})
+	rec := renderRecord()
+	rec.SSHPublicKeys = []string{commentless}
+	res, err := Render(rec, SiteFacts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -965,11 +971,10 @@ func TestRenderSSHPasswdAlwaysEnabled(t *testing.T) {
 	} {
 		rec := renderRecord()
 		rec.SSHPassword = pw
-		var facts SiteFacts
 		if label == "record w/ key" {
-			facts.SSHPublicKeys = []PublicKey{{Type: "ssh-ed25519", Value: "AAAA"}}
+			rec.SSHPublicKeys = []string{testKeyEd25519}
 		}
-		res, err := Render(rec, facts)
+		res, err := Render(rec, SiteFacts{})
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -270,6 +270,7 @@ func TestTrustRegistrySnapshot(t *testing.T) {
 		"ssh_sha512passwd", "ssh_md5passwd",
 		"led_override", "disabled", "led_override_color_brightness",
 		"led_override_color", "ssh_password",
+		"regulatory_country_code", "ssh_public_keys",
 		"radio_intent", "device_wlans", "cmd_task",
 	}
 	sweep := []string{

@@ -25,7 +25,6 @@ import (
 	"github.com/lucavb/open-unifi/internal/app"
 	"github.com/lucavb/open-unifi/internal/metrics"
 	"github.com/lucavb/open-unifi/internal/server"
-	"github.com/lucavb/open-unifi/internal/server/systemcfg"
 	"github.com/lucavb/open-unifi/internal/store"
 	"github.com/lucavb/open-unifi/internal/telemetry"
 
@@ -44,11 +43,8 @@ func run() error {
 	listenAdmin := flag.String("listen-admin", "127.0.0.1:8443", "listen address for the admin API server")
 	listenDiscovery := flag.String("listen-discovery", ":10001", "UDP listen address for discovery")
 	discovery := flag.Bool("discovery", true, "enable the UDP discovery listener")
-	dataDir := flag.String("data-dir", "data", "directory for devices.json / site-settings.json")
+	dataDir := flag.String("data-dir", "data", "directory for devices.json")
 	controllerURL := flag.String("controller-url", "", "base URL devices are pointed at during adoption (e.g. http://10.0.0.5:8080)")
-	regulatoryCountryCode := flag.Int("regulatory-country-code", server.DefaultRegulatoryCountryCode, "ISO 3166-1 numeric regulatory country code (001-999); first-boot seed only — managed at runtime via the site-settings API")
-	deviceSSHKeys := &keyList{}
-	flag.Var(deviceSSHKeys, "device-ssh-key", "LAB ONLY: SSH authorized public key for adopted devices, one authorized_keys line per flag (repeatable; falls back to a single $OPEN_UNIFI_DEVICE_SSH_KEY); first-boot seed only — managed at runtime via the site-settings API. Parsed and validated fail-closed at startup; provisioned as sshd.auth.key.<n>.* rows (docs/PROTOCOL-systemcfg-wireless.md §13)")
 	// Default from the provider's token env var; --admin-token overrides it.
 	adminToken := flag.String("admin-token", os.Getenv("OPEN_UNIFI_ADMIN_TOKEN"),
 		"admin API bearer token (required; defaults to $OPEN_UNIFI_ADMIN_TOKEN)")
@@ -63,37 +59,6 @@ func run() error {
 	flag.Parse()
 	if err := validateAdminExposure(*listenAdmin, *adminToken, *allowAnonymousAdmin, *allowInsecureAdmin); err != nil {
 		return err
-	}
-	// settingsExisted reports whether a site-settings record was already on
-	// disk BEFORE app.New runs. Both the seed-flag guards below and the
-	// ignored-flags warn are conditioned on this pre-New determination:
-	// app.New seeds AND persists the record inside the call, and a post-New
-	// stat could never tell a preexisting record apart from the one this
-	// boot just wrote. A missing file (first boot, including the
-	// deleted-file re-seed flow — app.New treats a missing file as first
-	// boot) stats ENOENT → false. A non-ENOENT stat error also counts as
-	// false, conservative: the guards stay on and any real file problem
-	// surfaces via loadSettingsFile/CurrentSiteSettings startup refusal.
-	_, settingsStatErr := os.Stat(filepath.Join(*dataDir, "site-settings.json"))
-	settingsExisted := settingsStatErr == nil
-	// Seed-flag validation posture: on FIRST BOOT (!settingsExisted) the
-	// seed flags are validated fail-closed — the key lines by app.New's
-	// seed validation (the single parser), an explicit
-	// --regulatory-country-code 0 by the guard further down. Once the
-	// record exists the flags are dead
-	// seeds: warned as ignored (below), never validated — one consistent
-	// posture for every equally-dead input. app's seed validation applies
-	// the same save-verb rule (the seed is admin intent).
-	sshSeedKeys := effectiveSSHKeyLines(deviceSSHKeys.keys, os.Getenv("OPEN_UNIFI_DEVICE_SSH_KEY"))
-	if !settingsExisted {
-		// The flag default is nonzero, so a zero here can only come from an
-		// explicitly supplied --regulatory-country-code 0. Reject it before the
-		// server-side coercion silently maps 0 to the 840 default. Once the
-		// record exists ALL flag values (including 0 and out-of-range ones
-		// such as 1000) are dead seeds — warned as ignored, never validated.
-		if err := validateRegulatoryCountryCode(*regulatoryCountryCode); err != nil {
-			return err
-		}
 	}
 	if err := server.ValidateConfig(server.Config{ControllerURL: *controllerURL}); err != nil {
 		return fmt.Errorf("invalid configuration: %w", err)
@@ -144,35 +109,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("open device store: %w", err)
 	}
-	backend := app.New(st, filepath.Join(*dataDir, "site-settings.json"), siteSettingsSeed(*regulatoryCountryCode, sshSeedKeys), logger)
-	// Same discipline for the site-settings record: a present-but-bad
-	// file (or a failed first-boot seed persist) is retained as a REAL
-	// error in app.New and refuses the launch here. On first boot the
-	// flags seeded it — the flags' values already passed the validators
-	// above, so this check is the belt to their suspenders. The loaded
-	// record is also the single source of truth for the startup log and
-	// the sshd-facts warn below (the flags are seeds only).
-	siteSettings, serr := backend.CurrentSiteSettings()
-	if serr != nil {
-		return fmt.Errorf("site settings: %w", serr)
-	}
-	// One-time warn on the REMOVED password env — the HISTORICAL name
-	// (GHCR-era deploys export it; OPEN_UNIFI_DEVICE_SSH_PASSWORD never
-	// existed): a deployer still exporting the dead site password env must
-	// learn where the knob went. The per-device SSH password has no env at
-	// all — it is per-device admin intent via PATCH /api/v1/devices/{mac}.
-	if os.Getenv("OPEN_UNIFI_AP_SSH_PASSWORD") != "" {
-		logger.Warn("OPEN_UNIFI_AP_SSH_PASSWORD is no longer read; per-device SSH passwords are set via PATCH /api/v1/devices/{mac} (Terraform open-unifi_device)")
-	}
-	// The device-intent inputs are first-boot seeds only. Warn that they
-	// were ignored ONLY when a record existed before this boot (the pre-New
-	// settingsExisted determination — after app.New the file always exists,
-	// because the call seeds and persists it) AND at least one flag was
-	// actually supplied. On the seeding first boot the flags were honored:
-	// the default flow is the happy path, not a warning.
-	if siteIntentSupplied() && settingsExisted {
-		logger.Warn("site settings exist; --regulatory-country-code/--device-ssh-key ignored (first-boot seeds only — managed at runtime via the site-settings API)")
-	}
+	backend := app.New(st, logger)
 	adminH := adminapi.New(adminapi.Config{AdminToken: *adminToken}, backend)
 
 	if *allowAnonymousAdmin {
@@ -188,39 +125,6 @@ func run() error {
 		return app.DeviceWLANs(d)
 	}
 
-	// SiteSettingsSource feeds the app's site-settings record into inform-
-	// side provisioning (the managed device-intent facts) and into the
-	// adoption engine's live-provisioning gate. The record stores RAW
-	// authorized_keys lines; this seam is where the parse lands — every
-	// line through the single fail-closed parser (systemcfg.ParsePublicKey),
-	// same as the app did at seed and at every save (a line that reached the
-	// record unvalidated would be a trust-policy breach, not a parse-time
-	// concern here). The closure reads the record LIVE per call, so a
-	// site-settings save is visible on the device's next inform. On a load
-	// error the error propagates: the render fails before anything
-	// persists (the store cycle aborts — in-memory record writes are
-	// discarded with it), and the gate reads zero facts and stays inert
-	// (net fail-closed — startup already refused on this error, so it is
-	// embedder-only).
-	siteSettingsSource := func() (server.SiteSettings, error) {
-		rec, err := backend.CurrentSiteSettings()
-		if err != nil {
-			return server.SiteSettings{}, err
-		}
-		keys := make([]systemcfg.PublicKey, 0, len(rec.SSHPublicKeys))
-		for i, line := range rec.SSHPublicKeys {
-			k, perr := systemcfg.ParsePublicKey(line)
-			if perr != nil {
-				return server.SiteSettings{}, fmt.Errorf("invalid Device SSH public key #%d: %w", i+1, perr)
-			}
-			keys = append(keys, k)
-		}
-		return server.SiteSettings{
-			CountryCode:   rec.CountryCode,
-			SSHPublicKeys: keys,
-		}, nil
-	}
-
 	srv := server.New(server.Config{
 		InformListenAddr:  *listenInform,
 		DiscoveryListen:   *discovery,
@@ -228,7 +132,6 @@ func run() error {
 		ControllerURL:     *controllerURL,
 		AllowPlainText:    *allowPlainText,
 		WirelessForDevice: wirelessForDevice,
-		SiteSettings:      siteSettingsSource,
 		// Client-session transition observations ride the same ownership
 		// seam as IncInform: the transport stays Prometheus-free and main
 		// wires the hook (post-commit, exactly-once per persisted
@@ -341,11 +244,6 @@ func run() error {
 		"discovery", *discovery,
 		"discovery_port", dport,
 		"data_dir", *dataDir,
-		// The site facts are the RECORD's values now (the flags seeded it on
-		// first boot and are ignored thereafter). (The per-device SSH
-		// password left the site record — no site-level
-		// ssh_password_configured signal exists anymore.)
-		"ssh_public_keys", len(siteSettings.SSHPublicKeys),
 		"auth", *adminToken != "",
 		"plaintext_inform", *allowPlainText,
 		"controller_url", *controllerURL,
@@ -419,76 +317,6 @@ func run() error {
 // shutdownCtx yields the bounded 5s graceful-drain context (caller cancels).
 func shutdownCtx() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), 5*time.Second)
-}
-
-// keyList is a REPEATABLE flag.Value: every --device-ssh-key occurrence appends
-// one authorized_keys line. The env fallback ($OPEN_UNIFI_DEVICE_SSH_KEY, a
-// single key) consults the environment — passed in by run() AFTER
-// flag.Parse so this stays pure — only when the flag never appeared, so an
-// explicitly supplied flag wins over the environment (the same posture as
-// every other seed flag).
-type keyList struct {
-	keys []string
-}
-
-func (l *keyList) String() string { return strings.Join(l.keys, "\n") }
-
-func (l *keyList) Set(v string) error {
-	l.keys = append(l.keys, v)
-	return nil
-}
-
-// siteSettingsSeed builds the first-boot site-settings seed from the
-// device-intent flags. The key lines are passed RAW (the composition ran above
-// through effectiveSSHKeyLines; app.New runs the single fail-closed parser;
-// nothing is pre-parsed here). The saved record preserves what the flags
-// say, verbatim: on the first-boot path main's pre-New seed-flag guards
-// (explicit-0 country rejection) and app.New's seed validation (the
-// save-verb rule, key parse among them) already gated this boot. Once the
-// record exists the flags are dead seeds and this value is ignored by
-// app.New anyway.
-func siteSettingsSeed(countryCode int, keys []string) app.SiteSettings {
-	return app.SiteSettings{
-		CountryCode:   countryCode,
-		SSHPublicKeys: keys,
-	}
-}
-
-// effectiveSSHKeyLines is the flag/env source composition feeding the
-// first-boot SSH key seed (its single consumer): the flag occurrences win;
-// the env fallback ($OPEN_UNIFI_DEVICE_SSH_KEY, a single key line) supplies
-// only when the flag never appeared — an explicitly supplied flag wins
-// over the environment.
-func effectiveSSHKeyLines(flagKeys []string, envValue string) []string {
-	keys := flagKeys
-	if len(keys) == 0 && envValue != "" {
-		return []string{envValue}
-	}
-	return keys
-}
-
-// siteIntentSupplied reports whether at least one of the device-intent
-// inputs was explicitly supplied — the seed the "site settings exist"
-// warning actually refers to. Two sources count: flag.Visit over the
-// flag names (explicit occurrences on the command line), and the env
-// fallback $OPEN_UNIFI_DEVICE_SSH_KEY — those feed
-// the flag DEFAULTS, so flag.Visit alone misses them. Must run AFTER
-// flag.Parse (flag.Visit walks parsed flags).
-func siteIntentSupplied() bool {
-	names := map[string]bool{
-		"regulatory-country-code": true,
-		"device-ssh-key":          true,
-	}
-	supplied := false
-	flag.Visit(func(f *flag.Flag) {
-		if names[f.Name] {
-			supplied = true
-		}
-	})
-	if os.Getenv("OPEN_UNIFI_DEVICE_SSH_KEY") != "" {
-		supplied = true
-	}
-	return supplied
 }
 
 // drainShutdown tears both HTTP servers down with a fresh 5s deadline.
@@ -567,19 +395,6 @@ func discoveryPort(addr string) (host string, port int, err error) {
 		return "", 0, errors.New("want numeric UDP port, got " + p)
 	}
 	return host, n, nil
-}
-
-// validateRegulatoryCountryCode rejects an explicitly supplied 0 before the
-// server-side coercion would silently map it to the 840 default; the flag
-// default is nonzero, so a zero here always means the user passed 0.
-// Called only on the first-boot seed path (no site-settings record yet);
-// once the record exists every flag value is a dead seed — warned as
-// ignored, never validated.
-func validateRegulatoryCountryCode(code int) error {
-	if code == 0 {
-		return errors.New("--regulatory-country-code 0 is not a valid ISO 3166-1 numeric code; omit the flag to use the default")
-	}
-	return nil
 }
 
 func validateAdminExposure(addr, token string, anonymous, insecure bool) error {

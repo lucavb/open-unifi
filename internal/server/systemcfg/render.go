@@ -22,32 +22,14 @@ import (
 	"github.com/lucavb/open-unifi/internal/wireless"
 )
 
-// SiteFacts are the controller-level inputs a render needs (CONTEXT.md:
-// site facts): controller URL, regulatory country code, the provisioned
-// SSH public keys, and the current WLANs. The per-device SSH password is
-// NOT a site fact — it rides the device record itself (store.Device
-// .SSHPassword, the admin-owned typed field).
+// SiteFacts are the per-render inputs that are not read from the device
+// record: controller URL and the WLAN envelope snapshot. Regulatory
+// country, SSH public keys, and SSH password come from store.Device.
 type SiteFacts struct {
 	// ControllerURL is the configured controller base URL. Empty means
 	// "not overridden" (nothing in system_cfg derives from it today; it is
 	// carried for symmetry with the site-facts definition and future rows).
 	ControllerURL string
-
-	// CountryCode is the regulatory country code used for the radio rows,
-	// already resolved by the caller (zero is not defaulted here — the
-	// caller maps its configured zero to the compatibility default before
-	// building the facts).
-	CountryCode int
-
-	// SSHPublicKeys are the site's authorized public keys, rendered as the
-	// sshd.auth.key.<n>.* rows (1-based, slice order, no dedup). Zero keys
-	// emit zero rows. The firmware rebuilds /etc/dropbear/authorized_keys
-	// from these rows on every boot/apply, so keys pushed here survive
-	// where a manually written file is wiped (see sshkey.go for the
-	// firmware evidence). NOT yet live-bench-validated — a live-validated
-	// apply is owed before the rows are treated as trusted
-	// (docs/PROTOCOL-systemcfg-wireless.md §13).
-	SSHPublicKeys []PublicKey
 
 	// WLANs is the current WLAN envelope (the engine's per-decision
 	// snapshot, so the drift hash and the rendered config always agree).
@@ -99,13 +81,19 @@ type Alert struct {
 // x_ssh_password default "ubnt").
 const defaultSSHPassword = "ubnt"
 
+// DefaultRegulatoryCountryCode is the render default when the device's
+// regulatory_country_code admin field is unset (0).
+const DefaultRegulatoryCountryCode = 840
+
 // render carries one render's accumulated outputs (warnings-as-values and
 // credential-cache deltas) plus the resolved site facts.
 type render struct {
-	facts    SiteFacts
-	warnings []string // debug-level diagnostics (Result.Warnings)
-	alerts   []Alert  // warn-level diagnostics (Result.Alerts)
-	deltas   map[string]string
+	facts         SiteFacts
+	countryCode   int
+	sshPublicKeys []PublicKey
+	warnings      []string // debug-level diagnostics (Result.Warnings)
+	alerts        []Alert  // warn-level diagnostics (Result.Alerts)
+	deltas        map[string]string
 	// dasDadStatusDone is the jar's cross-wlan once-flag for the
 	// radius.dad.status/dad.port block: initialized once per device render
 	// (zero value), advancing only when the dad block emits (jar local 19,
@@ -152,7 +140,15 @@ func Render(d store.Device, facts SiteFacts) (Result, error) {
 // TestRenderWithPlanIgnoresFactsWLAN.
 // See the wireless section's emission notes in wireless.go.
 func RenderWithPlan(d store.Device, facts SiteFacts, plan wireless.ProvisioningPlan) (Result, error) {
-	rd := &render{facts: facts}
+	country := d.RegulatoryCountryCode
+	if country == 0 {
+		country = DefaultRegulatoryCountryCode
+	}
+	keys, err := parseDeviceSSHPublicKeys(d.SSHPublicKeys)
+	if err != nil {
+		return Result{}, err
+	}
+	rd := &render{facts: facts, countryCode: country, sshPublicKeys: keys}
 	var b strings.Builder
 	line := rd.lineWriter(&b, "system_cfg")
 	raw := func(l string) {
@@ -315,7 +311,7 @@ func RenderWithPlan(d store.Device, facts SiteFacts, plan wireless.ProvisioningP
 	// firmware's three-field line writer. NOT yet live-bench-validated —
 	// a live-validated apply is owed before these rows are treated as
 	// trusted (render.go minimal-diff policy; docs §13).
-	for i, k := range rd.facts.SSHPublicKeys {
+	for i, k := range rd.sshPublicKeys {
 		n := i + 1
 		line(fmt.Sprintf("sshd.auth.key.%d.status", n), "enabled")
 		line(fmt.Sprintf("sshd.auth.key.%d.value", n), k.Value)
