@@ -28,21 +28,6 @@ import (
 	"github.com/lucavb/open-unifi/internal/wireless"
 )
 
-// ErrLiveWLANProvisioningUnsupported is returned for the exact U7PG2
-// firmware lane whose system_cfg WLAN template has not been differentially
-// verified against the official controller. The caller must not retry this as
-// a successful delivery.
-type ErrLiveWLANProvisioningUnsupported struct {
-	Model    string
-	Firmware string
-}
-
-func (e *ErrLiveWLANProvisioningUnsupported) Error() string {
-	return "live WLAN provisioning is unsupported for " + e.Model + " firmware " + e.Firmware + "; awaiting an official-controller differential fixture"
-}
-
-func (e *ErrLiveWLANProvisioningUnsupported) Status() int { return http.StatusNotImplemented }
-
 // Wire-shape constant of the classic controller (FID-54 dedupe): the
 // factory-notype pending annotation.
 const informFactoryNotype = "inform:factory"
@@ -64,15 +49,12 @@ type Config struct {
 
 	// SiteSettings supplies the CURRENT site-settings record — the
 	// managed device-intent facts — at use time (the WirelessSource precedent:
-	// a live source closure, read per decision). The adoption engine's
-	// live-provisioning gate and renderSystemCfg both call it per inform,
-	// so a site-settings save is visible on the device's NEXT inform with
-	// no wiring refresh. nil ⇒ zero facts (the rendering defaults).
-	// The returned error is REAL (a present-but-unreadable/corrupt/invalid
+	// a live source closure, read per decision). renderSystemCfg calls it
+	// per inform, so a site-settings save is visible on the device's NEXT
+	// inform with no wiring refresh. nil ⇒ zero facts (the rendering
+	// defaults). The returned error is REAL (a present-but-unreadable/corrupt/invalid
 	// site-settings file retained by the app): renderSystemCfg propagates
-	// it as a render failure — no record mutation, no emission; the gate
-	// closure maps it to zero facts so the gate stays inert and the
-	// render's error does the failing (net fail-closed). The record stores
+	// it as a render failure — no record mutation, no emission. The record stores
 	// RAW authorized_keys lines; the adapter closure parses them into
 	// SSHPublicKeys via systemcfg.ParsePublicKey at its single seam (in
 	// cmd/openunifi or the test fixtures — the server never imports the
@@ -89,14 +71,6 @@ type Config struct {
 	// detection. nil ⇒ empty list ⇒ no wlans provisioned.
 	WirelessSource func() []Wlan
 
-	// AllowGatedLiveWLAN lifts the fail-closed live-WLAN gate for the
-	// U7PG2 6.8.2.15592 lane (the typed 501, "live WLAN provisioning
-	// gated"). Default false: live WLAN provisioning for that exact
-	// model+firmware stays rejected unless a sanctioned live round
-	// explicitly opts in — the offline minimal-diff harness gates the
-	// push candidate separately, before any bytes reach the device.
-	AllowGatedLiveWLAN bool
-
 	// OnSessionEvents, when non-nil, receives the client-session
 	// transitions (connect/disconnect counts) each COMMITTED inform cycle
 	// observed in its station refresh — called after the store cycle
@@ -109,8 +83,7 @@ type Config struct {
 }
 
 // SiteSettings carries the MANAGED device-intent site facts the server
-// renders into system_cfg and the adoption engine's live-provisioning gate
-// reads: the regulatory country code (0 = unset → the server-side 840
+// renders into system_cfg: the regulatory country code (0 = unset → the server-side 840
 // default at renderSystemCfg) and the PARSED authorized public keys. It
 // mirrors the app site-settings record (whose SSHPublicKeys are raw lines);
 // the raw→parsed conversion belongs to
@@ -202,23 +175,7 @@ func New(cfg Config, st store.DeviceStore, lg *slog.Logger) *Server {
 		Wireless:           s.currentWireless,
 		SystemCfg:          s.renderSystemCfg,
 		ControllerURL:      cfg.ControllerURL,
-		InformListenAddr:   cfg.InformListenAddr,
-		AllowGatedLiveWLAN: cfg.AllowGatedLiveWLAN,
-		// The gate reads the CURRENT sshd site facts at gate time: the
-		// closure resolves the site-settings source per call (nil source ⇒
-		// zero facts). On a settings load error the closure below returns
-		// ZERO facts — the gate stays inert — and the subsequent render
-		// propagates the real error before anything persists (the store
-		// cycle aborts, so the in-memory record writes are discarded with
-		// it): net fail-closed (the CLI refuses startup on that error
-		// anyway, so it is embedder-only).
-		SSHSiteFacts: func() (keyRows int) {
-			facts, ferr := s.currentSiteSettings()
-			if ferr != nil {
-				return 0
-			}
-			return len(facts.SSHPublicKeys)
-		},
+		InformListenAddr: cfg.InformListenAddr,
 	})
 	return s
 }
@@ -517,12 +474,6 @@ func (s *Server) handlePacket(w http.ResponseWriter, pkt *inform.Packet, body []
 			w.WriteHeader(rej.status)
 			return
 		}
-		var unsupported *ErrLiveWLANProvisioningUnsupported
-		if errors.As(uerr, &unsupported) {
-			s.lg.Warn("inform: live WLAN provisioning gated", "mac", mac, "status", unsupported.Status())
-			w.WriteHeader(unsupported.Status())
-			return
-		}
 		// FID-71: UpdateExisting refuses to resurrect records — an
 		// ErrNotFound here means the device was deleted (or expired) between
 		// the Get and this write. The jar answers an unknown MAC with the
@@ -685,12 +636,6 @@ func (s *Server) handlePlain(w http.ResponseWriter, mac string, jm map[string]an
 		return nil
 	})
 	if uerr != nil {
-		var unsupported *ErrLiveWLANProvisioningUnsupported
-		if errors.As(uerr, &unsupported) {
-			s.lg.Warn("inform-plain: live WLAN provisioning gated", "mac", mac, "status", unsupported.Status())
-			w.WriteHeader(unsupported.Status())
-			return
-		}
 		// FID-71: a record deleted between the Get and this write answers
 		// the jar's unknown-MAC marker (404); any other failure is FID-69's
 		// 200 noop.
@@ -730,13 +675,10 @@ func (s *Server) handlePlain(w http.ResponseWriter, mac string, jm map[string]an
 
 // mapEngineError converts engine error sentinels onto the transport-layer
 // protocol rejections they map to (FID-1 default-key rejection → the 404
-// marker; the unsupported-live-WLAN lane → the typed 501).
+// marker).
 func (s *Server) mapEngineError(rec *store.Device, err error) error {
 	if errors.Is(err, adoption.ErrDefaultKeyRejected) {
 		return errDefaultKeyRejected
-	}
-	if errors.Is(err, adoption.ErrLiveWLANProvisioningUnsupported) {
-		return &ErrLiveWLANProvisioningUnsupported{Model: rec.Model, Firmware: rec.Firmware}
 	}
 	return err
 }

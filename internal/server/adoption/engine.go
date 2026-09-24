@@ -43,14 +43,6 @@ const (
 // Object.ÖoÓ000 → 404). The transport adapter maps this onto the HTTP 404.
 var ErrDefaultKeyRejected = errors.New("default key used by an adopted device")
 
-// ErrLiveWLANProvisioningUnsupported is returned for the exact U7PG2
-// firmware lane whose system_cfg WLAN template has not been differentially
-// verified against the official controller. The caller must not retry this as
-// a successful delivery. (The transport adapter maps this onto its typed
-// HTTP 501 error.)
-var ErrLiveWLANProvisioningUnsupported = errors.New(
-	"live WLAN provisioning is unsupported; awaiting an official-controller differential fixture")
-
 // informKnownTypes labels the NON-EMPTY request _type values the inform
 // state machine processes specially. Real firmware sends its periodic
 // status informs with an EMPTY _type (live evidence: U7PG2 on BZ.6.8.2,
@@ -274,48 +266,6 @@ type Deps struct {
 	// fallback).
 	InformListenAddr string
 
-	// AllowGatedLiveWLAN lifts the fail-closed live-provisioning gate for
-	// the exact U7PG2 6.8.2.15592 lane (see RejectUnsupportedLiveProvisioning).
-	// The default false keeps live WLAN and sshd-fact provisioning
-	// fail-closed; this is the explicit bench opt-in for a sanctioned live
-	// push whose candidate has passed the offline minimal-diff gates
-	// (tmpwork harness). It changes nothing else: the gate remains on for
-	// every normal start.
-	AllowGatedLiveWLAN bool
-
-	// SSHSiteFacts supplies the distilled site-fact sshd scalar the gate
-	// needs (the renderer package's input, already resolved by the caller)
-	// AT GATE TIME, not construction time: the count of provisioned
-	// authorized-key rows. Like Deps.Wireless this is a live source — a
-	// site-settings save
-	// between engine construction and the next inform must flip the gate on
-	// that inform. Deliberately scalars, NOT systemcfg facts/keys — the
-	// adoption engine must not depend on the renderer package (HARD RULE,
-	// engine deps docblock above SystemCfg: decisions receive only the
-	// wire-facing values the adapter hands them). The signature cannot
-	// fail: on a settings load error the adapter closure returns ZERO
-	// facts, the gate stays inert, and the subsequent render propagates the
-	// real error before anything persists (the store cycle aborts, so the
-	// in-memory record writes are discarded with it) — net fail-closed
-	// (the CLI refuses startup on that error anyway, so it is
-	// embedder-only).
-	//
-	// Residual race (documented, not yet fixed): the gate read (this
-	// closure) and the render read of the settings record (renderSystemCfg)
-	// are two independent live reads of the settings within one decision.
-	// A site-settings save whose smu acquisition lands in the microsecond
-	// window between the two reads can emit ONE ungated full provisioning
-	// of the just-saved sshd rows (the gate read the old facts, the render
-	// read the new). The escape is one-shot and self-corrects at the next
-	// inform: the mint sweep's per-MAC write is ordered after the escape's
-	// cycle, so the device's next inform is guaranteed to mismatch and
-	// gate. KNOWN REMEDY (recorded here, deliberately not implemented):
-	// re-derive the gate's sshd half render-side inside renderSystemCfg
-	// under its own single facts read — the same defense-in-depth shape as
-	// the country-code re-check — to be applied before the owed
-	// live-bench validation round (docs/PROTOCOL-systemcfg-wireless.md
-	// §13.3). nil ⇒ zero facts.
-	SSHSiteFacts func() (keyRows int)
 }
 
 // Engine is the pure adoption decider.
@@ -327,8 +277,6 @@ type Engine struct {
 	systemCfg        func(store.Device, []wireless.Wlan, wireless.ProvisioningPlan) (string, map[string]string, error)
 	controllerURL    string
 	informListenAddr string
-	allowGatedWLAN   bool
-	sshSiteFacts     func() int
 }
 
 // New builds an Engine. A nil logger falls back to a discarding one.
@@ -345,8 +293,6 @@ func New(d Deps) *Engine {
 		systemCfg:        d.SystemCfg,
 		controllerURL:    d.ControllerURL,
 		informListenAddr: d.InformListenAddr,
-		allowGatedWLAN:   d.AllowGatedLiveWLAN,
-		sshSiteFacts:     d.SSHSiteFacts,
 	}
 }
 
@@ -856,63 +802,6 @@ func (e *Engine) decidePlain(req Request, wls []wireless.Wlan, plan wireless.Pro
 	}
 }
 
-// RejectUnsupportedLiveProvisioning gates the exact U7PG2 firmware lane
-// whose system_cfg rows have not been differentially verified against the
-// official controller — the WLAN template (the original trigger) AND, since
-// the 2026-09-20 sshd-auth lane, the firmware-derived but NOT
-// live-bench-validated sshd.auth.key.<n>.* rows when the site facts
-// configure them (zero-value site facts keep the
-// rendered sshd block byte-identical to the pre-feature shape, so the gate
-// stays inert for them). wls is the decision's resolved WLAN envelope (the
-// caller's single snapshot for this inform), not the live source. The gate
-// is the fail-closed default; Deps.AllowGatedLiveWLAN is the explicit
-// bench opt-in that lifts it for a sanctioned live push — every normal
-// start keeps the gate on.
-func (e *Engine) RejectUnsupportedLiveProvisioning(d store.Device, wls []wireless.Wlan) error {
-	if e.allowGatedWLAN {
-		return nil
-	}
-	if d.Model != "U7PG2" || !fwMatches68215592(d.Firmware) {
-		return nil
-	}
-	for _, w := range wls {
-		if w.Name != "" || w.SSID != "" {
-			return ErrLiveWLANProvisioningUnsupported
-		}
-	}
-	// The sshd scalar is read AT GATE TIME (Deps.SSHSiteFacts is live):
-	// a site-settings save between engine construction and this inform
-	// flips the gate on it. nil/zero facts keep the gate inert (the
-	// zero-value rendered sshd block stays byte-identical to the
-	// pre-feature shape); on a settings load error the adapter closure
-	// returns zero facts, the gate stays inert, and the subsequent render
-	// propagates the real error before anything persists (the store cycle
-	// aborts, so the in-memory record writes are discarded with it) —
-	// net fail-closed (the CLI refuses startup on that error anyway, so it
-	// is embedder-only).
-	keyRows := 0
-	if e.sshSiteFacts != nil {
-		keyRows = e.sshSiteFacts()
-	}
-	if keyRows > 0 {
-		return ErrLiveWLANProvisioningUnsupported
-	}
-	return nil
-}
-
-// fwMatches68215592 reports whether s identifies the U7PG2 6.8.2 build
-// 15592. The device-reported version may arrive as the short form
-// ("6.8.2.15592") or the long form the docs capture shows
-// ("BZ.qca956x_6.8.2+15592.260126.1358", docs/PROTOCOL.md:374-375) — both
-// name the same build; nothing else legitimately contains either fragment.
-// TODO(firmware): the exact wire form of the inform `version` field is still
-// unpinned (the only capture sample in docs shows "6.6.55"); once the
-// morning capture is fetched, pin the real string in the fixture
-// (docs/PROTOCOL.md:396-398).
-func fwMatches68215592(s string) bool {
-	return strings.Contains(s, "6.8.2.15592") || strings.Contains(s, "6.8.2+15592")
-}
-
 // assignedKeyFlow is the shared tail of the assigned-key (x_authkey-held)
 // path: it emits FULL PROVISIONING — fresh cfgversion when unset, adopting
 // state, ssh password-hash cache, and capture of the emitted wireless
@@ -924,19 +813,12 @@ func fwMatches68215592(s string) bool {
 // the plaintext lane on every claim match.
 // It is the single emission point for system_cfg + drift hash + delivery
 // bookkeeping shared by BOTH transports (the encrypted decideEncrypted and
-// the plaintext decidePlain), so one call here gates both. mgmt_cfg-only
-// paths (re-key pushes, adoption pushes, noop) never reach this function and
-// are deliberately NOT gated — mgmt pushes keep working for gated devices.
+// the plaintext decidePlain). mgmt_cfg-only paths (re-key pushes, adoption
+// pushes, noop) never reach this function.
 // plan is the decision's provisioning plan: the drift hash captured here and
 // the delivery placements come from the same value the renderer emitted the
 // rows from — no re-derivation inside this tail.
 func (e *Engine) assignedKeyFlow(d *store.Device, now time.Time, wls []wireless.Wlan, plan wireless.ProvisioningPlan) (Outcome, error) {
-	// The unsupported-live-provisioning gate runs FIRST — before any
-	// record mutation (State/CfgVersion must not change on a rejected
-	// push) and before any emission.
-	if err := e.RejectUnsupportedLiveProvisioning(*d, wls); err != nil {
-		return Outcome{}, err
-	}
 	if d.CfgVersion == "" {
 		nv, err := e.keyChars(16)
 		if err != nil {

@@ -1,23 +1,12 @@
 # PROTOCOL-systemcfg-wireless — `radio.*` / `aaa.*` / `wireless.*` schema for a classic Atheros AP (U7PG2)
 
-> **Open-unifi implementation note:** open-unifi emits a full synthetic
-> `radio.*`/`aaa.*`/`wireless.*` block for the accepted U7PG2 6.8.2.15592
-> baseline, per the emitter contract in §2-§7 below (multiple WLANs, both
-> bands, tagged VLANs). The safety mechanism for live delivery is the
-> fail-closed gate that rejects ANY nonempty managed WLAN for this model +
-> firmware with a typed 501 and no `system_cfg` emission; it stays on for
-> every normal start and lifts only by the explicit lab opt-in
-> (`--allow-gated-live-wlan`, `adoption.Deps.AllowGatedLiveWLAN`), used
-> for sanctioned pushes whose candidate passed the offline minimal-diff
-> harness. The 2026-09-18 C1-shape round did exactly that: the gated
-> wpa-p candidate (sha256 `9891d9ff…`) was pushed, applied, and
-> device-verified byte-for-byte (`/tmp/system.cfg` sha match) with the AP
-> reachable through the `{wireless, aaa}` restart — evidence in
-> `docs/WLAN-ACCEPTANCE-6.8.2.15592.md` §2026-09-18. (An earlier revision
-> of this banner described a one-WLAN/2 GHz/VLAN-1 design sketch that
-> patches the existing `ath0`/`wifi0` user-VAP slot — that was never
-> implemented and has
-> been dropped.)
+> **Open-unifi implementation note (2026-09-24):** The runtime fail-closed
+> live-provisioning gate and `--allow-gated-live-wlan` were removed; managed
+> WLANs and site-settings SSH keys are delivered on the normal inform loop.
+> open-unifi emits a full synthetic `radio.*`/`aaa.*`/`wireless.*` block for
+> the U7PG2 6.8.2.15592 baseline per §2-§7 below. Historical bench evidence
+> (including the 2026-09-18 C1-shape round) is in
+> `docs/WLAN-ACCEPTANCE-6.8.2.15592.md`.
 
 Resolves UNRESOLVED item #1 of `docs/PROTOCOL-mgmt.md` §9 ("exact `wireless.<n>` line set").
 Complements `docs/PROTOCOL-mgmt.md` §3 (where this block sits inside `system_cfg`)

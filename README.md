@@ -54,7 +54,7 @@ configuration; defaults to 840/US and is not a claim of regulatory approval),
 (bearer auth for `/api/v1/*` AND `/metrics`; empty disables auth entirely and logs
 a loud startup warning — env fallback `OPEN_UNIFI_ADMIN_TOKEN`), `--device-ssh-key` (repeatable; env
 `OPEN_UNIFI_DEVICE_SSH_KEY`; one authorized_keys line per occurrence, provisioned as
-`sshd.auth.key.<n>` rows — LAB ONLY, live pushes behind `--allow-gated-live-wlan`),
+`sshd.auth.key.<n>` rows — LAB ONLY),
 `--allow-plaintext-inform` (reject by default, like the real controller),
 `--log-level`, `--log-format` (logging is human-readable TEXT by default;
 `--log-format json` / env `OPEN_UNIFI_LOG_FORMAT=json` opts into one-JSON-object-per-line
@@ -75,17 +75,7 @@ that file does not exist yet. After that the persisted record is the single
 source of truth — manage it through `PUT /api/v1/site-settings` or Terraform
 (`open-unifi_site_settings`, below); a save that changes the record mints
 `cfgversion` and every adopted device picks the new sshd rows up at its next
-inform. Caveat on default-gated deployments (U7PG2 firmware 6.8.2.15592):
-a save that carries provisioned SSH public keys still returns 200 — but
-every subsequent full provisioning, including
-the delivery of future WLAN changes, is rejected with the typed 501
-live-provisioning gate until the sshd facts are cleared (an effective
-site-settings save of the defaults) or the controller restarts with
-`--allow-gated-live-wlan` (startup-only; a runtime save can never lift the
-gate). The rejected inform aborts its whole store cycle, so record
-absorption freezes too — affected devices go stale in the console (they
-look dead, not gated). See `docs/PROTOCOL-systemcfg-wireless.md` §13.
-Supplying any of the three when the record already exists logs a
+inform. Supplying any of the three when the record already exists logs a
 startup warning and the record wins (the deployment-input flags like
 `--controller-url` are unaffected).
 There is no site-wide SSH-password flag or environment-variable replacement:
@@ -235,15 +225,7 @@ regulatory country code and the provisioned
 authorized_keys lines (ordered; one `sshd.auth.key.<n>` row family per
 line). A change to either of them
 re-provisions every adopted device at its next inform. Deleting the resource
-restores the controller defaults. Watch the live gate before combining
-these fields: the example above (provisioned `device_ssh_public_keys`) is
-exactly the sshd provisioning the gate
-blocks on the supported hardware (U7PG2 firmware 6.8.2.15592) — the apply
-succeeds, but every subsequent full provisioning returns the typed 501
-until the sshd facts are cleared (an effective save of the defaults) or
-the controller restarts with `--allow-gated-live-wlan` (startup-only),
-and blocked devices then go stale in the console; see
-`docs/PROTOCOL-systemcfg-wireless.md` §13.
+restores the controller defaults.
 `open-unifi_device` manages a device by MAC. Its `ssh_password` attribute is
 Optional and Sensitive; Terraform null/absent reconciles to an explicit API
 clear/stop-managing operation. The site-settings resource exposes
@@ -260,15 +242,11 @@ See `examples/terraform/` (includes filesystem-mirror dev overrides so
 
 ## WLAN provisioning status
 
-Live WLAN provisioning is unsupported/gated pending an official-controller
-differential fixture. On U7PG2 firmware 6.8.2.15592 the gate fails closed
-with a typed status and never emits `system_cfg`, on EITHER trigger: any
-nonempty managed WLAN, OR site-fact sshd provisioning (provisioned SSH
-public keys). The startup-only
-`--allow-gated-live-wlan` flag lifts it for sanctioned bench pushes.
+Managed WLANs and site-settings SSH public keys are pushed to adopted
+devices on the normal inform loop (`system_cfg` full provisioning). End-user
+WLAN acceptance evidence for U7PG2 firmware 6.8.2.15592 remains tracked in
+`docs/WLAN-ACCEPTANCE-6.8.2.15592.md` (template, not a release claim).
 Per-device SSH-password changes are bench/live-round owed, not live-proven.
-This is a limitation in the same sense as the gated WLAN status above; see
-`docs/PROTOCOL-systemcfg-wireless.md` §13.3.
 
 ## Protocol documentation
 

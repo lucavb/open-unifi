@@ -1555,31 +1555,6 @@ func TestAdoptionEchoThenEnvelopeDrift(t *testing.T) {
 	}
 }
 
-// Firmware normalization (fix 2): the gate must fire on BOTH wire spellings
-// of the 6.8.2 build 15592 — the short form and the long BZ.qca956x form
-// (docs/PROTOCOL.md:374-375) — and must NOT fire for other firmware or
-// other models.
-func TestGateFirmwareForms(t *testing.T) {
-	env := workedEnvelope()
-	s := New(Config{WirelessSource: func() []Wlan { return env }}, store.NewMemStore(), testLogger())
-	cases := []struct {
-		model, fw string
-		want      bool
-	}{
-		{"U7PG2", "6.8.2.15592", true},
-		{"U7PG2", "BZ.qca956x_6.8.2+15592.260126.1358", true},
-		{"U7PG2", "6.6.55", false},
-		{"U7PG2", "", false},
-		{"U6LR", "6.8.2.15592", false},
-	}
-	for _, c := range cases {
-		got := s.engine.RejectUnsupportedLiveProvisioning(store.Device{Model: c.model, Firmware: c.fw}, env) != nil
-		if got != c.want {
-			t.Fatalf("gate(model=%q, fw=%q) = %v, want %v", c.model, c.fw, got, c.want)
-		}
-	}
-}
-
 // Settle FSM with firmware-shaped vap_table (fix 3): confirmation requires
 // every desired SSID RUN on its PLACED radio (placements survive absorption
 // via the controller-owned key class). A wrong-radio VAP cannot settle the
@@ -2423,16 +2398,6 @@ func TestPlainLaneProvisionsWirelessRows(t *testing.T) {
 		Random:   func() float64 { return 0.5 },
 		KeyChars: func(n int) (string, error) { return strings.Repeat("f", n), nil },
 		Wireless: func() []wireless.Wlan { return env },
-		// The same live sshd-facts closure the real server wires (the
-		// gate must read the current settings at gate time even in this
-		// rebuilt engine).
-		SSHSiteFacts: func() (keyRows int) {
-			facts, ferr := s.currentSiteSettings()
-			if ferr != nil {
-				return 0
-			}
-			return len(facts.SSHPublicKeys)
-		},
 		SystemCfg: func(d store.Device, wls []wireless.Wlan, plan wireless.ProvisioningPlan) (string, map[string]string, error) {
 			handedPlan = plan
 			return realRender(d, wls, plan)
@@ -2852,88 +2817,6 @@ func TestAdapterDefaultKeyPostAdoption404(t *testing.T) {
 	// Pending and adopting records still accept the default key (the
 	// UNKNOWN/two-phase acceptance window), covered by TestHappyAdoption,
 	// TestGCMAdoptionMatrix and TestAuthkeysPrunedToTwo.
-}
-
-// (b) Adapter: a device whose reported version trips the live-WLAN gate
-// reaches the full-provisioning path → HTTP 501 via the typed
-// *ErrLiveWLANProvisioningUnsupported (the engine sentinel maps onto it in
-// mapEngineError); the gated inform NEVER emits a system_cfg and the record
-// is not mutated by the gate. (Engine-side twin:
-// adoption.TestEncryptedGateBlocksSystemCfg.)
-func TestAdapterLiveWLANGate501(t *testing.T) {
-	env := workedEnvelope()
-	st := store.NewMemStore()
-	xkey := "11112222333344445555666677778888"
-	if err := st.Put(store.Device{
-		MAC: testMAC, State: store.StateAdopted,
-		CfgVersion: "aaaa", AppliedCfg: "",
-		XAuthkey: xkey, Authkeys: []string{xkey}, Model: "U7PG2",
-		Extra: u7pg2Record().Extra,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	h := wiredServer(t, func() []Wlan { return env }, st)
-
-	body := infoBody("")
-	body["version"] = "6.8.2.15592"
-	resp := post(t, h, encryptCBC(t, mustJSON(t, body), hexKey(t, xkey), testIV))
-	if resp.Code != http.StatusNotImplemented {
-		t.Fatalf("gated inform status = %d, want 501", resp.Code)
-	}
-	if strings.Contains(resp.Body.String(), "system_cfg") {
-		t.Fatalf("gated inform leaked system_cfg: %q", resp.Body.String())
-	}
-	rec, err := st.Get(testMAC)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rec.State != store.StateAdopted || rec.CfgVersion != "aaaa" {
-		t.Fatalf("gate must not mutate the record: state=%d cfg=%q", rec.State, rec.CfgVersion)
-	}
-	// The typed error the adapter maps the engine sentinel onto carries the
-	// classic 501 status.
-	s := New(Config{WirelessSource: func() []Wlan { return env }}, st, testLogger())
-	mapped := s.mapEngineError(&store.Device{Model: "U7PG2", Firmware: "6.8.2.15592"},
-		adoption.ErrLiveWLANProvisioningUnsupported)
-	var unsupported *ErrLiveWLANProvisioningUnsupported
-	if !errors.As(mapped, &unsupported) || unsupported.Status() != http.StatusNotImplemented {
-		t.Fatalf("gate error mapping = %v, want typed 501 error", mapped)
-	}
-
-	// Adapter-level sshd-facts gate arm (the live settings seam): a
-	// U7PG2 / 6.8.2.15592 inform with NO WLAN envelope is gated by the
-	// SITE SETTINGS closure alone. A closure returning 2 keys trips the
-	// typed 501; the SAME closure returning zero facts (a settings save
-	// back to defaults) lets the SAME push through — the gate reads the
-	// source AT GATE TIME, not a construction-frozen scalar.
-	st2 := store.NewMemStore()
-	if err := st2.Put(store.Device{
-		MAC: testMAC, State: store.StateAdopted,
-		CfgVersion: "aaaa", AppliedCfg: "",
-		XAuthkey: xkey, Authkeys: []string{xkey}, Model: "U7PG2",
-		Extra: u7pg2Record().Extra,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	keyRows := 2
-	s2 := New(Config{SiteSettings: func() (SiteSettings, error) {
-		return SiteSettings{SSHPublicKeys: make([]systemcfg.PublicKey, keyRows)}, nil
-	}}, st2, testLogger())
-	gateBody := infoBody("")
-	gateBody["version"] = "6.8.2.15592"
-	resp2 := post(t, s2.InformHandler(), encryptCBC(t, mustJSON(t, gateBody), hexKey(t, xkey), testIV))
-	if resp2.Code != http.StatusNotImplemented {
-		t.Fatalf("ssh-facts-gated inform status = %d, want 501", resp2.Code)
-	}
-	keyRows = 0
-	resp2 = post(t, s2.InformHandler(), encryptCBC(t, mustJSON(t, gateBody), hexKey(t, xkey), testIV))
-	if resp2.Code != http.StatusOK {
-		t.Fatalf("zero-facts inform status = %d, want 200 (gate inert)", resp2.Code)
-	}
-	_, jm2 := decryptResponse(t, resp2.Body.Bytes(), hexKey(t, xkey))
-	if jm2["_type"] != "setparam" || jm2["system_cfg"] == nil {
-		t.Fatalf("zero-facts inform must full-provision, got %v", jm2["_type"])
-	}
 }
 
 // ---- multi-WLAN system_cfg pin (§8c) ---------------------------------------

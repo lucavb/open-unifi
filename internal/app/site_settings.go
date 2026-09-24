@@ -331,16 +331,6 @@ func (a *App) PutSiteSettings(_ context.Context, doc adminapi.SiteSettingsDocume
 		// silent 200.
 		return zero, err
 	}
-	if changed && len(next.SSHPublicKeys) > 0 {
-		// Mirrors the startup warn (cmd/openunifi, same document):
-		// the app layer does not know whether the live gate was lifted
-		// via --allow-gated-live-wlan, so the warn fires on the FACTS —
-		// and it is honest either way: it says pushes stay gated BEHIND
-		// the flag, not that they are blocked. One line per effective
-		// save (not per device, and not on a sweepFailed retry — a
-		// retry arms nothing new).
-		a.lg.Warn("ssh site facts saved into the site-settings record: the sshd.auth.key rows are firmware-derived but NOT yet live-bench-validated — live pushes stay gated behind --allow-gated-live-wlan (docs/PROTOCOL-systemcfg-wireless.md §13, bench use only)")
-	}
 	a.lg.Debug("site settings replaced",
 		"country_code", next.CountryCode,
 		"keys", len(next.SSHPublicKeys),

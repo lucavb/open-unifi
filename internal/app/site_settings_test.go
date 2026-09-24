@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -603,51 +602,5 @@ func TestPutSiteSettingsSweepFailureRetryResweeps(t *testing.T) {
 	}
 	if st.injected != 1 {
 		t.Fatalf("injection re-fired: %d failures, want still 1", st.injected)
-	}
-}
-
-// TestPutSiteSettingsWarnsOnSSHFactSave pins the one-line save-time warn
-// (the startup warn's save-moment twin): an effective save whose SAVED
-// record carries SSHPublicKeys emits exactly one
-// Warn — unconditional on the facts, because the app layer does not know
-// the gate flag (the warn honestly says pushes stay gated BEHIND it).
-func TestPutSiteSettingsWarnsOnSSHFactSave(t *testing.T) {
-	buf := &bytes.Buffer{}
-	capture := slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	spath := filepath.Join(t.TempDir(), "site-settings.json")
-	a := New(store.NewMemStore(), filepath.Join(t.TempDir(), "wireless.json"), spath, SiteSettings{}, capture)
-
-	doc := adminapi.SiteSettingsDocument{
-		RegulatoryCountryCode: 840,
-		DeviceSSHPublicKeys:   []string{testKeyEd25519Line},
-	}
-	if _, err := a.PutSiteSettings(context.Background(), doc); err != nil {
-		t.Fatalf("put: %v", err)
-	}
-	warns := 0
-	for _, line := range strings.Split(buf.String(), "\n") {
-		if strings.Contains(line, "level=WARN") && strings.Contains(line, "saved into the site-settings record") {
-			warns++
-		}
-	}
-	if warns != 1 {
-		t.Fatalf("warn lines with the save-moment phrase = %d, want 1; log:\n%s", warns, buf.String())
-	}
-	if !strings.Contains(buf.String(), "--allow-gated-live-wlan") {
-		t.Fatalf("warn does not name the gate flag; log:\n%s", buf.String())
-	}
-
-	// A no-change save (and a save carrying no SSH facts) stay silent.
-	buf.Reset()
-	if _, err := a.PutSiteSettings(context.Background(), doc); err != nil {
-		t.Fatalf("no-change put: %v", err)
-	}
-	if _, err := a.PutSiteSettings(context.Background(), adminapi.SiteSettingsDocument{
-		RegulatoryCountryCode: 276,
-	}); err != nil {
-		t.Fatalf("facts-free put: %v", err)
-	}
-	if warns := strings.Count(buf.String(), "saved into the site-settings record"); warns != 0 {
-		t.Fatalf("non-fact or no-change saves warned %d times; log:\n%s", warns, buf.String())
 	}
 }

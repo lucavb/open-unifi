@@ -1,10 +1,12 @@
 # Live WLAN acceptance evidence template
 
-This remains a pending evidence template, not an acceptance claim. Live WLAN
-provisioning is gated by default (the fail-closed runtime gate rejects any
-managed WLAN for U7PG2 6.8.2.15592 with a typed 501); the gate lifts only by
-the explicit lab opt-in `--allow-gated-live-wlan`, and end-user acceptance
-still requires the matrix below.
+> **2026-09-24:** The runtime fail-closed live-provisioning gate (typed HTTP
+> 501 on U7PG2 6.8.2.15592) and `--allow-gated-live-wlan` were removed from
+> the controller; pushes proceed on the normal inform loop. The matrix below
+> remains historical acceptance evidence, not an automatic release claim.
+
+This remains a pending evidence template, not an acceptance claim. End-user
+acceptance still requires the matrix below.
 
 This is a repeatable, firmware-specific acceptance record for a
 **UAP-AC-Pro-Gen2 (`U7PG2`) running firmware `6.8.2.15592`**. Copy this file

@@ -65,18 +65,18 @@ func decryptResponseRaw(t *testing.T, respBody []byte, keyHex []byte) (uint16, [
 // lifecycleFixture wires the real admin API (adminapi handler over App)
 // and the real inform handler over ONE store, and returns both handlers.
 func lifecycleFixture(t *testing.T) (admin, informH http.Handler, st store.DeviceStore) {
-	return siteSettingsFixture(t, app.SiteSettings{}, nil, false)
+	return siteSettingsFixture(t, app.SiteSettings{}, nil)
 }
 
 // siteSettingsFixture is lifecycleFixture with a seeded site-settings
 // record, the app→server settings source wired exactly like
-// cmd/openunifi (the single raw-lines→parsed-keys seam), an optional WLAN
-// envelope for the WirelessSource, and the live-provisioning gate opt-in.
-func siteSettingsFixture(t *testing.T, seed app.SiteSettings, wlans []Wlan, gatedLiveWLAN bool) (admin, informH http.Handler, st store.DeviceStore) {
+// cmd/openunifi (the single raw-lines→parsed-keys seam), and an optional
+// WLAN envelope for the WirelessSource.
+func siteSettingsFixture(t *testing.T, seed app.SiteSettings, wlans []Wlan) (admin, informH http.Handler, st store.DeviceStore) {
 	t.Helper()
 	st = store.NewMemStore()
 	a := app.New(st, filepath.Join(t.TempDir(), "wireless.json"), filepath.Join(t.TempDir(), "site-settings.json"), seed, testLogger())
-	cfg := Config{AllowGatedLiveWLAN: gatedLiveWLAN, SiteSettings: appSettingsSource(a)}
+	cfg := Config{SiteSettings: appSettingsSource(a)}
 	if wlans != nil {
 		cfg.WirelessSource = func() []Wlan { return wlans }
 	}
@@ -466,63 +466,14 @@ func gateInformBody(appliedCfg string) map[string]any {
 	return body
 }
 
-// TestSiteSettingsSaveGatedByLiveGate501E2E: on an adopted U7PG2 /
-// 6.8.2.15592 device with an EMPTY WLAN envelope, a site-settings save
-// carrying keys is minted by the save sweep, but the device's
-// next inform answers the TYPED 501 (the live-provisioning gate reads the
-// saved facts at gate time — no opt-in). The record is untouched by the
-// rejected emission: the store cycle aborted (the save's mint stands, the
-// inform persisted nothing — no credential cache, no WLAN bookkeeping).
-func TestSiteSettingsSaveGatedByLiveGate501E2E(t *testing.T) {
-	adminH, informH, st := siteSettingsFixture(t, app.SiteSettings{}, nil, false)
-	const cfg = "aaaabbbbccccdddd"
-	const xk = "11112222333344445555666677778888"
-	registerAdopted(t, st, cfg, xk)
-	kx := hexKey(t, xk)
-
-	// 1. Admin saves 2 keys through the real handler.
-	putSiteSettings(t, adminH, 840, []string{ssKeyLine1, ssKeyLine2})
-
-	// 2. The save's mint sweep re-stamped the provisioned device.
-	d, err := st.Get(testMAC)
-	if err != nil {
-		t.Fatal(err)
-	}
-	minted := d.CfgVersion
-	if minted == cfg || !isHex(minted) || len(minted) != 16 {
-		t.Fatalf("save sweep minted %q, want a fresh 16-hex != %q", minted, cfg)
-	}
-
-	// 3. The device informs → the typed 501 (no opt-in, ssh facts alone).
-	resp := post(t, informH, encryptCBC(t, mustJSON(t, gateInformBody("")), kx, testIV))
-	if resp.Code != http.StatusNotImplemented {
-		t.Fatalf("gated inform status = %d, want 501 (body %q)", resp.Code, resp.Body.String())
-	}
-
-	// 4. The record is untouched by the rejected emission: the save's mint
-	// stands, and the rejected inform persisted nothing.
-	d, err = st.Get(testMAC)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if d.State != store.StateAdopted || d.CfgVersion != minted || d.AppliedCfg != cfg {
-		t.Fatalf("gate must not mutate the record: %+v", d)
-	}
-	for _, k := range []string{"ssh_sha512passwd", "ssh_md5passwd", "wlan_cfg_pending_sha", "wlan_cfg_offered_cfgversion"} {
-		if _, present := d.Extra[k]; present {
-			t.Fatalf("rejected inform must persist no %q (Extra: %+v)", k, d.Extra)
-		}
-	}
-}
-
-// TestSiteSettingsSaveDeliversSSHDRowsFullProvisioningE2E: with the gate
-// opt-in, the SAME save → mint → inform arc answers full provisioning whose
+// TestSiteSettingsSaveDeliversSSHDRowsFullProvisioningE2E: save → mint →
+// inform answers full provisioning whose
 // system_cfg carries the saved sshd facts — exactly 3 numbered
 // sshd.auth.key families (1..3: status/value/type, comment only when
 // non-empty, NO .0 or .4 rows), the always-enabled sshd.auth.passwd row,
 // and the full mgmt_cfg/blocked_sta shape.
 func TestSiteSettingsSaveDeliversSSHDRowsFullProvisioningE2E(t *testing.T) {
-	adminH, informH, st := siteSettingsFixture(t, app.SiteSettings{}, nil, true)
+	adminH, informH, st := siteSettingsFixture(t, app.SiteSettings{}, nil)
 	const cfg = "aaaabbbbccccdddd"
 	const xk = "11112222333344445555666677778888"
 	registerAdopted(t, st, cfg, xk)
@@ -580,13 +531,10 @@ func TestSiteSettingsSaveDeliversSSHDRowsFullProvisioningE2E(t *testing.T) {
 	}
 }
 
-// TestSiteSettingsSaveUngatedForeignModelDeliversE2E: the gate is scoped to
-// the EXACT U7PG2 / 6.8.2.15592 lane — the same save on a non-U7PG2 device
-// reaches full provisioning WITHOUT the opt-in and carries the new sshd
-// rows (the save's mint sweep is model-agnostic; the gate is the only
-// per-model check).
+// TestSiteSettingsSaveUngatedForeignModelDeliversE2E: a site-settings save on
+// a non-U7PG2 device reaches full provisioning and carries the new sshd rows.
 func TestSiteSettingsSaveUngatedForeignModelDeliversE2E(t *testing.T) {
-	adminH, informH, st := siteSettingsFixture(t, app.SiteSettings{}, nil, false)
+	adminH, informH, st := siteSettingsFixture(t, app.SiteSettings{}, nil)
 	const cfg = "aaaabbbbccccdddd"
 	const xk = "11112222333344445555666677778888"
 	registerAdopted(t, st, cfg, xk)
@@ -629,7 +577,7 @@ func TestSiteSettingsSaveUngatedForeignModelDeliversE2E(t *testing.T) {
 func TestSiteSettingsSaveEscapesExhaustedWLANDeliveryE2E(t *testing.T) {
 	e1 := []Wlan{{Name: "old", SSID: "oldnet", Security: "open", Enabled: true}}
 	e2 := []Wlan{{Name: "pending", SSID: "pendingnet", Security: "open", Enabled: true}}
-	adminH, informH, st := siteSettingsFixture(t, app.SiteSettings{}, e2, false)
+	adminH, informH, st := siteSettingsFixture(t, app.SiteSettings{}, e2)
 	const cfg = "aaaabbbbccccdddd"
 	const xk = "11112222333344445555666677778888"
 	// u7pg2Record() (radio_table present — the aaa.* wireless rows need it
@@ -749,7 +697,7 @@ func TestSiteSettingsSaveEscapesExhaustedWLANDeliveryE2E(t *testing.T) {
 // regression is caught within the rounds rather than by the luck of one
 // interleave.
 func TestSiteSettingsPutConcurrentWithInformsNoDeadlock(t *testing.T) {
-	adminH, informH, st := siteSettingsFixture(t, app.SiteSettings{}, nil, false)
+	adminH, informH, st := siteSettingsFixture(t, app.SiteSettings{}, nil)
 	const cfg = "aaaabbbbccccdddd"
 	const xk = "11112222333344445555666677778888"
 	registerAdopted(t, st, cfg, xk)
@@ -923,7 +871,7 @@ func decodeInformResponse(respBody []byte, keyHex []byte) (map[string]any, error
 // provisioning arc (password changes are UNGATED — the §13 gate reads
 // key rows only).
 func sshPasswordFixture(t *testing.T) (admin, informH http.Handler, st store.DeviceStore) {
-	return siteSettingsFixture(t, app.SiteSettings{}, nil, false)
+	return siteSettingsFixture(t, app.SiteSettings{}, nil)
 }
 
 // patchDevicePassword saves the per-device SSH password through the real

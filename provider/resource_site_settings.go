@@ -47,14 +47,8 @@ func (r *siteSettingsResource) Configure(_ context.Context, req resource.Configu
 func (r *siteSettingsResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
 		MarkdownDescription: "The singleton site-settings record of the open-unifi control plane: the " +
-			"Device-intent site facts. A change re-provisions every adopted device at its next inform (cfgversion mint). " +
-			"Deleting the resource restores the controller defaults. Caveat on default-gated deployments " +
-			"(U7PG2 firmware 6.8.2.15592): a save carrying SSH public keys " +
-			"succeeds, but every subsequent server-side full provisioning is rejected with the typed 501 " +
-			"live-provisioning gate until the sshd facts are cleared (an effective save of the defaults) or " +
-			"the controller restarts with --allow-gated-live-wlan (a startup-only flag); the rejected " +
-			"devices then go stale in the console until one of those remedies. See " +
-			"docs/PROTOCOL-systemcfg-wireless.md §13.",
+			"device-intent site facts. A change re-provisions every adopted device at its next inform (cfgversion mint). " +
+			"Deleting the resource restores the controller defaults.",
 		Attributes: map[string]schema.Attribute{
 			"regulatory_country_code": schema.Int64Attribute{
 				MarkdownDescription: "ISO 3166-1 numeric country code (1..999). Unset (null/omitted) = the " +

@@ -49,15 +49,13 @@ func run() error {
 	controllerURL := flag.String("controller-url", "", "base URL devices are pointed at during adoption (e.g. http://10.0.0.5:8080)")
 	regulatoryCountryCode := flag.Int("regulatory-country-code", server.DefaultRegulatoryCountryCode, "ISO 3166-1 numeric regulatory country code (001-999); first-boot seed only — managed at runtime via the site-settings API")
 	deviceSSHKeys := &keyList{}
-	flag.Var(deviceSSHKeys, "device-ssh-key", "LAB ONLY: SSH authorized public key for adopted devices, one authorized_keys line per flag (repeatable; falls back to a single $OPEN_UNIFI_DEVICE_SSH_KEY); first-boot seed only — managed at runtime via the site-settings API. Parsed and validated fail-closed at startup; provisioned as sshd.auth.key.<n>.* rows — firmware-derived but NOT yet live-bench-validated, pushes gated behind --allow-gated-live-wlan (docs/PROTOCOL-systemcfg-wireless.md §13)")
+	flag.Var(deviceSSHKeys, "device-ssh-key", "LAB ONLY: SSH authorized public key for adopted devices, one authorized_keys line per flag (repeatable; falls back to a single $OPEN_UNIFI_DEVICE_SSH_KEY); first-boot seed only — managed at runtime via the site-settings API. Parsed and validated fail-closed at startup; provisioned as sshd.auth.key.<n>.* rows (docs/PROTOCOL-systemcfg-wireless.md §13)")
 	// Default from the provider's token env var; --admin-token overrides it.
 	adminToken := flag.String("admin-token", os.Getenv("OPEN_UNIFI_ADMIN_TOKEN"),
 		"admin API bearer token (required; defaults to $OPEN_UNIFI_ADMIN_TOKEN)")
 	allowAnonymousAdmin := flag.Bool("allow-anonymous-admin", false, "LAB ONLY: allow anonymous admin API and metrics")
 	allowInsecureAdmin := flag.Bool("allow-insecure-admin", false, "LAB ONLY: allow non-loopback plaintext admin HTTP (normally use an HTTPS reverse proxy)")
 	allowPlainText := flag.Bool("allow-plaintext-inform", false, "accept unencrypted JSON inform bodies")
-	allowGatedLiveWLAN := flag.Bool("allow-gated-live-wlan", false,
-		"LAB ONLY: lift the fail-closed live WLAN provisioning gate for U7PG2 fw 6.8.2.15592 (typed 501 without this flag); requires a push candidate pre-cleared by the offline minimal-diff harness")
 	allowSSHSetInformPush := flag.Bool("allow-ssh-set-inform-push", false,
 		"LAB ONLY: arm the controller-side SSH set-inform push lane — the console Adopt action on a factory announce candidate dials ubnt@<candidate-ip> with the factory default password and runs mca-cli-op set-inform (explicit admin-action opt-in, never on by default; requires --controller-url)")
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, error")
@@ -275,9 +273,8 @@ func run() error {
 		DiscoveryListen:    *discovery,
 		DiscoveryPort:      dport,
 		ControllerURL:      *controllerURL,
-		AllowPlainText:     *allowPlainText,
-		AllowGatedLiveWLAN: *allowGatedLiveWLAN,
-		WirelessSource:     wirelessSource,
+		AllowPlainText: *allowPlainText,
+		WirelessSource: wirelessSource,
 		SiteSettings:       siteSettingsSource,
 		// Client-session transition observations ride the same ownership
 		// seam as IncInform: the transport stays Prometheus-free and main
@@ -285,21 +282,6 @@ func run() error {
 		// transition).
 		OnSessionEvents: metrics.IncClientSessionEvents,
 	}, st, logger)
-	if *allowGatedLiveWLAN {
-		logger.Warn("live WLAN provisioning gate LIFTED for U7PG2 6.8.2.15592 (--allow-gated-live-wlan): live WLAN pushes are enabled — bench use only, candidate must be pre-cleared by the offline minimal-diff harness")
-	}
-	// Source the condition from the RECORD (the loaded siteSettings, the
-	// single source of truth for the facts — not the seed flags,
-	// which are ignored whenever the record file exists): the warn's
-	// operative content is "live pushes stay gated", and that depends on
-	// the facts the gate will actually read.
-	if len(siteSettings.SSHPublicKeys) > 0 {
-		// Prominent, not debug: the sshd site facts are already gated
-		// behind the same live-WLAN opt-in at the engine choke point, but
-		// an admin with provisioned sshd facts in the record must SEE
-		// that pushes will not go live until the bench validation lands.
-		logger.Warn("ssh site facts configured in the site-settings record: the sshd.auth.key rows are firmware-derived but NOT yet live-bench-validated — live pushes stay gated behind --allow-gated-live-wlan (docs/PROTOCOL-systemcfg-wireless.md §13, bench use only)")
-	}
 	// The SSH set-inform push lane (internal/app/setinform.go): armed here
 	// so the console Adopt action can hand never-informed factory pending
 	// candidates an inform URL over SSH. EnableSetInformPush fails startup
