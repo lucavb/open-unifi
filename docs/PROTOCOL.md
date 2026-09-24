@@ -335,9 +335,11 @@ Web UI (lane D): static page at `/`:
   optional there (≥8 when set).
   VLAN id; save → PUT /api/v1/devices/{mac}/wireless (per-device envelope, adminapi shape).
 
-Package `provider` (lane E, at provider/ dir + cmd/tfprovider):
+Terraform provider (lane E, repository
+[terraform-provider-open-unifi](https://github.com/lucavb/terraform-provider-open-unifi),
+registry `lucavb/open-unifi`):
 resources `open-unifi_device` (adopt, by MAC + controller URL/token),
-`open-unifi_wlan` (ssid, security, passphrase, vlan), data source `open-unifi_devices`.
+per-device WLAN item routes, data source `open-unifi_devices`.
 Provider `Configure` accepts `url`, `token` (honest: token required unless server
 started without --admin-token).
 The device resource is `open-unifi_device`; `ssh_password` is Optional and

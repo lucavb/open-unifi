@@ -2,7 +2,8 @@
 
 A minimal, self-contained UniFi control plane for UniFi devices — currently
 targeting the UAP-AC-Pro-Gen2 (`U7PG2`): inform/adoption protocol server,
-admin REST API + web console, Prometheus metrics, and a Terraform provider.
+admin REST API + web console, and Prometheus metrics. The Terraform provider
+lives in [terraform-provider-open-unifi](https://github.com/lucavb/terraform-provider-open-unifi).
 Wire behavior was reverse-engineered byte-for-byte from the official
 controller's bytecode — see `docs/`.
 
@@ -12,8 +13,7 @@ over the standard inform channel.
 ## Layout
 
 - `cmd/openunifi/` — controller binary (inform server, UDP discovery, admin API, metrics).
-- `cmd/tfprovider/` — Terraform provider binary (terraform-plugin-framework, protocol 6).
-- `provider/` — provider implementation (client, `device` resource, `devices` data source).
+- `integration/provider/` — contract tests against [terraform-provider-open-unifi](https://github.com/lucavb/terraform-provider-open-unifi).
 - `internal/inform/` — inform packet codec: 40-byte header, AES-128-CBC, AES-GCM (header-bound AAD), zlib.
 - `internal/server/` — inform handler, adoption state machine, `mgmt_cfg`/`system_cfg` builders, UDP :10001 discovery listener.
 - `internal/store/` — device persistence (JSON-file backed, atomic writes).
@@ -22,7 +22,6 @@ over the standard inform channel.
 - `internal/metrics/` — Prometheus collectors (`openunifi_*`).
 - `internal/adminapi/static/index.html` — the embedded web console (go:embed; single source of truth).
 - `docs/` — protocol specifications (bytecode-cited).
-- `examples/terraform/` — provider usage with local dev overrides.
 
 ## Build & run
 
@@ -32,7 +31,6 @@ Agent / CI matrix (including golangci-lint): [`AGENTS.md`](AGENTS.md).
 make check          # CI check job: tracked gofmt + vet + test (not golangci-lint)
 make build          # go build ./...
 make test           # go test ./...
-make provider-build # dist/openunifi-tfprovider
 ```
 
 ```
@@ -212,8 +210,7 @@ and `/api/v1/site-settings` are removed — set country and SSH keys on each
 device instead. Update configuration and remove/import or recreate state as
 appropriate.
 
-See `examples/terraform/` (includes filesystem-mirror dev overrides so
-`terraform init` isn't needed during development).
+See the provider repo [`examples/terraform/`](https://github.com/lucavb/terraform-provider-open-unifi/tree/main/examples/terraform) for local dev overrides and sample configuration.
 
 ## WLAN provisioning status
 

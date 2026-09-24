@@ -1,6 +1,6 @@
 GO ?= go
 
-.PHONY: build test run provider-build check acceptance
+.PHONY: build test run check
 
 build:
 	$(GO) build ./...
@@ -13,9 +13,6 @@ test:
 run:
 	$(GO) run ./cmd/openunifi --listen-inform :8080 --listen-admin 127.0.0.1:8443 --admin-token dev-local
 
-provider-build:
-	$(GO) build -o dist/openunifi-tfprovider ./cmd/tfprovider
-
 # CI job "check" only — golangci-lint is a separate workflow job (AGENTS.md).
 # Format only the tracked sources: a bare `gofmt -l .` also walks gitignored
 # scratch state (worktree caches and the like) and trips on third-party
@@ -27,8 +24,3 @@ check:
 	$(GO) vet ./...
 	$(GO) test -count=1 ./...
 
-# Hermetic black-box Terraform acceptance suite. The test itself is gated by
-# TF_ACC=1; this target makes that opt-in explicit and keeps all artifacts in
-# the test's temporary root.
-acceptance:
-	TF_ACC=1 $(GO) test -tags acceptance -count=1 ./acceptance -v
