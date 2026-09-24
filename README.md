@@ -13,7 +13,7 @@ over the standard inform channel.
 
 - `cmd/openunifi/` — controller binary (inform server, UDP discovery, admin API, metrics).
 - `cmd/tfprovider/` — Terraform provider binary (terraform-plugin-framework, protocol 6).
-- `provider/` — provider implementation (client, `device`/`wlan` resources, `devices` data source).
+- `provider/` — provider implementation (client, `device`/`site_settings` resources, `devices` data source).
 - `internal/inform/` — inform packet codec: 40-byte header, AES-128-CBC, AES-GCM (header-bound AAD), zlib.
 - `internal/server/` — inform handler, adoption state machine, `mgmt_cfg`/`system_cfg` builders, UDP :10001 discovery listener.
 - `internal/store/` — device persistence (JSON-file backed, atomic writes).
@@ -46,7 +46,7 @@ go run ./cmd/openunifi \
 
 All flags: `--listen-inform` (device inform endpoint), `--listen-admin`
 (admin API/console/metrics), `--listen-discovery` + `--discovery` (UDP 10001
-announce listener), `--data-dir` (devices.json, wireless.json, site-settings.json), `--controller-url`
+announce listener), `--data-dir` (devices.json, site-settings.json), `--controller-url`
 (the URL devices should inform to; embedded in the pushed config),
 `--regulatory-country-code` (ISO 3166-1 numeric code used in generated wireless
 configuration; defaults to 840/US and is not a claim of regulatory approval),
@@ -65,8 +65,7 @@ off unless `OTEL_EXPORTER_OTLP_ENDPOINT(_TRACES)` is set; `http://` = plaintext 
 `OTEL_EXPORTER_OTLP_HEADERS/TIMEOUT/COMPRESSION`, `OTEL_SERVICE_NAME`,
 `OTEL_RESOURCE_ATTRIBUTES` are honored natively by the SDK). When tracing is on, JSON
 log lines carry `trace_id`/`span_id` (see `docs/alloy-openunifi.example.alloy` for a
-Grafana Alloy example wiring OTLP into Tempo and the controller log into Loki). A corrupt
-`wireless.json` refuses startup rather than silently provisioning the device with zero WLANs.
+Grafana Alloy example wiring OTLP into Tempo and the controller log into Loki).
 
 The device-intent settings above (`--regulatory-country-code`,
 `--device-ssh-key`) are
@@ -139,7 +138,8 @@ POST          /api/v1/devices/{mac}/factory-reset   arm remote factory reset
                                           (fires on the device's next inform)
 GET           /api/v1/pending           unadopted devices heard so far
 POST          /api/v1/pending/{mac}/adopt
-GET/PUT       /api/v1/wireless          whole-doc WLAN config ({"wlans":[…]})
+GET/PUT       /api/v1/devices/{mac}/wireless   per-device WLAN envelope ({"wlans":[…]})
+POST/GET/PUT/DELETE /api/v1/devices/{mac}/wireless/{name}   one WLAN on that device
 GET/PUT       /api/v1/site-settings     the device-intent site facts (whole-doc PUT)
 GET           /api/v1/devices/{mac}/radios          per-radio echo + admin intent
 PUT/DELETE    /api/v1/devices/{mac}/radios/{radio} set / clear per-radio intent
@@ -205,13 +205,9 @@ resource "open-unifi_device" "ap" {
   ssh_password = var.device_ssh_password # optional, sensitive
 }
 
-resource "open-unifi_wlan" "corp" {
-  name       = "corp"
-  ssid       = "corp"
-  security   = "wpa-p"
-  passphrase = "correcthorsebatterystaple"
-  vlan       = 42
-}
+# Per-device WLANs: PUT /api/v1/devices/{mac}/wireless ({"wlans":[…]}) or the
+# item routes under /api/v1/devices/{mac}/wireless/{name}. The removed
+# `open-unifi_wlan` resource had site-wide scope; WLAN intent is per AP now.
 
 resource "open-unifi_site_settings" "site" {
   regulatory_country_code = 840
@@ -287,7 +283,7 @@ network. For remote administration, terminate HTTPS in a reverse proxy as
 described above.
 
 `data/devices.json` holds live per-device keys (chmod 0600, gitignored);
-`data/wireless.json` holds WLAN passphrases. Treat both as credentials.
+`devices.json` and per-device `device_wlans` rows hold WLAN passphrases. Treat both as credentials.
 The data directory has an exclusive advisory lock to prevent concurrent JSON
 writes. Keep it private, encrypt backups, and restore the complete directory
 only while stopped. Terraform state can contain tokens and WLAN passphrases;

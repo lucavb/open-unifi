@@ -66,10 +66,9 @@ type Config struct {
 	// Default false.
 	AllowPlainText bool
 
-	// WirelessSource supplies the WLAN envelope (admin-API mirror: Wlan
-	// struct) that system_cfg provisioning renders and hashes for drift
-	// detection. nil ⇒ empty list ⇒ no wlans provisioned.
-	WirelessSource func() []Wlan
+	// WirelessForDevice supplies the WLAN envelope for one device at inform
+	// time (admin-owned device_wlans on the record). nil ⇒ empty list.
+	WirelessForDevice func(store.Device) []Wlan
 
 	// OnSessionEvents, when non-nil, receives the client-session
 	// transitions (connect/disconnect counts) each COMMITTED inform cycle
@@ -172,9 +171,9 @@ func New(cfg Config, st store.DeviceStore, lg *slog.Logger) *Server {
 		KeyChars: func(n int) (string, error) {
 			return s.keyChars(n)
 		},
-		Wireless:           s.currentWireless,
-		SystemCfg:          s.renderSystemCfg,
-		ControllerURL:      cfg.ControllerURL,
+		Wireless:         s.wirelessForDevice,
+		SystemCfg:        s.renderSystemCfg,
+		ControllerURL:    cfg.ControllerURL,
 		InformListenAddr: cfg.InformListenAddr,
 	})
 	return s

@@ -23,11 +23,13 @@ import (
 // fakeBackend implements Backend with fixed fixtures; it records calls so
 // tests can assert behavior (adopt routing, whole-doc wireless upsert).
 type fakeBackend struct {
-	devices  []DeviceView
-	pending  []PendingView
-	wireless WlansEnvelope
+	devices        []DeviceView
+	pending        []PendingView
+	wireless       WlansEnvelope
+	deviceWireless map[string]WlansEnvelope
 
 	lastPut           WlansEnvelope
+	lastPutMAC        string
 	created           []DeviceUpsert
 	adopted           []string
 	deleted           []string
@@ -61,6 +63,11 @@ func newFakeBackend() *fakeBackend {
 		},
 		pending: []PendingView{
 			{MAC: "a0:40:a0:aa:bb:cc", Source: "discovery-beacon"},
+		},
+		deviceWireless: map[string]WlansEnvelope{
+			"f0:9f:c2:84:8f:2a": {Wlans: []Wlan{
+				{ID: "wlan-1", Name: "home", SSID: "home-net", Security: "wpa-p", Passphrase: "correct-horse", VLAN: 1, Enabled: true},
+			}},
 		},
 		wireless: WlansEnvelope{Wlans: []Wlan{
 			{ID: "wlan-1", Name: "home", SSID: "home-net", Security: "wpa-p", Passphrase: "correct-horse", VLAN: 1, Enabled: true},
@@ -115,12 +122,55 @@ func (f *fakeBackend) PatchDevice(_ context.Context, mac string, p DevicePatch) 
 	f.byMAC[mac] = d
 	return d, nil
 }
-func (f *fakeBackend) CreateWlan(context.Context, Wlan) (Wlan, error) { return Wlan{}, nil }
-func (f *fakeBackend) GetWlan(context.Context, string) (Wlan, error) {
-	return Wlan{}, fmt.Errorf("%w", ErrNotFound)
+func (f *fakeBackend) CreateDeviceWlan(_ context.Context, mac string, wlan Wlan) (Wlan, error) {
+	if _, ok := f.byMAC[mac]; !ok {
+		return Wlan{}, fmt.Errorf("%w: %s", ErrNotFound, mac)
+	}
+	env := f.deviceWirelessEnv(mac)
+	env.Wlans = append(append([]Wlan(nil), env.Wlans...), wlan)
+	f.deviceWireless[mac] = env
+	return wlan, nil
 }
-func (f *fakeBackend) UpdateWlan(context.Context, string, Wlan) (Wlan, error) { return Wlan{}, nil }
-func (f *fakeBackend) DeleteWlan(context.Context, string) error               { return nil }
+func (f *fakeBackend) GetDeviceWlan(_ context.Context, mac, name string) (Wlan, error) {
+	env, err := f.GetDeviceWireless(context.Background(), mac)
+	if err != nil {
+		return Wlan{}, err
+	}
+	for _, w := range env.Wlans {
+		if w.Name == name {
+			return w, nil
+		}
+	}
+	return Wlan{}, fmt.Errorf("%w: wlan %s", ErrNotFound, name)
+}
+func (f *fakeBackend) UpdateDeviceWlan(_ context.Context, mac, name string, wlan Wlan) (Wlan, error) {
+	return Wlan{}, nil
+}
+func (f *fakeBackend) DeleteDeviceWlan(_ context.Context, mac, name string) error { return nil }
+
+func (f *fakeBackend) deviceWirelessEnv(mac string) WlansEnvelope {
+	if env, ok := f.deviceWireless[mac]; ok {
+		return env
+	}
+	return WlansEnvelope{Wlans: []Wlan{}}
+}
+
+func (f *fakeBackend) GetDeviceWireless(_ context.Context, mac string) (WlansEnvelope, error) {
+	if _, ok := f.byMAC[mac]; !ok {
+		return WlansEnvelope{}, fmt.Errorf("%w: %s", ErrNotFound, mac)
+	}
+	return f.deviceWirelessEnv(mac), nil
+}
+
+func (f *fakeBackend) PutDeviceWireless(_ context.Context, mac string, env WlansEnvelope) error {
+	if _, ok := f.byMAC[mac]; !ok {
+		return fmt.Errorf("%w: %s", ErrNotFound, mac)
+	}
+	f.lastPut = env
+	f.lastPutMAC = mac
+	f.deviceWireless[mac] = env
+	return nil
+}
 
 func (f *fakeBackend) CreateDevice(_ context.Context, up DeviceUpsert) (DeviceView, error) {
 	f.created = append(f.created, up)
@@ -261,14 +311,6 @@ func (f *fakeBackend) AdoptPending(_ context.Context, mac string) (DeviceView, e
 	return DeviceView{}, fmt.Errorf("%w: %s", ErrNotFound, mac)
 }
 
-func (f *fakeBackend) GetWireless(context.Context) WlansEnvelope { return f.wireless }
-
-func (f *fakeBackend) PutWireless(_ context.Context, env WlansEnvelope) error {
-	f.lastPut = env
-	f.wireless = env
-	return nil
-}
-
 // Site-settings fixtures: the fake carries the fixed GET view and records
 // the last PUT body so route tests can pin the decoded document verbatim
 // and that rejected requests never reach the Backend.
@@ -381,10 +423,10 @@ func TestUnauthorizedPostWhenTokenSet(t *testing.T) {
 		{"POST", "/api/v1/devices/f0:9f:c2:84:8f:2a/reboot"},
 		{"POST", "/api/v1/devices/f0:9f:c2:84:8f:2a/factory-reset"},
 		{"POST", "/api/v1/pending/a0:40:a0:aa:bb:cc/adopt"},
-		{"PUT", "/api/v1/wireless"},
+		{"PUT", "/api/v1/devices/f0:9f:c2:84:8f:2a/wireless"},
 		// GETs require the token too when auth is on:
 		{"GET", "/api/v1/devices"},
-		{"GET", "/api/v1/wireless"},
+		{"GET", "/api/v1/devices/f0:9f:c2:84:8f:2a/wireless"},
 		{"GET", "/api/v1/whoami"},
 	} {
 		run(t, testCase{
@@ -1007,9 +1049,11 @@ func TestMACInputBoundary(t *testing.T) {
 
 // ---- wireless validation + round trip ----------------------------------------
 
-func putWireless(t *testing.T, h http.Handler, body string) *httptest.ResponseRecorder {
+const testWirelessDeviceMAC = "f0:9f:c2:84:8f:2a"
+
+func putDeviceWireless(t *testing.T, h http.Handler, body string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest("PUT", "/api/v1/wireless", strings.NewReader(body))
+	req := httptest.NewRequest("PUT", "/api/v1/devices/"+testWirelessDeviceMAC+"/wireless", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec
@@ -1019,7 +1063,7 @@ func TestWirelessValidation(t *testing.T) {
 	h := New(Config{}, newFakeBackend())
 
 	// open + passphrase -> 400
-	rec := putWireless(t, h, `{"wlans":[{"ssid":"guest","security":"open","passphrase":"secret12","vlan":1}]}`)
+	rec := putDeviceWireless(t, h, `{"wlans":[{"ssid":"guest","security":"open","passphrase":"secret12","vlan":1}]}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("open+passphrase: %d", rec.Code)
 	}
@@ -1028,37 +1072,37 @@ func TestWirelessValidation(t *testing.T) {
 	}
 
 	// vlan 5000 -> 400
-	rec = putWireless(t, h, `{"wlans":[{"ssid":"x","security":"wpa-p","passphrase":"longenough","vlan":5000}]}`)
+	rec = putDeviceWireless(t, h, `{"wlans":[{"ssid":"x","security":"wpa-p","passphrase":"longenough","vlan":5000}]}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("vlan 5000: %d", rec.Code)
 	}
 
 	// vlan 0 -> 400
-	rec = putWireless(t, h, `{"wlans":[{"ssid":"x","security":"wpa-p","passphrase":"longenough","vlan":0}]}`)
+	rec = putDeviceWireless(t, h, `{"wlans":[{"ssid":"x","security":"wpa-p","passphrase":"longenough","vlan":0}]}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("vlan 0: %d", rec.Code)
 	}
 
 	// short passphrase -> 400
-	rec = putWireless(t, h, `{"wlans":[{"ssid":"x","security":"wpa-p","passphrase":"short","vlan":1}]}`)
+	rec = putDeviceWireless(t, h, `{"wlans":[{"ssid":"x","security":"wpa-p","passphrase":"short","vlan":1}]}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("short passphrase: %d", rec.Code)
 	}
 
 	// bad security enum -> 400
-	rec = putWireless(t, h, `{"wlans":[{"ssid":"x","security":"wpa2","passphrase":"longenough","vlan":1}]}`)
+	rec = putDeviceWireless(t, h, `{"wlans":[{"ssid":"x","security":"wpa2","passphrase":"longenough","vlan":1}]}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("bad security: %d", rec.Code)
 	}
 
 	// 33-char ssid -> 400
-	rec = putWireless(t, h, `{"wlans":[{"ssid":"`+strings.Repeat("a", 33)+`","security":"open","vlan":1}]}`)
+	rec = putDeviceWireless(t, h, `{"wlans":[{"ssid":"`+strings.Repeat("a", 33)+`","security":"open","vlan":1}]}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("33-char ssid: %d", rec.Code)
 	}
 
 	// open without passphrase is fine
-	rec = putWireless(t, h, `{"wlans":[{"ssid":"guest","security":"open","vlan":20,"enabled":true}]}`)
+	rec = putDeviceWireless(t, h, `{"wlans":[{"ssid":"guest","security":"open","vlan":20,"enabled":true}]}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("open without passphrase: %d %q", rec.Code, rec.Body.String())
 	}
@@ -1073,7 +1117,7 @@ func TestWPAEAPRadiusValidation(t *testing.T) {
 	h := New(Config{}, newFakeBackend())
 
 	// Without a profile: still rejected, new wording.
-	rec := putWireless(t, h, `{"wlans":[{"ssid":"corp","security":"wpa-eap","vlan":1}]}`)
+	rec := putDeviceWireless(t, h, `{"wlans":[{"ssid":"corp","security":"wpa-eap","vlan":1}]}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("profile-less wpa-eap: %d, want 400", rec.Code)
 	}
@@ -1082,7 +1126,7 @@ func TestWPAEAPRadiusValidation(t *testing.T) {
 	}
 
 	// With a minimal profile: accepted.
-	rec = putWireless(t, h, `{"wlans":[{"ssid":"corp","security":"wpa-eap","vlan":1,`+
+	rec = putDeviceWireless(t, h, `{"wlans":[{"ssid":"corp","security":"wpa-eap","vlan":1,`+
 		`"radius_servers":[{"ip":"10.1.0.5"}],"radius_secret":"s3cr3t!"}]}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("wpa-eap with profile: %d %q, want 200", rec.Code, rec.Body.String())
@@ -1144,7 +1188,7 @@ func TestWPAEAPRadiusValidation(t *testing.T) {
 			`"security":"open","radius_servers":[{"ip":"10.1.0.5"}]`,
 			"require security wpa-eap"},
 	} {
-		rec := putWireless(t, h, `{"wlans":[{"ssid":"corp","name":"corp","vlan":1,`+tc.extra+`}]}`)
+		rec := putDeviceWireless(t, h, `{"wlans":[{"ssid":"corp","name":"corp","vlan":1,`+tc.extra+`}]}`)
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("%s: %d %q, want 400", tc.name, rec.Code, rec.Body.String())
 		}
@@ -1155,7 +1199,7 @@ func TestWPAEAPRadiusValidation(t *testing.T) {
 
 	// The full accepted shape round-trips through the 200 echo body,
 	// including the optional port and vlan mode.
-	rec = putWireless(t, h, `{"wlans":[{"ssid":"corp","security":"wpa-eap","vlan":1,`+
+	rec = putDeviceWireless(t, h, `{"wlans":[{"ssid":"corp","security":"wpa-eap","vlan":1,`+
 		`"radius_servers":[{"ip":"10.1.0.5","port":1812},{"ip":"10.1.0.6"}],`+
 		`"radius_secret":"s3cr3t!","radius_vlan_mode":"required"}]}`)
 	if rec.Code != http.StatusOK {
@@ -1179,7 +1223,7 @@ func TestWPAEAPAccountingAcceptance(t *testing.T) {
 	profile := `"radius_servers":[{"ip":"10.1.0.5"}],"radius_secret":"s3cr3t!"`
 
 	// Full accounting shape: accepted and echoed.
-	rec := putWireless(t, h, `{"wlans":[{"ssid":"corp","security":"wpa-eap","vlan":1,`+profile+`,`+
+	rec := putDeviceWireless(t, h, `{"wlans":[{"ssid":"corp","security":"wpa-eap","vlan":1,`+profile+`,`+
 		`"accounting_enabled":true,`+
 		`"acct_servers":[{"ip":"10.2.0.1"},{"ip":"10.2.0.2","port":18131}],`+
 		`"interim_update_enabled":true}]}`)
@@ -1200,7 +1244,7 @@ func TestWPAEAPAccountingAcceptance(t *testing.T) {
 	// radius_das_enabled with accounting and a valid acct server:
 	// accepted and echoed (the judge's acct_servers precheck applies —
 	// das adds only the requires-accounting rule).
-	rec = putWireless(t, h, `{"wlans":[{"ssid":"corp","security":"wpa-eap","vlan":1,`+profile+`,`+
+	rec = putDeviceWireless(t, h, `{"wlans":[{"ssid":"corp","security":"wpa-eap","vlan":1,`+profile+`,`+
 		`"accounting_enabled":true,"acct_servers":[{"ip":"10.2.0.1"}],`+
 		`"radius_das_enabled":true}]}`)
 	if rec.Code != http.StatusOK {
@@ -1212,7 +1256,7 @@ func TestWPAEAPAccountingAcceptance(t *testing.T) {
 
 	// Stored acct servers with accounting off: accepted (inert list —
 	// the renderer goldens pin the byte-identity).
-	rec = putWireless(t, h, `{"wlans":[{"ssid":"corp","security":"wpa-eap","vlan":1,`+profile+`,`+
+	rec = putDeviceWireless(t, h, `{"wlans":[{"ssid":"corp","security":"wpa-eap","vlan":1,`+profile+`,`+
 		`"acct_servers":[{"ip":"10.2.0.1"}]}]}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("inert acct_servers wpa-eap: %d %q, want 200", rec.Code, rec.Body.String())
@@ -1220,7 +1264,7 @@ func TestWPAEAPAccountingAcceptance(t *testing.T) {
 
 	// accounting_enabled alone (zero acct servers): accepted — the
 	// radiusprofile stores toggle and server list independently.
-	rec = putWireless(t, h, `{"wlans":[{"ssid":"corp","security":"wpa-eap","vlan":1,`+profile+`,`+
+	rec = putDeviceWireless(t, h, `{"wlans":[{"ssid":"corp","security":"wpa-eap","vlan":1,`+profile+`,`+
 		`"accounting_enabled":true}]}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("accounting without servers: %d %q, want 200", rec.Code, rec.Body.String())
@@ -1231,33 +1275,33 @@ func TestWirelessNameCapAndBodyStrictness(t *testing.T) {
 	h := New(Config{}, newFakeBackend())
 
 	// 65-byte name -> 400 (same cap style as the ID).
-	rec := putWireless(t, h, `{"wlans":[{"name":"`+strings.Repeat("a", 65)+`","ssid":"x","security":"open","vlan":1}]}`)
+	rec := putDeviceWireless(t, h, `{"wlans":[{"name":"`+strings.Repeat("a", 65)+`","ssid":"x","security":"open","vlan":1}]}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("65-byte name: %d, want 400", rec.Code)
 	}
 	// exactly 64 bytes is fine
-	rec = putWireless(t, h, `{"wlans":[{"name":"`+strings.Repeat("a", 64)+`","ssid":"x","security":"open","vlan":1}]}`)
+	rec = putDeviceWireless(t, h, `{"wlans":[{"name":"`+strings.Repeat("a", 64)+`","ssid":"x","security":"open","vlan":1}]}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("64-byte name: %d %q, want 200", rec.Code, rec.Body.String())
 	}
 
 	// Unknown fields must be rejected (DisallowUnknownFields).
-	rec = putWireless(t, h, `{"wlans":[{"ssid":"x","security":"open","vlan":1,"typo_field":true}]}`)
+	rec = putDeviceWireless(t, h, `{"wlans":[{"ssid":"x","security":"open","vlan":1,"typo_field":true}]}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("unknown field: %d %q, want 400", rec.Code, rec.Body.String())
 	}
-	rec = putWireless(t, h, `{"wlans":[],"extra_field":1}`)
+	rec = putDeviceWireless(t, h, `{"wlans":[],"extra_field":1}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("unknown envelope field: %d, want 400", rec.Code)
 	}
 
 	// Trailing data after the JSON value must be rejected.
-	rec = putWireless(t, h, `{"wlans":[]} trail`)
+	rec = putDeviceWireless(t, h, `{"wlans":[]} trail`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("trailing data: %d, want 400", rec.Code)
 	}
 	// ...including trailing JSON values (smuggling attempts).
-	rec = putWireless(t, h, `{"wlans":[]} {"wlans":[]}`)
+	rec = putDeviceWireless(t, h, `{"wlans":[]} {"wlans":[]}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("trailing value: %d, want 400", rec.Code)
 	}
@@ -1275,7 +1319,7 @@ func TestWirelessGetPutRoundTrip(t *testing.T) {
 	be := newFakeBackend()
 	h := New(Config{}, be)
 
-	rec := putWireless(t, h, `{"wlans":[
+	rec := putDeviceWireless(t, h, `{"wlans":[
 		{"name":"home","ssid":"home-net","security":"wpa-p","passphrase":"correct-horse","vlan":1,"enabled":true},
 		{"name":"guest","ssid":"guests","security":"open","vlan":20,"enabled":false}
 	]}`)
@@ -1289,12 +1333,12 @@ func TestWirelessGetPutRoundTrip(t *testing.T) {
 	if len(saved.Wlans) != 2 || saved.Wlans[1].VLAN != 20 {
 		t.Fatalf("put response: %+v", saved)
 	}
-	if be.lastPut.Wlans[0].SSID != "home-net" || be.lastPut.Wlans[1].Passphrase != "" {
+	if be.lastPutMAC != testWirelessDeviceMAC || be.lastPut.Wlans[0].SSID != "home-net" || be.lastPut.Wlans[1].Passphrase != "" {
 		t.Fatalf("backend received: %+v", be.lastPut)
 	}
 
 	// GET echoes what was PUT
-	req := httptest.NewRequest("GET", "/api/v1/wireless", nil)
+	req := httptest.NewRequest("GET", "/api/v1/devices/"+testWirelessDeviceMAC+"/wireless", nil)
 	rec2 := httptest.NewRecorder()
 	h.ServeHTTP(rec2, req)
 	var got WlansEnvelope
@@ -1986,7 +2030,7 @@ func TestWirelessRejectsControlCharsAndBadID(t *testing.T) {
 		{"id with newline", `{"wlans":[{"id":"row1\nrow2","ssid":"x","security":"open","vlan":1}]}`, "id"},
 		{"id too long", `{"wlans":[{"id":"` + strings.Repeat("a", 65) + `","ssid":"x","security":"open","vlan":1}]}`, "id"},
 	} {
-		rec := putWireless(t, h, tc.body)
+		rec := putDeviceWireless(t, h, tc.body)
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("%s: got %d (%s), want 400", tc.name, rec.Code, rec.Body.String())
 		}
@@ -1996,7 +2040,7 @@ func TestWirelessRejectsControlCharsAndBadID(t *testing.T) {
 	}
 
 	// Clean values — including a hex-style ID — still pass.
-	rec := putWireless(t, h, `{"wlans":[
+	rec := putDeviceWireless(t, h, `{"wlans":[
 		{"id":"wlan-1","name":"home","ssid":"home-net","security":"wpa-p","passphrase":"correct-horse","vlan":1,"enabled":true},
 		{"name":"guest","ssid":"guests","security":"open","vlan":20}
 	]}`)

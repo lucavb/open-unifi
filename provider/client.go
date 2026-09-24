@@ -273,24 +273,28 @@ type wirelessEntry struct {
 	Band       string `json:"band,omitempty"`
 }
 
-func (c *apiClient) createWireless(ctx context.Context, entry *wirelessEntry) error {
-	return c.do(ctx, http.MethodPost, "/api/v1/wireless", entry, nil)
+func (c *apiClient) deviceWirelessBase(mac string) string {
+	return "/api/v1/devices/" + url.PathEscape(mac) + "/wireless"
 }
 
-func (c *apiClient) getWireless(ctx context.Context, name string) (*wirelessEntry, error) {
+func (c *apiClient) createWireless(ctx context.Context, mac string, entry *wirelessEntry) error {
+	return c.do(ctx, http.MethodPost, c.deviceWirelessBase(mac), entry, nil)
+}
+
+func (c *apiClient) getWireless(ctx context.Context, mac, name string) (*wirelessEntry, error) {
 	var entry wirelessEntry
-	if err := c.do(ctx, http.MethodGet, "/api/v1/wireless/"+url.PathEscape(name), nil, &entry); err != nil {
+	if err := c.do(ctx, http.MethodGet, c.deviceWirelessBase(mac)+"/"+url.PathEscape(name), nil, &entry); err != nil {
 		return nil, err
 	}
 	return &entry, nil
 }
 
-func (c *apiClient) updateWireless(ctx context.Context, name string, entry *wirelessEntry) error {
-	return c.do(ctx, http.MethodPut, "/api/v1/wireless/"+url.PathEscape(name), entry, nil)
+func (c *apiClient) updateWireless(ctx context.Context, mac, name string, entry *wirelessEntry) error {
+	return c.do(ctx, http.MethodPut, c.deviceWirelessBase(mac)+"/"+url.PathEscape(name), entry, nil)
 }
 
-func (c *apiClient) deleteWireless(ctx context.Context, name string) error {
-	return c.do(ctx, http.MethodDelete, "/api/v1/wireless/"+url.PathEscape(name), nil, nil)
+func (c *apiClient) deleteWireless(ctx context.Context, mac, name string) error {
+	return c.do(ctx, http.MethodDelete, c.deviceWirelessBase(mac)+"/"+url.PathEscape(name), nil, nil)
 }
 
 // siteSettings is the wire shape of GET/PUT /api/v1/site-settings

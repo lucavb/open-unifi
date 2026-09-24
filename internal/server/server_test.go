@@ -37,6 +37,10 @@ var testIV = bytes16(0x07)
 func bytes16(fill byte) []byte { return bytes.Repeat([]byte{fill}, 16) }
 func testMACRaw() []byte       { return []byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff} }
 
+func wirelessFromFunc(f func() []Wlan) func(store.Device) []Wlan {
+	return func(store.Device) []Wlan { return f() }
+}
+
 // ---- packet construction helpers (codec verbs) ---------------------------
 
 // forgeInform builds a request inform through the codec: NewPacket framing
@@ -84,7 +88,16 @@ func forgePlainInform(t *testing.T, mac []byte, flags uint16, iv, payload []byte
 // JSON body as plaintext, via the codec.
 func encryptCBC(t *testing.T, jsonBody []byte, keyHex, iv []byte) []byte {
 	t.Helper()
-	return forgeInform(t, testMACRaw(), inform.FlagEncCBC, keyHex, iv, jsonBody)
+	return encryptCBCForMAC(t, testMAC, jsonBody, keyHex, iv)
+}
+
+func encryptCBCForMAC(t *testing.T, mac12 string, jsonBody []byte, keyHex, iv []byte) []byte {
+	t.Helper()
+	raw, err := hex.DecodeString(mac12)
+	if err != nil || len(raw) != 6 {
+		t.Fatalf("mac12: %q", mac12)
+	}
+	return forgeInform(t, raw, inform.FlagEncCBC, keyHex, iv, jsonBody)
 }
 
 // encryptGCM seals with a 16-byte nonce and AAD = the 40-byte request header
@@ -262,7 +275,7 @@ func hexKey(t *testing.T, s string) []byte {
 // adapter's delta application.
 func mustBuildSys(t *testing.T, s *Server, rec store.Device) string {
 	t.Helper()
-	wls := s.currentWireless()
+	wls := s.wirelessForDevice(rec)
 	sys, deltas, err := s.renderSystemCfg(rec, wls, wireless.PlanProvisioning(rec, wls))
 	if err != nil {
 		t.Fatalf("system_cfg build: %v", err)
@@ -645,7 +658,7 @@ func u7pg2Record() store.Device {
 // 2=eth0 up, 3/4=ath0/ath1 slots down — then the tagged netconf.5=br0.42;
 // disabled guest ABSENT everywhere).
 func TestWorkedExampleWirelessSystemCfg(t *testing.T) {
-	s := New(Config{WirelessSource: func() []Wlan { return workedEnvelope() }}, store.NewMemStore(), testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return workedEnvelope() }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, u7pg2Record())
 	start := strings.Index(sys, "# wlans (radio)\n")
 	// The wireless compound ends at the last dhcpc row; the factory-echo
@@ -895,7 +908,7 @@ func TestWorkedExampleWirelessSystemCfg(t *testing.T) {
 // No radios in the stored inform data → the §1 no-radio variant and no other
 // wireless rows at all.
 func TestNoRadiosWirelessVariant(t *testing.T) {
-	s := New(Config{WirelessSource: func() []Wlan { return workedEnvelope() }}, store.NewMemStore(), testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return workedEnvelope() }}, store.NewMemStore(), testLogger())
 	rec := u7pg2Record()
 	delete(rec.Extra, "radio_table")
 	sys := mustBuildSys(t, s, rec)
@@ -912,7 +925,7 @@ func TestNoRadiosWirelessVariant(t *testing.T) {
 // dynamic_vlan=0, and the server warns.
 func TestWpaEapWirelessMinimal(t *testing.T) {
 	var logs strings.Builder
-	s := New(Config{WirelessSource: func() []Wlan {
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan {
 		return []Wlan{
 			{Name: "ent", SSID: "ent", Security: "wpa-eap", Enabled: true, ID: "eapident"},
 		}
@@ -952,7 +965,7 @@ func TestWpaEapWirelessMinimal(t *testing.T) {
 func TestVlanWiringStatusRowsAlwaysOn(t *testing.T) {
 	env := []Wlan{{Name: "net", SSID: "net", Security: "wpa-p",
 		Passphrase: "correcthorse", Enabled: true}} // untagged only
-	s := New(Config{WirelessSource: func() []Wlan { return env }}, store.NewMemStore(), testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return env }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, u7pg2Record())
 	for _, want := range []string{
 		"# vlan\nvlan.status=disabled\n",
@@ -1028,14 +1041,14 @@ func TestSystemCfgMcadValidatorGateKeysPresent(t *testing.T) {
 	}
 
 	// (a) radios + WLANs: the full worked-example generation path.
-	s := New(Config{WirelessSource: func() []Wlan { return workedEnvelope() }}, store.NewMemStore(), testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return workedEnvelope() }}, store.NewMemStore(), testLogger())
 	assertGate("with-radios", mustBuildSys(t, s, u7pg2Record()))
 
 	// (b) no radio_table: the "no wlan provisioned" early-return path
 	// still emits the netconf section (empty vids).
 	rec := u7pg2Record()
 	delete(rec.Extra, "radio_table")
-	s2 := New(Config{WirelessSource: func() []Wlan { return workedEnvelope() }}, store.NewMemStore(), testLogger())
+	s2 := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return workedEnvelope() }}, store.NewMemStore(), testLogger())
 	sys2 := mustBuildSys(t, s2, rec)
 	if want := "# no wlan provisioned as no radio found\nradio.status=disabled\n"; !strings.Contains(sys2, want) {
 		t.Fatalf("case (b) did not hit the no-radio variant:\n%s", sys2)
@@ -1067,7 +1080,7 @@ func TestOpenHostapdNeedsWifiCapsBit0x2000(t *testing.T) {
 		if tc.fwCaps != 0 {
 			rec.Extra["fw_caps"] = tc.fwCaps
 		}
-		s := New(Config{WirelessSource: func() []Wlan { return env }}, store.NewMemStore(), testLogger())
+		s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return env }}, store.NewMemStore(), testLogger())
 		sys := mustBuildSys(t, s, rec)
 		have := "aaa.1.status=disabled\n"
 		if tc.wantEn {
@@ -1084,7 +1097,7 @@ func TestOpenHostapdNeedsWifiCapsBit0x2000(t *testing.T) {
 // "disabled") — and the value is enabled at our defaults.
 func TestBgaFilterGatedOnWifiCapsBit64(t *testing.T) {
 	env := workedEnvelope()
-	s := New(Config{WirelessSource: func() []Wlan { return env }}, store.NewMemStore(), testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return env }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, u7pg2Record())
 	if strings.Contains(sys, "bga_filter") {
 		t.Fatalf("absent wifi_caps must skip the bga_filter row:\n%s", sys)
@@ -1109,7 +1122,7 @@ func TestEthInventoryInformsVlanRows(t *testing.T) {
 	rec.Extra["ethernet_table"] = []any{
 		map[string]any{"num_port": 2.0},
 	}
-	s := New(Config{WirelessSource: func() []Wlan { return workedEnvelope() }}, store.NewMemStore(), testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return workedEnvelope() }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, rec)
 	for _, want := range []string{
 		"vlan.status=enabled\n",
@@ -1129,7 +1142,7 @@ func TestEthInventoryInformsVlanRows(t *testing.T) {
 // to the single eth0 uplink and the server warns (wlans with radios).
 func TestPartialEthInventoryWarns(t *testing.T) {
 	var logs strings.Builder
-	s := New(Config{WirelessSource: func() []Wlan { return workedEnvelope() }},
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return workedEnvelope() }},
 		store.NewMemStore(), testWarnLogger(&logs))
 	sys := mustBuildSys(t, s, u7pg2Record())
 	if !strings.Contains(sys, "vlan.1.devname=eth0\n") {
@@ -1153,7 +1166,7 @@ func TestEthInventoryFromIfTable(t *testing.T) {
 		map[string]any{"name": "ath0", "up": true},
 		map[string]any{"name": "ath1", "up": true},
 	}
-	s := New(Config{WirelessSource: func() []Wlan { return workedEnvelope() }},
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return workedEnvelope() }},
 		store.NewMemStore(), testWarnLogger(&logs))
 	sys := mustBuildSys(t, s, rec)
 	if !strings.Contains(sys, "vlan.1.devname=eth0\nvlan.1.id=42\n") {
@@ -1175,7 +1188,7 @@ func TestEthInventoryFromIfTableMultiPort(t *testing.T) {
 		map[string]any{"name": "eth1", "up": true},
 		map[string]any{"name": "eth0", "up": true},
 	}
-	s := New(Config{WirelessSource: func() []Wlan { return workedEnvelope() }}, store.NewMemStore(), testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return workedEnvelope() }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, rec)
 	for _, want := range []string{
 		"vlan.1.devname=eth0\nvlan.1.id=42\n",
@@ -1201,7 +1214,7 @@ func TestEthInventoryUplinkOnlyStillWarns(t *testing.T) {
 		map[string]any{"name": "Main", "is_uplink": true, "port_idx": 1.0},
 		map[string]any{"name": "Secondary", "is_uplink": false, "port_idx": 2.0},
 	}
-	s := New(Config{WirelessSource: func() []Wlan { return workedEnvelope() }},
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return workedEnvelope() }},
 		store.NewMemStore(), testWarnLogger(&logs))
 	sys := mustBuildSys(t, s, rec)
 	if !strings.Contains(sys, "vlan.1.devname=eth1\n") {
@@ -1216,7 +1229,7 @@ func TestEthInventoryUplinkOnlyStillWarns(t *testing.T) {
 func TestDhcpcMgmtRowUsesMgmtDev(t *testing.T) {
 	rec := u7pg2Record()
 	rec.Extra["mgmt_dev"] = "br0.9"
-	s := New(Config{WirelessSource: func() []Wlan { return workedEnvelope() }}, store.NewMemStore(), testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return workedEnvelope() }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, rec)
 	if !strings.Contains(sys, "dhcpc.1.devname=br0.9\n") {
 		t.Fatalf("dhcpc mgmt row must follow mgmt_dev:\n%s", sys)
@@ -1226,7 +1239,12 @@ func TestDhcpcMgmtRowUsesMgmtDev(t *testing.T) {
 // radioBody returns the inform body map for the worked-example device
 // (radio_table rides in the body exactly as the server persists it).
 func radioBody(appliedCfg string) map[string]any {
+	return radioBodyForMAC(appliedCfg, testMAC)
+}
+
+func radioBodyForMAC(appliedCfg, mac12 string) map[string]any {
 	jm := infoBody(appliedCfg)
+	jm["mac"] = store.ColonMAC(mac12)
 	jm["radio_table"] = u7pg2Record().Extra["radio_table"]
 	return jm
 }
@@ -1292,7 +1310,7 @@ func systemCfgUsersPassword(t *testing.T, sys string) string {
 // as the WirelessSource backing, returning (recorder, store).
 func wiredServer(t *testing.T, env func() []Wlan, st store.DeviceStore) http.Handler {
 	t.Helper()
-	s := New(Config{WirelessSource: env}, st, testLogger())
+	s := New(Config{WirelessForDevice: wirelessFromFunc(env)}, st, testLogger())
 	return s.InformHandler()
 }
 
@@ -1385,6 +1403,74 @@ func TestWirelessDriftFSM(t *testing.T) {
 	_, jm = decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
 	if jm["_type"] != "noop" {
 		t.Fatalf("inform#4 type = %v, want noop after confirmation", jm["_type"])
+	}
+}
+
+// TestPerDeviceWirelessDriftIsolation: a WLAN edit on one AP must not
+// reprovision another AP that still carries the same envelope.
+func TestPerDeviceWirelessDriftIsolation(t *testing.T) {
+	const macA, macB = "aabbccddeeff", "112233445566"
+	envA := []Wlan{{Name: "home", SSID: "home-a", Security: "open", VLAN: 1, Enabled: true, ID: "ida"}}
+	envB := []Wlan{{Name: "home", SSID: "home-b", Security: "open", VLAN: 1, Enabled: true, ID: "idb"}}
+	st := store.NewMemStore()
+	xkey := "11112222333344445555666677778888"
+	seed := func(mac string, env []Wlan, sha string) store.Device {
+		d := u7pg2Record()
+		d.MAC = mac
+		d.State = store.StateAdopted
+		d.CfgVersion = "cfg-" + mac
+		d.AppliedCfg = d.CfgVersion
+		d.XAuthkey = xkey
+		d.Authkeys = []string{xkey}
+		if d.Extra == nil {
+			d.Extra = store.JSONMap{}
+		}
+		_ = wireless.SetDeviceWLANs(&d, env)
+		d.Extra["wlan_cfg_sha"] = sha
+		return d
+	}
+	if err := st.Put(seed(macA, envA, wireless.WlanListHash(envA))); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Put(seed(macB, envB, wireless.WlanListHash(envB))); err != nil {
+		t.Fatal(err)
+	}
+	s := New(Config{WirelessForDevice: func(d store.Device) []Wlan { return wireless.DeviceWLANs(d) }}, st, testLogger())
+	h := s.InformHandler()
+
+	postInform := func(mac12 string) map[string]any {
+		t.Helper()
+		rec, err := st.Get(mac12)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := encryptCBCForMAC(t, mac12, mustJSON(t, radioBodyForMAC(rec.CfgVersion, mac12)), hexKey(t, xkey), testIV)
+		resp := post(t, h, body)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("inform %s: %d", mac12, resp.Code)
+		}
+		_, jm := decryptResponse(t, resp.Body.Bytes(), hexKey(t, xkey))
+		return jm
+	}
+
+	if jm := postInform(macB); jm["_type"] != "noop" {
+		t.Fatalf("device B unchanged envelope: got %v", jm["_type"])
+	}
+
+	// Admin edit: device A only.
+	recA, _ := st.Get(macA)
+	envA[0].SSID = "home-a-changed"
+	_ = wireless.SetDeviceWLANs(&recA, envA)
+	if err := st.Put(recA); err != nil {
+		t.Fatal(err)
+	}
+
+	jmA := postInform(macA)
+	if jmA["_type"] != "setparam" {
+		t.Fatalf("device A after edit: got %v, want setparam", jmA["_type"])
+	}
+	if jm := postInform(macB); jm["_type"] != "noop" {
+		t.Fatalf("device B must stay noop when only A changed: got %v", jm["_type"])
 	}
 }
 
@@ -1699,7 +1785,7 @@ func TestMultiVLANContiguousNumbering(t *testing.T) {
 		{Name: "corp", SSID: "corp", Security: "wpa-p", Passphrase: "correcthorse", VLAN: 42, Enabled: true},
 		{Name: "iot", SSID: "iot", Security: "wpa-p", Passphrase: "correcthorse", VLAN: 43, Enabled: true},
 	}
-	s := New(Config{WirelessSource: func() []Wlan { return env }}, store.NewMemStore(), testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return env }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, u7pg2Record())
 	for _, want := range []string{
 		"netconf.1.devname=br0\n",
@@ -2251,7 +2337,7 @@ func TestNewlineInjectionGuarded(t *testing.T) {
 			"tx_power_mode": "auto", "tx_power": "auto",
 			"builtin_antenna": true, "builtin_ant_gain": 0.0},
 	}
-	s := New(Config{WirelessSource: func() []Wlan { return workedEnvelope() }}, store.NewMemStore(), testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return workedEnvelope() }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, rec)
 	if strings.Contains(sys, "injected=1") || strings.Contains(sys, "evil=1") {
 		t.Fatalf("injected newline value leaked into system_cfg:\n%s", sys)
@@ -2390,14 +2476,14 @@ func TestPlainLaneProvisionsWirelessRows(t *testing.T) {
 	if err := st.Put(rec); err != nil {
 		t.Fatal(err)
 	}
-	s := New(Config{AllowPlainText: true, WirelessSource: func() []Wlan { return env }}, st, testLogger())
+	s := New(Config{AllowPlainText: true, WirelessForDevice: func(_ store.Device) []Wlan { return env }}, st, testLogger())
 	realRender := s.renderSystemCfg
 	var handedPlan wireless.ProvisioningPlan
 	s.engine = adoption.New(adoption.Deps{
 		Logger:   testLogger(),
 		Random:   func() float64 { return 0.5 },
 		KeyChars: func(n int) (string, error) { return strings.Repeat("f", n), nil },
-		Wireless: func() []wireless.Wlan { return env },
+		Wireless: func(store.Device) []wireless.Wlan { return env },
 		SystemCfg: func(d store.Device, wls []wireless.Wlan, plan wireless.ProvisioningPlan) (string, map[string]string, error) {
 			handedPlan = plan
 			return realRender(d, wls, plan)
@@ -2830,7 +2916,7 @@ func TestMultiWlanSystemCfg(t *testing.T) {
 		{Name: "open", SSID: "opennet", Security: "open", Enabled: true, ID: "id00000000000000000000OA"},
 		{Name: "sec", SSID: "secnet", Security: "wpa-p", Passphrase: "correcthorse", VLAN: 42, Enabled: true, ID: "id00000000000000000000SB"},
 	}
-	s := New(Config{WirelessSource: func() []Wlan { return env }}, store.NewMemStore(), testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return env }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, u7pg2Record())
 
 	// global ath counter: the vap counter assigns ath0..ath3 in radio-sorted,
@@ -2938,7 +3024,7 @@ func TestUsers1PasswordIdenticalAcrossProvisionings(t *testing.T) {
 		t.Fatal(err)
 	}
 	env := []Wlan{{Name: "net", SSID: "net", Security: "open", Enabled: true}}
-	s := New(Config{WirelessSource: func() []Wlan { return env }}, st, testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return env }}, st, testLogger())
 	h := s.InformHandler()
 
 	pw := ""
@@ -3160,7 +3246,7 @@ func TestRadioIntentRidesFullProvisioning(t *testing.T) {
 		t.Fatal(err)
 	}
 	env := []Wlan{{Name: "net", SSID: "net", Security: "open", Enabled: true}}
-	s := New(Config{WirelessSource: func() []Wlan { return env }}, st, testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return env }}, st, testLogger())
 	h := s.InformHandler()
 
 	body := infoBody("aaaa") // device echoes the applied, not the bumped, version
@@ -3199,7 +3285,7 @@ func TestLEDOverrideRidesFullProvisioning(t *testing.T) {
 		t.Fatal(err)
 	}
 	env := []Wlan{{Name: "net", SSID: "net", Security: "open", Enabled: true}}
-	s := New(Config{WirelessSource: func() []Wlan { return env }}, st, testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return env }}, st, testLogger())
 	h := s.InformHandler()
 
 	body := infoBody("aaaa") // device echoes the applied, not the minted, version

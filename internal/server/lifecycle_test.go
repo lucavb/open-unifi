@@ -75,10 +75,10 @@ func lifecycleFixture(t *testing.T) (admin, informH http.Handler, st store.Devic
 func siteSettingsFixture(t *testing.T, seed app.SiteSettings, wlans []Wlan) (admin, informH http.Handler, st store.DeviceStore) {
 	t.Helper()
 	st = store.NewMemStore()
-	a := app.New(st, filepath.Join(t.TempDir(), "wireless.json"), filepath.Join(t.TempDir(), "site-settings.json"), seed, testLogger())
+	a := app.New(st, filepath.Join(t.TempDir(), "site-settings.json"), seed, testLogger())
 	cfg := Config{SiteSettings: appSettingsSource(a)}
 	if wlans != nil {
-		cfg.WirelessSource = func() []Wlan { return wlans }
+		cfg.WirelessForDevice = func(_ store.Device) []Wlan { return wlans }
 	}
 	return adminapi.New(adminapi.Config{}, a), New(cfg, st, testLogger()).InformHandler(), st
 }

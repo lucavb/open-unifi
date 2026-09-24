@@ -17,19 +17,16 @@ import (
 	"github.com/lucavb/open-unifi/internal/adminapi"
 	"github.com/lucavb/open-unifi/internal/server/systemcfg"
 	"github.com/lucavb/open-unifi/internal/store"
+	"github.com/lucavb/open-unifi/internal/wireless"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 )
 
-func testApp(t *testing.T) (*App, store.DeviceStore, string) {
+func testApp(t *testing.T) (*App, store.DeviceStore) {
 	t.Helper()
 	st := store.NewMemStore()
-	wpath := filepath.Join(t.TempDir(), "wireless.json")
-	// The settings file lives in its own temp dir: TestWirelessRoundtrip
-	// asserts its directory holds exactly one file (the old-world pin),
-	// and the site-settings record persists a file at New on first boot.
-	a := New(st, wpath, filepath.Join(t.TempDir(), "site-settings.json"), SiteSettings{}, quietLogger())
-	return a, st, wpath
+	a := New(st, filepath.Join(t.TempDir(), "site-settings.json"), SiteSettings{}, quietLogger())
+	return a, st
 }
 
 func quietLogger() *slog.Logger {
@@ -61,7 +58,7 @@ func counterDefault(name string) float64 {
 // ---- device CRUD ---------------------------------------------------------
 
 func TestDeviceCreateListGetRoundtrip(t *testing.T) {
-	a, st, _ := testApp(t)
+	a, st := testApp(t)
 	ctx := context.Background()
 
 	dv, err := a.CreateDevice(ctx, adminapi.DeviceUpsert{MAC: "F0:9F:C2:84:8F:2A", Name: "lobby", SiteID: "default"})
@@ -89,7 +86,7 @@ func TestDeviceCreateListGetRoundtrip(t *testing.T) {
 }
 
 func TestDuplicateCreateIsIdempotentUpsert(t *testing.T) {
-	a, _, _ := testApp(t)
+	a, _ := testApp(t)
 	ctx := context.Background()
 	if _, err := a.CreateDevice(ctx, adminapi.DeviceUpsert{MAC: "aabbccddeeff", Name: "first"}); err != nil {
 		t.Fatal(err)
@@ -118,7 +115,7 @@ func brightPtr(v int) *int { return &v }
 // and the backend-side enum fence rejects anything else WITHOUT touching
 // the record.
 func TestPatchDeviceLEDOverride(t *testing.T) {
-	a, st, _ := testApp(t)
+	a, st := testApp(t)
 	ctx := context.Background()
 
 	if _, err := a.CreateDevice(ctx, adminapi.DeviceUpsert{MAC: "aabbccddeeff"}); err != nil {
@@ -157,7 +154,7 @@ func TestPatchDeviceLEDOverride(t *testing.T) {
 // mint, a settled device never re-provisions and led_enabled never reaches
 // the mgmt_cfg it rides. Idempotent saves mint nothing.
 func TestPatchDeviceLEDMintsCfgVersionOncePerChange(t *testing.T) {
-	a, st, _ := testApp(t)
+	a, st := testApp(t)
 	ctx := context.Background()
 	if err := st.Put(store.Device{
 		MAC: "aabbccddeeff", Model: "U7PG2", State: store.StateAdopted,
@@ -206,7 +203,7 @@ func TestPatchDeviceLEDMintsCfgVersionOncePerChange(t *testing.T) {
 // discipline follows TestPatchDeviceLEDMintsCfgVersionOncePerChange:
 // effective change → fresh 16-hex cfgversion; idempotent save → nothing.
 func TestPatchDeviceLEDBarKnobs(t *testing.T) {
-	a, st, _ := testApp(t)
+	a, st := testApp(t)
 	ctx := context.Background()
 	if err := st.Put(store.Device{
 		MAC: "aabbccddeeff", Model: "U7PG2", State: store.StateAdopted,
@@ -298,7 +295,7 @@ func TestPatchDeviceLEDBarKnobs(t *testing.T) {
 // never changes (locked per-device semantics, store.Device.SSHPassword
 // docblock).
 func TestPatchDeviceSSHPassword(t *testing.T) {
-	a, st, _ := testApp(t)
+	a, st := testApp(t)
 	ctx := context.Background()
 	// fw_caps 0x400: the real U7PG2 SHA-512 password capability bit
 	// (supportsSha512Password, Default-0 semantics), so the
@@ -400,7 +397,7 @@ func TestPatchDeviceSSHPassword(t *testing.T) {
 // "leave unset" value for DeviceUpsert and the explicit clear for
 // DevicePatch.
 func TestDeviceNameValidationBackstop(t *testing.T) {
-	a, _, _ := testApp(t)
+	a, _ := testApp(t)
 	ctx := context.Background()
 
 	if _, err := a.CreateDevice(ctx, adminapi.DeviceUpsert{MAC: "aabbccddeeff", Name: "ok"}); err != nil {
@@ -430,7 +427,7 @@ func TestDeviceNameValidationBackstop(t *testing.T) {
 }
 
 func TestAdoptPendingFlow(t *testing.T) {
-	a, st, _ := testApp(t)
+	a, st := testApp(t)
 	ctx := context.Background()
 
 	if err := st.MarkPending("a040a0aabbcc", "discovery:platform=U7PG2"); err != nil {
@@ -512,7 +509,7 @@ func TestListPendingShapes(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			a, st, _ := testApp(t)
+			a, st := testApp(t)
 			if tc.seed != nil {
 				if err := st.Put(*tc.seed); err != nil {
 					t.Fatal(err)
@@ -535,14 +532,14 @@ func TestListPendingShapes(t *testing.T) {
 }
 
 func TestAdoptUnknownMACErrors(t *testing.T) {
-	a, _, _ := testApp(t)
+	a, _ := testApp(t)
 	if _, err := a.AdoptPending(context.Background(), "ff:ff:ff:ff:ff:ff"); err == nil {
 		t.Fatal("adopt of unknown mac must return an error")
 	}
 }
 
 func TestGetDeleteUnknownMACErrors(t *testing.T) {
-	a, _, _ := testApp(t)
+	a, _ := testApp(t)
 	ctx := context.Background()
 	_, err := a.GetDevice(ctx, "ff:ff:ff:ff:ff:ff")
 	if !errors.Is(err, adminapi.ErrNotFound) {
@@ -561,7 +558,7 @@ func TestGetDeleteUnknownMACErrors(t *testing.T) {
 // exists for either response), the record stays where it is, and the
 // second arm is idempotent (flag already true).
 func TestLifecycleArmingArmsOnlyTheFlag(t *testing.T) {
-	a, st, _ := testApp(t)
+	a, st := testApp(t)
 	ctx := context.Background()
 
 	seeded := store.Device{
@@ -636,7 +633,7 @@ func TestLifecycleArmingArmsOnlyTheFlag(t *testing.T) {
 // created without Extra): UpdateExisting allocates the map, the flag
 // lands, and nothing else changes.
 func TestLifecycleArmingWorksOnNilExtra(t *testing.T) {
-	a, st, _ := testApp(t)
+	a, st := testApp(t)
 	if err := st.Put(store.Device{MAC: "a040a0aabbcc", State: store.StatePending}); err != nil {
 		t.Fatal(err)
 	}
@@ -662,7 +659,7 @@ func TestLifecycleArmingWorksOnNilExtra(t *testing.T) {
 }
 
 func TestLifecycleArmingUnknownMACIsWrappedNotFound(t *testing.T) {
-	a, _, _ := testApp(t)
+	a, _ := testApp(t)
 	ctx := context.Background()
 	if _, err := a.RebootDevice(ctx, "ff:ff:ff:ff:ff:ff"); !errors.Is(err, adminapi.ErrNotFound) {
 		t.Fatalf("reboot unknown: want adminapi.ErrNotFound wrapped, got %v", err)
@@ -685,7 +682,7 @@ func TestLifecycleArmingUnknownMACIsWrappedNotFound(t *testing.T) {
 // task is armed, and a second enqueue REPLACES the armed task (at most
 // one; §6.3 silent on enqueue, chosen: overwrite).
 func TestEnqueueCmdTaskArmsOnlyTheRow(t *testing.T) {
-	a, st, _ := testApp(t)
+	a, st := testApp(t)
 	ctx := context.Background()
 
 	seeded := store.Device{
@@ -743,7 +740,7 @@ func TestEnqueueCmdTaskArmsOnlyTheRow(t *testing.T) {
 // record created without Extra): UpdateExisting allocates the map, the
 // row lands, nothing else changes.
 func TestEnqueueCmdTaskWorksOnNilExtra(t *testing.T) {
-	a, st, _ := testApp(t)
+	a, st := testApp(t)
 	if err := st.Put(store.Device{MAC: "a040a0aabbcc", State: store.StatePending}); err != nil {
 		t.Fatal(err)
 	}
@@ -770,7 +767,7 @@ func TestEnqueueCmdTaskWorksOnNilExtra(t *testing.T) {
 // unknown and unparseable MACs onto the wrapped ErrNotFound sentinel,
 // like the arming routes.
 func TestEnqueueCmdTaskUnknownMACIsWrappedNotFound(t *testing.T) {
-	a, _, _ := testApp(t)
+	a, _ := testApp(t)
 	ctx := context.Background()
 	if _, err := a.EnqueueDeviceCmd(ctx, "ff:ff:ff:ff:ff:ff", "restart"); !errors.Is(err, adminapi.ErrNotFound) {
 		t.Fatalf("enqueue unknown: want adminapi.ErrNotFound wrapped, got %v", err)
@@ -784,7 +781,7 @@ func TestEnqueueCmdTaskUnknownMACIsWrappedNotFound(t *testing.T) {
 // engine will actually fire — factory-reset and reboot outrank the queued
 // task exactly like armedLifecycle's emission order.
 func TestEnqueueCmdTaskViewPrecedence(t *testing.T) {
-	a, _, _ := testApp(t)
+	a, _ := testApp(t)
 	ctx := context.Background()
 	if err := a.st.Put(store.Device{MAC: "f09fc2848f2a", State: store.StateAdopted}); err != nil {
 		t.Fatal(err)
@@ -832,7 +829,7 @@ func truthyFlag(v any) bool {
 // no sockets. Pins the wire contract: unknown device must be HTTP 404 with a
 // JSON error body on GET/DELETE/adopt, never 500.
 func TestHTTPNotFoundThroughRealAdapter(t *testing.T) {
-	a, _, _ := testApp(t)
+	a, _ := testApp(t)
 	h := adminapi.New(adminapi.Config{}, a) // App implements Backend
 
 	for _, tc := range []struct {
@@ -872,514 +869,116 @@ func TestHTTPNotFoundThroughRealAdapter(t *testing.T) {
 	}
 }
 
-// ---- wireless persistence ------------------------------------------------
+// ---- per-device wireless persistence -------------------------------------
 
-func TestWirelessRoundTripPersistence(t *testing.T) {
-	a, _, wpath := testApp(t)
+const testWLANDeviceMAC = "aabbccddeeff"
+
+func seedWLANDevice(t *testing.T, a *App, st store.DeviceStore) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := a.CreateDevice(ctx, adminapi.DeviceUpsert{MAC: testWLANDeviceMAC, Name: "ap1"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = st
+}
+
+func TestDeviceWirelessRoundTripPersistence(t *testing.T) {
+	a, st := testApp(t)
+	seedWLANDevice(t, a, st)
 	ctx := context.Background()
 
-	// default empty document before first write
-	got := a.GetWireless(ctx)
-	if len(got.Wlans) != 0 {
-		t.Fatalf("default wireless: %+v", got)
+	got, err := a.GetDeviceWireless(ctx, testWLANDeviceMAC)
+	if err != nil || len(got.Wlans) != 0 {
+		t.Fatalf("default wireless: %+v err=%v", got, err)
 	}
 
 	env := adminapi.WlansEnvelope{Wlans: []adminapi.Wlan{
 		{ID: "w1", Name: "home", SSID: "home-net", Security: "wpa-p", Passphrase: "correct-horse", VLAN: 1, Enabled: true},
 		{Name: "guest", SSID: "guests", Security: "open", VLAN: 20},
 	}}
-	if err := a.PutWireless(ctx, env); err != nil {
+	if err := a.PutDeviceWireless(ctx, testWLANDeviceMAC, env); err != nil {
 		t.Fatalf("put wireless: %v", err)
 	}
 
-	// reads echo what was written
-	if back := a.GetWireless(ctx); len(back.Wlans) != 2 || back.Wlans[0].SSID != "home-net" || back.Wlans[1].VLAN != 20 {
-		t.Fatalf("readback: %+v", back)
+	back, err := a.GetDeviceWireless(ctx, testWLANDeviceMAC)
+	if err != nil || len(back.Wlans) != 2 || back.Wlans[0].SSID != "home-net" || back.Wlans[1].VLAN != 20 {
+		t.Fatalf("readback: %+v err=%v", back, err)
 	}
 
-	// persistence: reopen a fresh App over the same file
-	a2 := New(store.NewMemStore(), wpath, filepath.Join(t.TempDir(), "site-settings.json"), SiteSettings{}, quietLogger())
-	if re := a2.GetWireless(ctx); len(re.Wlans) != 2 || re.Wlans[0].Passphrase != "correct-horse" {
-		t.Fatalf("reopened: %+v", re)
-	}
-
-	// no temp files left behind
-	entries, _ := os.ReadDir(filepath.Dir(wpath))
-	if len(entries) != 1 {
-		t.Fatalf("expected exactly one wireless file, got %d: %v", len(entries), entries)
-	}
-}
-
-// ---- metrics poller ------------------------------------------------------
-
-// pollerSetup builds a fresh App + MemStore fixture for poller tests.
-func pollerSetup(t *testing.T) (*App, store.DeviceStore) {
-	t.Helper()
-	a, st, _ := testApp(t)
-	return a, st
-}
-
-func TestPollerSeedsAdoptedWithoutCounting(t *testing.T) {
-	a, st := pollerSetup(t)
-	// Fresh heartbeat: the lost sweep must not touch this device.
-	lastSeen := time.Now().Unix()
-	if err := st.Put(store.Device{MAC: "f09fc2848f2a", State: store.StateAdopted, Model: "U7PG2",
-		LastSeen: lastSeen, Extra: store.JSONMap{"uptime": 7231.0},
-		LastUps: store.JSONMap{"user-num_sta": 12.0, "user-tx_bytes": 1048576.0, "user-rx_bytes": 2097152.0},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	bAdopt := counterDefault("openunifi_adopt_total")
-	bFail := counterDefault("openunifi_adopt_fail_total")
-
-	a.PollOnce()
-
-	if got := counterDefault("openunifi_adopt_total"); got != bAdopt {
-		t.Fatalf("first observation must not count a transition: adopt %v -> %v", bAdopt, got)
-	}
-	if got := counterDefault("openunifi_adopt_fail_total"); got != bFail {
-		t.Fatalf("first observation counted a fail: %v -> %v", bFail, got)
-	}
-
-	// numeric fields must reach the gauges honestly
-	checkGauge(t, "openunifi_uptime_seconds", 7231)
-	checkGauge(t, "openunifi_sta_count", 12)
-	// NOTE: byte snapshots are honest GAUGES (see metrics.go) — the family
-	// names do NOT carry the Prometheus counter suffix _total.
-	checkGauge(t, "openunifi_user_tx_bytes", 1048576)
-	checkGauge(t, "openunifi_user_rx_bytes", 2097152)
-	checkGauge(t, "openunifi_device_state", 3)
-	checkGauge(t, "openunifi_last_inform_timestamp", float64(lastSeen))
-}
-
-func checkGauge(t *testing.T, family string, want float64) {
-	t.Helper()
-	fams, err := prometheus.DefaultGatherer.Gather()
+	rec, err := st.Get("aabbccddeeff")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, f := range fams {
-		if f.GetName() != family {
-			continue
-		}
-		for _, m := range f.Metric {
-			if g := m.GetGauge(); g != nil {
-				if got := g.GetValue(); got != want {
-					t.Fatalf("%s gauge = %v, want %v", family, got, want)
-				}
-				return
-			}
-		}
-	}
-	t.Fatalf("gauge family %s has no series (missing data for %v)", family, want)
-}
-
-func TestPollerAdoptTransitions(t *testing.T) {
-	a, st := pollerSetup(t)
-	if err := st.Put(store.Device{MAC: "010203040506", State: store.StatePending, Model: "U6Lite"}); err != nil {
-		t.Fatal(err)
-	}
-
-	a.PollOnce() // seed prevStates = pending
-
-	// transition pending -> adopted: counts exactly one adopt
-	d, _ := st.Get("010203040506")
-	d.State = store.StateAdopted
-	if err := st.Put(d); err != nil {
-		t.Fatal(err)
-	}
-	bA := counterDefault("openunifi_adopt_total")
-	bF := counterDefault("openunifi_adopt_fail_total")
-	a.PollOnce()
-	if got := counterDefault("openunifi_adopt_total"); got != bA+1 {
-		t.Fatalf("adopt_total = %v, want %v+1", got, bA)
-	}
-	if got := counterDefault("openunifi_adopt_fail_total"); got != bF {
-		t.Fatalf("adopt_fail_total changed unexpectedly: %v -> %v", bF, got)
-	}
-
-	// transition adopted -> lost: counts exactly one adopt failure
-	d, _ = st.Get("010203040506")
-	d.State = store.StateLost
-	if err := st.Put(d); err != nil {
-		t.Fatal(err)
-	}
-	a.PollOnce()
-	if got := counterDefault("openunifi_adopt_total"); got != bA+1 {
-		t.Fatalf("adopt_total grew again: %v", got)
-	}
-	if got := counterDefault("openunifi_adopt_fail_total"); got != bF+1 {
-		t.Fatalf("adopt_fail_total = %v, want %v+1", got, bF)
+	if len(wireless.DeviceWLANs(rec)) != 2 {
+		t.Fatalf("device_wlans on record: %+v", wireless.DeviceWLANs(rec))
 	}
 }
 
-func TestRunPollerStopsOnContextCancel(t *testing.T) {
-	a, _ := pollerSetup(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		a.RunPoller(ctx, time.Hour) // huge interval: only exit path is ctx
-		close(done)
-	}()
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("RunPoller did not exit after context cancel")
-	}
-}
-
-// ---- wireless cache (load-once, no per-request file I/O) ------------------
-
-func TestNewWithCorruptWirelessFileRetainsError(t *testing.T) {
-	dir := t.TempDir()
-	wpath := filepath.Join(dir, "wireless.json")
-	if err := os.WriteFile(wpath, []byte("{this is not json"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	a := New(store.NewMemStore(), wpath, filepath.Join(t.TempDir(), "site-settings.json"), SiteSettings{}, quietLogger())
-
-	env, err := a.CurrentWireless()
-	if err == nil {
-		t.Fatal("corrupt wireless.json must be a retained load error at New")
-	}
-	if len(env.Wlans) != 0 {
-		t.Fatalf("corrupt load must serve the empty default, got %+v", env)
-	}
-
-	// main-style startup gate: the process must refuse the corrupt file.
-	if startupErr := func() error {
-		_, err := a.CurrentWireless()
-		return err
-	}(); startupErr == nil {
-		t.Fatal("startup check (CurrentWireless) must keep returning the error")
-	}
-}
-
-func TestNewWithMissingWirelessFileIsEmptyDefault(t *testing.T) {
-	a, _, _ := testApp(t) // wpath in a fresh tempdir: file never written
-	env := a.GetWireless(context.Background())
-	if len(env.Wlans) != 0 {
-		t.Fatalf("missing file must yield empty default, got %+v", env)
-	}
-	if _, err := a.CurrentWireless(); err != nil {
-		t.Fatalf("missing file is not an error (first boot), got %v", err)
-	}
-}
-
-// TestNewLoadsEapWirelessDocument: a wpa-eap WLAN with a valid inline
-// RADIUS profile passes the load-time ValidateWlan pass and serves intact.
-func TestNewLoadsEapWirelessDocument(t *testing.T) {
-	dir := t.TempDir()
-	wpath := filepath.Join(dir, "wireless.json")
-	body := `{"wlans":[{"name":"corp","ssid":"corp","security":"wpa-eap","vlan":10,"enabled":true,` +
-		`"radius_servers":[{"ip":"10.1.0.5"},{"ip":"10.1.0.6","port":18120}],"radius_secret":"s3cr3t!",` +
-		`"radius_vlan_mode":"required"}]}`
-	if err := os.WriteFile(wpath, []byte(body), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	a := New(store.NewMemStore(), wpath, filepath.Join(t.TempDir(), "site-settings.json"), SiteSettings{}, quietLogger())
-	if _, err := a.CurrentWireless(); err != nil {
-		t.Fatalf("valid EAP document must load, got %v", err)
-	}
-	env := a.GetWireless(context.Background())
-	if len(env.Wlans) != 1 || env.Wlans[0].Security != "wpa-eap" {
-		t.Fatalf("EAP wlan lost in load: %+v", env)
-	}
-	w := env.Wlans[0]
-	if w.RadiusSecret != "s3cr3t!" || w.RadiusVLANMode != "required" || len(w.RadiusServers) != 2 ||
-		w.RadiusServers[0].IP != "10.1.0.5" || w.RadiusServers[0].Port != 0 ||
-		w.RadiusServers[1].IP != "10.1.0.6" || w.RadiusServers[1].Port != 18120 {
-		t.Fatalf("inline RADIUS profile lost in load: %+v", w)
-	}
-}
-
-// The load path runs the SAME validation as PUT /api/v1/wireless
-// (adminapi.ValidateWlan): a document that only DECODES but violates the
-// rules must fail startup, and the error must name the offending wlan
-// (FID-39), not wrap silently like the original json.Unmarshal-only path.
-func TestNewRejectsInvalidWirelessDocument(t *testing.T) {
-	for _, tc := range []struct {
-		name, body, wantText string
-	}{
-		{"wpa-eap without RADIUS support", `{"wlans":[{"name":"corp","ssid":"corp","security":"wpa-eap","vlan":1}]}`, "wpa-eap requires at least one RADIUS server"},
-		{"wpa-eap with empty server ip", `{"wlans":[{"name":"corp","ssid":"corp","security":"wpa-eap","vlan":1,"radius_servers":[{"ip":""}],"radius_secret":"s"}]}`, "radius_servers[0].ip must not be empty"},
-		{"wpa-eap without secret", `{"wlans":[{"name":"corp","ssid":"corp","security":"wpa-eap","vlan":1,"radius_servers":[{"ip":"10.1.0.5"}]}]}`, "wpa-eap requires a RADIUS shared secret"},
-		{"radius on wpa-p", `{"wlans":[{"ssid":"x","security":"wpa-p","passphrase":"longenough","vlan":1,"radius_secret":"s"}]}`, "require security wpa-eap"},
-		{"vlan out of range", `{"wlans":[{"ssid":"x","security":"wpa-p","passphrase":"longenough","vlan":5000}]}`, "vlan must be 1..4094"},
-		{"bad security enum", `{"wlans":[{"ssid":"x","security":"wpa2","passphrase":"longenough","vlan":1}]}`, "security must be one of open, wpa-p, wpa-eap"},
-		{"control char ssid", `{"wlans":[{"ssid":"a\nb","security":"open","vlan":1}]}`, "control characters"},
-		{"name too long", `{"wlans":[{"name":"` + strings.Repeat("n", 65) + `","ssid":"x","security":"open","vlan":1}]}`, "name must be at most 64 characters"},
-	} {
-		dir := t.TempDir()
-		wpath := filepath.Join(dir, "wireless.json")
-		if err := os.WriteFile(wpath, []byte(tc.body), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		a := New(store.NewMemStore(), wpath, filepath.Join(t.TempDir(), "site-settings.json"), SiteSettings{}, quietLogger())
-		env, err := a.CurrentWireless()
-		if err == nil {
-			t.Fatalf("%s: invalid document must fail the load error", tc.name)
-		}
-		if !strings.Contains(err.Error(), tc.wantText) {
-			t.Fatalf("%s: error %q must name the rule violation", tc.name, err.Error())
-		}
-		if !strings.Contains(err.Error(), "wlan[0]") {
-			t.Fatalf("%s: error %q must name the offending wlan index", tc.name, err.Error())
-		}
-		if len(env.Wlans) != 0 {
-			t.Fatalf("%s: invalid load must still serve the empty default, got %+v", tc.name, env)
-		}
-	}
-}
-
-// TestWirelessServedFromCacheWithoutFileIO proves GetWireless/CurrentWireless
-// hit the in-memory cache, not the disk: after PutWireless, the backing file
-// is removed and then replaced with garbage — reads keep serving the NEW
-// envelope with a nil error regardless.
-func TestWirelessServedFromCacheWithoutFileIO(t *testing.T) {
-	a, _, wpath := testApp(t)
+func TestPutDeviceWirelessFencesFullEnvelope(t *testing.T) {
+	a, st := testApp(t)
+	seedWLANDevice(t, a, st)
 	ctx := context.Background()
-
-	env := adminapi.WlansEnvelope{Wlans: []adminapi.Wlan{
-		{ID: "w1", Name: "home", SSID: "home-net", Security: "wpa-p", Passphrase: "correct-horse", VLAN: 1, Enabled: true},
-	}}
-	// VLAN:1 above (was absent at base): PutWireless fences the FULL
-	// envelope since the convergence, so a VLAN-0 seed the name-only loop
-	// once accepted is now a validation rejection before any caching step
-	// this pin observes.
-	if err := a.PutWireless(ctx, env); err != nil {
-		t.Fatalf("put wireless: %v", err)
-	}
-
-	// Destroy every trace of the file: gone, then corrupt.
-	if err := os.Remove(wpath); err != nil {
-		t.Fatal(err)
-	}
-	if got := a.GetWireless(ctx); len(got.Wlans) != 1 || got.Wlans[0].SSID != "home-net" {
-		t.Fatalf("post-delete read must serve the cached NEW envelope, got %+v", got)
-	}
-	if _, err := a.CurrentWireless(); err != nil {
-		t.Fatalf("post-delete CurrentWireless must be nil-error, got %v", err)
-	}
-	if err := os.WriteFile(wpath, []byte("garbage"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if got := a.GetWireless(ctx); len(got.Wlans) != 1 {
-		t.Fatalf("post-corrupt read must still serve the cache, got %+v", got)
-	}
-}
-
-// TestPutWirelessFencesFullEnvelope pins the whole-document PUT's
-// full-envelope fence (the same one CreateWlan/UpdateWlan run): a wlan the
-// route's per-row ValidateWlan loop cannot see through — an empty NAME —
-// is rejected at the Backend, and the error carries the `wlan[0]: `
-// index prefix. That prefix is the one REST-visible body delta: the PUT
-// route loops ValidateWlan (which never checks name emptiness), so a
-// 400-preflighted body could never carry it — only the direct-Backend
-// caller (Terraform provider, tests) now gets the conflict with the
-// offending index named. Before the fence such a document persisted
-// fine and then BLOCKED the next boot (loadWirelessFile refuses invalid
-// documents and cmd/openunifi refuses to launch on it).
-func TestPutWirelessFencesFullEnvelope(t *testing.T) {
-	a, _, _ := testApp(t)
-	ctx := context.Background()
-	err := a.PutWireless(ctx, adminapi.WlansEnvelope{Wlans: []adminapi.Wlan{
+	err := a.PutDeviceWireless(ctx, testWLANDeviceMAC, adminapi.WlansEnvelope{Wlans: []adminapi.Wlan{
 		{Name: "", SSID: "ssid-only", Security: "open", VLAN: 1},
 	}})
 	if !errors.Is(err, adminapi.ErrConflict) {
 		t.Fatalf("empty-name wlan must be ErrConflict, got %v", err)
 	}
-	if err.Error() != "conflict: wlan[0]: name must be 1..64 characters" {
-		t.Fatalf("conflict must carry the wlan[0] index prefix, got %q", err.Error())
-	}
-	// The rejected document must not have landed in the cache or on disk —
-	// Get serves the empty default after a fenced replace.
-	if env := a.GetWireless(ctx); len(env.Wlans) != 0 {
-		t.Fatalf("fenced put must not leave wlans in the cache: %+v", env.Wlans)
+	env, err := a.GetDeviceWireless(ctx, testWLANDeviceMAC)
+	if err != nil || len(env.Wlans) != 0 {
+		t.Fatalf("fenced put must not leave wlans on device: %+v err=%v", env, err)
 	}
 }
 
-func TestPutWirelessFailureLeavesCacheUntouched(t *testing.T) {
+func TestUpdateDeviceWlanDuplicateSSIDRejected(t *testing.T) {
+	a, st := testApp(t)
+	seedWLANDevice(t, a, st)
 	ctx := context.Background()
-	dir := t.TempDir()
-	a := New(store.NewMemStore(), filepath.Join(dir, "wireless.json"), filepath.Join(t.TempDir(), "site-settings.json"), SiteSettings{}, quietLogger())
-
-	// Seed and injected-failure payloads are VALID wlans (open security,
-	// in-range VLAN): the failure this pin exercises is persistence
-	// (chmod 0000 directory), not validation — since PutWireless fences the
-	// FULL envelope, an invalid payload would now be rejected before the
-	// persist path and the failure injection would go untested.
-	if err := a.PutWireless(ctx, adminapi.WlansEnvelope{Wlans: []adminapi.Wlan{{Name: "ok", SSID: "ok", Security: "open", VLAN: 1}}}); err != nil {
-		t.Fatal(err)
-	}
-
-	// Make persistence impossible: the temp file lives in dir, so a 0000
-	// directory forces CreateTemp to fail AFTER the cache is populated.
-	if err := os.Chmod(dir, 0o000); err != nil {
-		t.Fatalf("chmod inject: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
-
-	err := a.PutWireless(ctx, adminapi.WlansEnvelope{Wlans: []adminapi.Wlan{{Name: "fail", SSID: "fail", Security: "open", VLAN: 1}}})
-	if err == nil {
-		t.Fatal("put into an unwritable directory must fail")
-	}
-	if got := a.GetWireless(ctx); len(got.Wlans) != 1 || got.Wlans[0].Name != "ok" {
-		t.Fatalf("failed persist must leave the cache unchanged, got %+v", got)
-	}
-}
-
-// assertWirelessEnv compares two envelopes by the fields the cache-vs-disk
-// invariants care about (name + ssid, in order).
-func assertWirelessEnv(t *testing.T, got, want adminapi.WlansEnvelope) {
-	t.Helper()
-	if len(got.Wlans) != len(want.Wlans) {
-		t.Fatalf("wlan count %d != want %d: %+v", len(got.Wlans), len(want.Wlans), got.Wlans)
-	}
-	for i, w := range want.Wlans {
-		if got.Wlans[i].Name != w.Name || got.Wlans[i].SSID != w.SSID {
-			t.Fatalf("wlan[%d] = {name=%q ssid=%q}, want {name=%q ssid=%q}",
-				i, got.Wlans[i].Name, got.Wlans[i].SSID, w.Name, w.SSID)
-		}
-	}
-}
-
-func wirelessFixture() adminapi.WlansEnvelope {
-	return adminapi.WlansEnvelope{Wlans: []adminapi.Wlan{
+	pre := adminapi.WlansEnvelope{Wlans: []adminapi.Wlan{
 		{Name: "a", SSID: "aa", Security: "open", VLAN: 1, Enabled: true},
 		{Name: "b", SSID: "bb", Security: "open", VLAN: 2, Enabled: true},
 	}}
-}
-
-// TestUpdateWlanFailureLeavesCacheUntouched pins the clone-before-mutate
-// discipline: UpdateWlan used to write the new wlan into the SHARED backing
-// array of a.cachedWireless BEFORE validate/persist, so a rejected edit or
-// a failed persist left the rejected state live in the cache that
-// CurrentWireless serves to device provisioning. Mirror of
-// TestPutWirelessFailureLeavesCacheUntouched.
-func TestUpdateWlanFailureLeavesCacheUntouched(t *testing.T) {
-	ctx := context.Background()
-	dir := t.TempDir()
-	wpath := filepath.Join(dir, "wireless.json")
-	a := New(store.NewMemStore(), wpath, filepath.Join(t.TempDir(), "site-settings.json"), SiteSettings{}, quietLogger())
-	pre := wirelessFixture()
-	if err := a.PutWireless(ctx, pre); err != nil {
+	if err := a.PutDeviceWireless(ctx, testWLANDeviceMAC, pre); err != nil {
 		t.Fatal(err)
 	}
-
-	// Validation rejection: renaming "a" onto "b"'s SSID must fail.
-	_, err := a.UpdateWlan(ctx, "a", adminapi.Wlan{Name: "a", SSID: "bb", Security: "open", VLAN: 1, Enabled: true})
+	_, err := a.UpdateDeviceWlan(ctx, testWLANDeviceMAC, "a", adminapi.Wlan{Name: "a", SSID: "bb", Security: "open", VLAN: 1, Enabled: true})
 	if !errors.Is(err, adminapi.ErrConflict) {
-		t.Fatalf("duplicate-SSID update must be rejected with ErrConflict, got %v", err)
+		t.Fatalf("duplicate SSID update must be rejected, got %v", err)
 	}
-	got, cerr := a.CurrentWireless()
-	if cerr != nil {
-		t.Fatalf("CurrentWireless: %v", cerr)
+	got, err := a.GetDeviceWireless(ctx, testWLANDeviceMAC)
+	if err != nil || got.Wlans[0].SSID != "aa" {
+		t.Fatalf("unchanged: %+v err=%v", got, err)
 	}
-	assertWirelessEnv(t, got, pre)
-
-	// Persist failure: a 0000 directory forces CreateTemp to fail AFTER
-	// validation. The rejected state must never become live.
-	if err := os.Chmod(dir, 0o000); err != nil {
-		t.Fatalf("chmod inject: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
-	if _, err = a.UpdateWlan(ctx, "a", adminapi.Wlan{Name: "a", SSID: "a2", Security: "open", VLAN: 1, Enabled: true}); err == nil {
-		t.Fatal("update into an unwritable directory must fail")
-	}
-	_ = os.Chmod(dir, 0o755)
-
-	got, cerr = a.CurrentWireless()
-	if cerr != nil {
-		t.Fatalf("CurrentWireless: %v", cerr)
-	}
-	assertWirelessEnv(t, got, pre)
-	// Disk must still hold the pre-call document (memory==disk invariant).
-	fromDisk, derr := loadWirelessFile(wpath)
-	if derr != nil {
-		t.Fatalf("disk readback: %v", derr)
-	}
-	assertWirelessEnv(t, fromDisk, pre)
-
-	// Success path: only a PERSISTED clone may become the cached value.
-	if _, err = a.UpdateWlan(ctx, "a", adminapi.Wlan{Name: "a", SSID: "a2", Security: "open", VLAN: 1, Enabled: true}); err != nil {
-		t.Fatalf("valid update must persist: %v", err)
-	}
-	got, cerr = a.CurrentWireless()
-	if cerr != nil {
-		t.Fatalf("CurrentWireless: %v", cerr)
-	}
-	if len(got.Wlans) != 2 || got.Wlans[0].SSID != "a2" || got.Wlans[1].SSID != "bb" {
-		t.Fatalf("post-update cache: %+v", got.Wlans)
-	}
-	if fromDisk, derr = loadWirelessFile(wpath); derr != nil {
-		t.Fatalf("disk readback: %v", derr)
-	}
-	assertWirelessEnv(t, fromDisk, got)
 }
 
-// TestDeleteWlanFailureLeavesCacheUntouched pins the same invariant for
-// DeleteWlan: the old in-place compaction (Wlans[:0]) left the cache at
-// [b,b] over disk [a,b] when persist failed — duplicate entries in the
-// cache that device provisioning would then serve.
-func TestDeleteWlanFailureLeavesCacheUntouched(t *testing.T) {
+func TestDeleteDeviceWlan(t *testing.T) {
+	a, st := testApp(t)
+	seedWLANDevice(t, a, st)
 	ctx := context.Background()
-	dir := t.TempDir()
-	wpath := filepath.Join(dir, "wireless.json")
-	a := New(store.NewMemStore(), wpath, filepath.Join(t.TempDir(), "site-settings.json"), SiteSettings{}, quietLogger())
-	pre := wirelessFixture()
-	if err := a.PutWireless(ctx, pre); err != nil {
+	pre := adminapi.WlansEnvelope{Wlans: []adminapi.Wlan{
+		{Name: "a", SSID: "aa", Security: "open", VLAN: 1, Enabled: true},
+		{Name: "b", SSID: "bb", Security: "open", VLAN: 2, Enabled: true},
+	}}
+	if err := a.PutDeviceWireless(ctx, testWLANDeviceMAC, pre); err != nil {
 		t.Fatal(err)
 	}
+	if err := a.DeleteDeviceWlan(ctx, testWLANDeviceMAC, "nope"); !errors.Is(err, adminapi.ErrNotFound) {
+		t.Fatalf("unknown delete: %v", err)
+	}
+	if err := a.DeleteDeviceWlan(ctx, testWLANDeviceMAC, "a"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := a.GetDeviceWireless(ctx, testWLANDeviceMAC)
+	if err != nil || len(got.Wlans) != 1 || got.Wlans[0].Name != "b" {
+		t.Fatalf("post-delete: %+v err=%v", got, err)
+	}
+}
 
-	// Unknown name: not-found, cache untouched.
-	if err := a.DeleteWlan(ctx, "nope"); !errors.Is(err, adminapi.ErrNotFound) {
-		t.Fatalf("unknown delete: want not-found, got %v", err)
-	}
-	got, cerr := a.CurrentWireless()
-	if cerr != nil {
-		t.Fatalf("CurrentWireless: %v", cerr)
-	}
-	assertWirelessEnv(t, got, pre)
+// ---- metrics poller ------------------------------------------------------
 
-	// Persist failure: the deleted state must never go live before persist
-	// succeeds — neither as [b] nor as the old compaction bug's [b,b].
-	if err := os.Chmod(dir, 0o000); err != nil {
-		t.Fatalf("chmod inject: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
-	if err := a.DeleteWlan(ctx, "a"); err == nil {
-		t.Fatal("delete into an unwritable directory must fail")
-	}
-	_ = os.Chmod(dir, 0o755)
-
-	got, cerr = a.CurrentWireless()
-	if cerr != nil {
-		t.Fatalf("CurrentWireless: %v", cerr)
-	}
-	assertWirelessEnv(t, got, pre)
-	fromDisk, derr := loadWirelessFile(wpath)
-	if derr != nil {
-		t.Fatalf("disk readback: %v", derr)
-	}
-	assertWirelessEnv(t, fromDisk, pre)
-
-	// Success path: the filtered clone is swapped in only after persist.
-	if err := a.DeleteWlan(ctx, "a"); err != nil {
-		t.Fatalf("valid delete must persist: %v", err)
-	}
-	got, cerr = a.CurrentWireless()
-	if cerr != nil {
-		t.Fatalf("CurrentWireless: %v", cerr)
-	}
-	if len(got.Wlans) != 1 || got.Wlans[0].Name != "b" || got.Wlans[0].SSID != "bb" {
-		t.Fatalf("post-delete cache: %+v", got.Wlans)
-	}
-	if fromDisk, derr = loadWirelessFile(wpath); derr != nil {
-		t.Fatalf("disk readback: %v", derr)
-	}
-	assertWirelessEnv(t, fromDisk, got)
+func pollerSetup(t *testing.T) (*App, store.DeviceStore) {
+	t.Helper()
+	return testApp(t)
 }
 
 // ---- lost sweep (StateLost finally has a producer) ------------------------
@@ -1483,6 +1082,8 @@ func TestDeleteDevicePrunesMetricSeries(t *testing.T) {
 	d.State = store.StateAdopted
 	d.Model = "U7PG2"
 	d.LastSeen = time.Now().Unix()
+	d.Extra = store.JSONMap{"uptime": 7231.0}
+	d.LastUps = store.JSONMap{"user-num_sta": 12.0, "user-tx_bytes": 1048576.0, "user-rx_bytes": 2097152.0}
 	if err := st.Put(d); err != nil {
 		t.Fatal(err)
 	}
@@ -1539,7 +1140,7 @@ func seriesForMAC(g map[string]*dto.Metric, mac string) int {
 // ---- MAC consolidation (store.CanonicalMAC is the single normalizer) -----
 
 func TestInvalidMACIsRejectedOrNotFound(t *testing.T) {
-	a, _, _ := testApp(t)
+	a, _ := testApp(t)
 	ctx := context.Background()
 
 	for _, bad := range []string{"zz", "not a mac at all"} {
@@ -1596,7 +1197,7 @@ func txPtr(auto bool, dbm int) *adminapi.RadioTxPower {
 // (fresh 16-hex, the engine's operator-save shape); idempotent writes
 // do not bump; wholesale replaces/clears behave the same.
 func TestRadioIntentPutBumpsCfgVersionOncePerChange(t *testing.T) {
-	a, st, _ := testApp(t)
+	a, st := testApp(t)
 	ctx := context.Background()
 	seedRadioDevice(t, st)
 
@@ -1680,7 +1281,7 @@ func TestRadioIntentPutBumpsCfgVersionOncePerChange(t *testing.T) {
 // ranges, device-reported txpower bounds, the "auto" forms, unknown-band
 // rejection, missing-bounds rejection, and unknown MAC/radio 404s.
 func TestRadioIntentValidation(t *testing.T) {
-	a, st, _ := testApp(t)
+	a, st := testApp(t)
 	ctx := context.Background()
 	seedRadioDevice(t, st)
 	// An unknown-band radio and a bounds-less radio join the fixture.
@@ -1765,7 +1366,7 @@ func TestRadioIntentValidation(t *testing.T) {
 // fields formatted exactly as the renderer emits them, and intent
 // overlaying the echo.
 func TestRadioIntentListView(t *testing.T) {
-	a, st, _ := testApp(t)
+	a, st := testApp(t)
 	ctx := context.Background()
 	seedRadioDevice(t, st)
 	if _, err := a.PutDeviceRadioIntent(ctx, "aa:bb:cc:dd:ee:ff", "rai0",
@@ -1808,7 +1409,7 @@ func TestRadioIntentListView(t *testing.T) {
 // five rejected enqueues must equal the seeded literal EXACTLY, not merely
 // share the rows the earlier partial checks looked at.
 func TestEnqueueCmdFenceRecordByteUntouched(t *testing.T) {
-	a, st, _ := testApp(t)
+	a, st := testApp(t)
 	ctx := context.Background()
 	seeded := store.Device{
 		MAC: "f09fc2848f2a", State: store.StateAdopted, Model: "U7PG2",
@@ -1837,7 +1438,7 @@ func TestEnqueueCmdFenceRecordByteUntouched(t *testing.T) {
 // strings are ErrConflict and arm nothing; a reject happens before the
 // row write, so the record stays exactly as it was.
 func TestEnqueueCmdStringBackendFence(t *testing.T) {
-	a, st, _ := testApp(t)
+	a, st := testApp(t)
 	ctx := context.Background()
 	seeded := store.Device{
 		MAC: "f09fc2848f2a", State: store.StateAdopted, Model: "U7PG2",
@@ -1889,7 +1490,7 @@ func TestEnqueueCmdStringBackendFence(t *testing.T) {
 // out-of-domain site_id is ErrConflict and mutates nothing; "" stays the
 // documented explicit clear.
 func TestPatchSiteIDBackendFence(t *testing.T) {
-	a, _, _ := testApp(t)
+	a, _ := testApp(t)
 	ctx := context.Background()
 	if _, err := a.CreateDevice(ctx, adminapi.DeviceUpsert{MAC: "aabbccddeeff", SiteID: "default"}); err != nil {
 		t.Fatal(err)
@@ -1920,7 +1521,7 @@ func TestPatchSiteIDBackendFence(t *testing.T) {
 // existing test read the returned CfgVersion (the mint pins read the store
 // record instead), which is exactly the hole this closes.
 func TestPatchLEDEffectiveChangeEchoesMintedCfgVersion(t *testing.T) {
-	a, st, _ := testApp(t)
+	a, st := testApp(t)
 	ctx := context.Background()
 	const seeded = "aaaabbbbccccdddd"
 	if err := st.Put(store.Device{
@@ -1949,7 +1550,7 @@ func TestPatchLEDEffectiveChangeEchoesMintedCfgVersion(t *testing.T) {
 // st.Get snapshots, never against a constructed clone — CreateDevice
 // stamps FirstSeen). A valid site_id creates normally.
 func TestCreateDeviceSiteIDBackendFence(t *testing.T) {
-	a, st, _ := testApp(t)
+	a, st := testApp(t)
 	ctx := context.Background()
 
 	// Unknown MAC + garbage site_id: ErrConflict, and the aborted upsert
@@ -1986,7 +1587,7 @@ func TestCreateDeviceSiteIDBackendFence(t *testing.T) {
 // is never provisioned from — saving them effectively changes NO
 // provisioning input and therefore mints no cfgversion.
 func TestPatchBookkeepingRowsMintNothing(t *testing.T) {
-	a, st, _ := testApp(t)
+	a, st := testApp(t)
 	ctx := context.Background()
 	if err := st.Put(store.Device{
 		MAC: "aabbccddeeff", Model: "U7PG2", State: store.StateAdopted,

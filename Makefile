@@ -21,7 +21,7 @@ provider-build:
 # scratch state (worktree caches and the like) and trips on third-party
 # generated files that are not part of the module.
 check:
-	@out=$$(gofmt -l $$(git ls-files '*.go')); if [ -n "$$out" ]; then \
+	@out=$$(for f in $$(git ls-files '*.go'); do [ -f "$$f" ] || continue; gofmt -l "$$f"; done | sort -u); if [ -n "$$out" ]; then \
 		echo "gofmt needed on:"; echo "$$out"; exit 1; \
 	fi
 	$(GO) vet ./...

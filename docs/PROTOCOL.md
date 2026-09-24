@@ -312,8 +312,9 @@ DELETE /api/v1/devices/{mac}
     PATCH  /api/v1/devices/{mac}    name, site_id, led_override, ssh_password
 GET    /api/v1/pending            (discovery-found candidates)
 POST   /api/v1/pending/{mac}/adopt
-GET    /api/v1/wireless           (whole-document WLAN envelope)
-PUT    /api/v1/wireless           (replaces the whole document)
+GET    /api/v1/devices/{mac}/wireless        (per-device WLAN envelope)
+PUT    /api/v1/devices/{mac}/wireless        (replaces that device's WLAN list)
+POST/GET/PUT/DELETE /api/v1/devices/{mac}/wireless/{name}
 GET    /api/v1/devices/{mac}/radios    (per-radio views: echo fields + intent overlay)
 PUT    /api/v1/devices/{mac}/radios/{radio}    {"channel"?: int, "txpower"?: int|"auto"}  -> wholesale replace
 DELETE /api/v1/devices/{mac}/radios/{radio}     (clear the radio's intent; echo-only again)
@@ -332,7 +333,7 @@ Web UI (lane D): static page at `/`:
   wpa-eap). wpa-eap needs an inline RADIUS profile (up to 4 auth servers
   "ip"/"ip:port", shared secret, dynamic-VLAN mode); passphrase is
   optional there (≥8 when set).
-  VLAN id; save → PUT /api/v1/wireless (whole-document envelope, adminapi shape).
+  VLAN id; save → PUT /api/v1/devices/{mac}/wireless (per-device envelope, adminapi shape).
 
 Package `provider` (lane E, at provider/ dir + cmd/tfprovider):
 resources `open-unifi_device` (adopt, by MAC + controller URL/token),

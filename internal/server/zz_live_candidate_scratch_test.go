@@ -130,7 +130,7 @@ func TestZZLiveBlockedStaRenderUnchanged(t *testing.T) {
 	if got := store.BlockedClients(rec); len(got) != 1 || got[0] != "001122334455" {
 		t.Fatalf("blocked set = %v, want [001122334455]", got)
 	}
-	s := New(Config{WirelessSource: func() []Wlan { return env }, SiteSettings: func() (SiteSettings, error) { return facts, nil }}, store.NewMemStore(), testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return env }, SiteSettings: func() (SiteSettings, error) { return facts, nil }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, rec)
 	intended, violations := zzRunGate(t, "live-blocked-candidate vs DEVICE-VERIFIED APPLIED bytes (must be byte-identical)", appliedRaw, sys, zzManagedAllow)
 	if len(violations) > 0 {
@@ -158,7 +158,7 @@ func TestZZLiveRadioIntentCandidateVsApplied(t *testing.T) {
 	rec.Extra["radio_intent"] = map[string]any{
 		"wifi1": map[string]any{"channel": 36.0},
 	}
-	s := New(Config{WirelessSource: func() []Wlan { return env }, SiteSettings: func() (SiteSettings, error) { return facts, nil }}, store.NewMemStore(), testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return env }, SiteSettings: func() (SiteSettings, error) { return facts, nil }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, rec)
 	if err := os.WriteFile(zzHarnessDir+"/live-radio-intent-candidate-sys.txt", []byte(sys), 0o644); err != nil {
 		t.Fatal(err)
@@ -209,7 +209,7 @@ func TestZZLiveEapCandidateVsApplied(t *testing.T) {
 	cand.RadiusServers = []wireless.RadiusServer{{IP: "10.10.10.10", Port: 1812}}
 	cand.RadiusSecret = zzLiveEapSecret
 	cand.RadiusVLANMode = "disabled"
-	s := New(Config{WirelessSource: func() []Wlan { return []Wlan{cand} }, SiteSettings: func() (SiteSettings, error) { return facts, nil }}, store.NewMemStore(), testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return []Wlan{cand} }, SiteSettings: func() (SiteSettings, error) { return facts, nil }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, rec)
 	if err := os.WriteFile(zzHarnessDir+"/live-eap-candidate-sys.txt", []byte(sys), 0o644); err != nil {
 		t.Fatal(err)
@@ -310,7 +310,7 @@ func TestZZLiveDasCandidateVsApplied(t *testing.T) {
 	cand.AcctServers = []wireless.RadiusAcctServer{{IP: "10.10.10.10", Port: 1813}}
 	cand.InterimUpdateEnabled = true
 	cand.RadiusDASEnabled = true
-	s := New(Config{WirelessSource: func() []Wlan { return []Wlan{cand} }, SiteSettings: func() (SiteSettings, error) { return facts, nil }}, store.NewMemStore(), testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return []Wlan{cand} }, SiteSettings: func() (SiteSettings, error) { return facts, nil }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, rec)
 	if err := os.WriteFile(zzHarnessDir+"/live-das-candidate-sys.txt", []byte(sys), 0o644); err != nil {
 		t.Fatal(err)

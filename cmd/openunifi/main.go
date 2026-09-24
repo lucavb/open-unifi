@@ -28,7 +28,6 @@ import (
 	"github.com/lucavb/open-unifi/internal/server/systemcfg"
 	"github.com/lucavb/open-unifi/internal/store"
 	"github.com/lucavb/open-unifi/internal/telemetry"
-	"github.com/lucavb/open-unifi/internal/wireless"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
@@ -45,7 +44,7 @@ func run() error {
 	listenAdmin := flag.String("listen-admin", "127.0.0.1:8443", "listen address for the admin API server")
 	listenDiscovery := flag.String("listen-discovery", ":10001", "UDP listen address for discovery")
 	discovery := flag.Bool("discovery", true, "enable the UDP discovery listener")
-	dataDir := flag.String("data-dir", "data", "directory for devices.json / wireless.json / site-settings.json")
+	dataDir := flag.String("data-dir", "data", "directory for devices.json / site-settings.json")
 	controllerURL := flag.String("controller-url", "", "base URL devices are pointed at during adoption (e.g. http://10.0.0.5:8080)")
 	regulatoryCountryCode := flag.Int("regulatory-country-code", server.DefaultRegulatoryCountryCode, "ISO 3166-1 numeric regulatory country code (001-999); first-boot seed only — managed at runtime via the site-settings API")
 	deviceSSHKeys := &keyList{}
@@ -145,15 +144,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("open device store: %w", err)
 	}
-	backend := app.New(st, filepath.Join(*dataDir, "wireless.json"), filepath.Join(*dataDir, "site-settings.json"), siteSettingsSeed(*regulatoryCountryCode, sshSeedKeys), logger)
-	// The wireless document is loaded ONCE in app.New; a corrupt
-	// wireless.json must refuse startup here (same as a corrupt
-	// devices.json already does) — otherwise the provisioning side would
-	// degrade to zero WLANs and, on the next TF plan PUT, wipe every other
-	// WLAN off every device.
-	if _, err := backend.CurrentWireless(); err != nil {
-		return fmt.Errorf("wireless config: %w", err)
-	}
+	backend := app.New(st, filepath.Join(*dataDir, "site-settings.json"), siteSettingsSeed(*regulatoryCountryCode, sshSeedKeys), logger)
 	// Same discipline for the site-settings record: a present-but-bad
 	// file (or a failed first-boot seed persist) is retained as a REAL
 	// error in app.New and refuses the launch here. On first boot the
@@ -191,48 +182,10 @@ func run() error {
 		logger.Warn("admin API and metrics are ANONYMOUS (LAB ONLY)")
 	}
 
-	// WirelessSource feeds the admin-API WLAN envelope into inform-side
-	// provisioning (system_cfg wireless/VLAN emission + drift hash). After
-	// the CurrentWireless check above the error branch is nil in practice —
-	// the envelope is served from App's cache, which cannot fail — but it
-	// stays as the documented behavior before startup.
-	wirelessSource := func() []server.Wlan {
-		env, err := backend.CurrentWireless()
-		if err != nil {
-			logger.Warn("wireless envelope read failed; provisioning without wlans", "err", err)
-			return nil
-		}
-		out := make([]server.Wlan, 0, len(env.Wlans))
-		for _, w := range env.Wlans {
-			wl := server.Wlan{
-				Name:       w.Name,
-				SSID:       w.SSID,
-				Security:   w.Security,
-				Passphrase: w.Passphrase,
-				VLAN:       w.VLAN,
-				Enabled:    w.Enabled,
-				ID:         w.ID,
-				Band:       w.Band,
-				// Inline RADIUS profile (wpa-eap): the slices must be
-				// rebuilt, not aliased — env.Wlans belongs to App's
-				// cached envelope and out outlives this call.
-				RadiusSecret:   w.RadiusSecret,
-				RadiusVLANMode: w.RadiusVLANMode,
-				// Accounting fields (§12 rows 1013-1014): same no-alias
-				// rebuild for acct_servers; the booleans pass through.
-				AccountingEnabled:    w.AccountingEnabled,
-				InterimUpdateEnabled: w.InterimUpdateEnabled,
-				RadiusDASEnabled:     w.RadiusDASEnabled,
-			}
-			for _, s := range w.RadiusServers {
-				wl.RadiusServers = append(wl.RadiusServers, wireless.RadiusServer{IP: s.IP, Port: s.Port})
-			}
-			for _, s := range w.AcctServers {
-				wl.AcctServers = append(wl.AcctServers, wireless.RadiusAcctServer{IP: s.IP, Port: s.Port})
-			}
-			out = append(out, wl)
-		}
-		return out
+	// WirelessForDevice reads each device's admin-owned device_wlans at
+	// inform time (per-AP WLAN intent).
+	wirelessForDevice := func(d store.Device) []server.Wlan {
+		return app.DeviceWLANs(d)
 	}
 
 	// SiteSettingsSource feeds the app's site-settings record into inform-
@@ -269,13 +222,13 @@ func run() error {
 	}
 
 	srv := server.New(server.Config{
-		InformListenAddr:   *listenInform,
-		DiscoveryListen:    *discovery,
-		DiscoveryPort:      dport,
-		ControllerURL:      *controllerURL,
-		AllowPlainText: *allowPlainText,
-		WirelessSource: wirelessSource,
-		SiteSettings:       siteSettingsSource,
+		InformListenAddr:  *listenInform,
+		DiscoveryListen:   *discovery,
+		DiscoveryPort:     dport,
+		ControllerURL:     *controllerURL,
+		AllowPlainText:    *allowPlainText,
+		WirelessForDevice: wirelessForDevice,
+		SiteSettings:      siteSettingsSource,
 		// Client-session transition observations ride the same ownership
 		// seam as IncInform: the transport stays Prometheus-free and main
 		// wires the hook (post-commit, exactly-once per persisted

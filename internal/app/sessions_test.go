@@ -15,7 +15,7 @@ import (
 )
 
 func TestListDeviceClients(t *testing.T) {
-	a, st, _ := testApp(t)
+	a, st := testApp(t)
 	ctx := context.Background()
 	const mac = "aabbccddeeff"
 	if _, err := a.CreateDevice(ctx, adminapi.DeviceUpsert{MAC: mac}); err != nil {

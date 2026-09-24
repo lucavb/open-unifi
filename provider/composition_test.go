@@ -31,7 +31,7 @@ import (
 func composeAPI(t *testing.T) (*apiClient, store.DeviceStore, map[string]int) {
 	t.Helper()
 	st := store.NewMemStore()
-	ap := app.New(st, filepath.Join(t.TempDir(), "wireless.json"), filepath.Join(t.TempDir(), "site-settings.json"), app.SiteSettings{}, nil) // slog default logger
+	ap := app.New(st, filepath.Join(t.TempDir(), "site-settings.json"), app.SiteSettings{}, nil) // slog default logger
 	handler := adminapi.New(adminapi.Config{}, ap)
 
 	status := map[string]int{}
@@ -171,25 +171,30 @@ func TestDeviceUpdateClearsName(t *testing.T) {
 func TestProviderDecodesRealServerWireless(t *testing.T) {
 	c, _, status := composeAPI(t)
 	ctx := context.Background()
+	mac := "78:8a:20:11:22:33"
+	if err := c.do(ctx, http.MethodPost, "/api/v1/devices", map[string]string{"mac": mac, "name": "ap-wlan"}, nil); err != nil {
+		t.Fatal(err)
+	}
 	for _, e := range []wirelessEntry{{Name: "home", SSID: "home", Security: "wpa-p", Passphrase: "sup3rsecret", VLAN: 42, Enabled: true}, {Name: "guest", SSID: "guest", Security: "open", VLAN: 1, Enabled: true}} {
-		if err := c.createWireless(ctx, &e); err != nil {
+		e := e
+		if err := c.createWireless(ctx, mac, &e); err != nil {
 			t.Fatal(err)
 		}
 	}
-	home, err := c.getWireless(ctx, "home")
+	home, err := c.getWireless(ctx, mac, "home")
 	if err != nil || home.VLAN != 42 {
 		t.Fatalf("home read: %+v %v", home, err)
 	}
 	home.VLAN = 100
-	if err := c.updateWireless(ctx, "home", home); err != nil {
+	if err := c.updateWireless(ctx, mac, "home", home); err != nil {
 		t.Fatal(err)
 	}
-	guest, err := c.getWireless(ctx, "guest")
+	guest, err := c.getWireless(ctx, mac, "guest")
 	if err != nil || guest.Name != "guest" {
 		t.Fatalf("guest lost: %+v %v", guest, err)
 	}
-	if status["POST /api/v1/wireless"] != http.StatusCreated {
-		t.Fatalf("POST status %d", status["POST /api/v1/wireless"])
+	if status["POST /api/v1/devices/"+mac+"/wireless"] != http.StatusCreated {
+		t.Fatalf("POST status %d", status["POST /api/v1/devices/"+mac+"/wireless"])
 	}
 }
 
@@ -220,14 +225,18 @@ func TestRealServer404AndIDRoundTrip(t *testing.T) {
 	}
 
 	// Item PUT/GET round trip preserves the server-assigned wlan ID.
+	mac := "aa:bb:cc:dd:ee:01"
+	if err := c.do(ctx, http.MethodPost, "/api/v1/devices", map[string]string{"mac": mac, "name": "one-ap"}, nil); err != nil {
+		t.Fatal(err)
+	}
 	entry := &wirelessEntry{
 		ID: "srv-1", Name: "one", SSID: "one", Security: "wpa-p",
 		Passphrase: "eight+chars", VLAN: 2, Enabled: true,
 	}
-	if err := c.createWireless(ctx, entry); err != nil {
-		t.Fatalf("PUT: %v", err)
+	if err := c.createWireless(ctx, mac, entry); err != nil {
+		t.Fatalf("POST: %v", err)
 	}
-	got, err := c.getWireless(ctx, "one")
+	got, err := c.getWireless(ctx, mac, "one")
 	if err != nil {
 		t.Fatalf("GET after PUT: %v", err)
 	}

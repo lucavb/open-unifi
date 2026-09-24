@@ -469,14 +469,12 @@ type Backend interface {
 	// ValidateCmdString (the route 400s before the backend runs). Unknown
 	// MACs are a wrapped ErrNotFound.
 	EnqueueDeviceCmd(ctx context.Context, mac, cmd string) (DeviceView, error)
-	// GetWireless returns the whole wireless config document.
-	GetWireless(ctx context.Context) WlansEnvelope
-	// PutWireless replaces the whole wireless config document.
-	PutWireless(ctx context.Context, env WlansEnvelope) error
-	CreateWlan(ctx context.Context, wlan Wlan) (Wlan, error)
-	GetWlan(ctx context.Context, name string) (Wlan, error)
-	UpdateWlan(ctx context.Context, name string, wlan Wlan) (Wlan, error)
-	DeleteWlan(ctx context.Context, name string) error
+	GetDeviceWireless(ctx context.Context, mac string) (WlansEnvelope, error)
+	PutDeviceWireless(ctx context.Context, mac string, env WlansEnvelope) error
+	CreateDeviceWlan(ctx context.Context, mac string, wlan Wlan) (Wlan, error)
+	GetDeviceWlan(ctx context.Context, mac, name string) (Wlan, error)
+	UpdateDeviceWlan(ctx context.Context, mac, name string, wlan Wlan) (Wlan, error)
+	DeleteDeviceWlan(ctx context.Context, mac, name string) error
 	// GetSiteSettings returns the site-settings read view — the
 	// device-intent facts (controller-level record, site_settings file), read
 	// from the Backend's cache. The Backend's error is reserved for its
@@ -526,7 +524,8 @@ const (
 	routeRadioIntent        = "/api/v1/devices/{mac}/radios/{radio}"
 	routePendingList        = "/api/v1/pending"
 	routePendingAdopt       = "/api/v1/pending/{mac}/adopt"
-	routeWireless           = "/api/v1/wireless"
+	routeDeviceWireless     = "/api/v1/devices/{mac}/wireless"
+	routeDeviceWlanItem     = "/api/v1/devices/{mac}/wireless/{name}"
 	routeSiteSettings       = "/api/v1/site-settings"
 	routeWhoAmI             = "/api/v1/whoami"
 	routeOther              = "/api/other"
@@ -879,29 +878,48 @@ func New(cfg Config, be Backend) http.Handler {
 		}
 		writeJSON(w, http.StatusOK, dv)
 	}))
-	mux.HandleFunc("GET /api/v1/wireless", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, be.GetWireless(r.Context()))
+	mux.HandleFunc("GET "+routeDeviceWireless, requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+		mac, err := normalizeMAC(r.PathValue("mac"))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid mac: "+err.Error())
+			return
+		}
+		out, err := be.GetDeviceWireless(r.Context(), mac)
+		if err != nil {
+			handleBackendErr(w, lg, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
 	}))
-	mux.HandleFunc("PUT /api/v1/wireless", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("PUT "+routeDeviceWireless, requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+		mac, err := normalizeMAC(r.PathValue("mac"))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid mac: "+err.Error())
+			return
+		}
 		var env WlansEnvelope
 		if err := readJSON(r, &env); err != nil {
 			writeErr(w, http.StatusBadRequest, "invalid JSON body")
 			return
 		}
-		// Backend performs the authoritative duplicate/ID checks.
 		for i := range env.Wlans {
 			if msg := ValidateWlan(&env.Wlans[i]); msg != "" {
 				writeErr(w, http.StatusBadRequest, "wlan["+strconv.Itoa(i)+"]: "+msg)
 				return
 			}
 		}
-		if err := be.PutWireless(r.Context(), env); err != nil {
+		if err := be.PutDeviceWireless(r.Context(), mac, env); err != nil {
 			handleBackendErr(w, lg, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, env)
 	}))
-	mux.HandleFunc("POST /api/v1/wireless", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST "+routeDeviceWireless, requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+		mac, err := normalizeMAC(r.PathValue("mac"))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid mac: "+err.Error())
+			return
+		}
 		var wlan Wlan
 		if err := readJSON(r, &wlan); err != nil {
 			writeErr(w, http.StatusBadRequest, "invalid JSON body")
@@ -915,27 +933,37 @@ func New(cfg Config, be Backend) http.Handler {
 			writeErr(w, http.StatusBadRequest, msg)
 			return
 		}
-		out, err := be.CreateWlan(r.Context(), wlan)
+		out, err := be.CreateDeviceWlan(r.Context(), mac, wlan)
 		if err != nil {
 			handleBackendErr(w, lg, err)
 			return
 		}
 		writeJSON(w, http.StatusCreated, out)
 	}))
-	mux.HandleFunc("GET /api/v1/wireless/{name}", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET "+routeDeviceWlanItem, requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+		mac, err := normalizeMAC(r.PathValue("mac"))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid mac: "+err.Error())
+			return
+		}
 		name := r.PathValue("name")
 		if msg := ValidateWlanName(name); msg != "" {
 			writeErr(w, http.StatusBadRequest, msg)
 			return
 		}
-		out, err := be.GetWlan(r.Context(), name)
+		out, err := be.GetDeviceWlan(r.Context(), mac, name)
 		if err != nil {
 			handleBackendErr(w, lg, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, out)
 	}))
-	mux.HandleFunc("PUT /api/v1/wireless/{name}", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("PUT "+routeDeviceWlanItem, requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+		mac, err := normalizeMAC(r.PathValue("mac"))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid mac: "+err.Error())
+			return
+		}
 		name := r.PathValue("name")
 		if msg := ValidateWlanName(name); msg != "" {
 			writeErr(w, http.StatusBadRequest, msg)
@@ -955,20 +983,25 @@ func New(cfg Config, be Backend) http.Handler {
 			writeErr(w, http.StatusBadRequest, msg)
 			return
 		}
-		out, err := be.UpdateWlan(r.Context(), name, wlan)
+		out, err := be.UpdateDeviceWlan(r.Context(), mac, name, wlan)
 		if err != nil {
 			handleBackendErr(w, lg, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, out)
 	}))
-	mux.HandleFunc("DELETE /api/v1/wireless/{name}", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("DELETE "+routeDeviceWlanItem, requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+		mac, err := normalizeMAC(r.PathValue("mac"))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid mac: "+err.Error())
+			return
+		}
 		name := r.PathValue("name")
 		if msg := ValidateWlanName(name); msg != "" {
 			writeErr(w, http.StatusBadRequest, msg)
 			return
 		}
-		if err := be.DeleteWlan(r.Context(), name); err != nil {
+		if err := be.DeleteDeviceWlan(r.Context(), mac, name); err != nil {
 			handleBackendErr(w, lg, err)
 			return
 		}

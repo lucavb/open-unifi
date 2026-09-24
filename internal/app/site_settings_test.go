@@ -30,7 +30,7 @@ func testSettingsApp(t *testing.T, seed SiteSettings) (*App, store.DeviceStore, 
 	t.Helper()
 	st := store.NewMemStore()
 	spath := filepath.Join(t.TempDir(), "site-settings.json")
-	a := New(st, filepath.Join(t.TempDir(), "wireless.json"), spath, seed, quietLogger())
+	a := New(st, spath, seed, quietLogger())
 	return a, st, spath
 }
 
@@ -76,7 +76,7 @@ func TestFirstBootSeedPersistsThenFileWins(t *testing.T) {
 
 	// Reopen over the same file with a DIFFERENT seed: the file wins.
 	reseed := SiteSettings{CountryCode: 840}
-	a2 := New(store.NewMemStore(), filepath.Join(t.TempDir(), "wireless.json"), spath, reseed, quietLogger())
+	a2 := New(store.NewMemStore(), spath, reseed, quietLogger())
 	got2, err := a2.GetSiteSettings(context.Background())
 	if err != nil {
 		t.Fatalf("get after reopen: %v", err)
@@ -495,7 +495,7 @@ func TestSiteSettingsLoadAndSeedErrorRefusal(t *testing.T) {
 			if tc.prep != nil {
 				tc.prep(t, spath)
 			}
-			a := New(store.NewMemStore(), filepath.Join(t.TempDir(), "wireless.json"), spath, tc.seed, quietLogger())
+			a := New(store.NewMemStore(), spath, tc.seed, quietLogger())
 
 			if _, err := a.CurrentSiteSettings(); tc.wantErr != (err != nil) {
 				t.Fatalf("CurrentSiteSettings err = %v, wantErr %v", err, tc.wantErr)
@@ -545,7 +545,7 @@ func TestPutSiteSettingsSweepFailureRetryResweeps(t *testing.T) {
 	// MAC-ordered, so 112233445566 sweeps cleanly first and the fault
 	// hits aabbccddeeff deterministically.
 	st := &failingSweepStore{DeviceStore: base, mac: "aabbccddeeff", remaining: 1}
-	a := New(st, filepath.Join(t.TempDir(), "wireless.json"), spath, SiteSettings{}, quietLogger())
+	a := New(st, spath, SiteSettings{}, quietLogger())
 
 	if err := base.Put(store.Device{MAC: "112233445566", State: store.StateAdopted, CfgVersion: "cccc3333dddd4444"}); err != nil {
 		t.Fatal(err)

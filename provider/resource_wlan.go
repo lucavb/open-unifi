@@ -21,7 +21,8 @@ var _ resource.Resource = (*wlanResource)(nil)
 var _ resource.ResourceWithConfigure = (*wlanResource)(nil)
 var _ resource.ResourceWithImportState = (*wlanResource)(nil)
 
-// wlanResource manages one WLAN inside the controller's wireless config.
+// wlanResource manages one WLAN on a single device (PUT/GET/DELETE
+// /api/v1/devices/{mac}/wireless/{name}).
 type wlanResource struct {
 	client *apiClient
 }
@@ -40,18 +41,25 @@ func (r *wlanResource) Configure(_ context.Context, req resource.ConfigureReques
 
 func (r *wlanResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "A WLAN (wifi network) on the open-unifi control plane, keyed by `name`. " +
-			"Plan diffs for `passphrase` render as `(sensitive value)`.",
+		MarkdownDescription: "A WLAN on one open-unifi device, keyed by `device_mac` and wlan `name`. " +
+			"WLAN intent is per AP (`/api/v1/devices/{mac}/wireless`). Plan diffs for `passphrase` render as `(sensitive value)`.",
 		Attributes: map[string]schema.Attribute{
+			"device_mac": schema.StringAttribute{
+				MarkdownDescription: "MAC of the device that owns this WLAN, lowercase colon format. Immutable.",
+				Required:            true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
+			},
 			"name": schema.StringAttribute{
-				MarkdownDescription: "Unique name of this wlan; doubles as the resource's `id` (slug). Immutable.",
+				MarkdownDescription: "Unique wlan name on this device; doubles as the import slug. Immutable.",
 				Required:            true,
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.RequiresReplace(),
 				},
 			},
 			"ssid": schema.StringAttribute{
-				MarkdownDescription: "Broadcast SSID. Required; must also be unique among wlans.",
+				MarkdownDescription: "Broadcast SSID. Required; must be unique among wlans on this device.",
 				Required:            true,
 			},
 			"security": schema.StringAttribute{
@@ -78,7 +86,7 @@ func (r *wlanResource) Schema(_ context.Context, _ resource.SchemaRequest, resp 
 			},
 			"band": schema.StringAttribute{MarkdownDescription: "Radio band: `2g`, `5g`, or `both`.", Optional: true, Computed: true, Default: stringdefault.StaticString("both")},
 			"id": schema.StringAttribute{
-				MarkdownDescription: "Resource id = the wlan name.",
+				MarkdownDescription: "Resource id = `{device_mac}/{name}`.",
 				Computed:            true,
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.UseStateForUnknown(),
@@ -88,9 +96,9 @@ func (r *wlanResource) Schema(_ context.Context, _ resource.SchemaRequest, resp 
 	}
 }
 
-// wlanModel is the Terraform state shape for the wlan resource.
 type wlanModel struct {
 	ID         types.String `tfsdk:"id"`
+	DeviceMac  types.String `tfsdk:"device_mac"`
 	Name       types.String `tfsdk:"name"`
 	SSID       types.String `tfsdk:"ssid"`
 	Security   types.String `tfsdk:"security"`
@@ -100,10 +108,10 @@ type wlanModel struct {
 	Band       types.String `tfsdk:"band"`
 }
 
-// checkWlanConflicts enforces the name/ssid uniqueness rules the envelope
-// (and every PUT) depends on: one resource per wlan `name`, globally unique
-// SSIDs. selfIdx (the entry currently being updated; -1 on Create) is
-// excluded so an update does not collide with itself.
+func wlanID(mac, name string) string {
+	return mac + "/" + name
+}
+
 func (r *wlanResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	if r.client == nil {
 		notConfiguredErr(&resp.Diagnostics)
@@ -118,14 +126,14 @@ func (r *wlanResource) Create(ctx context.Context, req resource.CreateRequest, r
 		return
 	}
 
+	mac := plan.DeviceMac.ValueString()
 	entry := wlanEntryFromModel(&plan)
-	if err := r.client.createWireless(ctx, &entry); err != nil {
+	if err := r.client.createWireless(ctx, mac, &entry); err != nil {
 		resp.Diagnostics.AddError("Create wlan", err.Error())
 		return
 	}
 
-	// Read-back makes the state match server-normalized truth.
-	if err := readWlanInto(ctx, r.client, &plan); err != nil {
+	if err := readWlanInto(ctx, r.client, mac, &plan); err != nil {
 		resp.Diagnostics.AddError("Create wlan: post-create read", err.Error())
 		return
 	}
@@ -142,9 +150,9 @@ func (r *wlanResource) Read(ctx context.Context, req resource.ReadRequest, resp 
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	entry, err := r.client.getWireless(ctx, state.Name.ValueString())
+	mac := state.DeviceMac.ValueString()
+	entry, err := r.client.getWireless(ctx, mac, state.Name.ValueString())
 	if errNotFound(err) {
-		// Missing = gone: remove from state so Terraform plans re-create.
 		resp.State.RemoveResource(ctx)
 		return
 	}
@@ -152,7 +160,7 @@ func (r *wlanResource) Read(ctx context.Context, req resource.ReadRequest, resp 
 		resp.Diagnostics.AddError("Read wlan", err.Error())
 		return
 	}
-	entryToModel(entry, &state)
+	entryToModel(mac, entry, &state)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -169,10 +177,15 @@ func (r *wlanResource) Update(ctx context.Context, req resource.UpdateRequest, r
 	if !r.validateWlan(&plan, &resp.Diagnostics) {
 		return
 	}
+	mac := plan.DeviceMac.ValueString()
 	entry := wlanEntryFromModel(&plan)
-	plan.ID = types.StringValue(plan.Name.ValueString())
-	if err := r.client.updateWireless(ctx, plan.Name.ValueString(), &entry); err != nil {
+	plan.ID = types.StringValue(wlanID(mac, plan.Name.ValueString()))
+	if err := r.client.updateWireless(ctx, mac, plan.Name.ValueString(), &entry); err != nil {
 		resp.Diagnostics.AddError("Update wlan", err.Error())
+		return
+	}
+	if err := readWlanInto(ctx, r.client, mac, &plan); err != nil {
+		resp.Diagnostics.AddError("Update wlan: post-update read", err.Error())
 		return
 	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
@@ -188,17 +201,12 @@ func (r *wlanResource) Delete(ctx context.Context, req resource.DeleteRequest, r
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	if err := r.client.deleteWireless(ctx, state.Name.ValueString()); err != nil && !errNotFound(err) {
+	if err := r.client.deleteWireless(ctx, state.DeviceMac.ValueString(), state.Name.ValueString()); err != nil && !errNotFound(err) {
 		resp.Diagnostics.AddError("Delete wlan", err.Error())
 		return
 	}
 }
 
-// --- helpers ------------------------------------------------------------
-
-// wlanEntryFromModel converts Terraform state into a server entry. When
-// security is "open" the passphrase is dropped: the server rejects any PUT
-// with "passphrase must be empty when security is open".
 func wlanEntryFromModel(m *wlanModel) wirelessEntry {
 	e := wirelessEntry{
 		Name:     m.Name.ValueString(),
@@ -222,14 +230,9 @@ func wlanEntryFromModel(m *wlanModel) wirelessEntry {
 	return e
 }
 
-// entryToModel copies a server entry into the model. The server DOES echo
-// passphrase contents back (they are part of the stored whole-document
-// wireless config), so server truth wins: a non-empty server passphrase
-// replaces the model's sensitive value; an empty one (security=open, or the
-// operator cleared it) renders as null. The framework rewrites `sensitive`
-// in plan diffs; state round-trips the real value.
-func entryToModel(e *wirelessEntry, m *wlanModel) {
-	m.ID = types.StringValue(e.Name)
+func entryToModel(mac string, e *wirelessEntry, m *wlanModel) {
+	m.ID = types.StringValue(wlanID(mac, e.Name))
+	m.DeviceMac = types.StringValue(mac)
 	m.Name = types.StringValue(e.Name)
 	m.SSID = types.StringValue(e.SSID)
 	m.Security = types.StringValue(e.Security)
@@ -250,24 +253,15 @@ func entryToModel(e *wirelessEntry, m *wlanModel) {
 	}
 }
 
-// readWlanInto refreshes plan/state from the server for the wlan named by m.
-func readWlanInto(ctx context.Context, c *apiClient, m *wlanModel) error {
-	entry, err := c.getWireless(ctx, m.Name.ValueString())
+func readWlanInto(ctx context.Context, c *apiClient, mac string, m *wlanModel) error {
+	entry, err := c.getWireless(ctx, mac, m.Name.ValueString())
 	if err != nil {
 		return err
 	}
-	entryToModel(entry, m)
+	entryToModel(mac, entry, m)
 	return nil
 }
 
-// validateWlan mirrors the server's rules (internal/adminapi/helpers.go
-// validateWlan: security enum, ssid length 1..32, vlan 1..4094, passphrase
-// empty for open / >=8 chars otherwise) so clients get an attribute-level
-// error at plan/validate time instead of a mid-apply HTTP 400. Deliberately
-// NOT full lockstep: the server additionally rejects control characters in
-// ssid/name/passphrase and unsafe wlan IDs (defense-in-depth against
-// system_cfg row injection, helpers.go hasControlChar/validateWlanID) —
-// those checks stay server-side-only.
 func (r *wlanResource) validateWlan(m *wlanModel, d *diag.Diagnostics) bool {
 	band := m.Band.ValueString()
 	if band != "2g" && band != "5g" && band != "both" {
@@ -324,8 +318,15 @@ func (r *wlanResource) validateWlan(m *wlanModel, d *diag.Diagnostics) bool {
 }
 
 func (r *wlanResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
-	resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
-	if !resp.Diagnostics.HasError() {
-		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("name"), req.ID)...)
+	parts := strings.Split(req.ID, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		resp.Diagnostics.AddError(
+			"Invalid import id",
+			"Import id must be {device_mac}/{wlan_name}, e.g. fc:ec:da:a9:60:75/dummy",
+		)
+		return
 	}
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("device_mac"), parts[0])...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("name"), parts[1])...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), req.ID)...)
 }

@@ -151,12 +151,15 @@
   <section class="card" id="wlSection">
     <h2>Wireless / VLAN config</h2>
     <p class="hint">
-      Whole-document editor: <span class="mono">Save</span> PUTs all rows to
-      <span class="mono">/api/v1/wireless</span>. Passphrase &ge; 8 chars unless security is
+      Per device: choose a MAC, then <span class="mono">Save</span> PUTs all rows to
+      <span class="mono">/api/v1/devices/{mac}/wireless</span>. Passphrase &ge; 8 chars unless security is
       &ldquo;open&rdquo; (wpa-eap: optional, &ge; 8 when set); VLAN 1&ndash;4094. wpa-eap needs a
       RADIUS profile: up to 4 auth servers (&ldquo;ip&rdquo; or &ldquo;ip:port&rdquo;), a shared secret,
       and a dynamic-VLAN mode.
     </p>
+    <label class="rowform" for="wlDevice">Device MAC</label>
+    <select id="wlDevice" aria-label="Device for wireless config"></select>
+    <p class="hint" id="wlPickHint" hidden>Register or adopt a device above to edit WLANs.</p>
     <table aria-label="Wireless networks">
       <thead><tr><th>SSID</th><th>Name</th><th>Security</th><th>Passphrase</th><th>VLAN</th><th>RADIUS</th><th>On</th><th></th></tr></thead>
       <tbody id="wlRows"></tbody>
@@ -168,7 +171,7 @@
   <footer>
     Endpoints: <a href="/api/v1/devices">/api/v1/devices</a> &middot;
     <a href="/api/v1/pending">/api/v1/pending</a> &middot;
-    <a href="/api/v1/wireless">/api/v1/wireless</a> &middot;
+    <span class="mono">/api/v1/devices/{mac}/wireless</span> &middot;
     <a href="/metrics">/metrics</a> &middot;
     <a href="/healthz">/healthz</a>
   </footer>
@@ -191,6 +194,7 @@
   // every 5 s poll and re-expands the open rows (updateOpenClients).
   var openClients = {};
   var lastDevices = [];
+  var selectedWlMac = window.sessionStorage.getItem("ou_wl_mac") || "";
   // A device refresh must not discard an in-progress password entry. This is
   // only a render gate: the password itself is never copied into controller
   // state. Explicit password actions set this once so their normal refresh
@@ -199,6 +203,44 @@
 
   var tokenInput = document.getElementById("token");
   var tokenBox = document.getElementById("tokenbox");
+  var wlDeviceSelect = document.getElementById("wlDevice");
+
+  function deviceWirelessPath(mac) {
+    return "/api/v1/devices/" + encodeURIComponent(mac) + "/wireless";
+  }
+
+  function syncWlDeviceSelect(devices) {
+    var prev = selectedWlMac || wlDeviceSelect.value;
+    var opts = ['<option value="">— select device —</option>'];
+    devices.forEach(function (d) {
+      var label = d.mac + (d.name ? " (" + d.name + ")" : "");
+      opts.push('<option value="' + esc(d.mac) + '">' + esc(label) + "</option>");
+    });
+    wlDeviceSelect.innerHTML = opts.join("");
+    var pick = prev;
+    if (!pick || !devices.some(function (d) { return d.mac === pick; })) {
+      pick = devices.length ? devices[0].mac : "";
+    }
+    selectedWlMac = pick;
+    wlDeviceSelect.value = pick;
+    if (pick) { window.sessionStorage.setItem("ou_wl_mac", pick); }
+    else { window.sessionStorage.removeItem("ou_wl_mac"); }
+    document.getElementById("wlPickHint").hidden = !!pick;
+    document.getElementById("wlSave").disabled = !pick;
+    document.getElementById("wlAddRow").disabled = !pick;
+  }
+
+  function loadDeviceWireless() {
+    if (!selectedWlMac) {
+      renderWireless({ wlans: [] });
+      setError("wlError", "");
+      return Promise.resolve();
+    }
+    return api(deviceWirelessPath(selectedWlMac)).then(getJSON).then(function (env) {
+      renderWireless(env);
+      setError("wlError", "");
+    });
+  }
 
   function showToken(msg) {
     tokenBox.hidden = false;
@@ -674,14 +716,19 @@
       // a token-protected controller's first load down to the token prompt.
       .catch(function (e) { if (!is401(e)) { setError("globalError", e.message); } })
       .then(function () { return api("/api/v1/devices").then(getJSON); })
-      .then(function (env) { renderDevices(env.devices || []); setError("devError", ""); })
+      .then(function (env) {
+        var devices = env.devices || [];
+        renderDevices(devices);
+        syncWlDeviceSelect(devices);
+        setError("devError", "");
+        return loadDeviceWireless().catch(function (e) {
+          if (!is401(e)) { setError("wlError", "wireless: " + e.message); }
+        });
+      })
       .catch(function (e) { if (!is401(e)) { setError("devError", "devices: " + e.message); } })
       .then(function () { return api("/api/v1/pending").then(getJSON); })
       .then(function (env) { renderPending(env.pending || []); setError("pendingError", ""); })
-      .catch(function (e) { if (!is401(e)) { setError("pendingError", "pending: " + e.message); } })
-      .then(function () { return api("/api/v1/wireless").then(getJSON); })
-      .then(renderWireless)
-      .catch(function (e) { if (!is401(e)) { setError("wlError", "wireless: " + e.message); } });
+      .catch(function (e) { if (!is401(e)) { setError("pendingError", "pending: " + e.message); } });
   }
 
   document.getElementById("addForm").addEventListener("submit", function (ev) {
@@ -701,12 +748,25 @@
 
   document.getElementById("wlSave").addEventListener("click", function () {
     setError("wlError", "");
+    if (!selectedWlMac) { setError("wlError", "select a device first"); return; }
     var env = collectWireless();
     if (env.error) { setError("wlError", env.error); return; }
-    api("/api/v1/wireless", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(env) })
+    api(deviceWirelessPath(selectedWlMac), { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(env) })
       .then(getJSON)
       .then(renderWireless)
       .catch(function (e) { setError("wlError", "save failed: " + e.message); });
+  });
+
+  wlDeviceSelect.addEventListener("change", function () {
+    selectedWlMac = wlDeviceSelect.value;
+    if (selectedWlMac) { window.sessionStorage.setItem("ou_wl_mac", selectedWlMac); }
+    else { window.sessionStorage.removeItem("ou_wl_mac"); }
+    document.getElementById("wlPickHint").hidden = !!selectedWlMac;
+    document.getElementById("wlSave").disabled = !selectedWlMac;
+    document.getElementById("wlAddRow").disabled = !selectedWlMac;
+    loadDeviceWireless().catch(function (e) {
+      if (!is401(e)) { setError("wlError", "wireless: " + e.message); }
+    });
   });
 
   document.getElementById("tokenSave").addEventListener("click", function () {

@@ -375,7 +375,7 @@ func TestZZMinimalDiffGate(t *testing.T) {
 		SSID: "openunifi-gate-check", Security: "open",
 		VLAN: 1, Enabled: true, Band: "both",
 	}}
-	s := New(Config{WirelessSource: func() []Wlan { return env }}, store.NewMemStore(), testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return env }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, zzHarnessRecord())
 	_, violations := zzRunGate(t, "minimal-diff gate: synthetic record vs factory baseline", factoryRaw, sys, zzManagedAllow)
 	violations = zzExemptLedBarMigration(violations)
@@ -441,7 +441,7 @@ func TestZZMinimalDiffGateLiveRecord(t *testing.T) {
 		SSID: "openunifi-gate-check", Security: "open",
 		VLAN: 1, Enabled: true, Band: "both",
 	}}
-	s := New(Config{WirelessSource: func() []Wlan { return env }}, store.NewMemStore(), testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return env }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, rec)
 	if err := os.WriteFile(zzHarnessDir+"/render-live-sys.txt", []byte(sys), 0o644); err != nil {
 		t.Fatal(err)
@@ -512,7 +512,7 @@ func TestZZLiveIntentVsApplied(t *testing.T) {
 		t.Fatalf("live wireless envelope is empty")
 	}
 	facts := zzLiveSiteSettings(t)
-	s := New(Config{WirelessSource: func() []Wlan { return envFile.Wlans }, SiteSettings: func() (SiteSettings, error) { return facts, nil }}, store.NewMemStore(), testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return envFile.Wlans }, SiteSettings: func() (SiteSettings, error) { return facts, nil }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, rec)
 	if err := os.WriteFile(zzHarnessDir+"/live-intent-sys.txt", []byte(sys), 0o644); err != nil {
 		t.Fatal(err)
@@ -596,7 +596,7 @@ func TestZZLiveWpaCandidateVsApplied(t *testing.T) {
 	}
 	cand.Security, cand.Passphrase = "wpa-p", zzLiveWpaPSK
 	env := []Wlan{cand}
-	s := New(Config{WirelessSource: func() []Wlan { return env }}, store.NewMemStore(), testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return env }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, rec)
 	if err := os.WriteFile(zzHarnessDir+"/live-wpa-candidate-sys.txt", []byte(sys), 0o644); err != nil {
 		t.Fatal(err)
@@ -637,7 +637,7 @@ func TestZZSuccessivePushControlVsApplied(t *testing.T) {
 		SSID: "openunifi-gate-check", Security: "open",
 		VLAN: 1, Enabled: true, Band: "both",
 	}}
-	s := New(Config{WirelessSource: func() []Wlan { return env }}, store.NewMemStore(), testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return env }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, zzHarnessRecord())
 	if err := os.WriteFile(zzHarnessDir+"/night-cand-both-open-sys.txt", []byte(sys), 0o644); err != nil {
 		t.Fatal(err)
@@ -673,7 +673,7 @@ func TestZZSuccessivePush2gOnlyVsApplied(t *testing.T) {
 		SSID: "openunifi-gate-check", Security: "open",
 		VLAN: 1, Enabled: true, Band: "2g",
 	}}
-	s := New(Config{WirelessSource: func() []Wlan { return env }}, store.NewMemStore(), testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return env }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, zzHarnessRecord())
 	if err := os.WriteFile(zzHarnessDir+"/night-cand-2g-sys.txt", []byte(sys), 0o644); err != nil {
 		t.Fatal(err)
@@ -726,7 +726,7 @@ func TestZZSuccessivePushChannelIntentVsApplied(t *testing.T) {
 	rec.Extra["radio_intent"] = map[string]any{
 		"wifi1": map[string]any{"channel": 36.0},
 	}
-	s := New(Config{WirelessSource: func() []Wlan { return env }}, store.NewMemStore(), testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return env }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, rec)
 	if err := os.WriteFile(zzHarnessDir+"/night-cand-channel-intent-sys.txt", []byte(sys), 0o644); err != nil {
 		t.Fatal(err)
@@ -758,7 +758,7 @@ func TestZZSuccessivePushWpaPskVsApplied(t *testing.T) {
 		Passphrase: "openunifi-fake-gate-psk-20260917",
 		VLAN:       1, Enabled: true, Band: "both",
 	}}
-	s := New(Config{WirelessSource: func() []Wlan { return env }}, store.NewMemStore(), testLogger())
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return env }}, store.NewMemStore(), testLogger())
 	sys := mustBuildSys(t, s, zzHarnessRecord())
 	if err := os.WriteFile(zzHarnessDir+"/night-cand-wpa-p-sys.txt", []byte(sys), 0o644); err != nil {
 		t.Fatal(err)

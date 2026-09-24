@@ -49,6 +49,7 @@ resource "open-unifi_device" "attic" {
 
 # --- One secure wlan (wpa-p on a tagged vlan) ------------------------------
 resource "open-unifi_wlan" "main" {
+  device_mac = open-unifi_device.attic.mac
   name       = "main"
   ssid       = "ExampleNet"
   security   = "wpa-p"
@@ -59,13 +60,12 @@ resource "open-unifi_wlan" "main" {
 
 # --- One open wlan (guest) -------------------------------------------------
 resource "open-unifi_wlan" "guest" {
-  name     = "guest"
-  ssid     = "OpenGuest"
+  device_mac = open-unifi_device.attic.mac
+  name       = "guest"
+  ssid       = "OpenGuest"
   security = "open"
   vlan     = 1
   enabled  = true
-  # NOTE: on the single-radio UAP-AC-Pro-Gen2 skinniest configs, two wlans
-  # share one radio; the control plane applies both wlans to the same AP.
 }
 
 # --- Data source: everything the controller sees ---------------------------

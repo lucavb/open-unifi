@@ -11,15 +11,11 @@ package app
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -41,22 +37,10 @@ func unknownDevice(mac string) error {
 }
 
 // App implements adminapi.Backend over the JSON device store and persists
-// the wireless config document to its own JSON file.
+// site settings to its own JSON file.
 type App struct {
 	st store.DeviceStore
 	lg *slog.Logger
-
-	wirelessPath string
-	wmu          sync.RWMutex // guards the wireless cache (Get/Put pairs)
-
-	// cachedWireless is loaded EXACTLY ONCE by New; GetWireless and the
-	// provisioning side serve the cache — there is no per-request file I/O.
-	// PutWireless updates it in the same critical section that persists.
-	cachedWireless adminapi.WlansEnvelope
-	// loadErr is the error from that one eager load (unreadable/corrupt
-	// file); missing file is NOT an error. It is fixed at New time and
-	// surfaced by CurrentWireless so startup can refuse to launch.
-	loadErr error
 
 	// settingsPath is the JSON file holding the site-settings record
 	// (site_settings.go), the wireless-envelope precedent for a
@@ -103,24 +87,15 @@ type App struct {
 // Compile-time proof that App satisfies the admin API storage contract.
 var _ adminapi.Backend = (*App)(nil)
 
-// New builds the application backend. wirelessPath is the JSON file holding
-// the wireless config document (created atomically on first write; the
-// document shape is {"wlans":[...]}). The wireless file is read EXACTLY ONCE
-// here: a missing file yields the empty default (first boot), an unreadable
-// or JSON-corrupt file is retained in loadErr — callers must check
-// CurrentWireless at startup (cmd/openunifi refuses to launch) instead of
-// silently provisioning devices with zero WLANs.
-//
-// settingsPath + seed carry the site-settings record (site_settings.go),
-// the wireless-envelope precedent for a controller-level whole-document
-// document: the file is read EXACTLY ONCE here, a present file wins over
-// the seed (the startup flags are first-boot seeds only), and an absent
-// file seeds, validates, and persists the seed immediately.
-func New(st store.DeviceStore, wirelessPath, settingsPath string, seed SiteSettings, lg *slog.Logger) *App {
+// New builds the application backend. settingsPath + seed carry the
+// site-settings record (site_settings.go): the file is read EXACTLY ONCE
+// here, a present file wins over the seed (the startup flags are
+// first-boot seeds only), and an absent file seeds, validates, and
+// persists the seed immediately.
+func New(st store.DeviceStore, settingsPath string, seed SiteSettings, lg *slog.Logger) *App {
 	if lg == nil {
 		lg = slog.Default()
 	}
-	env, err := loadWirelessFile(wirelessPath)
 	// The logger is available before New returns: the loader warns once on
 	// a stale removed key (the device_ssh_password peek) through it.
 	settings, loaded, serr := loadSettingsFile(settingsPath, lg)
@@ -146,9 +121,6 @@ func New(st store.DeviceStore, wirelessPath, settingsPath string, seed SiteSetti
 	return &App{
 		st:              st,
 		lg:              lg,
-		wirelessPath:    wirelessPath,
-		cachedWireless:  env,
-		loadErr:         err,
 		settingsPath:    settingsPath,
 		cachedSettings:  settings,
 		settingsLoadErr: settingsErr,
@@ -186,10 +158,9 @@ func New(st store.DeviceStore, wirelessPath, settingsPath string, seed SiteSetti
 // behind RebootDevice/FactoryResetDevice, and EnqueueDeviceCmd.
 //
 // Deliberate exclusions: DeleteDevice (a pure delete, not a save — the
-// store's per-MAC delete owns its own cycle) and the wireless-envelope
-// verbs (CreateWlan/GetWlan/UpdateWlan/DeleteWlan/Get/PutWireless operate a
-// controller-level document, not a device record, and carry their own
-// lock/persist discipline).
+// store's per-MAC delete owns its own cycle) and the per-device WLAN
+// envelope verbs (Get/PutDeviceWireless and item CRUD persist device_wlans
+// via saveIntent without cfgversion mint — drift-on-inform is the trigger).
 
 // saveMode selects the RMW cycle the skeleton runs for a verb.
 type saveMode int
@@ -275,9 +246,7 @@ func saveIntent[T any](a *App, mac string, mode saveMode, change func(d *store.D
 // view maps a store record to the admin API read model. Actions is the
 // minimal supported set (delete) and is omitted only if empty.
 func (a *App) view(d store.Device) adminapi.DeviceView {
-	a.wmu.RLock()
-	desired := append([]adminapi.Wlan(nil), a.cachedWireless.Wlans...)
-	a.wmu.RUnlock()
+	desired := adminWlansFromDevice(d).Wlans
 	inSync := runtimeInSync(d, desired)
 	return adminapi.DeviceView{
 		MAC:                store.ColonMAC(d.MAC),
@@ -1213,309 +1182,6 @@ func (a *App) armLifecycle(mac, flag string) (adminapi.DeviceView, error) {
 		return adminapi.DeviceView{}, err
 	}
 	return a.view(rec), nil
-}
-
-// ---- wireless config file -------------------------------------------------
-
-// GetWireless serves the cached whole-document wireless config. There is NO
-// file I/O here: New loaded the document once, PutWireless keeps the cache
-// in sync. A missing file was the empty default {"wlans":[]}; an unreadable
-// or corrupt file was rejected at startup (CurrentWireless error, main
-// refuses) — so serving empty-to-then-PUT-one-wlan (silent config wipes)
-// cannot happen anymore.
-func (a *App) GetWireless(_ context.Context) adminapi.WlansEnvelope {
-	a.wmu.RLock()
-	defer a.wmu.RUnlock()
-	return cloneWireless(a.cachedWireless)
-}
-
-// CurrentWireless exposes the cached wireless envelope without the Backend
-// context shape, for provisioning-side wiring (cmd/openunifi feeds it into
-// server.Config.WirelessSource through an adminapi.Wlan → server.Wlan
-// conversion). The error is REAL, not reserved: it is set at NEW time when
-// the wireless file was unreadable or JSON-corrupt (missing file is not an
-// error — first boot). cmd/openunifi checks it immediately after New and
-// refuses to launch, so a corrupt wireless.json becomes a visible startup
-// failure (matching store.NewJSONStore's corrupt-file behavior) instead of a
-// silent future deconfiguration of adopted devices.
-func (a *App) CurrentWireless() (adminapi.WlansEnvelope, error) {
-	a.wmu.RLock()
-	defer a.wmu.RUnlock()
-	return cloneWireless(a.cachedWireless), a.loadErr
-}
-
-// loadWirelessFile reads and decodes the wireless config document exactly
-// once (called from New): a missing file yields the empty default with a nil
-// error; an unreadable, corrupt, or INVALID file yields the empty default
-// PLUS a real error that App retains until process exit.
-//
-// Validation runs the exact same rules as PUT /api/v1/wireless
-// (adminapi.ValidateWlan): a document that would be rejected at the API must
-// not be loaded silently and then provisioned to devices.
-func loadWirelessFile(path string) (adminapi.WlansEnvelope, error) {
-	def := adminapi.WlansEnvelope{Wlans: []adminapi.Wlan{}}
-	raw, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return def, nil
-	}
-	if err != nil {
-		return def, fmt.Errorf("wireless file unreadable %s: %w", path, err)
-	}
-	var env adminapi.WlansEnvelope
-	if err := json.Unmarshal(raw, &env); err != nil {
-		return def, fmt.Errorf("wireless file corrupt %s: %w", path, err)
-	}
-	if env.Wlans == nil {
-		env.Wlans = []adminapi.Wlan{}
-	}
-	for i := range env.Wlans {
-		wl := &env.Wlans[i]
-		if msg := adminapi.ValidateWlan(wl); msg != "" {
-			return def, fmt.Errorf(
-				"wireless file %s: invalid wlan[%d] (name=%q ssid=%q): %s; remove or convert it (e.g. via PUT /api/v1/wireless) and restart",
-				path, i, wl.Name, wl.SSID, msg)
-		}
-	}
-	if err := validateWlanUniqueness(env); err != nil {
-		return def, err
-	}
-	return env, nil
-}
-
-// PutWireless replaces the whole wireless config document, persisted
-// atomically (temp file + rename), and then swaps the in-memory cache in the
-// SAME critical section. On any persist error the cache is left untouched
-// and the error is returned — disk and memory can never disagree.
-func (a *App) PutWireless(_ context.Context, env adminapi.WlansEnvelope) error {
-	a.wmu.Lock()
-	defer a.wmu.Unlock()
-	if env.Wlans == nil {
-		env.Wlans = []adminapi.Wlan{}
-	}
-	for i := range env.Wlans {
-		env.Wlans[i].ID = wlanID(env.Wlans[i])
-	}
-	// Full-envelope validation, the same fence CreateWlan/UpdateWlan apply
-	// (name + ValidateWlan + uniqueness — a strict superset of the old
-	// name-only loop): IDs are assigned BEFORE validation so derived IDs are
-	// visible to the duplicate-ID check, and a direct caller can no longer
-	// persist an envelope the loader/next boot (loadWirelessFile) would
-	// refuse with a startup failure.
-	if err := a.validateWlans(&env); err != nil {
-		return err
-	}
-	blob, err := json.MarshalIndent(env, "", "  ")
-	if err != nil {
-		return fmt.Errorf("wireless marshal: %w", err)
-	}
-	dir := filepath.Dir(a.wirelessPath)
-	tmp, err := os.CreateTemp(dir, filepath.Base(a.wirelessPath)+".tmp-*")
-	if err != nil {
-		return fmt.Errorf("wireless temp file: %w", err)
-	}
-	tmpName := tmp.Name()
-	defer func() {
-		if tmpName != "" {
-			_ = os.Remove(tmpName)
-		}
-	}()
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("wireless chmod: %w", err)
-	}
-	if _, err := tmp.Write(blob); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("wireless write: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("wireless fsync: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("wireless close: %w", err)
-	}
-	if err := os.Rename(tmpName, a.wirelessPath); err != nil {
-		return fmt.Errorf("wireless rename: %w", err)
-	}
-	tmpName = ""
-	syncDir(dir)           // best effort: make the rename itself durable
-	a.cachedWireless = env // persist succeeded: swap the cache atomically
-	a.lg.Debug("wireless config replaced", "wlans", len(env.Wlans))
-	return nil
-}
-
-func wlanID(w adminapi.Wlan) string {
-	if w.ID != "" {
-		return w.ID
-	}
-	sum := sha256.Sum256([]byte(w.Name + w.SSID))
-	return fmt.Sprintf("%x", sum[:12])
-}
-func (a *App) validateWlans(env *adminapi.WlansEnvelope) error {
-	names, ssids, ids := map[string]bool{}, map[string]bool{}, map[string]bool{}
-	for i := range env.Wlans {
-		w := &env.Wlans[i]
-		if msg := adminapi.ValidateWlanName(w.Name); msg != "" {
-			return fmt.Errorf("%w: wlan[%d]: %s", adminapi.ErrConflict, i, msg)
-		}
-		if msg := adminapi.ValidateWlan(w); msg != "" {
-			return fmt.Errorf("%w: wlan[%d]: %s", adminapi.ErrConflict, i, msg)
-		}
-		if names[w.Name] || ssids[w.SSID] || (w.ID != "" && ids[w.ID]) {
-			return fmt.Errorf("%w: duplicate wlan", adminapi.ErrConflict)
-		}
-		names[w.Name], ssids[w.SSID], ids[w.ID] = true, true, w.ID != ""
-	}
-	return nil
-}
-
-// validateWlanUniqueness is the loader-side duplicate check
-// (loadWirelessFile); the PUT paths fence through a.validateWlans, which
-// embeds the same duplicates rule alongside the rule set it carries.
-func validateWlanUniqueness(env adminapi.WlansEnvelope) error {
-	names, ssids, ids := map[string]bool{}, map[string]bool{}, map[string]bool{}
-	for _, w := range env.Wlans {
-		if names[w.Name] || ssids[w.SSID] || (w.ID != "" && ids[w.ID]) {
-			return fmt.Errorf("%w: duplicate wlan", adminapi.ErrConflict)
-		}
-		names[w.Name], ssids[w.SSID], ids[w.ID] = true, true, w.ID != ""
-	}
-	return nil
-}
-func (a *App) CreateWlan(_ context.Context, wlan adminapi.Wlan) (adminapi.Wlan, error) {
-	a.wmu.Lock()
-	defer a.wmu.Unlock()
-	env := a.cachedWireless
-	if msg := adminapi.ValidateWlanName(wlan.Name); msg != "" {
-		return adminapi.Wlan{}, fmt.Errorf("%w: %s", adminapi.ErrConflict, msg)
-	}
-	wlan.ID = wlanID(wlan)
-	env.Wlans = append(append([]adminapi.Wlan(nil), env.Wlans...), wlan)
-	if err := a.validateWlans(&env); err != nil {
-		return adminapi.Wlan{}, err
-	}
-	if err := a.persistWirelessLocked(env); err != nil {
-		return adminapi.Wlan{}, err
-	}
-	return wlan, nil
-}
-func (a *App) GetWlan(_ context.Context, name string) (adminapi.Wlan, error) {
-	a.wmu.RLock()
-	defer a.wmu.RUnlock()
-	for _, w := range a.cachedWireless.Wlans {
-		if w.Name == name {
-			return w, nil
-		}
-	}
-	return adminapi.Wlan{}, fmt.Errorf("%w: wlan %s", adminapi.ErrNotFound, name)
-}
-func (a *App) UpdateWlan(_ context.Context, name string, wlan adminapi.Wlan) (adminapi.Wlan, error) {
-	a.wmu.Lock()
-	defer a.wmu.Unlock()
-	// Clone BEFORE any mutation: a shallow copy shares the backing array of
-	// a.cachedWireless, so writing env.Wlans[i] here would leak the new
-	// (possibly rejected) wlan into the live cache that CurrentWireless
-	// serves to device provisioning before validateWlans/persistWirelessLocked
-	// have a say. persistWirelessLocked swaps the clone in on success.
-	env := cloneWireless(a.cachedWireless)
-	if msg := adminapi.ValidateWlanName(name); msg != "" {
-		return adminapi.Wlan{}, fmt.Errorf("%w: %s", adminapi.ErrConflict, msg)
-	}
-	if wlan.Name != "" && wlan.Name != name {
-		return adminapi.Wlan{}, fmt.Errorf("%w: name must match path", adminapi.ErrConflict)
-	}
-	wlan.Name = name
-	found := false
-	for i := range env.Wlans {
-		if env.Wlans[i].Name == name {
-			wlan.ID = env.Wlans[i].ID
-			env.Wlans[i] = wlan
-			found = true
-			break
-		}
-	}
-	if !found {
-		return adminapi.Wlan{}, fmt.Errorf("%w: wlan %s", adminapi.ErrNotFound, name)
-	}
-	if err := a.validateWlans(&env); err != nil {
-		return adminapi.Wlan{}, err
-	}
-	if err := a.persistWirelessLocked(env); err != nil {
-		return adminapi.Wlan{}, err
-	}
-	return wlan, nil
-}
-
-func cloneWireless(env adminapi.WlansEnvelope) adminapi.WlansEnvelope {
-	env.Wlans = append([]adminapi.Wlan(nil), env.Wlans...)
-	return env
-}
-func (a *App) DeleteWlan(_ context.Context, name string) error {
-	a.wmu.Lock()
-	defer a.wmu.Unlock()
-	// Clone BEFORE any mutation (same discipline as UpdateWlan): the old
-	// in-place compaction via Wlans[:0] wrote the filtered list into the
-	// SHARED backing array of a.cachedWireless, so a failed persist left
-	// the deleted state live in the cache while disk kept the old document.
-	env := cloneWireless(a.cachedWireless)
-	out := make([]adminapi.Wlan, 0, len(env.Wlans))
-	found := false
-	for _, w := range env.Wlans {
-		if w.Name == name {
-			found = true
-		} else {
-			out = append(out, w)
-		}
-	}
-	if !found {
-		return fmt.Errorf("%w: wlan %s", adminapi.ErrNotFound, name)
-	}
-	env.Wlans = out
-	return a.persistWirelessLocked(env)
-}
-func (a *App) persistWirelessLocked(env adminapi.WlansEnvelope) error {
-	blob, err := json.MarshalIndent(env, "", "  ")
-	if err != nil {
-		return err
-	}
-	dir := filepath.Dir(a.wirelessPath)
-	tmp, err := os.CreateTemp(dir, filepath.Base(a.wirelessPath)+".tmp-*")
-	if err != nil {
-		return err
-	}
-	name := tmp.Name()
-	defer func() { _ = os.Remove(name) }()
-	if _, err = tmp.Write(blob); err == nil {
-		err = tmp.Sync()
-	}
-	if cerr := tmp.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
-		return err
-	}
-	if err = os.Rename(name, a.wirelessPath); err != nil {
-		return err
-	}
-	// Same durability contract as PutWireless: flush the rename itself so
-	// every wireless mutation path survives a crash identically.
-	syncDir(dir)
-	a.cachedWireless = env
-	return nil
-}
-
-// syncDir fsyncs a directory so a just-renamed file entry survives a crash.
-// Best effort by design: some platforms reject directory fsync, and a
-// durability-flushing failure must not fail an otherwise-complete write.
-// (The same helper exists in the store package; the wireless writer is a
-// separate rename site, hence a tiny local copy rather than a dependency.)
-func syncDir(dir string) {
-	d, err := os.Open(dir)
-	if err != nil {
-		return
-	}
-	_ = d.Sync()
-	_ = d.Close()
 }
 
 // ---- metrics poller ------------------------------------------------------

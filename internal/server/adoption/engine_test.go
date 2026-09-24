@@ -34,7 +34,7 @@ func newTestEngine(t *testing.T) *Engine {
 		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Random:   func() float64 { return 0.5 },
 		KeyChars: func(n int) (string, error) { return "", nil }, // replaced below
-		Wireless: func() []wireless.Wlan { return nil },
+		Wireless: func(store.Device) []wireless.Wlan { return nil },
 		SystemCfg: func(store.Device, []wireless.Wlan, wireless.ProvisioningPlan) (string, map[string]string, error) {
 			return "# unifi\nunifi.version=0.1.0-dev\n", nil, nil
 		},
@@ -318,7 +318,7 @@ func notRunningHarness(t *testing.T) (e *Engine, fixture func(vaps any) store.De
 			s := strconv.FormatInt(int64(counter), 16)
 			return strings.Repeat("0", n-len(s)) + s, nil
 		},
-		Wireless: func() []wireless.Wlan { return env },
+		Wireless: func(store.Device) []wireless.Wlan { return env },
 		SystemCfg: func(store.Device, []wireless.Wlan, wireless.ProvisioningPlan) (string, map[string]string, error) {
 			return "sys\n", nil, nil
 		},
@@ -966,7 +966,7 @@ func TestEncryptedU7PG2WLANFullProvisioning(t *testing.T) {
 		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Random:   func() float64 { return 0.5 },
 		KeyChars: func(n int) (string, error) { return strings.Repeat("0", n), nil },
-		Wireless: func() []wireless.Wlan { return workedEnvelopeAdoption() },
+		Wireless: func(store.Device) []wireless.Wlan { return workedEnvelopeAdoption() },
 		SystemCfg: func(store.Device, []wireless.Wlan, wireless.ProvisioningPlan) (string, map[string]string, error) {
 			return "# unifi\nunifi.version=0.1.0-dev\n", nil, nil
 		},
@@ -1001,7 +1001,7 @@ func TestEncryptedU7PG2WLANFullProvisioning(t *testing.T) {
 // not carry system_cfg.
 func TestPlainMgmtResendNotGated(t *testing.T) {
 	e := newTestEngine(t)
-	e.wireless = func() []wireless.Wlan { return workedEnvelopeAdoption() }
+	e.wireless = func(store.Device) []wireless.Wlan { return workedEnvelopeAdoption() }
 	dev := store.Device{
 		MAC:        engineMAC,
 		State:      store.StateAdopted,
@@ -1349,7 +1349,7 @@ func TestEnvelopeDriftDeliveryIsBounded(t *testing.T) {
 		RadiusServers: []wireless.RadiusServer{{IP: "10.10.10.10", Port: 1812}}, RadiusSecret: "eap-secret",
 	}}
 	e := newTestEngine(t)
-	e.wireless = func() []wireless.Wlan { return base }
+	e.wireless = func(store.Device) []wireless.Wlan { return base }
 	snap, err := json.Marshal(base)
 	if err != nil {
 		t.Fatal(err)
@@ -1380,7 +1380,7 @@ func TestEnvelopeDriftDeliveryIsBounded(t *testing.T) {
 
 	// (b) Admin WLAN save: the EAP envelope drifts a SETTLED record. The
 	// first drifted inform mints ONCE and offers full provisioning.
-	e.wireless = func() []wireless.Wlan { return eap }
+	e.wireless = func(store.Device) []wireless.Wlan { return eap }
 	out := inform(1005)
 	if out.Kind != KindSetparam || !out.FullProvision {
 		t.Fatalf("first drifted inform = %+v, want setparam full provisioning", out)
@@ -1460,7 +1460,7 @@ func TestEnvelopeDriftDeliveryIsBounded(t *testing.T) {
 
 	// (f) A NEW envelope after settle is a new delivery operation: fresh
 	// mint, fresh budget.
-	e.wireless = func() []wireless.Wlan { return base }
+	e.wireless = func(store.Device) []wireless.Wlan { return base }
 	if out = inform(1250); out.Kind != KindSetparam || out.CfgVersion == minted {
 		t.Fatalf("post-settle new envelope = %+v (cfg %q), want a fresh-minted re-provision", out, out.CfgVersion)
 	}

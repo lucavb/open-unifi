@@ -57,8 +57,8 @@ passphrase, VLAN, enabled).
 _Avoid_: vap (that is the per-radio instance emitted into system_cfg),
 network.
 
-**Wireless envelope**: the whole-document WLAN config (`{"wlans": [...]}`),
-replaced wholesale on change.
+**Wireless envelope**: the per-device admin-owned WLAN list on a device record
+(`device_wlans` in Extra, API shape `{"wlans": [...]}`), replaced wholesale per device.
 _Avoid_: wireless config (too vague).
 
 **Drift settle**: the confirmation flow that watches a pushed WLAN until the

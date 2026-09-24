@@ -53,7 +53,7 @@ const factoryNote = "discovery:uptime=43,version=BZ.4.3.20,model=U7PG2,ip=10.10.
 // default New() has no armed lane, adopts keep working (state 1), and
 // nothing pushes.
 func TestAdoptPendingWithoutLaneNeverPushes(t *testing.T) {
-	a, st, _ := testApp(t)
+	a, st := testApp(t)
 	if a.informPush != nil {
 		t.Fatal("default New must leave the lane disarmed (nil)")
 	}
@@ -73,7 +73,7 @@ func TestAdoptPendingWithoutLaneNeverPushes(t *testing.T) {
 // path: exactly one push with the note's ip, the jar-default sshd port 22
 // and the derived inform URL; the adopt still returns the state-1 view.
 func TestAdoptPendingWithLanePushesFactoryCandidate(t *testing.T) {
-	a, st, _ := testApp(t)
+	a, st := testApp(t)
 	armInformPush(t, a)
 	run, calls := countingRunner(nil)
 	a.informPush.run = run
@@ -105,7 +105,7 @@ func TestAdoptPendingWithLanePushesFactoryCandidate(t *testing.T) {
 // TestAdoptPendingRespectsSshdPortNote pins the note-transported port:
 // sshd_port=2222 (discovery TLV 28) must reach the runner verbatim.
 func TestAdoptPendingRespectsSshdPortNote(t *testing.T) {
-	a, st, _ := testApp(t)
+	a, st := testApp(t)
 	armInformPush(t, a)
 	run, calls := countingRunner(nil)
 	a.informPush.run = run
@@ -127,7 +127,7 @@ func TestAdoptPendingRespectsSshdPortNote(t *testing.T) {
 // record with no pending-map entry at all.
 func TestAdoptPendingGating(t *testing.T) {
 	t.Run("factory=false", func(t *testing.T) {
-		a, st, _ := testApp(t)
+		a, st := testApp(t)
 		armInformPush(t, a)
 		run, calls := countingRunner(nil)
 		a.informPush.run = run
@@ -142,7 +142,7 @@ func TestAdoptPendingGating(t *testing.T) {
 		}
 	})
 	t.Run("factory-key-absent", func(t *testing.T) {
-		a, st, _ := testApp(t)
+		a, st := testApp(t)
 		armInformPush(t, a)
 		run, calls := countingRunner(nil)
 		a.informPush.run = run
@@ -157,7 +157,7 @@ func TestAdoptPendingGating(t *testing.T) {
 		}
 	})
 	t.Run("inform-factory-note", func(t *testing.T) {
-		a, st, _ := testApp(t)
+		a, st := testApp(t)
 		armInformPush(t, a)
 		run, calls := countingRunner(nil)
 		a.informPush.run = run
@@ -172,7 +172,7 @@ func TestAdoptPendingGating(t *testing.T) {
 		}
 	})
 	t.Run("pending-record-without-map-entry", func(t *testing.T) {
-		a, st, _ := testApp(t)
+		a, st := testApp(t)
 		armInformPush(t, a)
 		run, calls := countingRunner(nil)
 		a.informPush.run = run
@@ -195,7 +195,7 @@ func TestAdoptPendingGating(t *testing.T) {
 // promotion STANDS (state 1 in the store), and the SECOND AdoptPending
 // re-attempts (exactly two runner calls total — no background loop).
 func TestAdoptPendingPushRetryIsOneShotPerClick(t *testing.T) {
-	a, st, _ := testApp(t)
+	a, st := testApp(t)
 	armInformPush(t, a)
 	boom := errors.New("mca-cli-op set-inform: exit status 1: permission denied")
 	run, calls := countingRunner(boom)
@@ -264,7 +264,7 @@ func TestSetInformCandidateParser(t *testing.T) {
 // server write budget is 30s), and a runner that blocks until ctx.Done()
 // fails the adopt with the sentinel.
 func TestAdoptPendingPushDeadlinePinsTimeoutWindow(t *testing.T) {
-	a, st, _ := testApp(t)
+	a, st := testApp(t)
 	armInformPush(t, a)
 	a.informPush.run = func(ctx context.Context, ip string, port int, informURL string) error {
 		dl, ok := ctx.Deadline()
@@ -297,7 +297,7 @@ func TestAdoptPendingPushDeadlinePinsTimeoutWindow(t *testing.T) {
 // controller URL cannot derive an inform URL, so arming must fail (main
 // turns this into startup refusal).
 func TestEnableSetInformPushControllerURLRefusal(t *testing.T) {
-	a, _, _ := testApp(t)
+	a, _ := testApp(t)
 	if err := a.EnableSetInformPush("", ":8080"); err == nil {
 		t.Fatal("arming with an empty controller URL must fail")
 	}

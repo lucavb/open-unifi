@@ -64,6 +64,10 @@ const (
 	// intent map (wireless.PlanVaps' ProvisioningPlan input).
 	RadioIntentExtraKey = "radio_intent"
 
+	// DeviceWLANsExtraKey is the admin-owned per-device WLAN envelope
+	// (wireless.DeviceWLANs / SetDeviceWLANs).
+	DeviceWLANsExtraKey = "device_wlans"
+
 	// BlockedStaShaExtraKey is the blocked_sta delivery baseline
 	// (sha256 of the last EMITTED §4 wire string, adoption-blockedsta's
 	// offer-then-confirm bookkeeping). Admin-owned — the same
@@ -123,7 +127,7 @@ var adminOwnedKeys = []string{
 	SSHSha512PasswdKey, SSHMd5PasswdKey,
 	"led_override", "disabled", "led_override_color_brightness",
 	"led_override_color", "ssh_password",
-	RadioIntentExtraKey, CmdTaskKey,
+	RadioIntentExtraKey, DeviceWLANsExtraKey, CmdTaskKey,
 }
 
 // FactoryResetSweepKeys is the subset of the controller-owned class the

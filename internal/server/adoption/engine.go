@@ -241,8 +241,9 @@ type Deps struct {
 	// the adapter); failures surface as errors and abort the inform.
 	KeyChars func(n int) (string, error)
 
-	// Wireless supplies the current WLAN envelope (nil ⇒ empty list).
-	Wireless func() []wireless.Wlan
+	// Wireless supplies the per-device WLAN envelope for the record being
+	// decided (nil ⇒ empty list).
+	Wireless func(store.Device) []wireless.Wlan
 
 	// SystemCfg renders the system_cfg blob for the record with the NEUTRAL
 	// producer shape: (text, credential deltas, error). The adapter wires
@@ -265,7 +266,6 @@ type Deps struct {
 	// InformListenAddr is the inform TCP listen address (inform_url port
 	// fallback).
 	InformListenAddr string
-
 }
 
 // Engine is the pure adoption decider.
@@ -273,7 +273,7 @@ type Engine struct {
 	lg               *slog.Logger
 	random           func() float64
 	keyChars         func(n int) (string, error)
-	wireless         func() []wireless.Wlan
+	wireless         func(store.Device) []wireless.Wlan
 	systemCfg        func(store.Device, []wireless.Wlan, wireless.ProvisioningPlan) (string, map[string]string, error)
 	controllerURL    string
 	informListenAddr string
@@ -300,12 +300,13 @@ type discard struct{}
 
 func (discard) Write(p []byte) (int, error) { return len(p), nil }
 
-// currentWireless resolves the configured source; nil source ⇒ empty list.
-func (e *Engine) currentWireless() []wireless.Wlan {
+// wirelessForDevice resolves the configured source for one device; nil
+// source ⇒ empty list.
+func (e *Engine) wirelessForDevice(d store.Device) []wireless.Wlan {
 	if e.wireless == nil {
 		return nil
 	}
-	return e.wireless()
+	return e.wireless(d)
 }
 
 // Decide applies the adoption state machine (docs/PROTOCOL-mgmt.md §6.2) for
@@ -335,7 +336,7 @@ func (e *Engine) Decide(req Request) (Outcome, error) {
 	// decision (drift hash, gate, rendered system_cfg, delivery snapshot and
 	// placements) sees the SAME slice, so the drift hash and the rendered
 	// config can never disagree.
-	wls := e.currentWireless()
+	wls := e.wirelessForDevice(work)
 	// One provisioning plan per decision: the single value computed from a
 	// device and the wireless envelope (CONTEXT.md) — drift hash, vap
 	// placements, wireless rows together — threaded through both lanes and

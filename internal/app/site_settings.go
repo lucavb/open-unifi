@@ -431,3 +431,12 @@ func (a *App) sweepSiteCfgVersionMints() (int, error) {
 	}
 	return minted, nil
 }
+
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	_ = d.Sync()
+	_ = d.Close()
+}
