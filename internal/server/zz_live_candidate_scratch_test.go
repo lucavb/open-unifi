@@ -3,9 +3,10 @@ package server
 // zz_live_candidate_scratch_test.go — live-round successive-push candidate
 // gates for the 2026-09-19 full-chain validation round (the nine commits
 // after 34082cd0, the last device-verified round): blocked_sta delivery, the
-// per-radio channel intent, and the WPA-EAP envelope; and for the
+// per-radio channel intent, and the WPA-EAP envelope; for the
 // 2026-09-20 DAS/DAD round: the standing full-accounting candidate
-// (auth + acct + interim + das). Every gate loads
+// (auth + acct + interim + das); and for the 2026-09-24 WPA3 round: the
+// wpa3-p and wpa2-wpa3 re-security candidates. Every gate loads
 // the CURRENT live fixtures (live-devices.json + live-wireless.json) and
 // parse-diffs its candidate against the DEVICE-VERIFIED applied bytes
 // (live-applied-sys.txt, sha256 11cb0472… — re-seeded by the 2026-09-21
@@ -32,6 +33,12 @@ package server
 //     as the proven C1/A2 security rounds. zzLiveEapSecret is synthetic
 //     bench material, not a site secret; the live PUT must send the same
 //     constant so the gated candidate and the pushed bytes are identical.
+//   - wpa3-p / wpa2-wpa3: deltas confined to {aaa} (authmode stays 1);
+//     pmf flips to enabled 2|1, wpa 3->2, the wpa3.* rows arrive, mgmt
+//     WPA-PSK -> SAE. The passphrase is KEPT (the live PUT preserves it);
+//     the sae.psk.1 pair (wpa3-p) and the DUPLICATE wpa.psk pair
+//     (wpa2-wpa3) are raw-count asserted — a parse-diff collapses
+//     duplicate rows and cannot see them (the das dad.status precedent).
 //
 // The LED override rides mgmt_cfg (§2), not system_cfg: its system_cfg
 // invariance is the TestZZLiveIntentVsApplied steady state, its mgmt_cfg
@@ -402,4 +409,210 @@ func TestZZLiveDasCandidateVsApplied(t *testing.T) {
 		t.Fatalf("das candidate changed %d wireless.* row(s) — authmode must stay 1 across the security flip; got %v", wirelessRows, intended)
 	}
 	fmt.Printf("[live-das-candidate] %d intended deltas, all inside aaa.* (restart set = {aaa}; parse-identical to the device-verified das-state capture) — PUSH-PRE-CLEARED\n", len(intended))
+}
+
+// TestZZLiveWpa3CandidateVsApplied — the WPA3-Personal push gate (2026-09-24
+// WPA3 round): the live envelope (id and passphrase preserved verbatim —
+// the live PUT keeps them, so the gated candidate and the pushed bytes are
+// identical) re-secured to wpa3-p, rendered and diffed against the running
+// bytes. Enforced: zero violations, every intended delta inside {wireless,
+// aaa}, and NO wireless.* delta at all (authmode stays 1 across the
+// security flip — the WPA3 shape lives entirely in aaa.*, the EAP gate's
+// precedent). Shape proof: pmf flips to enabled/2 (PmfMode REQUIRED), the
+// B/F-forced wpa 3→2, the wpa3.support/transition/ft rows, the broadcast
+// sae.psk.1 pair, and mgmt WPA-PSK → SAE. The raw emission must carry the
+// sae.psk.1 pair exactly once per vap and a SINGLE wpa.psk row per vap
+// (the duplicate pair is the transition shape, not this one).
+func TestZZLiveWpa3CandidateVsApplied(t *testing.T) {
+	rec, env, appliedRaw := zzLiveFixtures(t)
+	if len(env) != 1 {
+		t.Fatalf("expected exactly the one live gate-check WLAN, got %d", len(env))
+	}
+	cand := env[0]
+	if cand.Security == "wpa3-p" {
+		t.Skipf("live envelope already wpa3-p — the candidate would be the steady state; see TestZZLiveIntentVsApplied")
+	}
+	if cand.Security != "wpa-p" {
+		t.Fatalf("live envelope security = %q, expected the wpa-p baseline before the WPA3 mutation", cand.Security)
+	}
+	cand.Security = "wpa3-p" // passphrase KEPT — the live push preserves it
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return []Wlan{cand} }}, store.NewMemStore(), testLogger())
+	sys := mustBuildSys(t, s, rec)
+	if err := os.WriteFile(zzHarnessDir+"/live-wpa3-candidate-sys.txt", []byte(sys), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(sys))
+	fmt.Printf("[live-wpa3-candidate] render sha256=%s\n", hex.EncodeToString(sum[:]))
+	intended, violations := zzRunGate(t, "live-wpa3-candidate vs DEVICE-VERIFIED APPLIED bytes", appliedRaw, sys, zzManagedAllow)
+	if len(violations) > 0 {
+		t.Fatalf("minimal-diff invariant broken for the wpa3-p candidate: %d unmanaged row(s) differ — ABORT the push: %v", len(violations), violations)
+	}
+	zzFailIsDefaultRegression(t, intended)
+	for _, d := range intended {
+		if !strings.HasPrefix(d, "wireless.") && !strings.HasPrefix(d, "aaa.") {
+			t.Fatalf("wpa3-p candidate touches rows beyond {wireless, aaa} — ABORT the push: %s", d)
+		}
+	}
+	var pmfStatus, pmfMode, wpaRow, mgmt, support, transition, ft, sae bool
+	for _, d := range intended {
+		switch {
+		case strings.Contains(d, `aaa.1.pmf.status: "disabled" -> "enabled"`):
+			pmfStatus = true
+		case strings.Contains(d, `aaa.1.pmf.mode: "0" -> "2"`):
+			pmfMode = true
+		case strings.Contains(d, `aaa.1.wpa: "3" -> "2"`):
+			wpaRow = true
+		case strings.Contains(d, `aaa.1.wpa.key.1.mgmt: "WPA-PSK" -> "SAE"`):
+			mgmt = true
+		case strings.Contains(d, "aaa.1.wpa3.support"):
+			support = true
+		case strings.Contains(d, "aaa.1.wpa3.transition"):
+			transition = true
+		case strings.Contains(d, "aaa.1.wpa3.ft.status"):
+			ft = true
+		case strings.Contains(d, "aaa.1.sae.psk.1.psk"):
+			sae = true
+		}
+	}
+	for _, c := range []struct {
+		ok   bool
+		rows string
+	}{
+		{pmfStatus, `aaa.*.pmf.status disabled -> enabled`},
+		{pmfMode, `aaa.*.pmf.mode 0 -> 2 (PmfMode REQUIRED)`},
+		{wpaRow, `aaa.*.wpa 3 -> 2 (B/F.Ó00000 forces wpa_mode="wpa2" on WPA3 vaps)`},
+		{mgmt, `aaa.*.wpa.key.1.mgmt WPA-PSK -> SAE`},
+		{support, "aaa.*.wpa3.support"},
+		{transition, "aaa.*.wpa3.transition"},
+		{ft, "aaa.*.wpa3.ft.status"},
+		{sae, "aaa.*.sae.psk.1.psk"},
+	} {
+		if !c.ok {
+			t.Fatalf("wpa3-p candidate emits no %s row — the WPA3 mutation did not reach the render; got %v", c.rows, intended)
+		}
+	}
+	var wirelessRows int
+	for _, d := range intended {
+		if strings.HasPrefix(d, "wireless.") {
+			wirelessRows++
+		}
+	}
+	if wirelessRows != 0 {
+		t.Fatalf("wpa3-p candidate changed %d wireless.* row(s) — authmode must stay 1 across the security flip; got %v", wirelessRows, intended)
+	}
+	// Raw-count shape (parse-level invisible): the broadcast sae.psk.1
+	// pair exactly once per vap, a SINGLE wpa.psk row per vap (the mgmt
+	// writer's — no transition duplicate here), and the mac literal.
+	for _, row := range []struct {
+		row  string
+		want int
+	}{
+		{"aaa.1.sae.psk.1.mac=ff:ff:ff:ff:ff:ff", 1},
+		{"aaa.2.sae.psk.1.mac=ff:ff:ff:ff:ff:ff", 1},
+		{"aaa.1.sae.psk.1.psk=", 1},
+		{"aaa.2.sae.psk.1.psk=", 1},
+		{"aaa.1.wpa.psk=", 1},
+		{"aaa.2.wpa.psk=", 1},
+	} {
+		if got := strings.Count(sys, row.row); got != row.want {
+			t.Fatalf("wpa3-p raw emission broke the jar byte shape: %s count=%d, want %d", row.row, got, row.want)
+		}
+	}
+	fmt.Printf("[live-wpa3-candidate] %d intended deltas, all inside aaa.* (restart set = {aaa}; sae.psk.1 pair raw-verified) — PUSH-PRE-CLEARED\n", len(intended))
+}
+
+// TestZZLiveWpa2Wpa3CandidateVsApplied — the WPA2/WPA3 transition push gate
+// (2026-09-24 WPA3 round): the live envelope re-secured to wpa2-wpa3
+// (passphrase kept). Same discipline as the wpa3-p gate; transition
+// deltas: pmf.mode 0→1 (PmfMode OPTIONAL), wpa3.transition=enabled, and
+// NO sae.psk.1 pair. The jar's transition DUPLICATE — the B/O0OO psk
+// sub-writer's wpa.psk row ahead of the mgmt writer's own — is invisible
+// to the parse-diff (same key, same value), so like the DAS gate's
+// dad.status duplicate it is asserted as a RAW count: exactly two
+// aaa.<n>.wpa.psk rows per vap.
+func TestZZLiveWpa2Wpa3CandidateVsApplied(t *testing.T) {
+	rec, env, appliedRaw := zzLiveFixtures(t)
+	if len(env) != 1 {
+		t.Fatalf("expected exactly the one live gate-check WLAN, got %d", len(env))
+	}
+	cand := env[0]
+	if cand.Security == "wpa2-wpa3" {
+		t.Skipf("live envelope already wpa2-wpa3 — the candidate would be the steady state; see TestZZLiveIntentVsApplied")
+	}
+	if cand.Security != "wpa-p" {
+		t.Fatalf("live envelope security = %q, expected the wpa-p baseline before the transition mutation", cand.Security)
+	}
+	cand.Security = "wpa2-wpa3" // passphrase KEPT — the live push preserves it
+	s := New(Config{WirelessForDevice: func(_ store.Device) []Wlan { return []Wlan{cand} }}, store.NewMemStore(), testLogger())
+	sys := mustBuildSys(t, s, rec)
+	if err := os.WriteFile(zzHarnessDir+"/live-wpa23-candidate-sys.txt", []byte(sys), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(sys))
+	fmt.Printf("[live-wpa23-candidate] render sha256=%s\n", hex.EncodeToString(sum[:]))
+	intended, violations := zzRunGate(t, "live-wpa23-candidate vs DEVICE-VERIFIED APPLIED bytes", appliedRaw, sys, zzManagedAllow)
+	if len(violations) > 0 {
+		t.Fatalf("minimal-diff invariant broken for the wpa2-wpa3 candidate: %d unmanaged row(s) differ — ABORT the push: %v", len(violations), violations)
+	}
+	zzFailIsDefaultRegression(t, intended)
+	for _, d := range intended {
+		if !strings.HasPrefix(d, "wireless.") && !strings.HasPrefix(d, "aaa.") {
+			t.Fatalf("wpa2-wpa3 candidate touches rows beyond {wireless, aaa} — ABORT the push: %s", d)
+		}
+	}
+	var pmfStatus, pmfMode, wpaRow, mgmt, support, transition bool
+	for _, d := range intended {
+		switch {
+		case strings.Contains(d, `aaa.1.pmf.status: "disabled" -> "enabled"`):
+			pmfStatus = true
+		case strings.Contains(d, `aaa.1.pmf.mode: "0" -> "1"`):
+			pmfMode = true
+		case strings.Contains(d, `aaa.1.wpa: "3" -> "2"`):
+			wpaRow = true
+		case strings.Contains(d, `aaa.1.wpa.key.1.mgmt: "WPA-PSK" -> "SAE"`):
+			mgmt = true
+		case strings.Contains(d, "aaa.1.wpa3.support"):
+			support = true
+		case strings.Contains(d, "aaa.1.wpa3.transition"):
+			transition = true
+		}
+	}
+	for _, c := range []struct {
+		ok   bool
+		rows string
+	}{
+		{pmfStatus, `aaa.*.pmf.status disabled -> enabled`},
+		{pmfMode, `aaa.*.pmf.mode 0 -> 1 (PmfMode OPTIONAL)`},
+		{wpaRow, `aaa.*.wpa 3 -> 2 (B/F.Ó00000 forcing)`},
+		{mgmt, `aaa.*.wpa.key.1.mgmt WPA-PSK -> SAE`},
+		{support, "aaa.*.wpa3.support"},
+		{transition, "aaa.*.wpa3.transition"},
+	} {
+		if !c.ok {
+			t.Fatalf("wpa2-wpa3 candidate emits no %s row — the transition mutation did not reach the render; got %v", c.rows, intended)
+		}
+	}
+	var wirelessRows int
+	for _, d := range intended {
+		if strings.HasPrefix(d, "wireless.") {
+			wirelessRows++
+		}
+	}
+	if wirelessRows != 0 {
+		t.Fatalf("wpa2-wpa3 candidate changed %d wireless.* row(s) — authmode must stay 1 across the security flip; got %v", wirelessRows, intended)
+	}
+	// Raw-count shape (parse-invisible): the transition DUPLICATE wpa.psk
+	// pair (B/O0OO psk sub-writer + mgmt writer, same value) — exactly two
+	// per vap; and no sae.psk.* row at all (the pair is the wpa3-only
+	// shape).
+	if got := strings.Count(sys, "aaa.1.wpa.psk="); got != 2 {
+		t.Fatalf("wpa2-wpa3 raw emission lost the jar's DUPLICATE wpa.psk pair: aaa.1.wpa.psk count=%d, want 2", got)
+	}
+	if got := strings.Count(sys, "aaa.2.wpa.psk="); got != 2 {
+		t.Fatalf("wpa2-wpa3 raw emission lost the jar's DUPLICATE wpa.psk pair: aaa.2.wpa.psk count=%d, want 2", got)
+	}
+	if strings.Contains(sys, "sae.psk.") {
+		t.Fatalf("wpa2-wpa3 must emit no sae.psk.* row (wpa3-only shape):\n%s", sys)
+	}
+	fmt.Printf("[live-wpa23-candidate] %d intended deltas, all inside aaa.* (restart set = {aaa}; duplicate wpa.psk pair raw-verified) — PUSH-PRE-CLEARED\n", len(intended))
 }

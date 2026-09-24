@@ -1091,6 +1091,29 @@ func TestWirelessValidation(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("open without passphrase: %d %q", rec.Code, rec.Body.String())
 	}
+
+	// WPA3 family accepted: wpa3-p (SAE-only) and wpa2-wpa3 (transition)
+	// with a >= 8 passphrase — the same PSK-family rule as wpa-p.
+	rec = putDeviceWireless(t, h, `{"wlans":[{"ssid":"w3","security":"wpa3-p","passphrase":"longenough","vlan":1,"enabled":true}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("wpa3-p: %d %q", rec.Code, rec.Body.String())
+	}
+	rec = putDeviceWireless(t, h, `{"wlans":[{"ssid":"w23","security":"wpa2-wpa3","passphrase":"longenough","vlan":1,"enabled":true}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("wpa2-wpa3: %d %q", rec.Code, rec.Body.String())
+	}
+
+	// WPA3 shares the PSK-family rules: short passphrase -> 400
+	rec = putDeviceWireless(t, h, `{"wlans":[{"ssid":"x","security":"wpa3-p","passphrase":"short","vlan":1}]}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("wpa3-p short passphrase: %d", rec.Code)
+	}
+
+	// ...and radius fields stay EAP-only: wpa2-wpa3 + radius_secret -> 400
+	rec = putDeviceWireless(t, h, `{"wlans":[{"ssid":"x","security":"wpa2-wpa3","passphrase":"longenough","vlan":1,"radius_secret":"s"}]}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("wpa2-wpa3 radius fields: %d", rec.Code)
+	}
 }
 
 func TestWPAEAPRadiusValidation(t *testing.T) {

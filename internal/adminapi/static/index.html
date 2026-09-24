@@ -157,8 +157,9 @@
     <h2>Wireless / VLAN config</h2>
     <p class="hint">
       Per device: choose a MAC, then <span class="mono">Save</span> PUTs all rows to
-      <span class="mono">/api/v1/devices/{mac}/wireless</span>. Passphrase &ge; 8 chars unless security is
-      &ldquo;open&rdquo; (wpa-eap: optional, &ge; 8 when set); VLAN 1&ndash;4094. wpa-eap needs a
+      <span class="mono">/api/v1/devices/{mac}/wireless</span>. Passphrase &ge; 8 chars for wpa-p,
+      wpa3-p and wpa2-wpa3; optional for wpa-eap (&ge; 8 when set); empty for &ldquo;open&rdquo;; VLAN
+      1&ndash;4094. wpa-eap needs a
       RADIUS profile: up to 4 auth servers (&ldquo;ip&rdquo; or &ldquo;ip:port&rdquo;), a shared secret,
       and a dynamic-VLAN mode.
     </p>
@@ -662,12 +663,12 @@
   }
 
   function wlanRowInputs(w) {
-    var sec = w.security === "open" || w.security === "wpa-eap" ? w.security : "wpa-p";
+    var sec = ["open", "wpa-p", "wpa3-p", "wpa2-wpa3", "wpa-eap"].indexOf(w.security) >= 0 ? w.security : "wpa-p";
     var eap = sec === "wpa-eap";
     return '<td><input name="ssid" value="' + esc(w.ssid || "") + '"></td>' +
       '<td><input name="name" value="' + esc(w.name || "") + '"></td>' +
       '<td><select name="security">' +
-      ["open", "wpa-p", "wpa-eap"].map(function (s) {
+      ["open", "wpa-p", "wpa3-p", "wpa2-wpa3", "wpa-eap"].map(function (s) {
         return '<option value="' + s + '"' + (s === sec ? " selected" : "") + ">" + s + "</option>";
       }).join("") +
       "</select></td>" +
@@ -718,7 +719,7 @@
   }
 
   function validateWlan(w) {
-    if (["open", "wpa-p", "wpa-eap"].indexOf(w.security) < 0) { return "bad security"; }
+    if (["open", "wpa-p", "wpa3-p", "wpa2-wpa3", "wpa-eap"].indexOf(w.security) < 0) { return "bad security"; }
     if (!w.ssid || w.ssid.length > 32) { return "ssid must be 1..32 characters"; }
     if (w.vlan < 1 || w.vlan > 4094) { return "vlan must be 1..4094"; }
     if (w.security === "open") {

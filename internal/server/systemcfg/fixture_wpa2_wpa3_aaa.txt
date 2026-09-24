@@ -1,0 +1,56 @@
+# WPA2/WPA3 transition (admin security=wpa2-wpa3): full aaa.1 block, the
+# jar-derived byte contract (ace.jar, UniFi controller 6.8.2.15592).
+# Lines starting with '#' are provenance, not rows; the test skips them.
+#
+# Same emitter chain as fixture_wpa3_only_aaa.txt (see there for the
+# javap offset map). Differences vs the wpa3-only shape:
+#   - pmf_mode stored "optional" (the UniFi UI's transition value) ->
+#     PmfMode OPTIONAL -> pmf.status=enabled, pmf.mode=1.
+#   - aaa.1.wpa3.transition=enabled (int 2795-2828: the row ALWAYS
+#     carries the isWpa3LegacyEnabled() value).
+#   - B/O0OO psk sub-writer o00000: transition branch writes the
+#     WPA2-side psk row aaa.<n>.wpa.psk=<psk> BEFORE the mgmt writer's
+#     own wpa.psk row — the DUPLICATE is the jar's byte shape (the two
+#     rows carry the same fallback value on a plain wlan). The
+#     sae.psk.1.* pair is wpa3-only and does NOT appear here.
+#   - wpa=2 (B/F.O'00000 forcing), mgmt=SAE for BOTH rows of the
+#     duplicate pair's neighborhood, pairwise CCMP, pmf.cipher
+#     AES-128-CMAC — unchanged from the wpa3-only shape.
+#   - com.ubnt.service.wifi.class o00000(transition=true): transition
+#     mode SKIPS sae_psk entries with psks longer than 64 chars (hex
+#     SAE passwords stay SAE-only) — with no sae_psk entries this is
+#     the same empty-resolver fallback either way.
+#
+# Canonical test envelope: Name/SSID "w23mix", passphrase
+# "transition-psk", id "w23mix", no VLAN (br0), first vap (ath0, n=1).
+aaa.1.pmf.status=enabled
+aaa.1.pmf.mode=1
+aaa.1.ft.status=disabled
+aaa.1.country_beacon=disabled
+aaa.1.11k.status=disabled
+aaa.1.br.devname=br0
+aaa.1.devname=ath0
+aaa.1.driver=madwifi
+aaa.1.ssid=w23mix
+aaa.1.status=enabled
+aaa.1.verbose=2
+aaa.1.wpa=2
+aaa.1.eapol_version=2
+aaa.1.wpa.group_rekey=3600
+aaa.1.p2p=disabled
+aaa.1.p2p_cross_connect=disabled
+aaa.1.proxy_arp=disabled
+aaa.1.is_guest=false
+aaa.1.tdls_prohibit=disabled
+aaa.1.bss_transition=enabled
+aaa.1.id=w23mix
+aaa.1.wpa3.support=enabled
+aaa.1.wpa3.transition=enabled
+aaa.1.wpa3.ft.status=disabled
+aaa.1.wpa.psk=transition-psk
+aaa.1.wpa.key.1.mgmt=SAE
+aaa.1.wpa.psk=transition-psk
+aaa.1.wpa.1.pairwise=CCMP
+aaa.1.pmf.cipher=AES-128-CMAC
+aaa.1.radius.macacl.status=disabled
+aaa.1.hide_ssid=false

@@ -154,8 +154,9 @@ fresh `cfgversion` is minted and the device confirms it by echoing the new
 version back.
 
 Wireless fields per WLAN: `name`, `ssid`, `security` (`open` | `wpa-p` |
-`wpa-eap`), `passphrase` (≥8, required for `wpa-p`, rejected for `open`,
-optional for `wpa-eap`), `vlan` (1–4094),
+`wpa3-p` | `wpa2-wpa3` | `wpa-eap`), `passphrase` (≥8, required for the
+PSK family `wpa-p`/`wpa3-p`/`wpa2-wpa3`, rejected for `open`, optional
+for `wpa-eap`), `vlan` (1–4094),
 `enabled`. `wpa-eap` requires an inline RADIUS profile:
 `radius_servers` (1–4 `{ip, port}` auth servers, port default 1812),
 `radius_secret` (shared secret, emitted verbatim), and
@@ -299,9 +300,22 @@ Still open (classic behavior vs open-unifi):
   dynamic-VLAN mode); accounting (radius.acct), DAS/DAD, interim-update,
   keyid and filter_id rows are omitted (docs/PROTOCOL-systemcfg-wireless.md
   §12). The Terraform provider still pins security to open|wpa-p — radius
-  fields there are a follow-up. Live EAP association against a bench
-  RADIUS server is not yet proven (see acceptance docs).
-- No firmware upgrade / `upgrade` responses; no hotspot2/WPA3/SAE emission.
+  fields and the WPA3 securities there are a follow-up. Live EAP association
+  against a bench RADIUS server is not yet proven (see acceptance docs).
+- WPA3-Personal/SAE (2026-09-24): `wpa3-p` (SAE-only) and `wpa2-wpa3`
+  (WPA2/WPA3 transition) supported via the admin API + web console; the
+  renderer emits the jar-decompiled SAE byte contract
+  (docs/PROTOCOL-systemcfg-wireless.md §4.3: pmf required/optional, the
+  B/F-forced `wpa=2`, the `wpa3.*` + `sae.psk.1.*` rows, `mgmt=SAE`, the
+  transition `wpa.psk` duplicate; pinned by
+  `internal/server/systemcfg/fixture_wpa3_only_aaa.txt` and
+  `fixture_wpa2_wpa3_aaa.txt`). open-unifi does not replicate the classic
+  controller's chipset-capability downgrade/drop of WPA3 vaps (documented
+  deviation — the admin owns device selection; the bench U7PG2 is
+  WPA3-capable). Live WPA3 client association on the bench is not yet
+  proven (acceptance rows B4/B5, NOT RUN).
+- No firmware upgrade / `upgrade` responses; no hotspot2/OSEN emission;
+  no WPA3-Enterprise-192 emission.
 - `system.analytics.status` is not emitted (see Limitations).
 - Real-device **protocol/control-plane evidence** was captured on 2026-09-16
   (UAP-AC-Pro-Gen2 / U7PG2, firmware 6.8.2.15592): adoption, default-key

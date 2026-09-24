@@ -1,0 +1,73 @@
+# WPA3-Personal only (admin security=wpa3-p): full aaa.1 block, the
+# jar-derived byte contract (ace.jar, UniFi controller 6.8.2.15592).
+# Lines starting with '#' are provenance, not rows; the test skips them.
+#
+# Emitter chain (javap dumps under tmpwork/javap/):
+#   com.ubnt.service.config.int  — AAA writer: pmf rows offsets 1643-1753
+#     (PmfMode.of(stored pmf_mode): status=enabled iff != DISABLED,
+#     mode=intValue; WDS forces DISABLED — no WDS vaps here), WPA-branch
+#     16-pair block 2355-2756, wpa3.support/transition rows 2761-2828,
+#     mgmt-writer call 2887-2921, pairwise 2924-2982, pmf.cipher
+#     2985-3028, macacl/hide_ssid tail.
+#   int mgmt writer super(StringBuilder,WlanConf,int) (~line 8589):
+#     isWpa3() -> mgmt="SAE" + B/O0OO writer FIRST, then the rows
+#     wpa.key.1.mgmt and wpa.psk (wpa.psk is ALWAYS written, even SAE).
+#   com.ubnt.service.config.B/O0OO — SAE sub-writer: row 1
+#     wpa3.ft.status=disabled (isWpa3SaeFastRoamingEnabled() default
+#     false, WlanConf.txt:2031); sae.anti_clogging / sae.sync only when
+#     the stored int > 0 (absent -> NO row); sae.groups.* +
+#     sae.has_groups only when the list is non-empty (absent -> NO row).
+#   B/O0OO psk sub-writer o00000 (via com.ubnt.service.wifi.class
+#     o00000(transition)): no sae_psk entries -> resolver returns "" ->
+#     psk = getWpaPreSharedKey() (x_passphrase with the "letmeinnow"
+#     fallback, the same value the wpa.psk row carries). wpa3-only +
+#     fallback -> rows sae.psk.1.psk + sae.psk.1.mac=ff:ff:ff:ff:ff:ff
+#     (broadcast entry, slots 1-based); per-entry sae.psk.<i>.* rows
+#     need sae_psk entries (none in v1); dynamic_vlan rides the
+#     sae_psk_vlan_required gate (unset -> NO row).
+#   com.ubnt.service.config.B/F.O'00000 (dump lines 665-680): the vap
+#     walker FORCES wpa_mode="wpa2" onto every WPA3-flagged vap on a
+#     WPA3-capable chipset (class() 59-67, walker super() 14-69) ->
+#     aaa.1.wpa=2 (WpaMode.WPA2.getMode()=2, WpaMode.txt clinit). Plain
+#     WPA2 keeps stored AUTO -> wpa=3 (FID-4).
+#   pmf_mode stored "required" (the value the UniFi UI sends for
+#     WPA3-Personal; system.class "Ensure PMF Mode is not null" defaults
+#     only LEGACY rows to optional) -> PmfMode REQUIRED -> status=enabled
+#     mode=2. wireless.<n> rows: authmode stays "1" (open-only rule,
+#     int 3435-3464), security=none, aes128 — WPA3 changes NO
+#     wireless.<n> row.
+#
+# Canonical test envelope: Name/SSID "wpa3only", passphrase
+# "correcthorse", id "w3only", no VLAN (br0), first vap (ath0, n=1).
+aaa.1.pmf.status=enabled
+aaa.1.pmf.mode=2
+aaa.1.ft.status=disabled
+aaa.1.country_beacon=disabled
+aaa.1.11k.status=disabled
+aaa.1.br.devname=br0
+aaa.1.devname=ath0
+aaa.1.driver=madwifi
+aaa.1.ssid=wpa3only
+aaa.1.status=enabled
+aaa.1.verbose=2
+aaa.1.wpa=2
+aaa.1.eapol_version=2
+aaa.1.wpa.group_rekey=3600
+aaa.1.p2p=disabled
+aaa.1.p2p_cross_connect=disabled
+aaa.1.proxy_arp=disabled
+aaa.1.is_guest=false
+aaa.1.tdls_prohibit=disabled
+aaa.1.bss_transition=enabled
+aaa.1.id=w3only
+aaa.1.wpa3.support=enabled
+aaa.1.wpa3.transition=disabled
+aaa.1.wpa3.ft.status=disabled
+aaa.1.sae.psk.1.psk=correcthorse
+aaa.1.sae.psk.1.mac=ff:ff:ff:ff:ff:ff
+aaa.1.wpa.key.1.mgmt=SAE
+aaa.1.wpa.psk=correcthorse
+aaa.1.wpa.1.pairwise=CCMP
+aaa.1.pmf.cipher=AES-128-CMAC
+aaa.1.radius.macacl.status=disabled
+aaa.1.hide_ssid=false

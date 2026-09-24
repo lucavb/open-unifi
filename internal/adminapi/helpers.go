@@ -157,11 +157,16 @@ func normalizeMAC(s string) (string, error) {
 
 // ---- wireless config validation -----------------------------------------
 
-// validSecurities is the allowed Security enum for a Wlan.
+// validSecurities is the allowed Security enum for a Wlan. wpa3-p maps to
+// the jar's wpa3_support (SAE-only), wpa2-wpa3 to wpa3_support +
+// wpa3_transition (mixed mode); the stored pmf_mode/wpa_mode implications
+// are renderer-derived (see PROTOCOL-systemcfg-wireless.md §4.3).
 var validSecurities = map[string]bool{
-	"open":    true,
-	"wpa-p":   true,
-	"wpa-eap": true,
+	"open":      true,
+	"wpa-p":     true,
+	"wpa3-p":    true,
+	"wpa2-wpa3": true,
+	"wpa-eap":   true,
 }
 
 // ValidateWlan is the exported form of validateWlan: the SAME server-side
@@ -323,7 +328,7 @@ func validateWlan(wl *Wlan) string {
 		return "band must be one of 2g, 5g, both"
 	}
 	if !validSecurities[wl.Security] {
-		return "security must be one of open, wpa-p, wpa-eap"
+		return "security must be one of open, wpa-p, wpa3-p, wpa2-wpa3, wpa-eap"
 	}
 	if hasControlChar(wl.SSID) {
 		return "ssid must not contain control characters"
@@ -366,8 +371,11 @@ func validateWlan(wl *Wlan) string {
 	if wl.Security == "wpa-eap" {
 		return validateWlanEap(wl)
 	}
-	// wpa-p: radius fields are EAP-only; a non-EAP row carrying them is a
-	// client bug the renderer would silently drop — fail loud instead.
+	// PSK family (wpa-p, wpa3-p, wpa2-wpa3): radius fields are EAP-only; a
+	// non-EAP row carrying them is a client bug the renderer would
+	// silently drop — fail loud instead. The WPA3 modes share the
+	// passphrase rule with wpa-p (≥ 8; the jar's SAE psk sub-writer rides
+	// the same getWpaPreSharedKey() fallback).
 	if wl.hasRadiusFields() {
 		return "radius_servers/radius_secret/radius_vlan_mode require security wpa-eap"
 	}

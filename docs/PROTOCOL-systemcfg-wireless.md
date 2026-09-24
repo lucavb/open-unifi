@@ -329,8 +329,8 @@ Semantics (Go contract, `internal/wireless.RadioIntents` +
 
 ### 4.1 Always-first block (int §566-578)
 ```
-aaa.<n>.pmf.status=disabled|enabled       (PmfMode != DISABLED; forced disabled when vWire flags set, §563-565)
-aaa.<n>.pmf.mode=0|1|2                    PmfMode enum: disabled=0 optional=1 required=2 (javap values)
+aaa.<n>.pmf.status=disabled|enabled       (PmfMode != DISABLED; forced disabled when vWire flags set, §563-565; open-unifi derives the stored pmf_mode from the security enum: wpa3-p ⇒ REQUIRED, wpa2-wpa3 ⇒ OPTIONAL, everything else DISABLED)
+aaa.<n>.pmf.mode=0|1|2                    PmfMode enum: disabled=0 optional=1 required=2 (javap values; the enum's own intValue)
 aaa.<n>.ft.status=disabled|enabled        isFastRoamingEnabled()
 aaa.<n>.log_level=<int>                   only when wlanConf.getInt("log_level") >= 0
 aaa.<n>.country_beacon=disabled|enabled   is("country_beacon", false)
@@ -401,9 +401,58 @@ aaa.<n>.wpa.1.pairwise=CCMP        WpaEncryption.getRsnGroup(wpaMode, !isWpa3):
                                    AUTO → "CCMP", or "TKIP CCMP" iff wpa_mode==WPA1; else wpa_enc name upper-cased
 aaa.<n>.pmf.cipher=AES-128-CMAC    PmfCipher default AUTO → cipher string "AES-128-CMAC"
 ```
-WPA3/SAE variant adds: `wpa.key.1.mgmt=SAE`, `wpa3.support/transition` rows and
-per-PSK entries via `config/B/O0OO` (`sae.sync`, `sae.groups.<i>.group`,
-`sae.psk.<i>.psk/.mac/.vlan/.id`) — cited, not part of the MVP contract.
+**WPA3-Personal (`wpa3-p` SAE-only, `wpa2-wpa3` transition)** — implemented
+(2026-09-24, jar-decompiled byte contract; full pinned blocks with per-row
+javap provenance in `internal/server/systemcfg/fixture_wpa3_only_aaa.txt`
+and `fixture_wpa2_wpa3_aaa.txt`, asserted by `wireless_wpa3_test.go`):
+```
+aaa.<n>.pmf.status=enabled, .pmf.mode=2|1   stored pmf_mode REQUIRED (wpa3-p) / OPTIONAL (wpa2-wpa3);
+                                             the UI-shaped value the classic controller persists; the writer's
+                                             always-first rows (int 1643-1753) turn it into enabled+intValue
+aaa.<n>.wpa=2                               NOT the plain-PSK 3: the vap walker forces wpa_mode="wpa2" onto
+                                             every WPA3-flagged vap on a WPA3-capable chipset before the
+                                             writer runs (B/F.Ó00000 — B__F.txt 665-680, reached on BOTH the
+                                             capable and the downgrade paths via class()/super());
+                                             WpaMode.WPA2.getMode()=2 (clinit: AUTO=3, WPA1=1, WPA2=2)
+aaa.<n>.wpa3.support=enabled                int 2761-2828, rides the isWpa3() gate
+aaa.<n>.wpa3.transition=enabled|disabled    int 2795-2828, ALWAYS written for WPA3, value =
+                                             isWpa3LegacyEnabled() (disabled for wpa3-p, enabled for wpa2-wpa3)
+aaa.<n>.wpa3.ft.status=disabled             B/O0OO.Ó00000 row 1 (SAE sub-writer, runs at the HEAD of the mgmt
+                                             writer, int ~8589): isWpa3SaeFastRoamingEnabled() default false
+                                             (WlanConf.txt:2031); no admin knob in v1
+aaa.<n>.sae.psk.1.psk=<psk>                 wpa3-p ONLY (B/O0OO psk sub-writer o00000): no sae_psk entries ⇒
+aaa.<n>.sae.psk.1.mac=ff:ff:ff:ff:ff:ff     resolver (com.ubnt.service.wifi.class o00000) returns "" ⇒ falls
+                                             back to getWpaPreSharedKey() — the same value the wpa.psk row
+                                             carries; broadcast entry, slots 1-based
+aaa.<n>.wpa.psk=<psk>                       wpa2-wpa3 ONLY, emitted here by the psk sub-writer's transition
+                                             branch BEFORE the mgmt writer's own wpa.psk row — the DUPLICATE
+                                             pair is the jar's byte shape (same value on a plain wlan)
+aaa.<n>.wpa.key.1.mgmt=SAE                  mgmt writer: isWpa3() overrides the PSK/EAP value (int ~8589)
+aaa.<n>.wpa.psk=<psk>                       mgmt writer: ALWAYS written, SAE included (§8 fallback applies)
+aaa.<n>.wpa.1.pairwise=CCMP                 getRsnGroup(mode, !isWpa3): SAE keeps "CCMP" (TKIP CCMP needs
+                                             wpa_mode==WPA1, int 2924-2982)
+aaa.<n>.pmf.cipher=AES-128-CMAC             unchanged (PmfCipher AUTO)
+```
+Unset-knob absences (the jar's own unset-field shape; no v1 admin knobs):
+`sae.anti_clogging`/`sae.sync` (only when stored int > 0), `sae.groups.<i>.*`
++ `sae.has_groups` (only when the list is non-empty), per-entry
+`sae.psk.<i>.*` (only with sae_psk entries), `dynamic_vlan` (the SAE
+writer's copy rides the sae_psk_vlan_required gate — unset ⇒ NO row,
+unlike the EAP branch's radius_vlan_mode-driven row), and every
+radius/auth_cache/interim row family (EAP-only). `wireless.<n>` rows are
+unchanged by WPA3 (authmode stays "1" — open-only rule, int 3435-3464;
+security=none/aes128).
+
+Device-capability note (documented deviation): the jar's vap walker gates
+WPA3 vaps on chipset capability flags (`radio_caps`/`radio_caps2` bits,
+model/B/oOOO): on an incapable chipset `wpa2-wpa3` is downgraded to pure
+WPA2 (wpa3 flags cleared) and `wpa3-p` is dropped entirely; on a capable
+chipset the only fixups are the forced `wpa_mode="wpa2"` (above) and
+fast-roaming clears. open-unifi does NOT replicate the capability gate —
+the admin owns device selection, and the emitted rows always match the
+configured security. The bench U7PG2 is WPA3-capable, so the live bytes
+follow the capable path. Live client-association proof on the bench is
+pending (acceptance rows B4/B5, NOT RUN).
 
 **WPA-Enterprise (`wpaeap` / `osen`)** — int §775-789, RADIUS helper
 §791-840. Emitted by open-unifi for `security=wpa-eap` (OSEN is not an
@@ -717,6 +766,8 @@ dhcpc.1.devname=<getMgmtDev() of the device>
 | `name` | `name` (same value used for `ssid`) | `wireless.<n>.name`/`ssid`, `aaa.<n>.ssid` |
 | `security=open` | `security=open` | NO `aaa.<n>.wpa.*`; `wireless.<n>.authmode=0`, `security=none`; `aaa.<n>.status` = enabled iff device `wifi_caps` bit `0x2000` (`supportOpenHostapd`, Device.java §1275 & §1247) — **device-record dependent; check per adopter** |
 | `security=wpa-p` | `security=wpapsk` (wpa_mode AUTO→3, wpa_enc AUTO→CCMP) | `aaa.<n>.wpa=3` (AUTO; jar truth — WPA1=1/WPA2=2/AUTO=3, WpaMode static-init `WpaMode.txt:197-211`), `.eapol_version=2`, `.wpa.key.1.mgmt=WPA-PSK`, `.wpa.psk=<passphrase>` (plaintext), `.wpa.1.pairwise=CCMP`, `.pmf.cipher=AES-128-CMAC`, `.wpa.group_rekey=3600`, `wireless.<n>.authmode=1`, `security=none` |
+| `security=wpa3-p` | `wpa3_support=true` (SAE-only; stored pmf_mode "required") | §4.3 WPA3 block: `pmf.status=enabled`/`pmf.mode=2`, `wpa=2` (B/F.Ó00000 forces wpa_mode="wpa2" on WPA3 vaps), `wpa3.support=enabled`, `wpa3.transition=disabled`, `wpa3.ft.status=disabled`, `sae.psk.1.psk=<passphrase>` + `.mac=ff:ff:ff:ff:ff:ff`, `wpa.key.1.mgmt=SAE`, `wpa.psk=<passphrase>` (ALWAYS written), `.wpa.1.pairwise=CCMP`, `.pmf.cipher=AES-128-CMAC`; no anti_clogging/sync/groups/dynamic_vlan rows (unset knobs); pinned by `fixture_wpa3_only_aaa.txt` |
+| `security=wpa2-wpa3` | `wpa3_support=true` + `wpa3_transition=true` (stored pmf_mode "optional") | §4.3 WPA3 block with the transition deltas: `pmf.mode=1`, `wpa3.transition=enabled`, the psk sub-writer's `wpa.psk=<passphrase>` DUPLICATE ahead of the mgmt writer's own `wpa.psk` row (same value), NO `sae.psk.1.*` pair (wpa3-only), rest identical to wpa3-p; pinned by `fixture_wpa2_wpa3_aaa.txt` |
 | `security=wpa-eap` | `security=wpaeap` + a valid radiusprofile (requireRadiusProfile, int §13492+) | `.wpa.key.1.mgmt=WPA-EAP`, `.psk=<passphrase or the "letmeinnow" fallback — passphrase optional, ≥8 when set>`, `auth_cache=enabled`, `radius.auth.<i>.*` per `radius_servers` (i=1..4, port 0→1812, secret=`radius_secret`), `dynamic_vlan` per `radius_vlan_mode`, `wireless.<n>.authmode=1`, `security=none`. Without a profile the API rejects the row; the renderer flags an envelope built outside the API with a dead-vap Alert. `radius.acct.<i>.*` rows per `accounting_enabled` + `interim_update.*` rows per `interim_update_enabled` + the das/dad rows per `radius_das_enabled` (all behind the accounting gate, §12 rows 1013-1014 implemented — the das gate also requires the device fw_caps 0x100000 bit); keyid/filter_id rows omitted (§12 row 1015) |
 | `radius_servers` (wpa-eap only; 1..4 entries) | radiusprofile `auth_servers` (copied onto the wlanConf, int §1401-1405) | `aaa.<n>.radius.auth.<i>.ip` + `.port` (0→1812); row index = ARRAY POSITION (empty-ip slot skipped, no backfill, no 5th slot — the API rejects both, renderer defense mirrors the jar) |
 | `radius_secret` (wpa-eap only) | radiusprofile `x_secret` | `aaa.<n>.radius.auth.<i>.secret` verbatim on EVERY server row — never hashed/obfuscated (the radius writers follow the psk-writer rule); also `aaa.<n>.radius.acct.<i>.secret` on every acct row (the doc's `<x_secret>` symbol, §12 row 1013) |

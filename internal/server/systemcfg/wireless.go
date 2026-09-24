@@ -218,10 +218,32 @@ func (rd *render) emitAaaRows(b *strings.Builder, n int, v wireless.VapPlan, ope
 	line := func(k, vv string) { prefix(p+k, vv) }
 	name := wireless.SSIDOf(v.Wlan)
 
+	// WPA3 family (admin securities wpa3-p / wpa2-wpa3 → jar flags
+	// wpa3_support / wpa3_transition): the UI-shaped stored fields are
+	// implied by the security enum in v1 — no separate admin knobs. The
+	// stored pmf_mode is required (wpa3-p) / optional (wpa2-wpa3), and the
+	// vap walker forces wpa_mode="wpa2" onto every WPA3-flagged vap
+	// (B/F.Ó00000, tmpwork/javap/com__ubnt__service__config__B__F.txt
+	// 665-680) — both surface as byte differences below.
+	wpa3 := v.Wlan.Security == "wpa3-p" || v.Wlan.Security == "wpa2-wpa3"
+	transition := v.Wlan.Security == "wpa2-wpa3"
+
 	// §4.1 always-first block (int §566-578; no log_level row: record field
-	// absent ⇒ default never >= 0).
-	line("pmf.status", "disabled")
-	line("pmf.mode", "0")
+	// absent ⇒ default never >= 0). pmf rows come from the stored pmf_mode
+	// (PmfMode.of: status=enabled iff mode != DISABLED, row value=intValue;
+	// WDS forces DISABLED — no WDS vaps here): WPA3 modes imply
+	// required(2)/optional(1), every other security keeps DISABLED(0).
+	pmfStatus, pmfMode := "disabled", "0"
+	if wpa3 {
+		pmfStatus = "enabled"
+		if transition {
+			pmfMode = "1" // PmfMode OPTIONAL ("optional", 1)
+		} else {
+			pmfMode = "2" // PmfMode REQUIRED ("required", 2)
+		}
+	}
+	line("pmf.status", pmfStatus)
+	line("pmf.mode", pmfMode)
 	line("ft.status", "disabled")
 	line("country_beacon", "disabled")
 	line("11k.status", "disabled")
@@ -273,9 +295,18 @@ func (rd *render) emitAaaRows(b *strings.Builder, n int, v wireless.VapPlan, ope
 		// NOTE for wpa-eap: still the fixed §4.3 block; psk uses the same
 		// getWpaPreSharedKey() fallback shape.
 		line("verbose", "2")
-		// wpa_mode default = WpaMode.AUTO → getMode() = 3 (enum javap
-		// static{}: AUTO=3, WPA1=1, WPA2=2; FID-4 — NOT wpa2's 2).
-		line("wpa", "3")
+		// wpa_mode: AUTO → 3 when absent (the plain securities; FID-4 —
+		// NOT wpa2's 2). The WPA3 modes flip it: the vap walker forces
+		// wpa_mode="wpa2" onto every WPA3-flagged vap on a WPA3-capable
+		// chipset before the writer runs (B/F.Ó00000 — duplicate + put,
+		// B__F.txt 665-680, reached via class()/super() on both the
+		// capable and the downgrade paths), so WpaMode.WPA2.getMode()=2
+		// for wpa3-p and wpa2-wpa3 alike.
+		if wpa3 {
+			line("wpa", "2")
+		} else {
+			line("wpa", "3")
+		}
 		line("eapol_version", "2")
 		line("wpa.group_rekey", "3600")
 		line("p2p", "disabled")
@@ -290,13 +321,50 @@ func (rd *render) emitAaaRows(b *strings.Builder, n int, v wireless.VapPlan, ope
 		if psk == "" {
 			psk = fallbackPsk // getWpaPreSharedKey() fallback shape (§8)
 		}
+
+		if wpa3 {
+			// int 2761-2828: both rows ride the isWpa3() gate;
+			// wpa3.transition always carries its enabled|disabled value.
+			line("wpa3.support", "enabled")
+			if transition {
+				line("wpa3.transition", "enabled")
+			} else {
+				line("wpa3.transition", "disabled")
+			}
+			// SAE sub-writer B/O0OO.Ó00000 runs at the HEAD of the mgmt
+			// writer (int ~8589), so its rows sit between
+			// wpa3.transition and wpa.key.1.mgmt. Row 1:
+			// wpa3.ft.status — isWpa3SaeFastRoamingEnabled() default
+			// false (WlanConf.txt:2031). sae.anti_clogging / sae.sync
+			// need a stored int > 0 and sae.groups.* a non-empty list;
+			// v1 sets none, so the rows are absent — the jar's own
+			// unset-field shape.
+			line("wpa3.ft.status", "disabled")
+			// PsK sub-writer (B/O0OO o00000 + com.ubnt.service.wifi.class
+			// o00000): no sae_psk entries ⇒ the resolver returns "" and
+			// the psk falls back to getWpaPreSharedKey() — the SAME
+			// value the wpa.psk row below carries. Transition emits the
+			// WPA2-side psk row here; its DUPLICATE of the mgmt writer's
+			// own wpa.psk row is the jar's byte shape. Wpa3-only emits
+			// the broadcast sae.psk.1 pair instead (mac literal
+			// ff:ff:ff:ff:ff:ff, slots 1-based).
+			if transition {
+				line("wpa.psk", psk)
+			} else {
+				line("sae.psk.1.psk", psk)
+				line("sae.psk.1.mac", "ff:ff:ff:ff:ff:ff")
+			}
+		}
 		// Row order below the fixed block per the AAA writer (int offsets
-		// 2357-3031 + EAP sub-writer at 8616-8920): mgmt → psk → auth_cache
-		// → [radius.*] → dynamic_vlan → wpa.1.pairwise → pmf.cipher
-		// (FID-25).
+		// 2357-3031 + EAP sub-writer at 8616-8920): [wpa3.*/sae.* rows]
+		// → mgmt → psk → auth_cache → [radius.*] → dynamic_vlan →
+		// wpa.1.pairwise → pmf.cipher (FID-25).
 		mgmt := "WPA-PSK"
 		if v.Wlan.Security == "wpa-eap" {
 			mgmt = "WPA-EAP"
+		}
+		if wpa3 {
+			mgmt = "SAE" // mgmt writer: isWpa3() overrides the PSK/EAP value
 		}
 		line("wpa.key.1.mgmt", mgmt)
 		line("wpa.psk", psk) // psk writer: NEVER hashed/obfuscated (§8)
@@ -409,7 +477,10 @@ func (rd *render) emitAaaRows(b *strings.Builder, n int, v wireless.VapPlan, ope
 			// → 0, optional → 1, required → 2.
 			line("dynamic_vlan", dynamicVlanOf(v.Wlan.RadiusVLANMode))
 		}
-		line("wpa.1.pairwise", "CCMP") // wpa_enc auto → CCMP (§8)
+		// wpa_enc AUTO → CCMP; getRsnGroup(mode, !isWpa3) stays "CCMP" for
+		// the WPA3 modes too (the TKIP CCMP branch needs wpa_mode==WPA1,
+		// int 2924-2982; §8).
+		line("wpa.1.pairwise", "CCMP")
 		line("pmf.cipher", "AES-128-CMAC")
 	}
 
