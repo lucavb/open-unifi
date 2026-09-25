@@ -67,6 +67,17 @@ off unless `OTEL_EXPORTER_OTLP_ENDPOINT(_TRACES)` is set; `http://` = plaintext 
 log lines carry `trace_id`/`span_id` (see `docs/alloy-openunifi.example.alloy` for a
 Grafana Alloy example wiring OTLP into Tempo and the controller log into Loki).
 
+Inform traces include child spans (`inform.handle`, `inform.decode`, `inform.adoption.decide`,
+`inform.render_system_cfg`) with attributes such as `openunifi.device.mac` and
+`openunifi.adoption.outcome`. Example Tempo TraceQL (RFC3339 time bounds in the UI):
+
+```
+{ resource.service.name = "openunifi" && name = "POST /inform" }
+{ resource.service.name = "openunifi" && openunifi.adoption.outcome = "setparam" }
+```
+
+Link Loki JSON logs to Tempo with a derived field on `trace_id` (documented in the Alloy example).
+
 Per-device admin intent (regulatory country code, SSH public keys, SSH
 password) is managed only through the admin API, web console, or Terraform
 `open-unifi_device` — there are no controller startup flags for those fields.

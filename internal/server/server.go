@@ -6,6 +6,7 @@
 package server
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -25,6 +26,7 @@ import (
 	"github.com/lucavb/open-unifi/internal/server/adoption"
 	"github.com/lucavb/open-unifi/internal/server/systemcfg"
 	"github.com/lucavb/open-unifi/internal/store"
+	"github.com/lucavb/open-unifi/internal/telemetry"
 	"github.com/lucavb/open-unifi/internal/wireless"
 )
 
@@ -230,6 +232,9 @@ func (s *Server) handleInform(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	ctx, handleSpan := telemetry.StartServerSpan(r.Context(), "inform.handle")
+	defer handleSpan.End()
+
 	body, err := io.ReadAll(io.LimitReader(r.Body, inform.MaxBodySize+1))
 	if err != nil {
 		s.lg.Debug("inform: body read error", "err", err)
@@ -251,10 +256,10 @@ func (s *Server) handleInform(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if pkt.Flags&(inform.FlagEncCBC|inform.FlagGCM) == 0 {
-			s.handlePacketPlain(w, pkt)
+			s.handlePacketPlain(ctx, w, pkt)
 			return
 		}
-		s.handlePacket(w, pkt, body)
+		s.handlePacket(ctx, w, pkt, body)
 		return
 	}
 
@@ -275,7 +280,7 @@ func (s *Server) handleInform(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	s.handlePlain(w, mac, jm)
+	s.handlePlain(ctx, w, mac, jm)
 }
 
 // handlePacketPlain processes a FRAMED packet that carries no encryption
@@ -285,14 +290,14 @@ func (s *Server) handleInform(w http.ResponseWriter, r *http.Request) {
 // classic error. Decode's no-encryption-flags branch ignores the key
 // entirely and only inflates zlib/parses snappy — any valid key works, the
 // factory default is simply the cheapest candidate.
-func (s *Server) handlePacketPlain(w http.ResponseWriter, pkt *inform.Packet) {
+func (s *Server) handlePacketPlain(ctx context.Context, w http.ResponseWriter, pkt *inform.Packet) {
 	mac := canonMACFromHeader(pkt.MAC)
 	if mac == "" {
 		s.lg.Debug("inform-plain: empty MAC in header")
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	d, derr := inform.Decode(pkt, []string{inform.DefaultKeyHex})
+	d, derr := s.decodeInformPacket(ctx, pkt, []string{inform.DefaultKeyHex})
 	if derr != nil {
 		if errors.Is(derr, inform.ErrNotJSONObject) {
 			s.lg.Debug("inform-plain: payload not a JSON object")
@@ -302,7 +307,7 @@ func (s *Server) handlePacketPlain(w http.ResponseWriter, pkt *inform.Packet) {
 		writeJSONErr(w, http.StatusBadRequest, "unable to parse inform payload")
 		return
 	}
-	s.handlePlain(w, mac, d.Body)
+	s.handlePlain(ctx, w, mac, d.Body)
 }
 
 // handlePacket processes one binary (CBC or GCM) inform.
@@ -343,7 +348,7 @@ func payloadMACMatches(hdrMAC string, jm map[string]any) bool {
 	return err == nil && c == hdrMAC
 }
 
-func (s *Server) handlePacket(w http.ResponseWriter, pkt *inform.Packet, body []byte) {
+func (s *Server) handlePacket(ctx context.Context, w http.ResponseWriter, pkt *inform.Packet, body []byte) {
 	mac := canonMACFromHeader(pkt.MAC)
 	if mac == "" {
 		s.lg.Debug("inform: empty MAC in header")
@@ -359,7 +364,7 @@ func (s *Server) handlePacket(w http.ResponseWriter, pkt *inform.Packet, body []
 		// only AFTER the payload proved decryptable (FID-8) and its MAC
 		// matched (FID-35). A garbage/mis-keyed payload touches no state.
 		s.lg.Debug("inform: unregistered device", "mac", mac)
-		jd, derr := inform.Decode(pkt, []string{inform.DefaultKeyHex})
+		jd, derr := s.decodeInformPacket(ctx, pkt, []string{inform.DefaultKeyHex})
 		if derr != nil {
 			s.lg.Debug("inform: no key produced a valid JSON payload", "mac", mac, "tried", 1)
 			writeJSONErr(w, http.StatusBadRequest, "unable to decrypt inform payload")
@@ -390,7 +395,7 @@ func (s *Server) handlePacket(w http.ResponseWriter, pkt *inform.Packet, body []
 	s.lg.Debug("inform: packet", "mac", mac, "flags", fmt.Sprintf("0x%04x", pkt.Flags), "bodyLen", len(body))
 
 	candidates := keyCandidates(rec)
-	jd, derr := inform.Decode(pkt, candidates)
+	jd, derr := s.decodeInformPacket(ctx, pkt, candidates)
 	if derr != nil {
 		s.lg.Debug("inform: no key produced a valid JSON payload", "mac", mac, "tried", len(candidates))
 		writeJSONErr(w, http.StatusBadRequest, "unable to decrypt inform payload")
@@ -415,7 +420,7 @@ func (s *Server) handlePacket(w http.ResponseWriter, pkt *inform.Packet, body []
 		now := time.Now()
 		s.absorbInform(rec, jm, now, gcmReq)
 		connects, disconnects := refreshClientSessions(rec, jm, now)
-		out, aerr := s.engine.Decide(adoption.Request{
+		out, aerr := s.decideInform(ctx, mac, adoption.Request{
 			Transport:      adoption.TransportEncrypted,
 			Device:         *rec,
 			Body:           jm,
@@ -534,7 +539,7 @@ func (s *Server) internalPlainNoopResponse(w http.ResponseWriter, cause string, 
 // handlePlain processes a plaintext inform (AllowPlainText only): either an
 // unframed JSON body (mac from the body) or a framed no-flags packet
 // (mac from the header, section-1 gating upstream in handleInform).
-func (s *Server) handlePlain(w http.ResponseWriter, mac string, jm map[string]any) {
+func (s *Server) handlePlain(ctx context.Context, w http.ResponseWriter, mac string, jm map[string]any) {
 	if mac == "" {
 		s.lg.Debug("inform-plain: empty MAC")
 		w.WriteHeader(http.StatusBadRequest)
@@ -583,7 +588,7 @@ func (s *Server) handlePlain(w http.ResponseWriter, mac string, jm map[string]an
 		now := time.Now()
 		s.absorbInform(rec, jm, now, false)
 		connects, disconnects := refreshClientSessions(rec, jm, now)
-		out, aerr := s.engine.Decide(adoption.Request{
+		out, aerr := s.decideInform(ctx, mac, adoption.Request{
 			Transport:      adoption.TransportPlaintext,
 			Device:         *rec,
 			Body:           jm,
@@ -805,8 +810,16 @@ func (s *Server) absorbInform(rec *store.Device, body map[string]any, now time.T
 // store cycle aborts with NO record mutation (assignedKeyFlow runs the gate
 // first and the render before any record write, so the abort happens before
 // State/CfgVersion/wlan bookkeeping move).
-func (s *Server) renderSystemCfg(d store.Device, wls []wireless.Wlan, plan wireless.ProvisioningPlan) (string, map[string]string, error) {
+func (s *Server) renderSystemCfg(ctx context.Context, d store.Device, wls []wireless.Wlan, plan wireless.ProvisioningPlan) (string, map[string]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, span := telemetry.StartServerSpan(ctx, "inform.render_system_cfg")
+	defer span.End()
+	telemetry.SetDeviceMAC(span, d.MAC)
+
 	if err := ValidateConfig(s.cfg); err != nil {
+		telemetry.RecordSpanErr(span, err)
 		return "", nil, err
 	}
 	res, err := systemcfg.RenderWithPlan(d, systemcfg.SiteFacts{
@@ -814,6 +827,7 @@ func (s *Server) renderSystemCfg(d store.Device, wls []wireless.Wlan, plan wirel
 		WLANs:         wls,
 	}, plan)
 	if err != nil {
+		telemetry.RecordSpanErr(span, err)
 		return "", nil, err
 	}
 	for _, warn := range res.Warnings {
@@ -821,10 +835,10 @@ func (s *Server) renderSystemCfg(d store.Device, wls []wireless.Wlan, plan wirel
 	}
 	for _, alert := range res.Alerts {
 		if alert.Where != "" {
-			s.lg.Warn(alert.Msg, "where", alert.Where, "key", alert.Key)
+			s.lg.WarnContext(ctx, alert.Msg, "where", alert.Where, "key", alert.Key)
 			continue
 		}
-		s.lg.Warn(alert.Msg)
+		s.lg.WarnContext(ctx, alert.Msg)
 	}
 	if diagnostic, derr := systemcfg.Diagnostic(res.Text); derr == nil {
 		s.lg.Debug(diagnostic)

@@ -92,3 +92,8 @@ loki.write "default" {
 // then open the matching trace in one click. Works because the controller's
 // JSON log lines carry trace_id/span_id, and the stage above promotes them
 // to structured metadata (searchable as a label).
+//
+// Tempo TraceQL examples (set time range in Grafana Explore):
+//   { resource.service.name = "openunifi" && name = "POST /inform" }
+//   { resource.service.name = "openunifi" && openunifi.adoption.outcome = "setparam" }
+// Inform spans also carry openunifi.device.mac and openunifi.inform.encryption.

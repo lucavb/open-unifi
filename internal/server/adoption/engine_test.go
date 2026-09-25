@@ -7,6 +7,7 @@ package adoption
 // helper here mirrors that contract.
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -35,7 +36,7 @@ func newTestEngine(t *testing.T) *Engine {
 		Random:   func() float64 { return 0.5 },
 		KeyChars: func(n int) (string, error) { return "", nil }, // replaced below
 		Wireless: func(store.Device) []wireless.Wlan { return nil },
-		SystemCfg: func(store.Device, []wireless.Wlan, wireless.ProvisioningPlan) (string, map[string]string, error) {
+		SystemCfg: func(context.Context, store.Device, []wireless.Wlan, wireless.ProvisioningPlan) (string, map[string]string, error) {
 			return "# unifi\nunifi.version=0.1.0-dev\n", nil, nil
 		},
 	})
@@ -319,7 +320,7 @@ func notRunningHarness(t *testing.T) (e *Engine, fixture func(vaps any) store.De
 			return strings.Repeat("0", n-len(s)) + s, nil
 		},
 		Wireless: func(store.Device) []wireless.Wlan { return env },
-		SystemCfg: func(store.Device, []wireless.Wlan, wireless.ProvisioningPlan) (string, map[string]string, error) {
+		SystemCfg: func(context.Context, store.Device, []wireless.Wlan, wireless.ProvisioningPlan) (string, map[string]string, error) {
 			return "sys\n", nil, nil
 		},
 	})
@@ -967,7 +968,7 @@ func TestEncryptedU7PG2WLANFullProvisioning(t *testing.T) {
 		Random:   func() float64 { return 0.5 },
 		KeyChars: func(n int) (string, error) { return strings.Repeat("0", n), nil },
 		Wireless: func(store.Device) []wireless.Wlan { return workedEnvelopeAdoption() },
-		SystemCfg: func(store.Device, []wireless.Wlan, wireless.ProvisioningPlan) (string, map[string]string, error) {
+		SystemCfg: func(context.Context, store.Device, []wireless.Wlan, wireless.ProvisioningPlan) (string, map[string]string, error) {
 			return "# unifi\nunifi.version=0.1.0-dev\n", nil, nil
 		},
 	})
@@ -1107,7 +1108,7 @@ func TestDefaultKeyLostStateRejected(t *testing.T) {
 func TestSystemCfgProducerErrorAbortsDecide(t *testing.T) {
 	const k = "11112222333344445555666677778888"
 	e := newTestEngine(t)
-	e.systemCfg = func(store.Device, []wireless.Wlan, wireless.ProvisioningPlan) (string, map[string]string, error) {
+	e.systemCfg = func(context.Context, store.Device, []wireless.Wlan, wireless.ProvisioningPlan) (string, map[string]string, error) {
 		return "", nil, errors.New("render failed")
 	}
 	dev := store.Device{
@@ -1247,7 +1248,7 @@ func TestOperatorMintEscapesExhaustedDeliveryGate(t *testing.T) {
 	// the escape offer is proven to render the minted record, not just to
 	// answer setparam.
 	sawIntent := false
-	e.systemCfg = func(d store.Device, wls []wireless.Wlan, plan wireless.ProvisioningPlan) (string, map[string]string, error) {
+	e.systemCfg = func(_ context.Context, d store.Device, wls []wireless.Wlan, plan wireless.ProvisioningPlan) (string, map[string]string, error) {
 		if _, ok := d.Extra["radio_intent"]; ok {
 			sawIntent = true
 		}

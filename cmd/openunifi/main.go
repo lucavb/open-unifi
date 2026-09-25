@@ -170,7 +170,11 @@ func run() error {
 			"status", sw.code,
 			"duration_ms", float64(time.Since(start).Microseconds())/1000,
 		)
-	}), "openunifi: inform")
+	}), "openunifi: inform",
+		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
+			return r.Method + " /inform"
+		}),
+	)
 
 	// ---- serving ---------------------------------------------------------
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -187,7 +191,14 @@ func run() error {
 		Addr: *listenAdmin,
 		// otelhttp is OUTERMOST: the adminapi auth (requireToken) and its
 		// metrics wrapper stay inside so the span covers the full request.
-		Handler:           otelhttp.NewHandler(adminH, "openunifi: admin"),
+		Handler: otelhttp.NewHandler(adminH, "openunifi: admin",
+			otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
+				if r.Pattern != "" {
+					return r.Method + " " + r.Pattern
+				}
+				return r.Method + " " + r.URL.Path
+			}),
+		),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,

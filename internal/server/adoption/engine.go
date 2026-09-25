@@ -15,6 +15,7 @@
 package adoption
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"math"
@@ -81,6 +82,8 @@ const (
 
 // Request carries one decoded inform into the pure decider.
 type Request struct {
+	// Context carries the active trace for system_cfg rendering and logging.
+	Context context.Context
 	// Transport selects the encrypted or plaintext decision lane.
 	Transport Transport
 	// Device is the device snapshot the transport adapter absorbed the
@@ -257,7 +260,7 @@ type Deps struct {
 	// systemcfg.RenderWithPlan — so the renderer emits rows from the same
 	// plan whose drift hash the branches below compared (one computation,
 	// never a re-derivation).
-	SystemCfg func(store.Device, []wireless.Wlan, wireless.ProvisioningPlan) (text string, credentialDeltas map[string]string, err error)
+	SystemCfg func(context.Context, store.Device, []wireless.Wlan, wireless.ProvisioningPlan) (text string, credentialDeltas map[string]string, err error)
 
 	// ControllerURL is the configured controller base URL (mgmt_cfg host
 	// facts). Empty means "not overridden".
@@ -274,7 +277,7 @@ type Engine struct {
 	random           func() float64
 	keyChars         func(n int) (string, error)
 	wireless         func(store.Device) []wireless.Wlan
-	systemCfg        func(store.Device, []wireless.Wlan, wireless.ProvisioningPlan) (string, map[string]string, error)
+	systemCfg        func(context.Context, store.Device, []wireless.Wlan, wireless.ProvisioningPlan) (string, map[string]string, error)
 	controllerURL    string
 	informListenAddr string
 }
@@ -663,7 +666,7 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 	// kind of content change (§6.2(d) delivers it only inside full
 	// provisioning), so the arm is shared.
 	case wlanDrift || blockedDrift:
-		out, err := e.assignedKeyFlow(d, now, wls, plan)
+		out, err := e.assignedKeyFlow(req.Context, d, now, wls, plan)
 		if err != nil {
 			return Outcome{}, err
 		}
@@ -748,7 +751,7 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 		return e.noopFor(d, now, req.PrevNoopTarget, KindNoop), nil
 
 	default:
-		out, err := e.assignedKeyFlow(d, now, wls, plan)
+		out, err := e.assignedKeyFlow(req.Context, d, now, wls, plan)
 		if err != nil {
 			return Outcome{}, err
 		}
@@ -799,7 +802,7 @@ func (e *Engine) decidePlain(req Request, wls []wireless.Wlan, plan wireless.Pro
 		return e.adoptionPush(*d, req.UsedKey), nil
 
 	default:
-		return e.assignedKeyFlow(d, now, wls, plan)
+		return e.assignedKeyFlow(req.Context, d, now, wls, plan)
 	}
 }
 
@@ -819,7 +822,10 @@ func (e *Engine) decidePlain(req Request, wls []wireless.Wlan, plan wireless.Pro
 // plan is the decision's provisioning plan: the drift hash captured here and
 // the delivery placements come from the same value the renderer emitted the
 // rows from — no re-derivation inside this tail.
-func (e *Engine) assignedKeyFlow(d *store.Device, now time.Time, wls []wireless.Wlan, plan wireless.ProvisioningPlan) (Outcome, error) {
+func (e *Engine) assignedKeyFlow(ctx context.Context, d *store.Device, now time.Time, wls []wireless.Wlan, plan wireless.ProvisioningPlan) (Outcome, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if d.CfgVersion == "" {
 		nv, err := e.keyChars(16)
 		if err != nil {
@@ -828,7 +834,7 @@ func (e *Engine) assignedKeyFlow(d *store.Device, now time.Time, wls []wireless.
 		d.CfgVersion = nv
 	}
 	d.State = store.StateAdopting
-	sys, deltas, serr := e.systemCfg(*d, wls, plan)
+	sys, deltas, serr := e.systemCfg(ctx, *d, wls, plan)
 	if serr != nil {
 		// FID-23: provisioning content that cannot be rendered (e.g. an
 		// unusable/empty SSH password hash) fails the whole push, like the

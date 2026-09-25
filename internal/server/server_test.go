@@ -8,6 +8,7 @@ package server
 import (
 	"bytes"
 	"compress/zlib"
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -276,7 +277,7 @@ func hexKey(t *testing.T, s string) []byte {
 func mustBuildSys(t *testing.T, s *Server, rec store.Device) string {
 	t.Helper()
 	wls := s.wirelessForDevice(rec)
-	sys, deltas, err := s.renderSystemCfg(rec, wls, wireless.PlanProvisioning(rec, wls))
+	sys, deltas, err := s.renderSystemCfg(context.Background(), rec, wls, wireless.PlanProvisioning(rec, wls))
 	if err != nil {
 		t.Fatalf("system_cfg build: %v", err)
 	}
@@ -2464,9 +2465,9 @@ func TestPlainLaneProvisionsWirelessRows(t *testing.T) {
 		Random:   func() float64 { return 0.5 },
 		KeyChars: func(n int) (string, error) { return strings.Repeat("f", n), nil },
 		Wireless: func(store.Device) []wireless.Wlan { return env },
-		SystemCfg: func(d store.Device, wls []wireless.Wlan, plan wireless.ProvisioningPlan) (string, map[string]string, error) {
+		SystemCfg: func(ctx context.Context, d store.Device, wls []wireless.Wlan, plan wireless.ProvisioningPlan) (string, map[string]string, error) {
 			handedPlan = plan
-			return realRender(d, wls, plan)
+			return realRender(ctx, d, wls, plan)
 		},
 	})
 	body := infoBody("aaaa")
