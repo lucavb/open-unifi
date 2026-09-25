@@ -1,6 +1,6 @@
 GO ?= go
 
-.PHONY: build test run check
+.PHONY: build test run check lint hooks hooks-prime
 
 build:
 	$(GO) build ./...
@@ -23,4 +23,15 @@ check:
 	fi
 	$(GO) vet ./...
 	$(GO) test -count=1 ./...
+
+lint:
+	PATH="$$(go env GOPATH)/bin:$$PATH" golangci-lint run
+
+hooks:
+	bash scripts/install-hook-tools.sh
+
+hooks-prime:
+	$(GO) build ./...
+	$(GO) test -count=1 ./...
+	PATH="$$(go env GOPATH)/bin:$$PATH" golangci-lint run
 

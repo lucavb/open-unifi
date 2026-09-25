@@ -31,7 +31,11 @@ Agent / CI matrix (including golangci-lint): [`AGENTS.md`](AGENTS.md).
 make check          # CI check job: tracked gofmt + vet + test (not golangci-lint)
 make build          # go build ./...
 make test           # go test ./...
+make hooks          # one-time: install pinned lefthook + golangci-lint, wire git hooks
+make lint           # golangci-lint, pinned to CI's version
 ```
+
+Git hooks: `make hooks` is one-time setup per clone. pre-commit formats and lints only the staged Go files (fast, auto-fixes and re-stages); pre-push runs the full CI matrix (`make check`, `make build`, `make lint`) in parallel, so a push that passes locally passes CI. The first run on a new machine is slower while caches warm — `make hooks-prime` warms them ahead of time. Both hooks honor the standard lefthook bypass: `LEFTHOOK=0` skips them.
 
 ```
 go run ./cmd/openunifi \

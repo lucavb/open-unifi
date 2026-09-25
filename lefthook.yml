@@ -1,0 +1,37 @@
+# Git hooks via lefthook (v2 config). One-time setup: `make hooks`.
+# pre-commit: fast lane — scoped to staged Go files, seconds warm, auto-fix.
+# pre-push:   full CI parity — as a *script* job, on purpose: lefthook v2
+#             silently skips pre-push `run:` jobs whenever `git diff HEAD
+#             @{push}` is empty (branch in sync) or unresolvable (first push
+#             of a new branch — the agent PR flow); script jobs are exempt
+#             from that implicit gate (upstream: evilmartians/lefthook#554).
+# Bypass for both hooks: LEFTHOOK=0.
+min_version: 2.0.0
+no_tty: true # headless/agent shells: never prompt, no spinner
+rc: scripts/hook-env.sh # prepend GOBIN to PATH in every hook run: pinned tools win over Homebrew
+output: [meta, summary, jobs]
+
+pre-commit:
+  piped: true # sequential: gofmt and golangci-lint --fix both rewrite staged files
+  jobs:
+    - name: gofmt
+      glob: "*.go" # skip unless Go files are staged
+      run: gofmt -w {staged_files}
+      stage_fixed: true
+    - name: go-vet
+      glob: "*.go" # skip unless Go files are staged
+      run: go vet $(git diff --cached --name-only --diff-filter=ACM -- '*.go' | sed -e 's|/[^/]*$||' -e 's|^|./|' | sort -u | tr '\n' ' ')
+    - name: golangci-lint
+      glob: "*.go"
+      run: golangci-lint run --new-from-rev HEAD --fix
+      stage_fixed: true
+
+pre-push:
+  # Script job, not run: — see the header comment. Executes the three CI
+  # jobs in parallel and fails the push if any of them fails. Script jobs
+  # have no implicit {push_files} gate, so this runs on every push,
+  # including the first push of a new branch.
+  jobs:
+    - name: ci-parity
+      script: ci-parity.sh # lives in .lefthook/pre-push/
+      runner: bash
