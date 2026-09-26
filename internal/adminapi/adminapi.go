@@ -999,7 +999,13 @@ func New(cfg Config, be Backend) http.Handler {
 			metrics.ObserveAPIRequest(sw.code, route)
 		}
 		if r.URL.Path != "/metrics" && r.URL.Path != "/healthz" {
-			lg.InfoContext(r.Context(), "admin: request",
+			// Console dashboard polling (successful GETs) dominates request
+			// volume; keep those at DEBUG so INFO stays signal-bearing.
+			lvl := slog.LevelInfo
+			if r.Method == http.MethodGet && sw.code/100 == 2 {
+				lvl = slog.LevelDebug
+			}
+			lg.Log(r.Context(), lvl, "admin: request",
 				"method", r.Method,
 				"path", r.URL.Path,
 				"status", sw.code,

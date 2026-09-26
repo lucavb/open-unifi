@@ -193,10 +193,20 @@ func run() error {
 		// metrics wrapper stay inside so the span covers the full request.
 		Handler: otelhttp.NewHandler(adminH, "openunifi: admin",
 			otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
-				if r.Pattern != "" {
-					return r.Method + " " + r.Pattern
+				// Go 1.22 patterns carry their method when one is registered
+				// ("GET /api/v1/devices"); bare patterns ("/") do not.
+				if p := r.Pattern; p != "" {
+					if strings.HasPrefix(p, r.Method+" ") {
+						return p
+					}
+					return r.Method + " " + p
 				}
 				return r.Method + " " + r.URL.Path
+			}),
+			otelhttp.WithFilter(func(r *http.Request) bool {
+				// Mirror the admin log middleware's scrape-noise skip list:
+				// no spans for /healthz probes or /metrics scrapes.
+				return r.URL.Path != "/metrics" && r.URL.Path != "/healthz"
 			}),
 		),
 		ReadHeaderTimeout: 10 * time.Second,
