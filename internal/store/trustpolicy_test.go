@@ -162,23 +162,81 @@ func TestAbsorbAdminOwnedPrevOrDelete(t *testing.T) {
 	}
 }
 
+// TestAbsorbWatchdogRowsRejectIntroduction pins the devname materialization
+// watchdog's trust class: both rows (wlan_cfg_vap_not_running_misses /
+// wlan_cfg_materialization_reboot) are admin-owned prev-or-delete, the
+// blocked_sta_sha shape — a device body can neither introduce, forge, nor
+// clear them. The realistic forging shape: the device knows its cfgversion
+// from the adoption echo (the same echo Absorb reads into AppliedCfg), so a
+// forged marker carrying that very cfgversion plus a forged counter=1 would
+// pre-arm the auto-heal and permanently suppress the boot-race grace for
+// that config — rejection is the whole point of the class move.
+func TestAbsorbWatchdogRowsRejectIntroduction(t *testing.T) {
+	cv := "aaaabbbbccccdddd"
+	body := map[string]any{
+		"model": "U7PG2", "version": "6.8.2.15592",
+		"cfgversion":                      cv,
+		"wlan_cfg_materialization_reboot": JSONMap{"cfgversion": cv},
+		"wlan_cfg_vap_not_running_misses": float64(1),
+	}
+	rec := Device{MAC: "aabbccddeeff"}
+	rec.Absorb(body, absorbNow, false)
+	for _, k := range []string{"wlan_cfg_materialization_reboot", "wlan_cfg_vap_not_running_misses"} {
+		if v, ok := rec.Extra[k]; ok {
+			t.Fatalf("body introduced watchdog row %q: %v", k, v)
+		}
+	}
+	if rec.AppliedCfg != cv {
+		t.Fatalf("AppliedCfg = %q, want the forged cfgversion (the forging mechanism the body exploits)", rec.AppliedCfg)
+	}
+
+	// Once the engine wrote the rows (the armed and mid-window shapes), a
+	// body copy cannot clobber them and a sparse heartbeat cannot drop
+	// them — the survival the watchdog needs holds under prev-or-delete.
+	seeded := Device{MAC: "aabbccddeeff", Extra: JSONMap{
+		"wlan_cfg_materialization_reboot": JSONMap{"cfgversion": cv},
+		"wlan_cfg_vap_not_running_misses": float64(1),
+	}}
+	seeded.Absorb(body, absorbNow, false)
+	if got, want := seeded.Extra["wlan_cfg_materialization_reboot"].(JSONMap)["cfgversion"], cv; got != want {
+		t.Fatalf("armed marker clobbered by body copy: %v, want %v", got, want)
+	}
+	if got, want := seeded.Extra["wlan_cfg_vap_not_running_misses"], float64(1); got != want {
+		t.Fatalf("armed counter clobbered by body copy: %v, want %v", got, want)
+	}
+	seeded.Absorb(map[string]any{"model": "U7PG2"}, absorbNow, false)
+	if _, ok := seeded.Extra["wlan_cfg_materialization_reboot"]; !ok {
+		t.Fatal("sparse heartbeat dropped the armed marker")
+	}
+	if _, ok := seeded.Extra["wlan_cfg_vap_not_running_misses"]; !ok {
+		t.Fatal("sparse heartbeat dropped the armed counter")
+	}
+}
+
 // TestAbsorbFactoryResetSweepExcludesSiteCache pins the demotion sweep's
-// shape: it clears exactly the per-device controller state and never the
-// per-device SSH password caches (they hold the DEVICE's last
-// controller-pushed password and deliberately survive the demotion — the
-// exclude keeps that survival; both caches are admin-owned, so the class
-// itself cannot land in the sweep either).
+// shape: it clears exactly the per-device controller state plus the devname
+// materialization watchdog's two admin-owned rows (the marker/counter must
+// not survive a reset/demotion — see the factory-reset-sweep comment in
+// trustpolicy.go) and never the per-device SSH password caches (they hold
+// the DEVICE's last controller-pushed password and deliberately survive the
+// demotion; both caches are admin-owned, so the class itself cannot land in
+// the sweep either).
 func TestAbsorbFactoryResetSweepExcludesSiteCache(t *testing.T) {
 	for _, k := range FactoryResetSweepKeys {
 		if k == SSHSha512PasswdKey || k == SSHMd5PasswdKey {
 			t.Fatal("the demotion sweep must not clear the per-device ssh password caches")
 		}
-		if !containsKey(controllerOwnedKeys, k) {
-			t.Fatalf("sweep key %q is not controller-owned", k)
+		if !containsKey(controllerOwnedKeys, k) &&
+			k != "wlan_cfg_vap_not_running_misses" && k != "wlan_cfg_materialization_reboot" {
+			t.Fatalf("sweep key %q is neither controller-owned nor the admin-owned watchdog pair", k)
 		}
 	}
 	if containsKey(controllerOwnedKeys, SSHSha512PasswdKey) || containsKey(controllerOwnedKeys, SSHMd5PasswdKey) {
 		t.Fatal("the ssh password caches must be admin-owned")
+	}
+	if !containsKey(adminOwnedKeys, "wlan_cfg_vap_not_running_misses") ||
+		!containsKey(adminOwnedKeys, "wlan_cfg_materialization_reboot") {
+		t.Fatal("the watchdog pair must be admin-owned while still swept")
 	}
 }
 
@@ -267,6 +325,7 @@ func TestTrustRegistrySnapshot(t *testing.T) {
 		"anonymous_controller_id", "anonymous_site_id",
 		"reboot_on_connect", "setdefault_armed",
 		"blocked_sta", "blocked_sta_sha",
+		"wlan_cfg_vap_not_running_misses", "wlan_cfg_materialization_reboot",
 		"ssh_sha512passwd", "ssh_md5passwd",
 		"led_override", "disabled", "led_override_color_brightness",
 		"led_override_color", "ssh_password",
@@ -280,6 +339,7 @@ func TestTrustRegistrySnapshot(t *testing.T) {
 		"wlan_cfg_last_attempt", "wlan_cfg_delivery_status",
 		"wlan_cfg_not_running_misses", "wlan_cfg_offered_cfgversion",
 		"client_sessions", "client_disconnect_pending",
+		"wlan_cfg_vap_not_running_misses", "wlan_cfg_materialization_reboot",
 	}
 	cases := []struct {
 		name string
@@ -296,9 +356,10 @@ func TestTrustRegistrySnapshot(t *testing.T) {
 			t.Errorf("%s registry drifted:\n got %q\nwant %q", tc.name, tc.got, tc.want)
 		}
 	}
-	// The sweep must be exactly controller-owned minus the ssh password
-	// caches — no other exclusion is licensed, and the caches are
-	// admin-owned so they cannot be swept by class either.
+	// The sweep's derived half must be exactly controller-owned minus the
+	// ssh password caches — no other exclusion is licensed — plus the two
+	// admin-owned watchdog rows the demotion must still clear, and the
+	// caches are admin-owned so they cannot be swept by class either.
 	for _, k := range []string{SSHSha512PasswdKey, SSHMd5PasswdKey} {
 		if containsKey(controllerOwnedKeys, k) {
 			t.Error("ssh password cache left the admin-owned class")

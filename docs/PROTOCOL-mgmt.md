@@ -419,6 +419,21 @@ is silently lost; whether the real controller re-sends an armed command
 until the device acks, or loses it the same way, is exactly the re-send
 question above.
 
+**open-unifi (2026-09-26 materialization watchdog addendum).** The arming
+writer list above is superseded: the engine's devname materialization
+watchdog (2026-09-26 production incident; see the same-dated addendum in
+docs/WLAN-ACCEPTANCE-6.8.2.15592.md) now also arms `reboot_on_connect`
+AUTONOMOUSLY — one shot per cfgversion, guarded by the
+`wlan_cfg_materialization_reboot` marker. The marker and the
+`wlan_cfg_vap_not_running_misses` miss counter behind it are admin-owned
+trust keys (prev-or-delete, the `blocked_sta_sha` shape: a device body can
+neither introduce, forge, nor clear them). §6.5 emission semantics are
+unchanged: the armed flag is still consumed by the device's next decoded
+inform, one-shot, with no cfgversion minted at arming or emission.
+Operator caveat: any admin save that mints a fresh cfgversion re-arms the
+one-shot budget while the vap gap persists — one reboot per save (each
+arm still separated by a delivered reboot and a genuine RUN proof).
+
 ### 6.6 `setdefault`
 Factory reset path (device state 8): `return new Object("setdefault");` (line 1018).
 Two-phase adoption (`o00000(string, device, x, …)` §902-924) stages:

@@ -15,13 +15,16 @@ import (
 // back EXACT key names and EXACT value formats (string/int/int64) so the
 // persisted Extra bytes stay identical to the pre-extraction behavior.
 //
-// Keys covered (all controller-owned):
+// Keys covered (all controller-owned, EXCEPT the last two — the devname
+// watchdog's counter and marker are admin-owned prev-or-delete rows since
+// the 2026-09-26 class move, the blocked_sta_sha shape):
 //
 //	wlan_cfg_sha, wlan_cfg_pending_sha, wlan_cfg_pending_wlans,
 //	wlan_cfg_pending_old_wlans, wlan_cfg_applied_wlans,
 //	wlan_cfg_pending_placements, wlan_cfg_attempt_sha, wlan_cfg_attempts,
 //	wlan_cfg_last_attempt, wlan_cfg_delivery_status,
-//	wlan_cfg_not_running_misses, wlan_cfg_offered_cfgversion.
+//	wlan_cfg_not_running_misses, wlan_cfg_offered_cfgversion,
+//	wlan_cfg_vap_not_running_misses, wlan_cfg_materialization_reboot.
 type wlanCfgState struct {
 	// extra is the map the state was loaded from (apply functions write here).
 	extra store.JSONMap
@@ -68,6 +71,16 @@ type wlanCfgState struct {
 	// (the store trust policy's controller-owned class). Absent = 0 =
 	// window unarmed.
 	notRunningMisses int
+
+	// vapNotRunningMisses is wlan_cfg_vap_not_running_misses: the consecutive
+	// miss counter behind the DEVNAME-level materialization watchdog (the
+	// engine's connected-noop arming that fires FlagRebootOnConnect — an
+	// SSID can read RUN somewhere while a planned band=both vap's devname
+	// never materialized, which the SSID-level counter above cannot see).
+	// ADMIN-owned prev-or-delete (the blocked_sta_sha shape) rather than
+	// controller-owned: a device body must not be able to introduce or
+	// forge the counter's window. Absent = 0 = window unarmed.
+	vapNotRunningMisses int
 
 	// offeredCfgversion is wlan_cfg_offered_cfgversion: the cfgversion the
 	// pending delivery operation was last OFFERED with (written by
@@ -142,6 +155,12 @@ func loadWlanCfgState(extra store.JSONMap) wlanCfgState {
 	case float64:
 		st.notRunningMisses = int(v)
 	}
+	switch v := extra["wlan_cfg_vap_not_running_misses"].(type) {
+	case int:
+		st.vapNotRunningMisses = v
+	case float64:
+		st.vapNotRunningMisses = int(v)
+	}
 	if v, ok := extra["wlan_cfg_offered_cfgversion"].(string); ok {
 		st.offeredPresent = true
 		st.offeredCfgversion = v
@@ -153,7 +172,15 @@ func loadWlanCfgState(extra store.JSONMap) wlanCfgState {
 // sides of the change: every desired SSID has RUN VAPs and every previously
 // enabled SSID being removed has disappeared. cfgversion equality is
 // deliberately not evidence of WLAN application.
-func (st *wlanCfgState) settle() {
+//
+// cfgversion is the record's CURRENT cfgversion (the device-reported desired
+// version), read for the materialization-marker lifecycle: a NEW config
+// settling is a fresh boot-window budget for the devname-level watchdog, so
+// the one-shot armed-reboot marker stamped for the PREVIOUS cfgversion is
+// deleted here — the arming rule (engine.go) never re-arms while a marker
+// for the same cfgversion stands, and a stale marker standing onto a new
+// config would suppress a genuinely NEW materialization gap for free.
+func (st *wlanCfgState) settle(cfgversion string) {
 	if !st.pendingSHAIsString {
 		return
 	}
@@ -220,6 +247,12 @@ func (st *wlanCfgState) settle() {
 	}
 	// A deleted WLAN is settled only when the old VAP is absent. Positive
 	// desired WLANs were checked above; no VAP table means unknown, not success.
+	// A NEW config settling also retires the devname watchdog's armed marker
+	// when it was stamped for the PREVIOUS cfgversion (fresh one-shot budget —
+	// see the doc above); a marker for the current cfgversion stands.
+	if armedCv, armed := materializationRebootArmedFor(st.extra); armed && armedCv != cfgversion {
+		delete(st.extra, "wlan_cfg_materialization_reboot")
+	}
 	st.extra["wlan_cfg_sha"] = st.pendingSHA
 	st.extra["wlan_cfg_applied_wlans"] = st.extra["wlan_cfg_pending_wlans"]
 	st.extra["wlan_cfg_delivery_status"] = "confirmed"
@@ -268,11 +301,17 @@ const (
 // the two-consecutive-miss arming policy over this classification absorbs.
 //
 // Evidence semantics mirror runtimeInSync (internal/app): an absent or
-// empty table is UNKNOWN, not regression (sparse heartbeats carry no
-// vap_table and the record keeps the last observed one); SSID presence is
-// the proof bar, not per-radio placement — re-arming must not false-fire
-// on a band detail. The applied snapshot is re-read from extra (not the
+// empty table is UNKNOWN, not regression. That neutrality is real, not a
+// defensive default: vap_table is in NO trust class, so Absorb's wholesale
+// Extra swap (store trustpolicy.go) REPLACES the record's table with the
+// inform body's — a body that omits vap_table DROPS it, there is no "the
+// record keeps the last observed one" to fall back on. A sparse heartbeat
+// therefore genuinely carries no table at all (unknown is the exact truth),
+// and a device that keeps reporting an empty table can never be misread as
+// regression evidence. The applied snapshot is re-read from extra (not the
 // typed load) because settle() may have promoted it in this same decision.
+// SSID presence remains the proof bar, not per-radio placement — re-arming
+// must not false-fire on a band detail.
 func (st *wlanCfgState) notRunningEvidence() notRunningClass {
 	vaps, ok := st.extra["vap_table"].([]any)
 	if !ok || len(vaps) == 0 {
@@ -337,6 +376,63 @@ func (st *wlanCfgState) recordNotRunningMiss() int {
 func (st *wlanCfgState) clearNotRunningMisses() {
 	st.notRunningMisses = 0
 	delete(st.extra, "wlan_cfg_not_running_misses")
+}
+
+// recordVapNotRunningMiss increments the consecutive devname-level miss
+// counter (wlan_cfg_vap_not_running_misses) and returns the new count. The
+// write-through shape mirrors recordNotRunningMiss exactly: the typed load
+// value increments and lands in the same extra map every bookkeeping write
+// uses, so it persists through the adapter's wholesale Extra assignment and
+// survives later sparse heartbeats via the store trust policy's admin-owned
+// prev-or-delete class.
+func (st *wlanCfgState) recordVapNotRunningMiss() int {
+	st.vapNotRunningMisses++
+	st.extra["wlan_cfg_vap_not_running_misses"] = st.vapNotRunningMisses
+	return st.vapNotRunningMisses
+}
+
+// clearVapNotRunningMisses resets the devname-level miss counter. Zero is
+// stored as an absent key, mirroring clearNotRunningMisses (no idle noise in
+// the persisted record).
+func (st *wlanCfgState) clearVapNotRunningMisses() {
+	st.vapNotRunningMisses = 0
+	delete(st.extra, "wlan_cfg_vap_not_running_misses")
+}
+
+// setMaterializationRebootArmed stamps the one-shot arm marker:
+// the engine has armed FlagRebootOnConnect to materialize THIS
+// config version's vaps (the devname watchdog miss#2 fire), and while the
+// marker stands for the same cfgversion the arming must never repeat — the
+// capacity case (a vap that can never materialize on this record) reads as
+// a permanent, view-visible gap instead of a silent reboot loop. The row is
+// an ADMIN-owned trust row (prev-or-delete — a device body can neither
+// introduce nor forge the marker, the blocked_sta_sha shape), a JSONMap
+// under the single key ("cfgversion"), the same stored-row shape as the
+// §6.3 task (store.ArmCmdTask) — clone-serialized with the rest of the
+// record's Extra.
+func setMaterializationRebootArmed(extra store.JSONMap, cfgversion string) {
+	extra["wlan_cfg_materialization_reboot"] = store.JSONMap{"cfgversion": cfgversion}
+}
+
+// materializationRebootArmedFor reads the arm marker back: the cfgversion it
+// was armed for and whether it stands at all. (json round-trips through a
+// map[string]any, so both concrete map shapes are accepted — same tolerance
+// ArmedCmdTask uses for the stored task row.)
+func materializationRebootArmedFor(extra store.JSONMap) (string, bool) {
+	var row map[string]any
+	switch t := extra["wlan_cfg_materialization_reboot"].(type) {
+	case store.JSONMap:
+		row = t
+	case map[string]any:
+		row = t
+	default:
+		return "", false
+	}
+	cv, _ := row["cfgversion"].(string)
+	if cv == "" {
+		return "", false
+	}
+	return cv, true
 }
 
 // retryDue rate-limits the unchanged pending WLAN delivery: a bounded

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/lucavb/open-unifi/internal/store"
 )
@@ -311,6 +312,52 @@ func PlanProvisioning(d store.Device, wls []Wlan) ProvisioningPlan {
 		Radios:     radios,
 		Placements: vapPlacements(vaps),
 	}
+}
+
+// MissingVaps returns the devnames ("ath<N>") of planned, enabled vaps that
+// are not reported RUN in the device vap_table. vapTable is the raw vap_table
+// value (the []any from the record Extra, passed through verbatim); absent or
+// empty is UNKNOWN — the devices that have never reported a table this inform
+// carry no negative evidence — so nil with zero rows. The state extraction
+// replicates notRunningEvidence's compare exactly (primary `state`, `status`
+// fallback, EqualFold "RUN") so the SSID-level and devname-level views can
+// never disagree about one row. The devname key is `name`, not `devname` —
+// vap rows key the devname by `name` (firmware-verified, mcad
+// FUN_0041cecc; corroborated by the live 2026-09-26 inform log — the same
+// statement as settle's wire-keys comment in the adoption wlanstate and the
+// dead-code note in PlanVaps above). The result is sorted for
+// deterministic display and equality in tests and the admin view.
+func MissingVaps(vaps []VapPlan, vapTable any) []string {
+	rawList, ok := vapTable.([]any)
+	if !ok || len(rawList) == 0 {
+		return nil
+	}
+	need := map[string]bool{}
+	for _, v := range vaps {
+		if !v.Wlan.Enabled {
+			continue // PlanVaps already drops disabled WLANs; belt and braces
+		}
+		need["ath"+strconv.Itoa(v.AthN)] = true
+	}
+	if len(need) == 0 {
+		return nil
+	}
+	for _, raw := range rawList {
+		m, ok := raw.(map[string]any)
+		if !ok || !strings.EqualFold(JSONStr(m, "state", JSONStr(m, "status", "")), "RUN") {
+			continue
+		}
+		delete(need, JSONStr(m, "name", ""))
+	}
+	if len(need) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(need))
+	for name := range need {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // vapPlacements records the intended SSID-to-radio placements from the vap

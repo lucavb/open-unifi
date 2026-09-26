@@ -1389,6 +1389,24 @@ WLAN-count changes — the official controller presumably reboots;
 ours is less disruptive but leaves the vap set partial until the
 next boot.
 
+> **2026-09-26 — design-consideration closure (materialization auto-reboot):**
+> the engine now watches the vap set at DEVNAME level, not SSID level: a
+> planned vap whose devname (`ath<N>`, from the plan) sits absent/not-RUN
+> across two consecutive settled informs — while every applied SSID still
+> proves RUN somewhere, the shape the SSID watchdog cannot see — arms a
+> ONE-SHOT §6.5 reboot per cfgversion (`reboot_on_connect` +
+> `wlan_cfg_materialization_reboot` marker; a stale marker retires when a
+> new config settles; a same-cfgversion repeat of the gap never re-arms
+> while the marker stands — and a RUN proof retires the marker live, so a
+> later regression under the same cfgversion arms a fresh budget, each arm
+> separated by a delivered reboot and a genuine RUN proof). The gap is
+> surfaced as
+> `vaps_not_running` in the admin device view. Live data point: the
+> 2026-09-26 production incident — the 2.4 GHz guest WLAN (4th 2.4 vap,
+> `ath3`) sat configured-not-running after a post-boot push, silent under
+> the SSID-level watchdog, until a controller-armed §6.5 reboot
+> materialized it (hostapd ath3 running, 4/4 2.4 BSS on U7PG2 confirmed).
+
 **4a — baseline restore and end state:** full-shape PUT back to
 `openunifi-gate-check`/`…20260919` → one setparam push (22:53:04) →
 cfg echo `d49be04e0effe28f` under a second later, confirmed; the

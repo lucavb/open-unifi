@@ -240,3 +240,77 @@ func TestPlanProvisioningAgreement(t *testing.T) {
 		}
 	}
 }
+
+// TestMissingVapsEvidenceSemantics pins the devname-level watchdog's evidence
+// reader (the same proof bar the engine's notRunningEvidence applies at SSID
+// level): absent/empty tables are unknown (nil — no positive gap), a
+// non-RUN row for a planned devname is a miss, the legacy `status` spelling
+// and EqualFold "RUN" case stay honored, non-map rows are skipped, disabled
+// WLANs cannot arm anything, and the result comes out sorted.
+func TestMissingVapsEvidenceSemantics(t *testing.T) {
+	plan := func(aths ...int) []VapPlan {
+		vaps := make([]VapPlan, len(aths))
+		for i, a := range aths {
+			vaps[i] = VapPlan{Wlan: Wlan{Enabled: true}, AthN: a}
+		}
+		return vaps
+	}
+	run := map[string]any{"name": "ath0", "state": "RUN"}
+	init := map[string]any{"name": "ath0", "state": "INIT"}
+	legacy := map[string]any{"name": "ath0", "status": "RUN"}
+	lower := map[string]any{"name": "ath0", "state": "run"}
+
+	tests := []struct {
+		name     string
+		vaps     []VapPlan
+		vapTable any
+		want     []string
+	}{
+		{"absent table is unknown", plan(0), nil, nil},
+		{"present but non-slice table is unknown", plan(0), "nope", nil},
+		{"empty table is unknown", plan(0), []any{}, nil},
+		{"planned devname not RUN is a miss", plan(0), []any{init}, []string{"ath0"}},
+		{"row with no devname key cannot clear the miss", plan(0), []any{map[string]any{"state": "RUN"}}, []string{"ath0"}},
+		{"legacy status spelling is honored", plan(0), []any{legacy}, nil},
+		{"lowercase run proves running", plan(0), []any{lower}, nil},
+		{"non-map row is skipped", plan(0), []any{"garbage", init}, []string{"ath0"}},
+		{"unplanned devnames are ignored", plan(0), []any{map[string]any{"name": "ath9", "state": "INIT"}}, []string{"ath0"}},
+		{"one RUN + one not-RUN row", plan(0, 1), []any{run, init}, []string{"ath1"}},
+		{"both missing, sorted output (plan order [1,0])", plan(1, 0), []any{map[string]any{"name": "ath1", "state": "INIT"}, init}, []string{"ath0", "ath1"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := MissingVaps(tt.vaps, tt.vapTable); !equalStrs(got, tt.want) {
+				t.Fatalf("MissingVaps = %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	// A plan of only disabled WLANs contributes no devnames — nothing to
+	// arm on, whatever the table carries.
+	disabled := []VapPlan{{Wlan: Wlan{Enabled: false}, AthN: 0}}
+	if got := MissingVaps(disabled, run); got != nil {
+		t.Fatalf("disabled-only plan MissingVaps = %v, want nil", got)
+	}
+	if got := MissingVaps(disabled, nil); got != nil {
+		t.Fatalf("disabled-only plan absent table = %v, want nil", got)
+	}
+}
+
+// equalStrs compares two devname lists (nil and empty compare equal —
+// safe here because MissingVaps only ever returns nil for the unknown
+// cases, never a non-nil empty slice).
+func equalStrs(a, b []string) bool {
+	if len(a) == 0 && len(b) == 0 {
+		return true
+	}
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

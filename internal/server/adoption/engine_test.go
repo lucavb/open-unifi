@@ -1470,3 +1470,562 @@ func TestEnvelopeDriftDeliveryIsBounded(t *testing.T) {
 		t.Fatalf("new delivery attempts = %v, want a fresh budget of 1", dev.Extra["wlan_cfg_attempts"])
 	}
 }
+
+// ---- devname-level materialization watchdog (2026-09-26) --------------------
+//
+// The SSID watchdog above cannot see the split-band materialization gap: a
+// band=both WLAN whose 4th 2.4GHz vap (ath3) never materialized still reads
+// nrRun (the SSID appears RUN on the radio where it DID materialize). The
+// vapMaterializationHarness builds that shape: one band=both WLAN over two
+// radios, so the plan has two vaps (ath0 on the ng radio, ath1 on the na
+// radio) and a vap_table row for ath0 alone proves the SSID while ath1 is
+// devname-missing.
+
+// vapMaterializationHarness: the settled-state fixture family of
+// notRunningHarness, plus the radio_table the plan needs. partialTable
+// proves the planned SSID RUN on ath0 and hides ath1; runningTable proves
+// both planned devnames RUN.
+func vapMaterializationHarness(t *testing.T) (e *Engine, fixture func(vaps any) store.Device, partialTable, runningTable []any) {
+	t.Helper()
+	env := []wireless.Wlan{{Name: "guest", SSID: "guest-net", Security: "wpa-p", Passphrase: "pw", VLAN: 2, Enabled: true}}
+	counter := 0
+	e = New(Deps{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Random: func() float64 { return 0.5 },
+		KeyChars: func(n int) (string, error) {
+			counter++
+			s := strconv.FormatInt(int64(counter), 16)
+			return strings.Repeat("0", n-len(s)) + s, nil
+		},
+		Wireless: func(store.Device) []wireless.Wlan { return env },
+		SystemCfg: func(context.Context, store.Device, []wireless.Wlan, wireless.ProvisioningPlan) (string, map[string]string, error) {
+			return "sys\n", nil, nil
+		},
+	})
+	snap, err := json.Marshal(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	radios := []any{
+		map[string]any{"name": "ra0", "radio": "ng"},
+		map[string]any{"name": "ra1", "radio": "na"},
+	}
+	const k = "11112222333344445555666677778888"
+	partialTable = []any{map[string]any{"essid": "guest-net", "state": "RUN", "radio_name": "ra0", "name": "ath0"}}
+	runningTable = []any{
+		map[string]any{"essid": "guest-net", "state": "RUN", "radio_name": "ra0", "name": "ath0"},
+		map[string]any{"essid": "guest-net", "state": "RUN", "radio_name": "ra1", "name": "ath1"},
+	}
+	fixture = func(vaps any) store.Device {
+		return store.Device{
+			MAC: engineMAC, State: store.StateAdopted,
+			CfgVersion: "aaaa", AppliedCfg: "aaaa",
+			XAuthkey: k, Authkeys: []string{k}, Model: "U7PG2",
+			Extra: store.JSONMap{
+				"wlan_cfg_sha":           wireless.WlanListHash(env),
+				"wlan_cfg_applied_wlans": string(snap),
+				"radio_table":            radios,
+				"vap_table":              vaps,
+			},
+		}
+	}
+	return e, fixture, partialTable, runningTable
+}
+
+// vapMissCounter reads the devname-level miss counter out of an outcome
+// Extra (int in-process, float64 after a JSON round-trip) — the
+// missCounter twin for the wlan_cfg_vap_not_running_misses key.
+func vapMissCounter(extra store.JSONMap) (int, bool) {
+	v, ok := extra["wlan_cfg_vap_not_running_misses"]
+	if !ok {
+		return 0, false
+	}
+	switch n := v.(type) {
+	case int:
+		return n, true
+	case float64:
+		return int(n), true
+	}
+	return 0, false
+}
+
+// Split-band materialization gap (2026-09-26 production incident): a
+// planned band=both vap (ath1 here, the incident's 4th 2.4GHz ath3) sits
+// configured-not-running after a post-boot push while every applied SSID
+// still proves RUN somewhere — invisible to the SSID watchdog. Two
+// consecutive devname misses arm the ONE-SHOT materialization reboot: the
+// arming inform stays a plain noop, the next inform emits the §6.5 reboot,
+// and the arm is stamped with the cfgversion so the same version can never
+// arm twice.
+func TestVapMaterializationGapArmsOneShotReboot(t *testing.T) {
+	e, fixture, partialTable, _ := vapMaterializationHarness(t)
+	decide := func(dev store.Device, now int64) Outcome {
+		t.Helper()
+		out, err := e.Decide(Request{
+			Transport: TransportEncrypted, Device: dev,
+			Body: engineBody("aaaa"), UsedKey: dev.XAuthkey,
+			Now: time.Unix(now, 0),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	// Miss#1: recorded, not fired — the boot-race grace shape.
+	dev := fixture(partialTable)
+	out := decide(dev, 1000)
+	if out.Kind != KindNoop || out.SetCfgVersion {
+		t.Fatalf("devname miss#1 = %+v, want plain connected noop (grace)", out)
+	}
+	if n, ok := vapMissCounter(out.Extra); !ok || n != 1 {
+		t.Fatalf("devname miss#1 counter = %v/%v, want 1", n, ok)
+	}
+	if truthy(out.Extra[FlagRebootOnConnect]) {
+		t.Fatalf("miss#1 armed the reboot flag: %+v", out.Extra[FlagRebootOnConnect])
+	}
+	if _, armed := materializationRebootArmedFor(out.Extra); armed {
+		t.Fatalf("miss#1 stamped the arm marker: %+v", out.Extra)
+	}
+
+	// Miss#2 (consecutive): ARM — flag set, marker stamped with the
+	// current cfgversion, counter cleared, and the response stays the
+	// plain connected noop (the emission itself is the NEXT inform).
+	applyDeltas(&dev, out)
+	dev.Extra["vap_table"] = partialTable
+	out = decide(dev, 1010)
+	if out.Kind != KindNoop || out.SetCfgVersion {
+		t.Fatalf("devname miss#2 = %+v, want plain connected noop with the arm carried in Extra", out)
+	}
+	if !truthy(out.Extra[FlagRebootOnConnect]) {
+		t.Fatalf("miss#2 did not arm the reboot flag: %+v", out.Extra)
+	}
+	if cv, armed := materializationRebootArmedFor(out.Extra); !armed || cv != "aaaa" {
+		t.Fatalf("miss#2 arm marker = %q/%v, want the current cfgversion aaaa", cv, armed)
+	}
+	if _, ok := vapMissCounter(out.Extra); ok {
+		t.Fatalf("miss#2 left the counter armed with the flag: %v", out.Extra["wlan_cfg_vap_not_running_misses"])
+	}
+
+	// The armed inform EMITS the §6.5 reboot and consumes the flag.
+	applyDeltas(&dev, out)
+	out = decide(dev, 1020)
+	if out.Kind != KindReboot {
+		t.Fatalf("armed inform = %+v, want reboot", out)
+	}
+	if truthy(out.Extra[FlagRebootOnConnect]) {
+		t.Fatalf("reboot emission did not consume the flag: %v", out.Extra[FlagRebootOnConnect])
+	}
+	applyDeltas(&dev, out)
+	if truthy(dev.Extra[FlagRebootOnConnect]) {
+		t.Fatalf("reboot emission did not consume the flag: %v", dev.Extra[FlagRebootOnConnect])
+	}
+	if _, ok := dev.Extra["wlan_cfg_vap_not_running_misses"]; ok {
+		t.Fatalf("reboot emission left the devname window armed: %v", dev.Extra["wlan_cfg_vap_not_running_misses"])
+	}
+}
+
+// One-shot guard: with the arm marker standing for the CURRENT cfgversion
+// and the devname still missing after the reboot, the watchdog must never
+// re-arm (a devname this record cannot materialize — the capacity case —
+// would reboot-loop forever). The counter is cleared and the gap stays
+// view-visible instead.
+func TestVapMaterializationRebootDoesNotRepeat(t *testing.T) {
+	e, fixture, partialTable, _ := vapMaterializationHarness(t)
+	decide := func(dev store.Device, now int64) Outcome {
+		t.Helper()
+		out, err := e.Decide(Request{
+			Transport: TransportEncrypted, Device: dev,
+			Body: engineBody("aaaa"), UsedKey: dev.XAuthkey,
+			Now: time.Unix(now, 0),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	dev := fixture(partialTable)
+	setMaterializationRebootArmed(dev.Extra, "aaaa") // marker stands, counter absent (cleared at emission)
+	out := decide(dev, 1000)
+	if out.Kind != KindNoop || out.SetCfgVersion {
+		t.Fatalf("post-reboot inform = %+v, want plain connected noop", out)
+	}
+	if truthy(out.Extra[FlagRebootOnConnect]) {
+		t.Fatalf("post-reboot inform re-armed the reboot: %+v", out.Extra)
+	}
+	if _, ok := vapMissCounter(out.Extra); ok {
+		t.Fatalf("post-reboot inform re-armed the miss window: %v", out.Extra["wlan_cfg_vap_not_running_misses"])
+	}
+}
+
+// RUN proof at the devname level resets everything: counter cleared, arm
+// marker retired, and no arm ever fires.
+func TestVapMaterializationRunProofResets(t *testing.T) {
+	e, fixture, partialTable, runningTable := vapMaterializationHarness(t)
+	decide := func(dev store.Device, now int64) Outcome {
+		t.Helper()
+		out, err := e.Decide(Request{
+			Transport: TransportEncrypted, Device: dev,
+			Body: engineBody("aaaa"), UsedKey: dev.XAuthkey,
+			Now: time.Unix(now, 0),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	dev := fixture(partialTable)
+	out := decide(dev, 1000) // miss#1 arms the counter
+	if n, ok := vapMissCounter(out.Extra); !ok || n != 1 {
+		t.Fatalf("pre-proof counter = %v/%v, want 1", n, ok)
+	}
+	setMaterializationRebootArmed(dev.Extra, "aaaa") // a marker standing for the current config
+	// The gap resolved: every planned devname is RUN.
+	applyDeltas(&dev, out)
+	dev.Extra["vap_table"] = runningTable
+	out = decide(dev, 1010)
+	if out.Kind != KindNoop || out.SetCfgVersion {
+		t.Fatalf("RUN-proof inform = %+v, want plain connected noop", out)
+	}
+	if _, ok := vapMissCounter(out.Extra); ok {
+		t.Fatalf("RUN proof left the counter armed: %v", out.Extra["wlan_cfg_vap_not_running_misses"])
+	}
+	if _, armed := materializationRebootArmedFor(out.Extra); armed {
+		t.Fatalf("RUN proof left the arm marker standing: %+v", out.Extra)
+	}
+	if truthy(out.Extra[FlagRebootOnConnect]) {
+		t.Fatalf("RUN proof armed the reboot flag: %+v", out.Extra)
+	}
+}
+
+// Sparse heartbeats stay neutral at the devname level, exactly like the
+// SSID window: an absent or empty vap_table neither increments nor resets
+// the counter and never arms.
+func TestVapMaterializationSparseHeartbeatNeutral(t *testing.T) {
+	e, fixture, partialTable, _ := vapMaterializationHarness(t)
+	decide := func(dev store.Device, now int64) Outcome {
+		t.Helper()
+		out, err := e.Decide(Request{
+			Transport: TransportEncrypted, Device: dev,
+			Body: engineBody("aaaa"), UsedKey: dev.XAuthkey,
+			Now: time.Unix(now, 0),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	dev := fixture(partialTable)
+	out := decide(dev, 1000)
+	if n, ok := vapMissCounter(out.Extra); !ok || n != 1 {
+		t.Fatalf("miss#1 counter = %v/%v, want 1", n, ok)
+	}
+
+	// Absent table: unknown — no increment, no reset, no arm.
+	applyDeltas(&dev, out)
+	delete(dev.Extra, "vap_table")
+	out = decide(dev, 1010)
+	if out.Kind != KindNoop || out.SetCfgVersion {
+		t.Fatalf("sparse-absent outcome = %+v, want plain connected noop", out)
+	}
+	if n, ok := vapMissCounter(out.Extra); !ok || n != 1 {
+		t.Fatalf("sparse-absent counter = %v/%v, want kept 1", n, ok)
+	}
+	if truthy(out.Extra[FlagRebootOnConnect]) {
+		t.Fatalf("sparse heartbeat armed the reboot: %+v", out.Extra)
+	}
+
+	// Empty table: same neutrality.
+	applyDeltas(&dev, out)
+	dev.Extra["vap_table"] = []any{}
+	out = decide(dev, 1020)
+	if out.Kind != KindNoop || out.SetCfgVersion {
+		t.Fatalf("sparse-empty outcome = %+v, want plain connected noop", out)
+	}
+	if n, ok := vapMissCounter(out.Extra); !ok || n != 1 {
+		t.Fatalf("sparse-empty counter = %v/%v, want kept 1", n, ok)
+	}
+
+	// The chain is intact: the next full proof is the second consecutive
+	// miss and arms.
+	applyDeltas(&dev, out)
+	dev.Extra["vap_table"] = partialTable
+	out = decide(dev, 1030)
+	if !truthy(out.Extra[FlagRebootOnConnect]) {
+		t.Fatalf("post-sparse miss#2 did not arm: %+v", out.Extra)
+	}
+}
+
+// The §6.5 reboot emission opens a fresh window for the devname-level
+// counter too (the same lifecycle-boundary rule the SSID counter carries),
+// while the ONE-SHOT ARM MARKER deliberately survives the emission: the
+// watchdog's do-not-repeat rule ("never re-arm while the marker stands for
+// the same cfgversion") is what the post-reboot capacity case leans on,
+// mirroring the baseline-survival pin in lifecycle_test.go (the §6.5
+// emission keeps wlan_cfg_sha). Whether the marker is later consumed is
+// the watchdog's own bookkeeping (RUN proof / settle), not the emission's.
+func TestVapEmissionClearsVapNotRunningWindow(t *testing.T) {
+	e := newTestEngine(t)
+	dev := settledLifecycleDevice()
+	dev.Extra[FlagRebootOnConnect] = true
+	dev.Extra["wlan_cfg_vap_not_running_misses"] = 1
+	setMaterializationRebootArmed(dev.Extra, dev.CfgVersion)
+
+	out, err := e.Decide(Request{
+		Transport: TransportEncrypted, Device: dev,
+		Body: engineBody(dev.CfgVersion), UsedKey: lifecycleKey, Now: time.Unix(1000, 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Kind != KindReboot {
+		t.Fatalf("kind = %v, want reboot", out.Kind)
+	}
+	applyDeltas(&dev, out)
+	for _, k := range []string{"wlan_cfg_not_running_misses", "wlan_cfg_vap_not_running_misses"} {
+		if _, ok := dev.Extra[k]; ok {
+			t.Fatalf("reboot emission left %s armed: %v", k, dev.Extra[k])
+		}
+	}
+	if cv, armed := materializationRebootArmedFor(dev.Extra); !armed || cv != dev.CfgVersion {
+		t.Fatalf("reboot emission disturbed the arm marker: %q/%v, want standing for %q", cv, armed, dev.CfgVersion)
+	}
+}
+
+// A NEW config settling retires the arm marker that was stamped for the
+// PREVIOUS cfgversion (fresh one-shot budget for the new config); a marker
+// for the CURRENT cfgversion stands until a RUN proof retires it.
+func TestSettleRetiresStaleMaterializationMarker(t *testing.T) {
+	env := []wireless.Wlan{{Name: "guest", SSID: "guest-net", Security: "wpa-p", Passphrase: "pw", VLAN: 2, Enabled: true}}
+	snap, err := json.Marshal(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runTable := []any{
+		map[string]any{"essid": "guest-net", "state": "RUN", "radio_name": "ra0", "name": "ath0"},
+		map[string]any{"essid": "guest-net", "state": "RUN", "radio_name": "ra1", "name": "ath1"},
+	}
+	pend := func() store.JSONMap {
+		return store.JSONMap{
+			"wlan_cfg_pending_sha":        "pending-hash",
+			"wlan_cfg_pending_wlans":      string(snap),
+			"wlan_cfg_pending_placements": "{}",
+			"vap_table":                   runTable,
+		}
+	}
+
+	// Stale marker (armed for the previous config) → deleted on settle.
+	extra := pend()
+	setMaterializationRebootArmed(extra, "old-aaaa")
+	st := loadWlanCfgState(extra)
+	st.settle("current-bbbb")
+	if sha, _ := extra["wlan_cfg_sha"].(string); sha != "pending-hash" {
+		t.Fatalf("settle did not promote the baseline: %v", extra["wlan_cfg_sha"])
+	}
+	if _, armed := materializationRebootArmedFor(extra); armed {
+		t.Fatalf("settle kept the stale arm marker: %v", extra["wlan_cfg_materialization_reboot"])
+	}
+
+	// Marker of the CURRENT cfgversion → kept.
+	extra = pend()
+	setMaterializationRebootArmed(extra, "current-bbbb")
+	st = loadWlanCfgState(extra)
+	st.settle("current-bbbb")
+	if _, armed := materializationRebootArmedFor(extra); !armed {
+		t.Fatalf("settle deleted the current-config arm marker: %v", extra)
+	}
+}
+
+// A pending WLAN delivery SUPPRESSES the devname watchdog: with a real
+// pending sha (the non-empty string applyProvisioning writes) matching the
+// live envelope and the unchanged-envelope retry NOT yet due, the inform is
+// a noop-pending-wlan before any watchdog runs — no devname miss is
+// recorded, nothing arms. The placements map deliberately carries ONLY the
+// ra1 row, which the harness's partialTable (ath0 RUN at ra0) cannot
+// satisfy: with the literal two-row map the ath0 RUN row would
+// decrement the SSID need to zero and settle would CONFIRM the delivery on
+// this very table — settle re-reads only the SSID need counter, never the
+// leftover placement counts — voiding the pending shape. The retry clock
+// (wlan_cfg_last_attempt = the decide time) keeps the re-offer from
+// diverting the outcome into a setparam.
+func TestVapMaterializationPendingGatedByPendingSHA(t *testing.T) {
+	e, fixture, partialTable, _ := vapMaterializationHarness(t)
+	env := []wireless.Wlan{{Name: "guest", SSID: "guest-net", Security: "wpa-p", Passphrase: "pw", VLAN: 2, Enabled: true}}
+
+	dev := fixture(partialTable)
+	// NOTE(\u0000): JSON has no \xNN escape — the NUL in the placement key
+	// (SSID \x00 radio, the shape vapPlacements builds) is spelled \u0000.
+	pending := map[string]any{
+		"wlan_cfg_pending_sha":        wireless.WlanListHash(env),
+		"wlan_cfg_pending_wlans":      dev.Extra["wlan_cfg_applied_wlans"],
+		"wlan_cfg_pending_placements": `{"guest-net\u0000ra1":1}`,
+		"wlan_cfg_attempts":           1,
+		"wlan_cfg_last_attempt":       int64(1000), // retry not due at the decide time
+	}
+	for k, v := range pending {
+		dev.Extra[k] = v
+	}
+	decide := func(dev store.Device, now int64) Outcome {
+		t.Helper()
+		out, err := e.Decide(Request{
+			Transport: TransportEncrypted, Device: dev,
+			Body: engineBody("aaaa"), UsedKey: dev.XAuthkey,
+			Now: time.Unix(now, 0),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	// Inform #1: the pending operation holds the decision —
+	// noop-pending-wlan, and the devname watchdog saw nothing at all.
+	out := decide(dev, 1000)
+	if out.Kind != KindNoopPendingWLAN {
+		t.Fatalf("pending-shape inform = %+v, want noop-pending-wlan", out)
+	}
+	if _, ok := out.Extra["wlan_cfg_vap_not_running_misses"]; ok {
+		t.Fatalf("the pending gate let the devname watchdog record a miss: %+v", out.Extra)
+	}
+	if truthy(out.Extra[FlagRebootOnConnect]) {
+		t.Fatalf("the pending gate armed the reboot: %+v", out.Extra)
+	}
+
+	// Inform #2 (same clock: the unchanged-envelope retry is still not
+	// due): held again — still nothing recorded, still nothing armed.
+	applyDeltas(&dev, out)
+	out = decide(dev, 1001)
+	if out.Kind != KindNoopPendingWLAN {
+		t.Fatalf("second pending-shape inform = %+v, want noop-pending-wlan (retry still not due)", out)
+	}
+	if _, ok := out.Extra["wlan_cfg_vap_not_running_misses"]; ok || truthy(out.Extra[FlagRebootOnConnect]) {
+		t.Fatalf("second pending inform disturbed the devname watchdog: %+v", out.Extra)
+	}
+}
+
+// A stale arm marker does NOT suppress a fresh watchdog budget: a marker
+// stamped for the PREVIOUS cfgversion stands only until a NEW config
+// settles (st.settle) — and even then, the default arm reads it as
+// not-for-us before settle ever gets involved. With the record already on
+// cfgversion bbbb, miss#1 is recorded (not held by the stale marker) and
+// the second consecutive miss arms AND re-stamps the marker for the
+// CURRENT config version.
+func TestVapMaterializationStaleMarkerFreshBudget(t *testing.T) {
+	e, fixture, partialTable, _ := vapMaterializationHarness(t)
+	decide := func(dev store.Device, now int64) Outcome {
+		t.Helper()
+		out, err := e.Decide(Request{
+			Transport: TransportEncrypted, Device: dev,
+			Body: engineBody("bbbb"), UsedKey: dev.XAuthkey,
+			Now: time.Unix(now, 0),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	dev := fixture(partialTable)
+	dev.CfgVersion = "bbbb"
+	dev.AppliedCfg = "bbbb"
+	setMaterializationRebootArmed(dev.Extra, "old-aaaa")
+
+	// Miss#1 on the new config: the stale marker does not suppress it.
+	out := decide(dev, 1000)
+	if out.Kind != KindNoop || out.SetCfgVersion {
+		t.Fatalf("stale-marker miss#1 = %+v, want plain connected noop (fresh budget)", out)
+	}
+	if n, ok := vapMissCounter(out.Extra); !ok || n != 1 {
+		t.Fatalf("stale-marker miss#1 counter = %v/%v, want recorded 1", n, ok)
+	}
+	if truthy(out.Extra[FlagRebootOnConnect]) {
+		t.Fatalf("stale-marker miss#1 armed the reboot: %+v", out.Extra)
+	}
+
+	// Miss#2: the arm fires and re-stamps the marker for the CURRENT
+	// cfgversion (bbbb erases the stale old-aaaa stamp).
+	applyDeltas(&dev, out)
+	dev.Extra["vap_table"] = partialTable
+	out = decide(dev, 1010)
+	if !truthy(out.Extra[FlagRebootOnConnect]) {
+		t.Fatalf("stale-marker miss#2 did not arm: %+v", out.Extra)
+	}
+	if cv, armed := materializationRebootArmedFor(out.Extra); !armed || cv != "bbbb" {
+		t.Fatalf("re-stamped marker = %q/%v, want the current cfgversion bbbb", cv, armed)
+	}
+}
+
+// The nrRun gate keeps the two watchdogs from double-firing on the same
+// regression: an ALL-INIT table positively disproves the applied SSID set,
+// so the SSID watchdog owns the inform — its counter moves, the devname
+// watchdog stays completely out (no devname counter, no arm).
+func TestVapMaterializationNRRunGateKeepsDevnameWatchdogIdle(t *testing.T) {
+	e, fixture, _, _ := vapMaterializationHarness(t)
+	decide := func(dev store.Device, now int64) Outcome {
+		t.Helper()
+		out, err := e.Decide(Request{
+			Transport: TransportEncrypted, Device: dev,
+			Body: engineBody("aaaa"), UsedKey: dev.XAuthkey,
+			Now: time.Unix(now, 0),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	allInit := []any{map[string]any{"essid": "guest-net", "state": "INIT", "radio_name": "ra0", "name": "ath0"}}
+	dev := fixture(allInit)
+	out := decide(dev, 1000)
+	if out.Kind != KindNoop || out.SetCfgVersion {
+		t.Fatalf("all-INIT miss#1 = %+v, want plain connected noop (SSID grace)", out)
+	}
+	if n, ok := missCounter(out.Extra); !ok || n != 1 {
+		t.Fatalf("SSID counter = %v/%v, want recorded 1 (the SSID watchdog owns this inform)", n, ok)
+	}
+	if _, ok := out.Extra["wlan_cfg_vap_not_running_misses"]; ok {
+		t.Fatalf("the nrRun gate let the devname watchdog run on an nrMiss inform: %+v", out.Extra)
+	}
+	if truthy(out.Extra[FlagRebootOnConnect]) {
+		t.Fatalf("the nrRun gate armed the reboot flag: %+v", out.Extra)
+	}
+}
+
+// The devname proof is STATE-aware, not presence-aware: an ath1 row that IS
+// present but carries state INIT is still missing at the bar (EqualFold
+// state, "RUN") — the SSID evidence stays nrRun via the RUN ath0 row, so
+// the devname watchdog runs and records miss#1. Every existing fixture
+// models this shape with an absent row; pinning it as a PRESENT non-RUN row
+// kills a presence-only (state-blind) implementation.
+func TestVapMaterializationPresentButNotRUNIsAMiss(t *testing.T) {
+	e, fixture, partialTable, _ := vapMaterializationHarness(t)
+	decide := func(dev store.Device, now int64) Outcome {
+		t.Helper()
+		out, err := e.Decide(Request{
+			Transport: TransportEncrypted, Device: dev,
+			Body: engineBody("aaaa"), UsedKey: dev.XAuthkey,
+			Now: time.Unix(now, 0),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	rows := append(append([]any{}, partialTable...),
+		map[string]any{"essid": "guest-net", "state": "INIT", "radio_name": "ra1", "name": "ath1"})
+	dev := fixture(rows)
+	out := decide(dev, 1000)
+	if out.Kind != KindNoop || out.SetCfgVersion {
+		t.Fatalf("INIT-row miss#1 = %+v, want plain connected noop (grace)", out)
+	}
+	if n, ok := vapMissCounter(out.Extra); !ok || n != 1 {
+		t.Fatalf("INIT-row miss counter = %v/%v, want recorded 1", n, ok)
+	}
+	if truthy(out.Extra[FlagRebootOnConnect]) {
+		t.Fatalf("INIT-row miss#1 armed the reboot: %+v", out.Extra)
+	}
+}

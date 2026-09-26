@@ -1642,3 +1642,141 @@ func TestPatchBookkeepingRowsMintNothing(t *testing.T) {
 		t.Fatalf("bookkeeping-only save minted a cfgversion: %q", rec.CfgVersion)
 	}
 }
+
+// ---- devname-level device view (vaps_not_running) ----------------------------
+
+// TestDeviceViewVAPsNotRunning pins the GET read model's devname-level
+// runtime field: when a planned vap's devname is absent/not-RUN from the
+// record's vap_table while the SSID still proves RUN on another radio
+// (the 2026-09-26 split-band materialization gap), GET device JSON carries
+// vaps_not_running with the missing devnames; when every planned devname is
+// RUN (or the device reported no table — unknown), the field is omitted.
+func TestDeviceViewVAPsNotRunning(t *testing.T) {
+	a, st := testApp(t)
+	ctx := context.Background()
+
+	env := []wireless.Wlan{{Name: "guest", SSID: "guest-net", Security: "wpa-p", Passphrase: "pw", VLAN: 2, Enabled: true}}
+	envJSON, err := json.Marshal(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mac := "aabbccddeeff"
+	seed := func(extra store.JSONMap) {
+		t.Helper()
+		if err := st.Put(store.Device{
+			MAC: mac, State: store.StateAdopted, Model: "U7PG2",
+			CfgVersion: "aaaa", AppliedCfg: "aaaa",
+			Extra: store.JSONMap{
+				"device_wlans": string(envJSON),
+				"radio_table": []any{
+					map[string]any{"name": "ra0", "radio": "ng"},
+					map[string]any{"name": "ra1", "radio": "na"},
+				},
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		d, err := st.Get(mac)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for k, v := range extra {
+			d.Extra[k] = v
+		}
+		if err := st.Put(d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 1. Split-band gap: ath0 RUN for the SSID, ath1 missing → surfaced.
+	seed(store.JSONMap{
+		"vap_table": []any{map[string]any{"essid": "guest-net", "state": "RUN", "radio_name": "ra0", "name": "ath0"}},
+	})
+	dv, err := a.GetDevice(ctx, mac)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(dv.VAPsNotRunning, []string{"ath1"}) {
+		t.Fatalf("view vaps_not_running = %v, want [ath1]", dv.VAPsNotRunning)
+	}
+	body, err := json.Marshal(dv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `"vaps_not_running":["ath1"]`) {
+		t.Fatalf("GET device JSON missing the field: %s", body)
+	}
+	if dv.InSync == nil || !*dv.InSync {
+		t.Fatalf("in_sync with SSID RUN present = %v, want true (the gap is devname-invisible to the SSID bar, by design)", dv.InSync)
+	}
+
+	// 2. All planned devnames RUN → field omitted from the JSON.
+	rec, err := st.Get(mac)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.Extra["vap_table"] = []any{
+		map[string]any{"essid": "guest-net", "state": "RUN", "radio_name": "ra0", "name": "ath0"},
+		map[string]any{"essid": "guest-net", "state": "RUN", "radio_name": "ra1", "name": "ath1"},
+	}
+	if err := st.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	dv, err = a.GetDevice(ctx, mac)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dv.VAPsNotRunning != nil {
+		t.Fatalf("all-RUN vaps_not_running = %v, want nil", dv.VAPsNotRunning)
+	}
+	body, err = json.Marshal(dv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "vaps_not_running") {
+		t.Fatalf("all-RUN GET device JSON carries the field: %s", body)
+	}
+
+	// 3. Sparse heartbeat (no vap_table at all) → unknown, field omitted.
+	rec, err = st.Get(mac)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delete(rec.Extra, "vap_table")
+	if err := st.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	dv, err = a.GetDevice(ctx, mac)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dv.VAPsNotRunning != nil {
+		t.Fatalf("absent-table vaps_not_running = %v, want nil (unknown is never a positive gap)", dv.VAPsNotRunning)
+	}
+
+	// 4. Present-but-EMPTY table → a DIFFERENT branch from absent: the
+	// value passes the type assert and hits len==0, still unknown from the
+	// view's side (the engine's nrRun gate screens the empty table off, so
+	// the view is the only reachable call site for this branch).
+	rec, err = st.Get(mac)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.Extra["vap_table"] = []any{}
+	if err := st.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	dv, err = a.GetDevice(ctx, mac)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dv.VAPsNotRunning != nil {
+		t.Fatalf("empty-table vaps_not_running = %v, want nil (unknown is never a positive gap)", dv.VAPsNotRunning)
+	}
+	body, err = json.Marshal(dv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "vaps_not_running") {
+		t.Fatalf("empty-table GET device JSON carries the field: %s", body)
+	}
+}

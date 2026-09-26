@@ -200,8 +200,13 @@ func (a *App) view(d store.Device) adminapi.DeviceView {
 		WLANDeliveryStatus: stringExtra(d.Extra, "wlan_cfg_delivery_status"),
 		WLANDeliveryCount:  intExtra(d.Extra, "wlan_cfg_attempts"),
 		WLANLastAttempt:    int64Extra(d.Extra, "wlan_cfg_last_attempt"),
-		SiteID:             d.SiteID,
-		LEDOverride:        d.LEDOverride,
+		// Devname-level runtime view, live-computed the same way the
+		// engine consumes it (vapsNotRunningDevice below): the same
+		// admin-owned envelope source, the same PlanVaps, the same
+		// MissingVaps bar.
+		VAPsNotRunning: vapsNotRunningDevice(d),
+		SiteID:         d.SiteID,
+		LEDOverride:    d.LEDOverride,
 		// The two §12 ledbar knobs map straight through: the view keeps
 		// the pointer semantics (explicit 0 survives; nil = jar default)
 		// and the verbatim color string.
@@ -255,6 +260,19 @@ func flagArmed(m store.JSONMap, key string) bool {
 }
 
 func stringExtra(m store.JSONMap, key string) string { v, _ := m[key].(string); return v }
+
+// vapsNotRunningDevice computes the devname-level runtime view for one
+// record (the view's VAPsNotRunning field, internal/wireless.MissingVaps):
+// the planned vap devnames whose vap_table row is absent or not RUN. The
+// envelope source mirrors the engine's (the admin-owned device_wlans list —
+// the same one DeviceWLANs feeds the inform lane's provisioning plan from),
+// so the view can never name a devname the engine does not plan. Absent or
+// empty vap_table is UNKNOWN (nil): a sparse heartbeat must never read as a
+// positive gap, matching InSync's nil-when-unknown semantics next to it.
+func vapsNotRunningDevice(d store.Device) []string {
+	vaps, _ := wireless.PlanVaps(d, wireless.DeviceWLANs(d))
+	return wireless.MissingVaps(vaps, d.Extra["vap_table"])
+}
 func intExtra(m store.JSONMap, key string) int {
 	if v, ok := m[key].(float64); ok {
 		return int(v)

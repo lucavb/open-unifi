@@ -146,18 +146,32 @@ const (
 	KindCmd Kind = "cmd"
 )
 
-// Admin-armed lifecycle command flags (the trust-policy "admin-owned rows"
-// class, CONTEXT.md: only an admin can set or change them — a device can
-// neither write nor introduce them via an inform body; record absorption
-// preserves them from the previous record through the store registry's
-// admin-owned class). Both are one-shot: the engine fires the
-// corresponding response on the device's next decoded inform and clears
-// the flag in the same decision.
+// Lifecycle command flags (the trust-policy "admin-owned rows" class,
+// CONTEXT.md: record absorption preserves them from the previous record
+// through the store registry's admin-owned class, so a refreshable
+// device body can neither wipe nor introduce them). One-shot
+// ownership differs per command:
+//
+//   - FlagSetdefaultArmed is ADMIN-ONLY: only an admin can set or change
+//     it (POST /api/v1/devices/{mac}/factory-reset; CONTEXT.md's literal
+//     "only an admin can set or change them" claim holds for it).
+//   - FlagRebootOnConnect has TWO non-device writers: the ordinary admin
+//     POST /api/v1/devices/{mac}/reboot, AND the adoption engine's own
+//     devname materialization watchdog (below, decideEncrypted) — the
+//     controller arms it autonomously, one shot per cfgversion, for a
+//     planned vap whose interface never materialized.
+//
+// Both are one-shot: the engine fires the corresponding response on the
+// device's next decoded inform (armedLifecycle) and clears the flag in
+// the same decision.
 const (
 	// FlagRebootOnConnect is the jar-verbatim record flag name the §6.5
 	// reboot response is emitted from (voidsuper comment: "only from
-	// reboot_on_connect flag"). Arming rides POST
-	// /api/v1/devices/{mac}/reboot.
+	// reboot_on_connect flag"). Arming rides the admin POST
+	// /api/v1/devices/{mac}/reboot AND the engine's devname
+	// materialization watchdog (decideEncrypted's connected-noop arm —
+	// one shot per cfgversion, budget tracked in the
+	// wlan_cfg_materialization_reboot marker).
 	FlagRebootOnConnect = store.FlagRebootOnConnect
 
 	// FlagSetdefaultArmed is open-unifi's arming flag for the §6.6
@@ -472,7 +486,11 @@ func (e *Engine) armedLifecycle(d *store.Device) (Outcome, bool) {
 		// boot-race false fire the two-consecutive-miss arming closes.
 		// The setdefault demotion already sweeps the whole
 		// controller-owned family, so only the reboot path needs this.
+		// The devname-level watchdog's counter (below) carries the same
+		// rule: its window must re-arm from zero for the post-boot
+		// materialization grace.
 		delete(d.Extra, "wlan_cfg_not_running_misses")
+		delete(d.Extra, "wlan_cfg_vap_not_running_misses")
 		return Outcome{Kind: KindReboot}, true
 	}
 	// §6.3 stored cmd task (last in the armed chain — see the precedence
@@ -542,7 +560,12 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 	// A system_cfg transmission is only an offer.  Its hash remains pending
 	// until a later inform proves the VAPs are actually running.
 	st := loadWlanCfgState(d.Extra)
-	st.settle()
+	// The record's CURRENT cfgversion rides settle for the materialization
+	// marker's one-shot budget (see settle's doc): the record's desired
+	// version is read BEFORE any mint this decision might make (an operator
+	// or drift mint below concerns the NEXT operation, not the config the
+	// pending bookkeeping was written under).
+	st.settle(d.CfgVersion)
 	wlanDrift := false
 	if st.sha != "" {
 		if cur := plan.DriftHash; cur != st.sha {
@@ -729,7 +752,13 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 		// provisions) and resets the window so it can re-arm; a RUN
 		// proof resets it; unknown informs (absent/empty table) leave it
 		// untouched in both directions.
-		switch st.notRunningEvidence() {
+		// The evidence classification is computed ONCE (the watchdog arm
+		// below reuses it): nothing between the switch and the block
+		// mutates its inputs (the applied snapshot and vap_table — the
+		// counters are writes), so the reuse is the same value the review
+		// verified ad hoc on all reachable paths.
+		ev := st.notRunningEvidence()
+		switch ev {
 		case nrMiss:
 			if misses := st.recordNotRunningMiss(); misses < 2 {
 				e.lg.Debug("inform: applied WLANs not running (miss 1 of 2, boot-race grace)", "mac", d.MAC)
@@ -745,6 +774,110 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 			return e.noopFor(d, now, req.PrevNoopTarget, KindNoop), nil
 		case nrRun:
 			st.clearNotRunningMisses()
+		}
+		// Devname-level materialization watchdog (2026-09-26 production
+		// incident, 2.4 guest guest-net ath3): 6.8.2.15592 only
+		// MATERIALIZES new vap interfaces at boot — a live push
+		// reconfigures existing ones only, so the 4th 2.4 vap (ath3) sat
+		// configured-not-running forever while hostapd crash-looped. The
+		// SSID watchdog above cannot see this shape: a band=both WLAN
+		// reads RUN on ONE radio (SSID present in vap_table), so the SSID
+		// view is nrRun and the missing devname is invisible. This block
+		// runs ONLY on the SSID view's nrRun arm (the invisible case) and
+		// only when NO delivery can be in flight: for a REAL pending sha
+		// (the non-empty string applyProvisioning stores) this branch is
+		// unreachable — the flow either answered noop-pending-wlan above
+		// when the unchanged-envelope retry was not yet due, or flagged
+		// wlanDrift and full-provisioned below — and the pendingSHAPresent
+		// precede-check here only catches a MALFORMED pending row (key
+		// present, "": a shape applyProvisioning never writes) to keep
+		// delivery out of an armed watchdog. A plan vap whose devname is
+		// absent (or not RUN) from THIS inform's vap_table is the real
+		// gap. Monitored with the same two-consecutive-miss boot-race
+		// grace: the first miss can be the post-reboot bring-up race on
+		// the freshly materialized set. Evidence semantics are
+		// wireless.MissingVaps — absent/empty tables are UNKNOWN and leave
+		// the window untouched, exactly like notRunningEvidence above.
+		if ev == nrRun {
+			missing := wireless.MissingVaps(plan.Vaps, st.extra["vap_table"])
+			if len(missing) == 0 {
+				// RUN proof at the devname level: everything planned is
+				// live on the wire. Reset the window AND retire the
+				// one-shot arm marker (fresh cfgversion ⇒ a fresh budget
+				// is the settle() path's job; same-version RUN proof
+				// means the materialization gap is GONE and the marker's
+				// purpose is served).
+				st.clearVapNotRunningMisses()
+				delete(d.Extra, "wlan_cfg_materialization_reboot")
+			} else {
+				alreadyPending := truthy(d.Extra[FlagRebootOnConnect])
+				armedCv, wasArmed := materializationRebootArmedFor(d.Extra)
+				switch {
+				case alreadyPending:
+					// Unreachable today: armedLifecycle consumes a truthy
+					// flag at the top of BOTH decide lanes and returns
+					// before this decision ever runs its bodies. Kept as
+					// a DEFENSIVE guard against a future non-returning
+					// writer of the flag — without it this default arm
+					// would stack the miss counter and mis-stamp the
+					// materialization marker OVER an unrelated pending
+					// reboot, suppressing a future genuine arm for the
+					// same cfgversion (a marker standing for the current
+					// config is the watchdog's own do-not-repeat rule).
+				case wasArmed && armedCv == d.CfgVersion:
+					// The reboot was already delivered for THIS config
+					// and the devname is STILL missing: a devname the
+					// firmware will not materialize for this record
+					// (the capacity case). The watchdog never re-arms
+					// while the marker stands for the same cfgversion —
+					// a marker only retires on a NEW config settling
+					// (st.settle deletes a stale-cfgversion one) or on a
+					// RUN proof (which, for a recovery→regression under
+					// the SAME cfgversion, deliberately re-arms: each
+					// arm is separated by a delivered reboot and a
+					// genuine proof) — and the view surfaces
+					// vaps_not_running while the gap lasts.
+					// The counter clear here is defensive idempotent
+					// symmetry, not state repair: no reachable record
+					// carries a counter>0 alongside a same-cfgversion
+					// marker (the arm path clears the counter in the
+					// same decision it stamps, and the reboot emission
+					// deletes the counter outright); re-running this
+					// branch stays a no-op.
+					st.clearVapNotRunningMisses()
+				default:
+					if misses := st.recordVapNotRunningMiss(); misses < 2 {
+						e.lg.Debug("inform: planned vap not running (miss 1 of 2, boot-race grace)", "mac", d.MAC, "vaps", missing)
+						// Fall through to the connected-noop flow below,
+						// byte-identical to miss#1 handling in the SSID
+						// watchdog (no early return).
+					} else {
+						st.clearVapNotRunningMisses()
+						// §6.5 reboot arm — the jar-verbatim one-shot
+						// flag (adminOwnedKeys carries it through the
+						// adapter's wholesale Extra assignment; the
+						// armedLifecycle fired on the NEXT decoded
+						// inform answers with the §6.5 response, docs/
+						// PROTOCOL-mgmt.md §6.5). The marker records the
+						// arm's cfgversion — the watchdog never re-arms
+						// while it stands for the SAME cfgversion (the
+						// one-shot guard above), and a marker only
+						// retires via a new config settling (st.settle
+						// deletes a stale-cfgversion one) or a RUN proof.
+						d.Extra[FlagRebootOnConnect] = true
+						setMaterializationRebootArmed(d.Extra, d.CfgVersion)
+						// Deliberate divergence — this is the adoption
+						// package's ONLY lg.Info call (even the §6.5
+						// reboot emission logs Debug, as does the SSID
+						// watchdog above): at the default log level this
+						// arm is the only operator-visible record of why
+						// a device will spontaneously reboot — the
+						// 2026-09-26 incident was silent.
+						e.lg.Info("inform: planned vaps not running after settle, arming materialization reboot", "mac", d.MAC, "vaps", missing)
+						return e.noopFor(d, now, req.PrevNoopTarget, KindNoop), nil
+					}
+				}
+			}
 		}
 		d.State = store.StateAdopted
 		e.lg.Debug("inform: connected noop", "mac", d.MAC, "cfg", d.CfgVersion)

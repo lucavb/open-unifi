@@ -72,7 +72,17 @@ type DeviceView struct {
 	WLANDeliveryStatus string `json:"wlan_delivery_status,omitempty"`
 	WLANDeliveryCount  int    `json:"wlan_delivery_count,omitempty"`
 	WLANLastAttempt    int64  `json:"wlan_last_attempt,omitempty"`
-	SiteID             string `json:"site_id,omitempty"`
+	// VAPsNotRunning is the devname-level runtime view (the SSID-presence
+	// InSync bar above cannot see it): the planned vap devnames ("ath<N>",
+	// wireless.MissingVaps over the same plan the engine provisions from)
+	// that the device's vap_table does not show RUN. nil (omitted) when
+	// every planned vap is running OR the device reported no table this
+	// inform (unknown — never a positive gap). Live firmware 6.8.2.15592
+	// materializes new vap interfaces only at boot, so a planned devname
+	// sitting absent/not-RUN across settled informs is a boot-requiring
+	// gap this field makes visible.
+	VAPsNotRunning []string `json:"vaps_not_running,omitempty"`
+	SiteID         string   `json:"site_id,omitempty"`
 	// LEDOverride is the admin-set per-device LED override (record field
 	// led_override, docs/PROTOCOL-mgmt.md §2): "" (omitted) = the jar's
 	// "default" (follow the site default), "on", "off". Read-only here.

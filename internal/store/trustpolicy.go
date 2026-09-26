@@ -124,6 +124,20 @@ var adminOwnedKeys = []string{
 	AnonymousControllerIDKey, AnonymousSiteIDKey,
 	FlagRebootOnConnect, FlagSetdefaultArmed,
 	BlockedStaExtraKey, BlockedStaShaExtraKey,
+	// The devname-level materialization watchdog's two rows (the
+	// consecutive-miss counter and the one-shot armed-reboot marker, per
+	// cfgversion — engine wlanstate). Admin-owned prev-or-delete, the same
+	// shape as blocked_sta_sha: a controller-written row guarded against
+	// device-baseline forging. Prev-owns alone would let a device body
+	// INTRODUCE either row — the device learns its cfgversion from the
+	// adoption echo that AppliedCfg reads, so a pre-planted marker for
+	// that version permanently suppresses the auto-heal, and a forged
+	// counter=1 plus one genuine miss arms the reboot instantly, skipping
+	// the two-inform boot-race grace. Prev-or-delete keeps the survival
+	// the watchdog needs either way: once the ENGINE wrote the row, a
+	// later sparse heartbeat (no body copy) restores the record's value,
+	// and a forged body copy never overwrites it.
+	"wlan_cfg_vap_not_running_misses", "wlan_cfg_materialization_reboot",
 	SSHSha512PasswdKey, SSHMd5PasswdKey,
 	"led_override", "disabled", "led_override_color_brightness",
 	"led_override_color", "ssh_password",
@@ -131,22 +145,32 @@ var adminOwnedKeys = []string{
 	RadioIntentExtraKey, DeviceWLANsExtraKey, CmdTaskKey,
 }
 
-// FactoryResetSweepKeys is the subset of the controller-owned class the
-// §6.6 factory-reset demotion clears: the PER-DEVICE controller state whose
+// FactoryResetSweepKeys is the subset of the trust registry the §6.6
+// factory-reset demotion clears: the PER-DEVICE controller state whose
 // staleness cannot survive a reset (a stale wlan_cfg_sha would let the
 // re-adopted device settle into connected noops while running factory
-// config). SSHSha512PasswdKey is deliberately excluded — and the same
-// survival now holds by CLASS membership, not just by this exclude: both
-// password caches are admin-owned (they hold the DEVICE's last
-// controller-pushed password and deliberately survive factory
+// config), PLUS the devname materialization watchdog's two admin-owned rows
+// (wlan_cfg_vap_not_running_misses / wlan_cfg_materialization_reboot). The
+// sweep keeps them deliberately, not by class: as admin rows they left the
+// controller-owned derivation when they moved to prev-or-delete (moving
+// classes the way blocked_sta_sha did — its baseline staleness self-heals,
+// because the post-reset re-adoption full-provisions and re-stamps it), but
+// a surviving marker would freeze the per-config one-shot budget across a
+// reset and a surviving counter would land the re-adopted device one
+// genuine miss away from an instant arm. So unlike blocked_sta_sha these
+// two are swept explicitly. SSHSha512PasswdKey is deliberately excluded —
+// and the same survival holds by CLASS membership, not just by this
+// exclude: both password caches are admin-owned (they hold the DEVICE's
+// last controller-pushed password and deliberately survive factory
 // reset/setdefault demotion; the exclude keeps that survival even if the
-// keys ever move classes again). Derived from
-// controllerOwnedKeys, so the sweep can never fall out of sync with the
-// class it clears. TREAT AS IMMUTABLE (do not append or reorder; it holds
-// the registry's own defensive copy — excludeKey built it fresh).
-// This is the only class slice left exported: the adoption engine is its
-// sole consumer, so the class membership itself stays sealed.
-var FactoryResetSweepKeys = excludeKey(controllerOwnedKeys, SSHSha512PasswdKey)
+// keys ever move classes again). Derived from controllerOwnedKeys for the
+// derived half, so that half can never fall out of sync with the class it
+// clears. TREAT AS IMMUTABLE (do not append or reorder; it holds the
+// registry's own defensive copy). This is the only class slice left
+// exported: the adoption engine is its sole consumer, so the class
+// membership itself stays sealed.
+var FactoryResetSweepKeys = append(excludeKey(controllerOwnedKeys, SSHSha512PasswdKey),
+	"wlan_cfg_vap_not_running_misses", "wlan_cfg_materialization_reboot")
 
 // excludeKey copies keys without the one named (copy so a caller that
 // appends to one list can never clobber the other's backing array).
