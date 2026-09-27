@@ -180,10 +180,10 @@ func TestForgetDevicePrunesAllSeries(t *testing.T) {
 	UpdateFromDevice(other, "U7PG2", 1, 1700000002, 5, 6, 7, 8)
 	IncClientSessionEvents(mac, 1, 1)
 
-	// 2 (mac, model) pairs on deviceState + 5 single-label gauges
-	// + 2 session-event series = 9 series.
-	if got := seriesForMAC(t, mac, ""); got != 9 {
-		t.Fatalf("series for %s = %d, want 9", mac, got)
+	// 1 (mac, model) pair on deviceState (latest model wins) + 5
+	// single-label gauges + 2 session-event series = 8 series.
+	if got := seriesForMAC(t, mac, ""); got != 8 {
+		t.Fatalf("series for %s = %d, want 8", mac, got)
 	}
 
 	ForgetDevice(mac)

@@ -9,6 +9,7 @@ package metrics
 import (
 	"net/http"
 	"strconv"
+	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -61,19 +62,25 @@ var clientSessionEvents = prometheus.NewCounterVec(prometheus.CounterOpts{
 // matching the store state enum (1=pending, 2=adopting, 3=adopted, 4=lost;
 // -1 = unknown). MACs are canonical lowercase colon-hex.
 //
-// Label caveat: the mac label is the canonical address we track (ours), but
-// the model label comes from inform bodies — i.e. DEVICE-influenced data.
-// Cardinality is therefore bounded by the set of distinct (mac, model) pairs
-// the trust domain ever reports; on a trusted LAN that is "one model per
-// device", small, and a churned repair only adds one extra series.
-// Residual risk mitigation: series for a device are pruned when the device
-// record is deleted via the admin API (ForgetDevice, called from
-// app.DeleteDevice) — that is the "until store removal" bound below, which
-// USED to be claimed but not implemented; it is now real.
+// Label note: the mac label is the canonical address we track (ours); the
+// model label comes from inform bodies — i.e. DEVICE-influenced data.
+// Cardinality is one series per MAC: SetDeviceState is latest-model-wins —
+// when a MAC starts reporting a different model, the previous (mac, model)
+// series is deleted before the new one is set, so a device's model churn
+// (repairs, reflashes, label reshuffles) can no longer grow the series
+// count. Series for a device are pruned when the device record is deleted
+// from the store (ForgetDevice, called from app.DeleteDevice); ForgetDevice
+// also clears the remembered model, so a re-added device starts fresh.
 var deviceState = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "openunifi_device_state",
 	Help: "Device lifecycle state as an integer (-1 unknown, 1 pending, 2 adopting, 3 adopted, 4 lost).",
 }, []string{"mac", "model"})
+
+// lastModel remembers the most recent model string reported for each MAC so
+// SetDeviceState can retire the previous (mac, model) series when a device
+// switches models (latest-model-wins: churn can no longer accrue stale
+// model-pair series for a known MAC).
+var lastModel sync.Map
 
 // lastInformTimestamp tracks the unix-seconds timestamp of the last inform
 // heard from each device (0 if never seen).
@@ -174,8 +181,17 @@ func IncClientSessionEvents(mac string, connects, disconnects int) {
 }
 
 // SetDeviceState records a device's lifecycle state. Pass -1 for unknown.
-// A model of "" is preserved as an empty label.
+// A model of "" is preserved as an empty label. Latest-model-wins: when the
+// MAC previously reported a different model, that earlier (mac, model)
+// series is deleted first, so exactly one device_state series exists per
+// known MAC regardless of model churn.
 func SetDeviceState(mac, model string, state int64) {
+	if prevAny, ok := lastModel.Load(mac); ok {
+		if prev, ok := prevAny.(string); ok && prev != model {
+			deviceState.DeleteLabelValues(mac, prev)
+		}
+	}
+	lastModel.Store(mac, model)
 	deviceState.WithLabelValues(mac, model).Set(float64(state))
 }
 
@@ -236,6 +252,7 @@ func UpdateFromDevice(mac, model string, state, lastSeenUnix int64, uptime, sta,
 // removing labels that were never set is a no-op.
 func ForgetDevice(mac string) {
 	deviceState.DeletePartialMatch(prometheus.Labels{"mac": mac})
+	lastModel.Delete(mac)
 	lastInformTimestamp.DeleteLabelValues(mac)
 	uptimeSeconds.DeleteLabelValues(mac)
 	staCount.DeleteLabelValues(mac)
