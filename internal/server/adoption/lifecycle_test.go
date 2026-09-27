@@ -146,6 +146,11 @@ func TestArmedSetdefaultDemotesToPendingCandidate(t *testing.T) {
 	// verbatim) — the lane's one deliberately distinctive demotion
 	// behavior, pinned here at engine level.
 	dev.Extra[store.SSHSha512PasswdKey] = "site-cache-sentinel"
+	// Seed the key-confirmation marker (an adopted, key-authenticated
+	// device that got armed): the demotion must clear it WITH the key
+	// assignment, or the post-reset factory-key re-inform would be
+	// rejected by the decideEncrypted gate (recovery broken).
+	dev.KeyConfirmed = true
 
 	out, err := e.Decide(Request{
 		Transport: TransportEncrypted, Device: dev,
@@ -175,11 +180,17 @@ func TestArmedSetdefaultDemotesToPendingCandidate(t *testing.T) {
 	if !out.SetAuthkeys || len(out.Authkeys) != 0 {
 		t.Fatalf("setdefault must drop the authkey history: %+v", out)
 	}
+	if !out.SetKeyConfirmed || out.KeyConfirmed {
+		t.Fatalf("setdefault must CLEAR the key-confirmation marker, not keep it: %+v", out)
+	}
 
 	applyDeltas(&dev, out)
 	if dev.State != store.StatePending || dev.XAuthkey != "" ||
 		dev.CfgVersion != "" || dev.AppliedCfg != "" || len(dev.Authkeys) != 0 {
 		t.Fatalf("record not in pending-candidate shape: %+v", dev)
+	}
+	if dev.KeyConfirmed {
+		t.Fatalf("key-confirmation marker survived the demotion: %+v", dev)
 	}
 	for _, k := range store.FactoryResetSweepKeys {
 		if _, ok := dev.Extra[k]; ok {
@@ -222,7 +233,7 @@ func TestSetdefaultReadoptOnDefaultKey(t *testing.T) {
 	// cfgversion), pending record → ordinary adoption push.
 	out, err = e.Decide(Request{
 		Transport: TransportEncrypted, Device: dev,
-		Body: engineBody(""), UsedKey: defaultKeyHex, Now: time.Unix(1020, 0),
+		Body: engineBody(""), UsedKey: defaultKeyHex, Now: time.Unix(1010, 0),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -247,36 +258,56 @@ func TestSetdefaultReadoptOnDefaultKey(t *testing.T) {
 	}
 }
 
-// TestSetdefaultFiresOnDefaultKeyInform pins the PRE-KEY-GATE placement:
-// a device that already factory-reset itself and re-informed on the
-// factory default key BEFORE the controller emitted still gets its
-// setdefault — the same inform without the flag is the FID-1
-// default-key-in-adopted-state reject (mirrors the classic dispatcher,
-// where the state-8 check precedes the §11006+ key gate).
+// TestSetdefaultFiresOnDefaultKeyInform pins the POST-KEY-GATE placement
+// (the C1+C2 key-confirmation fix): an inform sealed with a per-device key
+// answers an armed setdefault ahead of the key/drift machinery (the armed
+// commands ride the main status inform), while the same inform sealed with
+// the FACTORY default key never reaches the armed arm at all — the
+// key-confirmation gate at the top of decideEncrypted rejects it before
+// every other decision (a confirmed record's admin arming cannot be fired
+// on an unauthenticated factory-key claim, finding C2).
 func TestSetdefaultFiresOnDefaultKeyInform(t *testing.T) {
 	e := newTestEngine(t)
 
-	// Contrast first: same inform, no flag → FID-1 reject.
-	plain := settledLifecycleDevice()
+	// Contrast first: an UNARMED confirmed-equivalent record + factory
+	// default key → the FID-1 state/marker rejection (this arm predates
+	// the key-confirmation fix and still holds: unarmed adopted records
+	// reject the factory key on state alone).
 	if _, err := e.Decide(Request{
-		Transport: TransportEncrypted, Device: plain,
+		Transport: TransportEncrypted, Device: settledLifecycleDevice(),
 		Body: engineBody(""), UsedKey: defaultKeyHex, Now: time.Unix(1000, 0),
 	}); err != ErrDefaultKeyRejected {
 		t.Fatalf("unarmed default-key inform in adopted state: err = %v, want ErrDefaultKeyRejected", err)
 	}
 
-	// With the flag armed: setdefault fires before the key gate.
+	// With the flag armed AND the inform sealed with the DEVICE key: the
+	// setdefault fires before the key machinery (the classic dispatcher's
+	// state-8 precedence, narrowed to authenticated informs only).
 	dev := settledLifecycleDevice()
 	dev.Extra[FlagSetdefaultArmed] = true
 	out, err := e.Decide(Request{
 		Transport: TransportEncrypted, Device: dev,
-		Body: engineBody(""), UsedKey: defaultKeyHex, Now: time.Unix(1010, 0),
+		Body: engineBody(""), UsedKey: lifecycleKey, Now: time.Unix(1010, 0),
 	})
 	if err != nil {
-		t.Fatalf("armed default-key inform: %v", err)
+		t.Fatalf("armed device-key inform: %v", err)
 	}
 	if out.Kind != KindSetdefault {
-		t.Fatalf("kind = %v, want setdefault ahead of the key gate", out.Kind)
+		t.Fatalf("kind = %v, want setdefault for the authenticated armed inform", out.Kind)
+	}
+
+	// Third case (the C2 flip): armed + confirmed + FACTORY default key →
+	// the key-confirmation gate rejects the whole inform before
+	// armedLifecycle — setdefault does NOT fire on the unauthenticated
+	// claim, no matter the arming.
+	confirmed := settledLifecycleDevice()
+	confirmed.KeyConfirmed = true
+	confirmed.Extra[FlagSetdefaultArmed] = true
+	if _, err := e.Decide(Request{
+		Transport: TransportEncrypted, Device: confirmed,
+		Body: engineBody(""), UsedKey: defaultKeyHex, Now: time.Unix(1020, 0),
+	}); err != ErrDefaultKeyRejected {
+		t.Fatalf("armed factory-key inform on a confirmed record: err = %v, want ErrDefaultKeyRejected (gate outranks the armed lifecycle)", err)
 	}
 }
 

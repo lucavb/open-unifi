@@ -59,7 +59,12 @@ Response construction (controller → device):
   not supported" unless the controller runs with `--allow-plaintext-inform` (mirrors the
   classic servlet's debug-build gate, PROTOCOL-mgmt.md §5). When allowed, the response
   is plain JSON. Open-unifi deviation from classic debug behavior: plaintext informs
-  never initiate adoption and never rotate keys (PROTOCOL-mgmt.md §9).
+  never initiate adoption and never rotate keys (PROTOCOL-mgmt.md §9). The plaintext
+  lane also never carries key material BACK: the mgmt_cfg re-send a mismatching (or
+  omitted) `_authkey` claim receives omits the `authkey=` line (a debug device that
+  lost its key re-learns it over the encrypted path or by re-registration), and
+  admin-armed lifecycle responses (reboot/setdefault/cmd) fire only when the claim
+  matches the record's assigned key.
 - JSON body keys for every response: at minimum `server_time_in_utc` (ms epoch, string).
 
 ## 2. Encryption keys
@@ -87,6 +92,20 @@ Response construction (controller → device):
   Earlier revisions described "default-key inform ⇒ re-adopt" unconditionally; the
   unconditional re-adopt was an **open-unifi deviation**, not classic behavior —
   open-unifi is being aligned to the jar's state gate in this fix wave.
+  Open-unifi adds a persisted refinement: the state enum alone cannot express
+  "not yet authenticated its per-device key" (re-key flows re-enter
+  `state=adopting` AFTER a key was assigned), so a per-device record carries
+  `key_confirmed` — set whenever an inform was authenticated with any assigned
+  per-device key (`authkeys` never holds the factory default), cleared with the
+  keys by the setdefault demotion. The gate accepts a default-key inform for
+  `state=pending` records, or keyed `state=adopting` records **without** the
+  confirmation marker (the documented mid-adoption double-rotation window,
+  step 4 of the handshake below); every other shape — adopting+confirmed,
+  adopted, lost — is rejected before the gentle-noop and armed-lifecycle
+  decisions (a confirmed record's admin-armed factory reset cannot be fired
+  on an unauthenticated factory-key claim; recovery: admin deletes the
+  record, or re-registers the MAC, or — post-demotion — the cleared record
+  accepts the factory key again).
 - A device may have MULTIPLE valid keys (`device.authkeys` list); controller tries each
   until one decrypts. Include the default key in the list during adoption so we can
   decrypt the first packet.
@@ -280,7 +299,8 @@ record is absent); `Get` returns a deep copy. `Device` fields as implemented: MA
 (canonical lowercase 12-hex string), Name, Model, Firmware, Serial, SiteID, State
 (controller-side lifecycle: 1=pending, 2=adopting, 3=adopted, 4=lost), IP, InformURL,
 LastSeen, FirstSeen, CfgVersion, AppliedCfg, Authkeys (assigned-key history, newest
-last, capped at 2 — the factory default key is NEVER stored here), XAuthkey, AESGCM,
+last, capped at 2 — the factory default key is NEVER stored here), XAuthkey,
+KeyConfirmed (the key-confirmation gate marker above), AESGCM,
 LastUps, Extra (inform-body passthrough; controller-owned `wlan_cfg_*` rows
 and admin-owned keys — `wlan_cfg_*` overrides, `radio_intent`, the typed
 `ssh_password` field's twin, and the `ssh_sha512passwd`/`ssh_md5passwd`

@@ -45,8 +45,19 @@ type Device struct {
 	Authkeys   []string `json:"authkeys,omitempty"`    // per-device keys we assigned (newest last, capped to the newest two); the factory default key is NEVER stored here — keyCandidates appends it at use time
 	XAuthkey   string   `json:"x_authkey,omitempty"`   // per-device key we assigned (>=32 hex)
 	AESGCM     bool     `json:"aes_gcm,omitempty"`     // device advertised GCM support
-	LastUps    JSONMap  `json:"last_ups,omitempty"`    // decoded stats snapshot from last inform
-	Extra      JSONMap  `json:"extra,omitempty"`       // raw passthrough of interesting inform fields
+
+	// KeyConfirmed is the controller-side key-confirmation marker (the
+	// state machine's own words: "default key accepted only for a device
+	// that has not yet authenticated its per-device key"): once an inform
+	// was authenticated with ANY assigned per-device key (Authkeys), the
+	// Engine stamps it so the factory default key is rejected for the
+	// record no matter which lifecycle state it re-enters (the documented
+	// mid-adoption double-rotation window stays open for records whose
+	// assigned key was never proven used — docs/PROTOCOL.md §2/§3). The
+	// setdefault demotion clears it with XAuthkey/Authkeys.
+	KeyConfirmed bool    `json:"key_confirmed,omitempty"`
+	LastUps      JSONMap `json:"last_ups,omitempty"` // decoded stats snapshot from last inform
+	Extra        JSONMap `json:"extra,omitempty"`    // raw passthrough of interesting inform fields
 
 	// LEDOverride is the admin-set per-device LED override — the classic
 	// controller's device record field "led_override"

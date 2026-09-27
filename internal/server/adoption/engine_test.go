@@ -80,6 +80,9 @@ func applyDeltas(dev *store.Device, out Outcome) {
 	if out.SetAuthkeys {
 		dev.Authkeys = out.Authkeys
 	}
+	if out.SetKeyConfirmed {
+		dev.KeyConfirmed = out.KeyConfirmed
+	}
 	dev.Extra = out.Extra
 	for k, v := range out.CredentialDeltas {
 		dev.Extra[k] = v
@@ -891,9 +894,12 @@ func TestAuthkeysPrunedToTwo(t *testing.T) {
 	}
 }
 
-// (a4) plaintext claim = stale/missing key → mgmt_cfg-only push carrying
-// the CURRENT XAuthkey, NO rotation, state unchanged. (The handler defaults
-// an empty _authkey claim to the factory key before calling the engine.)
+// (a4) plaintext claim = stale/missing key → mgmt_cfg-only re-send push
+// carrying the config rows WITHOUT the authkey= line (finding C3 fix: no
+// key material to an unauthenticated claim), NO rotation, state unchanged.
+// (The handler defaults an empty _authkey claim to the factory key before
+// calling the engine; a debug device that lost its key re-learns it over
+// the encrypted path or by re-registration, PROTOCOL.md §1.)
 func TestPlainRekeyPushNoRotation(t *testing.T) {
 	const xk = "11112222333344445555666677778888"
 	e := newTestEngine(t)
@@ -919,8 +925,11 @@ func TestPlainRekeyPushNoRotation(t *testing.T) {
 	if out.Kind != KindSetparam || out.FullProvision {
 		t.Fatalf("plain push kind = %v full=%v, want adoption push", out.Kind, out.FullProvision)
 	}
-	if !strings.Contains(out.MgmtCfg, "authkey="+xk+"\n") {
-		t.Fatalf("plain push mgmt_cfg missing current assignment: %q", out.MgmtCfg)
+	if strings.Contains(out.MgmtCfg, "authkey=") {
+		t.Fatalf("plain push mgmt_cfg leaked the assigned key to the unauthenticated claim: %q", out.MgmtCfg)
+	}
+	if !strings.Contains(out.MgmtCfg, "cfgversion=aaaa\n") {
+		t.Fatalf("plain push must keep the config rows: %q", out.MgmtCfg)
 	}
 	if out.SetXAuthkey || out.SetCfgVersion || out.SetState || out.SetAuthkeys {
 		t.Fatalf("plain push rotated/mutated assignment: %+v", out)

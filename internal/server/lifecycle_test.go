@@ -186,22 +186,31 @@ func TestRebootLifecycleEndToEnd(t *testing.T) {
 }
 
 // TestFactoryResetLifecycleEndToEnd: admin POST
-// /devices/{mac}/factory-reset arms the flag; the next GCM-sealed inform
-// answers the §6.6 shape byte-exact and the record lands in the
-// pending-candidate shape (controller-owned WLAN bookkeeping cleared);
+// /devices/{mac}/factory-reset arms the flag on a CONFIRMED, key-authenticated
+// adopted record. The armed inform must be AUTHENTICATED to fire the lifecycle:
+// a factory-default-key inform on the confirmed record is rejected by the
+// key-confirmation gate (the 404 marker; record untouched, arming intact);
+// the device-key-sealed inform answers the §6.6 shape byte-exact and the
+// record lands in the pending-candidate shape (keys, cfgversions AND the
+// KeyConfirmed marker cleared, controller-owned WLAN bookkeeping cleared);
 // the factory-reset device re-informs on the factory default key and is
 // re-adopted by the existing flow (mgmt_cfg-only push with fresh key and
 // cfgversion), whose post-key-rotation follow-up inform takes the ordinary
-// full provisioning path.
+// full provisioning path — the recovery loop the demotion's marker clear
+// preserves.
 func TestFactoryResetLifecycleEndToEnd(t *testing.T) {
 	adminH, informH, st := lifecycleFixture(t)
 	const cfg = "aaaabbbbccccdddd"
 	const xkey = "11112222333344445555666677778888"
 	registerAdopted(t, st, cfg, xkey)
-	// Stale controller-owned bookkeeping: the demotion must clear it, or
-	// the re-adopted device would settle into connected noops against a
-	// baseline its factory config never matched.
+	// The record has authenticated its per-device key in its history: the
+	// persisted confirmation marker (gate input) is set, matching any
+	// adopted production record.
 	if err := st.UpdateExisting(testMAC, func(d *store.Device) error {
+		d.KeyConfirmed = true
+		// Stale controller-owned bookkeeping: the demotion must clear it, or
+		// the re-adopted device would settle into connected noops against a
+		// baseline its factory config never matched.
 		if d.Extra == nil {
 			d.Extra = store.JSONMap{}
 		}
@@ -217,6 +226,7 @@ func TestFactoryResetLifecycleEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	kx := hexKey(t, xkey)
+	kd := hexKey(t, inform.DefaultKeyHex)
 
 	// 1. arm the factory reset.
 	rec := postAdmin(t, adminH, http.MethodPost, "/api/v1/devices/aa:bb:cc:dd:ee:ff/factory-reset")
@@ -230,9 +240,32 @@ func TestFactoryResetLifecycleEndToEnd(t *testing.T) {
 	if v, ok := d.Extra["setdefault_armed"]; !ok || v != true {
 		t.Fatalf("setdefault flag not armed after POST: %+v", d.Extra)
 	}
+	if !d.KeyConfirmed {
+		t.Fatalf("confirmation marker lost on the armed record: %+v", d)
+	}
 
-	// 2. GCM-sealed inform → §6.6 bytes; record demoted.
-	resp := post(t, informH, encryptGCM(t, mustJSON(t, infoBody(cfg)), kx, bytes16(0x09)))
+	// 2a. FACTORY-key inform on the confirmed record (even armed): the
+	// key-confirmation gate rejects the WHOLE inform — the 404 marker,
+	// NO lifecycle emission, record byte-unchanged, arming persists.
+	resp := post(t, informH, encryptCBC(t, mustJSON(t, infoBody("")), kd, testIV))
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("armed factory-key inform on a confirmed record: %d, want the 404 default-key rejection", resp.Code)
+	}
+	d, err = st.Get(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.State != store.StateAdopted || d.XAuthkey != xkey || d.CfgVersion != cfg ||
+		!d.KeyConfirmed {
+		t.Fatalf("rejected inform disturbed the record: %+v", d)
+	}
+	if v, ok := d.Extra["setdefault_armed"]; !ok || v != true {
+		t.Fatalf("arming not preserved past the rejected inform: %+v", d.Extra)
+	}
+
+	// 2b. GCM-sealed DEVICE-key inform → §6.6 bytes; record demoted
+	// (keys AND the confirmation marker cleared).
+	resp = post(t, informH, encryptGCM(t, mustJSON(t, infoBody(cfg)), kx, bytes16(0x09)))
 	if resp.Code != http.StatusOK {
 		t.Fatalf("armed inform: %d", resp.Code)
 	}
@@ -251,6 +284,9 @@ func TestFactoryResetLifecycleEndToEnd(t *testing.T) {
 		d.AppliedCfg != "" || len(d.Authkeys) != 0 {
 		t.Fatalf("record not in pending-candidate shape: %+v", d)
 	}
+	if d.KeyConfirmed {
+		t.Fatalf("key-confirmation marker survived the setdefault demotion: %+v", d)
+	}
 	if _, armed := d.Extra["setdefault_armed"]; armed {
 		t.Fatalf("setdefault flag survived emission: %+v", d.Extra)
 	}
@@ -264,8 +300,9 @@ func TestFactoryResetLifecycleEndToEnd(t *testing.T) {
 	}
 
 	// 3. factory-reset device re-informs on the factory default key →
-	// existing adoption flow: mgmt_cfg-only push, fresh key + cfgversion.
-	kd := hexKey(t, inform.DefaultKeyHex)
+	// existing adoption flow: mgmt_cfg-only push, fresh key + cfgversion
+	// (the demotion cleared the marker, so the gate's pre-key window
+	// admits it again — recovery preserved).
 	resp = post(t, informH, encryptCBC(t, mustJSON(t, infoBody("")), kd, testIV))
 	if resp.Code != http.StatusOK {
 		t.Fatalf("default-key re-inform: %d", resp.Code)
@@ -314,6 +351,22 @@ func TestFactoryResetLifecycleEndToEnd(t *testing.T) {
 	if _, ok := jm["cfgversion"]; !ok {
 		t.Fatalf("full provisioning missing top-level cfgversion: %v", jm)
 	}
+	// The step-4 inform authenticated with the freshly assigned key: the
+	// confirmation marker must be re-stamped by that inform itself.
+	if !d_confirmReStamped(st) {
+		t.Fatal("confirmation marker not re-stamped after the re-adoption inform")
+	}
+}
+
+// d_confirmReStamped reads st and asserts KeyConfirmed was re-set by the
+// re-adoption inform (a helper keeps the E2E linear: armed confirm →
+// reject → demoted unconfirm → re-adopt → the new inform confirms again).
+func d_confirmReStamped(st store.DeviceStore) bool {
+	d, err := st.Get(testMAC)
+	if err != nil {
+		return false
+	}
+	return d.KeyConfirmed
 }
 
 // TestArmedFlagsSurviveDeviceInformBodies pins the trust-policy side of

@@ -234,7 +234,14 @@ type Outcome struct {
 	AppliedCfg    string
 	SetAuthkeys   bool
 	Authkeys      []string
-	Extra         store.JSONMap
+	// SetKeyConfirmed carries the key-confirmation marker delta: the
+	// Decide wrapper stamps the working clone KeyConfirmed=true when the
+	// inform authenticated with a per-device key (Authkeys never holds the
+	// factory key), the armed setdefault demotion clears it (true→false)
+	// with XAuthkey/Authkeys. Emits only on change, both directions.
+	SetKeyConfirmed bool
+	KeyConfirmed    bool
+	Extra           store.JSONMap
 
 	// CmdTask is the stored-task row replayed VERBATIM as the §6.3 cmd
 	// response's payload keys (`mergeFrom((X)task)`): non-nil only for
@@ -376,6 +383,24 @@ func (e *Engine) Decide(req Request) (Outcome, error) {
 	if err != nil {
 		return Outcome{}, err
 	}
+	// Key-confirmation write (the persisted partner of the
+	// decideEncrypted gate): an inform authenticated with a per-device
+	// key — UsedKey equal to ANY Authkeys entry, case-insensitively
+	// (Authkeys never holds the factory default key, docs/PROTOCOL.md
+	// §6, so the gate's factory-key informs can never stamp this) proves
+	// the device runs controller-issued key material. The stamp rides
+	// the engine's deltas: deltas() emits the record delta only on
+	// change and the armed setdefault demotion clears it, so the wire
+	// effect is one marker field kept truthful by the same RMW cycle.
+	// Compared against the WORKING clone's Authkeys so a demotion in
+	// THIS decision (arm, then keys cleared) cannot re-confirm the
+	// record it just demoted.
+	for _, k := range work.Authkeys {
+		if strings.EqualFold(k, req.UsedKey) {
+			work.KeyConfirmed = true
+			break
+		}
+	}
 	// Stamp the record deltas the branch performed onto the working clone.
 	out.deltas(&snapshot, &work)
 	return out, nil
@@ -390,27 +415,46 @@ func (e *Engine) Decide(req Request) (Outcome, error) {
 // gate (the armed commands ride the main status inform, exactly the
 // empty-_type informs real firmware sends).
 //
-// Precedence: setdefault outranks reboot (a factory reset subsumes a
-// pending reboot, and clearing the reboot flag keeps the post-reset
-// default-key re-adoption from being preempted by a stale command), and
-// both fire BEFORE the key/state gate — mirroring the classic
-// dispatcher, where the state-8 setdefault check (voidsuper line 1018)
-// precedes every §6.2 setparam site (§1117+), the §6.3 task hook
-// (§1353-1359) and the default-key state gate. The jar's reboot emission
-// site itself is not line-pinned in docs/PROTOCOL-mgmt.md §6.5 (byte
-// shape only); placing it in the same early arm keeps the
-// "next inform carries the response" contract — recorded as a
-// live-proof obligation in the lane docs. The §6.3 cmd task slots AFTER
-// both: §6.3 is silent on the task's ordering against the other armed
-// commands — chosen: last, so the line-pinned setdefault check keeps
-// winning and a one-shot reboot merely defers the task by exactly one
-// inform without losing it (the post-reboot inform replays it). An armed
-// task OUTRANKS the drift machinery: the §6.3 hook runs before the
-// wireless/blocked drift arms below, so a drifted device with an armed
-// task gets the task response, and after it delivers the SAME device
-// falls back to the drift outcome on its next inform (the replay is not
-// lost — §6.3's task cleanup is consumption, and the deferred
-// provisioning re-fires exactly like the §6.5 deferred delivery).
+// Position vs the key gate: decideEncrypted's key-confirmation gate
+// (the factory-default-key rejection, see the gate comment there) runs
+// BEFORE this lane, so an inform sealed with the factory key on a
+// record that already authenticated its per-device key never reaches
+// the armed arm at all — the rejection answers instead (findings C1/
+// C2: state alone cannot prove the record is pre-key; the persisted
+// confirmation marker separates "mid-handshake window" from "already
+// confirmed", and the gate closes the armed-lifecycle-before-auth break
+// of the classic ordering). Within the lane, setdefault outRANKS
+// reboot: a factory reset subsumes a pending reboot, and clearing the
+// reboot flag keeps the post-reset default-key re-adoption from being
+// preempted by a stale command. The armed lane keeps FULL precedence
+// over the decisions below it for every inform that survives that gate and
+// (plaintext) the claim-match check: an armed record whose inform is
+// authenticated with its per-device key answers the armed command
+// ahead of the key/drift machinery, exactly the classic dispatcher,
+// where the state-8 setdefault check (voidsuper line 1018) precedes
+// every §6.2 setparam site (§1117+) and the §6.3 task hook.
+//
+// The setdefault demotion itself is the one armed branch that writes
+// the key shape: it clears XAuthkey/Authkeys AND the KeyConfirmed
+// marker, so the post-reset factory-key re-inform re-enters through
+// the gate's pre-key window (recovery preserved — see the gate table
+// in docs/PROTOCOL.md §2).
+//
+// The jar's reboot emission site itself is not line-pinned in
+// docs/PROTOCOL-mgmt.md §6.5 (byte shape only); placing it in the same
+// early arm keeps the "next inform carries the response" contract —
+// recorded as a live-proof obligation in the lane docs. The §6.3 cmd
+// task slots AFTER the §6.6 setdefault arm: §6.3 is silent on the
+// task's ordering against the other armed commands — chosen: last, so
+// the line-pinned setdefault check keeps winning and a one-shot reboot
+// merely defers the task by exactly one inform without losing it (the
+// post-reboot inform replays it). An armed task OUTRANKS the drift
+// machinery: the §6.3 hook runs before the wireless/blocked drift arms
+// below, so a drifted device with an armed task gets the task
+// response, and after it delivers the SAME device falls back to the
+// drift outcome on its next inform (the replay is not lost — §6.3's
+// task cleanup is consumption, and the deferred provisioning re-fires
+// exactly like the §6.5 deferred delivery).
 //
 // cfgversion-mint semantics — §6.2 catalog entries matched: NONE for the
 // emissions themselves. Neither §6.5 reboot nor §6.6 setdefault nor the
@@ -449,6 +493,13 @@ func (e *Engine) armedLifecycle(d *store.Device) (Outcome, bool) {
 		d.CfgVersion = ""
 		d.AppliedCfg = ""
 		d.Authkeys = nil
+		// The confirmation marker dies with the key assignment: the
+		// post-reset re-inform arrives on the factory default key and
+		// must re-enter the adoption flow through the pre-key window
+		// (the key-confirmation gate at the top of decideEncrypted
+		// rejects factory-key informs for confirmed records — recovery
+		// preserved ONLY if the marker is cleared here too).
+		d.KeyConfirmed = false
 		// Drop the controller-owned per-device bookkeeping (store
 		// trust-policy registry, FactoryResetSweepKeys): a stale
 		// wlan_cfg_sha would let the re-adopted device settle into
@@ -524,6 +575,28 @@ func CmdTaskString(task store.JSONMap) string {
 // usedKey is the lowercase hex key that authenticated the inform.
 func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless.ProvisioningPlan, d *store.Device) (Outcome, error) {
 	now := req.Now
+
+	// Key-confirmation gate (findings C1+C2): the shared factory default
+	// key is accepted ONLY for a device that has not yet authenticated
+	// its per-device key — StatePending (the pre-adoption record,
+	// devmgr UNKNOWN(0)) or a keyed StateAdopting record whose marker is
+	// unset (the documented mid-adoption double-rotation window,
+	// docs/PROTOCOL.md §3 step 4, where the device has not applied the
+	// pushed key yet → rotate then re-push). Once an inform was
+	// authenticated with a per-device key the Decide wrapper stamps the
+	// persisted KeyConfirmed marker, and a factory-key inform is then
+	// rejected ahead of EVERYTHING below — the gentle noop, the armed
+	// lifecycle (§6.6 setdefault included: a confirmed record's armed
+	// flag cannot be fired on an unauthenticated factory-key claim) and
+	// the drift/key machinery. Adopted and lost records keep the classic
+	// state rejection (FID-1, devmgr "used default key in X state, reject
+	// it!" → Object.ÖoÓ000 → 404); the demotion's marker clear keeps the
+	// factory-reset recovery (armedLifecycle) admissible again.
+	if strings.EqualFold(req.UsedKey, defaultKeyHex) &&
+		d.State != store.StatePending &&
+		(d.State != store.StateAdopting || d.KeyConfirmed) {
+		return Outcome{}, ErrDefaultKeyRejected
+	}
 
 	rtype, _ := req.Body["_type"].(string)
 	if informTypeGentleNoop(rtype) {
@@ -650,18 +723,13 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 	// push in the same key the device just sent (classic: send non-default
 	// authkey while the device still holds the default — §8 of the doc).
 	// FID-1: the shared default key is only ACCEPTED for a device that has
-	// not yet authenticated its per-device key — our StatePending stands in
-	// for the jar's UNKNOWN(0) pre-adoption record and StateAdopting for the
-	// jar's ADOPTING(7) two-phase default-key window (gate ôØ0000, devmgr
-	// §11006-11020). An adopted (or lost) device claiming the default key is
-	// REJECTED (devmgr "used default key in X state, reject it!" returns the
-	// ÖoÓ000 marker → servlet 404). No INFORM_ERROR(9) re-adopt state exists
-	// in the store yet — flagged for the store lane.
+	// not yet AUTHENTICATED its per-device key — the pre-verified window
+	// (StatePending, and keyed-adopting records without the
+	// KeyConfirmed marker) is enforced by the gate at the top of this
+	// function; every other shape was rejected before the gentle-noop and
+	// armedLifecycle arms, so reaching this switch arm IS admission.
 	case req.UsedKey == defaultKeyHex:
 		prev := d.State
-		if prev != store.StatePending && prev != store.StateAdopting {
-			return Outcome{}, ErrDefaultKeyRejected
-		}
 		if err := e.rotateKeys(d); err != nil {
 			return Outcome{}, err
 		}
@@ -901,8 +969,14 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 //     never initiate adoption — rotating/adopting from an unauthenticated
 //     channel would let any network observer seed a device's mgmt_cfg with
 //     an empty cfgversion/authkey);
-//   - claim ≠ XAuthkey → mgmt_cfg-only push carrying the CURRENT XAuthkey
-//     via the authkey= line (re-key me), no rotation, no cfgversion regen;
+//   - claim ≠ XAuthkey → mgmt_cfg-only re-send push (re-key me), NO
+//     rotation, no cfgversion regen, and NO key material: BuildMgmtCfg
+//     is called with the record's own XAuthkey as usedKey so the
+//     authkey= line is omitted — the lane is uncredentials plaintext,
+//     and a wrong or omitted _authkey claim must never learn the
+//     assigned key from the reply (finding C3; a debug device that
+//     lost its key re-learns it over the encrypted path or by
+//     re-registration instead);
 //   - claim == XAuthkey → the assigned-key flow, which ALWAYS emits full
 //     provisioning (the plaintext lane runs no drift-settle and has no
 //     cfgversion-match noop — the encrypted lane's connected-noop branch
@@ -911,6 +985,10 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 // It NEVER rotates keys, NEVER initiates adoption, has no default-key
 // rejection, and performs no drift settle — it shares noopFor,
 // assignedKeyFlow and the adoption push with the encrypted lane.
+// Admin-armed lifecycle commands (§6.5/§6.6/§6.3) require the same
+// authenticated claim: armedLifecycle runs ONLY on a claim-match inform,
+// so an unauthenticated (wrong or omitted) claim can no longer fire the
+// armed setdefault/reboot/task responses nor consume the arming.
 func (e *Engine) decidePlain(req Request, wls []wireless.Wlan, plan wireless.ProvisioningPlan, d *store.Device) (Outcome, error) {
 	now := req.Now
 	rtype, _ := req.Body["_type"].(string)
@@ -920,9 +998,14 @@ func (e *Engine) decidePlain(req Request, wls []wireless.Wlan, plan wireless.Pro
 	}
 
 	// Admin-armed remote commands fire on this lane too (same record,
-	// same admin intent; the outcome serialization is shared).
-	if out, armed := e.armedLifecycle(d); armed {
-		return out, nil
+	// same admin intent; the outcome serialization is shared) — but only
+	// behind the claim check (the C3 ordering fix): an inform that did
+	// not authenticate as the record's assigned key carries no admin
+	// result, gets no key echo, and consumes nothing.
+	if d.XAuthkey != "" && strings.EqualFold(d.XAuthkey, req.UsedKey) {
+		if out, armed := e.armedLifecycle(d); armed {
+			return out, nil
+		}
 	}
 
 	switch {
@@ -932,7 +1015,10 @@ func (e *Engine) decidePlain(req Request, wls []wireless.Wlan, plan wireless.Pro
 
 	case !strings.EqualFold(d.XAuthkey, req.UsedKey):
 		e.lg.Debug("inform-plain: re-send current assignment", "mac", d.MAC)
-		return e.adoptionPush(*d, req.UsedKey), nil
+		// The re-send carries the config rows WITHOUT the authkey= line:
+		// pass d.XAuthkey (not the unverified claim) so BuildMgmtCfg's
+		// used-key comparison always matches and omits the key.
+		return e.adoptionPush(*d, d.XAuthkey), nil
 
 	default:
 		return e.assignedKeyFlow(req.Context, d, now, wls, plan)
@@ -1197,6 +1283,9 @@ func (out *Outcome) deltas(snapshot, work *store.Device) {
 	}
 	if !equalStrings(work.Authkeys, snapshot.Authkeys) {
 		out.SetAuthkeys, out.Authkeys = true, work.Authkeys
+	}
+	if work.KeyConfirmed != snapshot.KeyConfirmed {
+		out.SetKeyConfirmed, out.KeyConfirmed = true, work.KeyConfirmed
 	}
 	out.Extra = work.Extra
 }

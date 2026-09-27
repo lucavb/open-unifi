@@ -691,6 +691,12 @@ func (s *Server) applyOutcome(mac string, rec *store.Device, out adoption.Outcom
 	if out.SetAuthkeys {
 		rec.Authkeys = out.Authkeys
 	}
+	if out.SetKeyConfirmed {
+		// The key-confirmation marker (the adoption engine's factory-key
+		// gate input): set by key-authenticated informs, cleared by the
+		// setdefault demotion.
+		rec.KeyConfirmed = out.KeyConfirmed
+	}
 	rec.Extra = out.Extra
 	// Credential-cache deltas from the pure renderer: the renderer no longer
 	// mutates anything, so the adapter applies them at the same point the
