@@ -458,6 +458,11 @@ func (s *Server) recordDiscoveryCandidate(src *net.UDPAddr, info discoveryInfo) 
 func discoveryNote(info discoveryInfo) string {
 	var parts []string
 	addString := func(k, v string) {
+		// Invariant (audit run-1 Fix 6, C7 discovery-note injection): the
+		// note is comma-joined k=v parts, so a value must never contain a
+		// comma or it could compose a fake part (e.g. ",factory=true").
+		// Strings are informational only, so stripping commas is cosmetic.
+		v = strings.ReplaceAll(v, ",", "")
 		if v != "" {
 			parts = append(parts, k+"="+v)
 		}
