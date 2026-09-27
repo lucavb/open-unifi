@@ -2574,6 +2574,7 @@ func TestParseDiscovery(t *testing.T) {
 		{"v2 seq 0", mkDiscoveryV2(0, outer, ip), "", true},
 		{"v2 cmd8 parses as reply-only", mkDiscoveryPacket(2, 8,
 			mkTLV(1, devMAC[:]), mkTLV(18, []byte{0, 0, 0, 1}), mkTLV(19, outer[:])), "00156d010001", false},
+		{"v2 cmd8 header-only probe parses (app shape)", []byte{2, 8, 0, 0}, "", false},
 		{"v1 challenge parses (dropped at dispatch)", mkDiscoveryPacket(1, 2,
 			mkTLV(1, devMAC[:])), "00156d010001", false},
 		{"v0 legacy valid", append(append([]byte{0,

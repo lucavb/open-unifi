@@ -505,8 +505,21 @@ else                      this.oo\u00d4000.o00000(mac, type, ip, port, user, pas
   {"type":"adopt","mac":…,"device_type":…"type-name","ip":…,"port":2022*,
    "username":…,"password":…,"url":"<inform url>","authkey":"<32hex>","key":"<hostkey>"}
   ```
-  (`*` port field always 2022 in code; result is parsed as JSON reply from device
-  with `rc` / `ssh_key_new` / `ssh_fingerprint_new`, voidsuper §3150-3163.)
+  (`*` port field always 2022 in code. The runner `ooOo$_o.run` writes the job
+  through `OutputStreamWriter` and closes the socket WITHOUT reading any reply —
+  there is no `getInputStream` on this lane (com__ubnt__service__devmgr__OOOo__o.txt
+  `run`). The callback always fires with the job X; only the connect/write-failure
+  path enriches it with `rc="error"`, `msg="Failed to connect via SSL: …"`. The TLS
+  callback `voidsuper.ø00000(String,String,X)` treats `rc != "error"` — default
+  `"ok"`, i.e. absence of rc — as adopt success → state 1; `rc=="error"` → state 0 +
+  `incAdoptTries`; `ssh_key_new`/`ssh_fingerprint_new` never occur on this lane.
+  The rich result parsing — `rc`/`msg` → `unreachable→2`/`loginfail→3`/
+  `ssh_fingerprint→4` and the `ssh_key_new`/`ssh_fingerprint_new` consumption via
+  `ÕO0000` — belongs to the SSH-lane callback `if(String,String,X)` above; those
+  fields are controller-side sshj session artifacts written into the job by
+  `privatesuper.o00000(X, e)`, never a device reply. 2026-09-27 APK-RE review
+  correction: the previous wording attached the SSH-lane reply parsing to this
+  TLS bullet.)
 
 `checkreachable` is the SSH-only variant (`_OOo`, always port 22, no command).
 `upgrade` task and `reboot` and `setdefault` (restore-default) reuse the same

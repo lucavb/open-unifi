@@ -45,6 +45,17 @@ type Config struct {
 	// DiscoveryPort is the UDP port for discovery (classically 10001).
 	DiscoveryPort int
 
+	// DiscoveryDiscoverable answers V2 cmd-8 beacon queries with the
+	// cmd-9 reply even once adoption has started — the analogue of the
+	// classic controller's "mgmt" → "discoverable" setting (default
+	// false). Without it, replies fire only while the controller is still
+	// in its default state (no device record has reached StateAdopting
+	// or beyond), mirroring the factory-default `is_default` system
+	// property of the deployed responder com.ubnt.net.K.while()
+	// (K.txt:601-646: running && (is_default [default true] || cached
+	// mgmt.discoverable [default false])).
+	DiscoveryDiscoverable bool
+
 	// ControllerURL is the base URL devices are pointed at during adoption,
 	// e.g. "http://10.0.0.5:8080".
 	ControllerURL string

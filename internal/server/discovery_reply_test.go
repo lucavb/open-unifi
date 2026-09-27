@@ -95,3 +95,81 @@ func TestDiscoveryCmd8SocketIntegration(t *testing.T) {
 	}
 	_ = listener.Close()
 }
+
+// TestDiscoveryCmd8HeaderOnlyReplyGate pins the reply gate against the
+// official Android app's probe shape ([02 08 00 00], no TLVs —
+// com.ubnt.easyunifi ee4.java:138-140) and the com.ubnt.net.K.while()
+// state analogue (review T6): a default-state controller answers the
+// header-only probe; once a device record has reached StateAdopting or
+// beyond, only DiscoveryDiscoverable keeps the reply armed.
+func TestDiscoveryCmd8HeaderOnlyReplyGate(t *testing.T) {
+	probe := []byte{2, 8, 0, 0}
+	listener, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+	src := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4242}
+
+	setup := func(t *testing.T, cfg Config, st store.DeviceStore) (*Server, *[]byte) {
+		t.Helper()
+		s := New(cfg, st, testLogger())
+		ss := s.discoverySightings()
+		var got []byte
+		ss.mu.Lock()
+		ss.testIdentity = "001122334455"
+		ss.replyMeta = &discoveryReplyMetadata{identity: ss.testIdentity, firmware: "unknown", board: "unknown", version: "unknown", aliases: []discoveryAlias{{mac: [6]byte{1, 2, 3, 4, 5, 6}, ip: [4]byte{10, 0, 1, 1}}}}
+		ss.replySourceAllowed = func(a *net.UDPAddr) bool { return a.IP.IsLoopback() }
+		ss.replyWriter = func(p []byte, dst *net.UDPAddr) error { got = append([]byte(nil), p...); return nil }
+		ss.mu.Unlock()
+		return s, &got
+	}
+
+	t.Run("default state answers the app probe", func(t *testing.T) {
+		s, got := setup(t, Config{}, store.NewMemStore())
+		s.handleDiscoveryPacketConn(listener, src, probe)
+		if *got == nil || (*got)[1] != 9 {
+			t.Fatalf("want cmd-9 reply to header-only probe, got %v", *got)
+		}
+	})
+	t.Run("pending candidates keep the default state", func(t *testing.T) {
+		st := store.NewMemStore()
+		if err := st.MarkPending("112233445566", "discovery:"); err != nil {
+			t.Fatal(err)
+		}
+		s, got := setup(t, Config{}, st)
+		s.handleDiscoveryPacketConn(listener, src, probe)
+		if *got == nil {
+			t.Fatal("pending-only store must still answer")
+		}
+	})
+	t.Run("adopted device silences the reply", func(t *testing.T) {
+		st := store.NewMemStore()
+		if err := st.Put(store.Device{MAC: "aabbccddeeff", State: store.StateAdopted}); err != nil {
+			t.Fatal(err)
+		}
+		s, got := setup(t, Config{}, st)
+		s.handleDiscoveryPacketConn(listener, src, probe)
+		if *got != nil {
+			t.Fatalf("provisioned controller must stay silent, got %v", *got)
+		}
+	})
+	t.Run("discoverable override answers with adopted devices", func(t *testing.T) {
+		st := store.NewMemStore()
+		if err := st.Put(store.Device{MAC: "aabbccddeeff", State: store.StateAdopted}); err != nil {
+			t.Fatal(err)
+		}
+		s, got := setup(t, Config{DiscoveryDiscoverable: true}, st)
+		s.handleDiscoveryPacketConn(listener, src, probe)
+		if *got == nil || (*got)[1] != 9 {
+			t.Fatal("discoverable override must reply")
+		}
+	})
+	t.Run("v1 probe never replies", func(t *testing.T) {
+		s, got := setup(t, Config{}, store.NewMemStore())
+		s.handleDiscoveryPacketConn(listener, src, []byte{1, 0, 0, 0})
+		if *got != nil {
+			t.Fatalf("v1 cmd-0 probe must not reply, got %v", *got)
+		}
+	})
+}

@@ -35,6 +35,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/lucavb/open-unifi/internal/store"
 )
 
 const (
@@ -185,6 +187,39 @@ func (s *Server) discoverySelfGuard(info discoveryInfo) bool {
 	return echo != "" && echo == s.discoveryIdentity()
 }
 
+// discoveryReplyEnabled mirrors the deployed responder's discoverable
+// gate com.ubnt.net.K.while() (K.txt:601-646): the cmd-9 reply fires only
+// while the controller is in its default (pre-setup) state or has been
+// explicitly made discoverable.
+//
+//   - mgmt.discoverable analogue: the DiscoveryDiscoverable config knob
+//     (default false — jar: Setting.is("discoverable", false), cached at
+//     afterPropertiesSet).
+//   - is_default analogue: the jar reads the `is_default` system property
+//     (default TRUE — flipped once setup completes). DEVIATION: open-unifi
+//     has no setup wizard, so the default state is derived from the only
+//     first-run signal it has — no device record has reached
+//     StateAdopting or beyond. Pending discovery candidates do NOT end
+//     the default state (they live outside List()), so a fresh controller
+//     still answers probes from a LAN full of announcing devices.
+//     Evaluated at reply time; a store read failure stays silent (a
+//     broken store must not flip the reply on).
+func (s *Server) discoveryReplyEnabled() bool {
+	if s.cfg.DiscoveryDiscoverable {
+		return true
+	}
+	devices, err := s.st.List()
+	if err != nil {
+		return false
+	}
+	for _, d := range devices {
+		if d.State >= store.StateAdopting {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Server) discoveryIdentity() string {
 	st := s.discoverySightings()
 	st.mu.Lock()
@@ -280,7 +315,14 @@ func (s *Server) handleDiscoveryPacketConn(conn *net.UDPConn, src *net.UDPAddr, 
 			allowed = st.replySourceAllowed
 		}
 		st.mu.Unlock()
-		if conn != nil && allowed(src) && !s.discoverySelfGuard(info) {
+		// Deployed parity: the jar's cmd-8 branch (redump :1706-1739)
+		// gates the reply on while() ∧ site-local only. The self-guard
+		// kept here is a documented superset (a TLV19 echo of our own
+		// interface MAC is a loop artifact; the app's header-only probe
+		// carries no TLV19 and is unaffected), and discoveryReplyEnabled
+		// is the while() analogue — the reply fires only in default
+		// state or under the discoverable knob.
+		if conn != nil && allowed(src) && !s.discoverySelfGuard(info) && s.discoveryReplyEnabled() {
 			dst := src
 			st := s.discoverySightings()
 			st.mu.Lock()
@@ -562,7 +604,20 @@ func (s *Server) parseDiscoveryModern(src *net.UDPAddr, b []byte) (discoveryInfo
 	}
 	info.ip = discoveryCandidateIP(src, info)
 
-	// v2 gates, in jar order (O0oO_discovery_redump.txt:815-928). v1
+	// cmd-8 optional-reply branch, FIRST — redump :1706-1739 (the TLV
+	// walk's exit at :302-306 lands directly on it, ahead of every v2
+	// gate). A v2 cmd-8 packet is reply-only: the caller fires the cmd-9
+	// answer, the packet is never recorded, and validity, self-guard,
+	// blocklist and anti-replay do NOT apply to it. The official Android
+	// app's discovery probes are exactly this header-only shape
+	// ([02 08 00 00], no TLVs — com.ubnt.easyunifi ee4.java:138-140), so
+	// placing this branch behind the validity gate would drop them
+	// unanswered (APK-RE review T6, 2026-09-27).
+	if info.ver == 2 && info.cmd == 8 {
+		return info, true
+	}
+
+	// v2 gates, in jar order (O0oO_discovery_redump.txt:832-928). v1
 	// packets skip gates 1-5 entirely. V0 was dispatched before the walk.
 	if info.ver == 2 {
 		// (1) validity: TLV1 ∧ seq >= 1 ∧ TLV19, else "invalid v2
@@ -574,11 +629,6 @@ func (s *Server) parseDiscoveryModern(src *net.UDPAddr, b []byte) (discoveryInfo
 		// (3) self-guard: own-interface MAC == TLV19 → drop (:844-855).
 		if s.discoverySelfGuard(info) {
 			return info, false
-		}
-		// cmd-8 is syntactically valid but reply-only; the receive path
-		// consumes it before command dispatch and never records it.
-		if info.cmd == 8 {
-			return info, true
 		}
 		// (4) model blocklist — mFi family (:855-862; list :1675-1733).
 		if discoveryModelBlocked(info.model) {

@@ -43,6 +43,8 @@ func run() error {
 	listenAdmin := flag.String("listen-admin", "127.0.0.1:8443", "listen address for the admin API server")
 	listenDiscovery := flag.String("listen-discovery", ":10001", "UDP listen address for discovery")
 	discovery := flag.Bool("discovery", true, "enable the UDP discovery listener")
+	discoveryDiscoverable := flag.Bool("discovery-discoverable", false,
+		"answer V2 cmd-8 discovery probes even after adoption has started (classic-controller 'mgmt.discoverable' analogue; default: replies fire only while no device is adopting, mirroring the factory-default is_default state)")
 	dataDir := flag.String("data-dir", "data", "directory for devices.json")
 	controllerURL := flag.String("controller-url", "", "base URL devices are pointed at during adoption (e.g. http://10.0.0.5:8080)")
 	// Default from the provider's token env var; --admin-token overrides it.
@@ -126,12 +128,13 @@ func run() error {
 	}
 
 	srv := server.New(server.Config{
-		InformListenAddr:  *listenInform,
-		DiscoveryListen:   *discovery,
-		DiscoveryPort:     dport,
-		ControllerURL:     *controllerURL,
-		AllowPlainText:    *allowPlainText,
-		WirelessForDevice: wirelessForDevice,
+		InformListenAddr:      *listenInform,
+		DiscoveryListen:       *discovery,
+		DiscoveryPort:         dport,
+		DiscoveryDiscoverable: *discoveryDiscoverable,
+		ControllerURL:         *controllerURL,
+		AllowPlainText:        *allowPlainText,
+		WirelessForDevice:     wirelessForDevice,
 		// Client-session transition observations ride the same ownership
 		// seam as IncInform: the transport stays Prometheus-free and main
 		// wires the hook (post-commit, exactly-once per persisted
@@ -264,6 +267,7 @@ func run() error {
 		"admin", *listenAdmin,
 		"discovery", *discovery,
 		"discovery_port", dport,
+		"discovery_discoverable", *discoveryDiscoverable,
 		"data_dir", *dataDir,
 		"auth", *adminToken != "",
 		"plaintext_inform", *allowPlainText,
