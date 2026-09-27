@@ -847,12 +847,18 @@ func ethPortNames(d store.Device) (ports []string, known bool) {
 }
 
 // ethPortNamesFromEthernetTable expands ethernet_table entries into ethN names
-// (an entry without num_port counts as one port).
+// (an entry without num_port counts as one port). Both counts are clamped:
+// num_port is a device-reported value, so a lying record must not drive an
+// attacker-sized allocation (unbounded num_port expansion, audit run 1).
+// Per entry, n is capped at 8 (real APs carry 1-2 ports); the aggregate total
+// is capped at 64.
 func ethPortNamesFromEthernetTable(d store.Device) ([]string, bool) {
 	rawList, ok := d.Extra["ethernet_table"].([]any)
 	if !ok {
 		return nil, false
 	}
+	const maxPerEntry = 8
+	const maxTotal = 64
 	total := 0
 	sawEntries := false
 	for _, item := range rawList {
@@ -862,6 +868,9 @@ func ethPortNamesFromEthernetTable(d store.Device) ([]string, bool) {
 		}
 		sawEntries = true
 		if n := wireless.JSONInt(m, "num_port"); n > 0 {
+			if n > maxPerEntry {
+				n = maxPerEntry
+			}
 			total += n
 		} else {
 			total++
@@ -869,6 +878,9 @@ func ethPortNamesFromEthernetTable(d store.Device) ([]string, bool) {
 	}
 	if !sawEntries || total <= 0 {
 		return nil, false
+	}
+	if total > maxTotal {
+		total = maxTotal
 	}
 	out := make([]string, 0, total)
 	for i := 0; i < total; i++ {
