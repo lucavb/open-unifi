@@ -18,14 +18,22 @@
 // setdefault demotion sweeps the controller-owned keys with it: a
 // factory-reset device re-adoption starts with fresh session state.
 //
-// Rows are deliberately never pruned for age or count: no recovered
-// retention rule exists in this worktree's docs, and an invented TTL
-// would be uncited behavior (the lane report records this as a noted
-// bound — row growth is bounded by the client population each device
-// ever serves).
+// Rows are bounded by a per-device retention cap: at most
+// sessionRowCap (2048) rows per device. When a refresh would leave a
+// device above the cap, the rows with the smallest last_seen (MAC as
+// the deterministic tie-break) are evicted until the device sits at
+// the cap, so persisted row growth is bounded per device (~2048 rows)
+// instead of the previously unbounded client population. This is the
+// retention policy cited by the audit run 1 sign-off (2026-09); before
+// that decision no recovered retention rule existed.
 package store
 
 import "sort"
+
+// sessionRowCap is the per-device session-row retention cap (see the
+// package comment): RefreshSessions evicts the rows with the oldest
+// last_seen once a device's row count would exceed it.
+const sessionRowCap = 2048
 
 // Extra keys of the session store (controller-owned class).
 const (
@@ -123,6 +131,7 @@ func RefreshSessions(d *Device, stationMACs []string, nowUnix int64) (connects, 
 	}
 	sort.Strings(connects)
 	sort.Strings(disconnects)
+	enforceSessionRowCap(rows)
 	writeSessionRows(d, rows)
 	if len(disconnects) > 0 {
 		if d.Extra == nil {
@@ -131,6 +140,32 @@ func RefreshSessions(d *Device, stationMACs []string, nowUnix int64) (connects, 
 		d.Extra[SessionDisconnectEventExtraKey] = true
 	}
 	return connects, disconnects
+}
+
+// enforceSessionRowCap evicts rows with the oldest last_seen (MAC as
+// the deterministic tie-break) until the row count sits at
+// sessionRowCap. Eviction is silent: the rows it retires produce no
+// connect/disconnect events; a later inform sighting of an evicted
+// client is simply a fresh connect.
+func enforceSessionRowCap(rows map[string]sessionRow) {
+	over := len(rows) - sessionRowCap
+	if over <= 0 {
+		return
+	}
+	macs := make([]string, 0, len(rows))
+	for mac := range rows {
+		macs = append(macs, mac)
+	}
+	sort.Slice(macs, func(i, j int) bool {
+		ri, rj := rows[macs[i]], rows[macs[j]]
+		if ri.lastSeen != rj.lastSeen {
+			return ri.lastSeen < rj.lastSeen
+		}
+		return macs[i] < macs[j]
+	})
+	for _, mac := range macs[:over] {
+		delete(rows, mac)
+	}
 }
 
 // readSessionRows loads the rows from Extra, tolerating absent/odd shapes
