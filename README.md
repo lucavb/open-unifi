@@ -20,7 +20,7 @@ over the standard inform channel.
 - `internal/adminapi/` — REST under `/api/v1/*`, bearer-token auth, embedded web console at `/`.
 - `internal/app/` — glue: Backend adapter over the store, wireless config persistence, metrics poller.
 - `internal/metrics/` — Prometheus collectors (`openunifi_*`).
-- `internal/adminapi/static/index.html` — the embedded web console (go:embed; single source of truth).
+- `web/` — the admin console: a minimal Vite project (Vue 3, no runtime compiler); its build output `internal/adminapi/static/dist` is never committed — the CI web job and the Docker image's node stage build it, and it is go:embed'ed into the single-binary deploy.
 - `docs/` — protocol specifications (bytecode-cited).
 
 ## Build & run

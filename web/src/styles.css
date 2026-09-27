@@ -1,0 +1,125 @@
+  [v-cloak] { display: none; }
+  :root {
+    --accent: #2563eb; --accent-hover: #1d4ed8; --accent-soft: #eff6ff;
+    --danger: #dc2626; --ok: #16a34a;
+    --bg: #f8fafc; --surface: #ffffff; --border: #e2e8f0;
+    --text: #0f172a; --muted: #64748b;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  .container { max-width: 980px; margin: 0 auto; padding: 24px 20px 64px; }
+  header.top {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 16px 20px; margin-bottom: 24px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  }
+  header.top h1 { font-size: 18px; margin: 0; letter-spacing: -0.01em; }
+  header.top .sub { color: var(--muted); font-size: 13px; }
+  .spacer { flex: 1; }
+  .tokenbox { display: flex; gap: 8px; align-items: center; }
+  .tokenbox input { width: 240px; }
+  input, select, button {
+    font: inherit; color: inherit;
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 7px 10px; background: var(--surface);
+  }
+  input:focus-visible, select:focus-visible, button:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px;
+  }
+  button.btn {
+    background: var(--accent); color: #fff; border-color: var(--accent);
+    cursor: pointer; transition: background .12s ease, transform .06s ease;
+  }
+  button.btn:hover { background: var(--accent-hover); }
+  button.btn:active { transform: translateY(1px); }
+  button.btn-ghost {
+    background: var(--accent-soft); color: var(--accent); border-color: transparent;
+    cursor: pointer; font-weight: 500;
+  }
+  button.btn-ghost:hover { background: #dbeafe; }
+  button.btn-small { padding: 4px 10px; font-size: 13px; border-radius: 7px; }
+  section.card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 20px; margin-bottom: 24px;
+  }
+  section.card > h2 {
+    margin: 0 0 4px; font-size: 15px; text-transform: uppercase;
+    letter-spacing: 0.06em; color: var(--muted); font-weight: 600;
+  }
+  section.card > p.hint { margin: 0 0 14px; color: var(--muted); font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  th {
+    font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--muted); font-weight: 600; border-bottom: 1px solid #cbd5e1;
+  }
+  tr:last-child > td { border-bottom: none; }
+  td input, td select { width: 100%; min-width: 90px; }
+  td input.num { width: 90px; }
+  td.radius-cell { min-width: 170px; }
+  td.radius-cell input, td.radius-cell select { display: block; margin: 2px 0; }
+  td.led-cell { min-width: 130px; }
+  td.led-cell input, td.led-cell button { display: block; margin: 2px 0; width: 110px; }
+  td.ssh-cell { min-width: 170px; }
+  td.ssh-cell input, td.ssh-cell button { display: block; margin: 2px 0; width: 145px; }
+  td.ssh-cell .sub { display: block; margin: 2px 0; }
+  td.country-cell { min-width: 100px; }
+  td.country-cell input, td.country-cell button { display: block; margin: 2px 0; width: 90px; }
+  td.sshkeys-cell { min-width: 200px; }
+  td.sshkeys-cell textarea { display: block; margin: 2px 0; width: 100%; min-height: 52px; font-size: 12px; }
+  td.sshkeys-cell button { display: block; margin: 2px 0; width: 145px; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+  .badge {
+    display: inline-block; padding: 2px 9px; border-radius: 999px;
+    font-size: 12px; font-weight: 600; line-height: 1.7;
+  }
+  .badge.state-1 { background: #fef3c7; color: #b45309; }  /* pending: amber */
+  .badge.state-2 { background: #dbeafe; color: #1d4ed8; }  /* adopting: blue */
+  .badge.state-3 { background: #dcfce7; color: #15803d; }  /* adopted: green */
+  .badge.state-4 { background: #fee2e2; color: #b91c1c; }  /* lost: red */
+  .badge.state-unknown { background: #e2e8f0; color: #475569; }
+  .badge.live { background: #dcfce7; color: #15803d; }
+  .pill {
+    display: inline-block; padding: 5px 12px; border-radius: 8px;
+    background: #fee2e2; color: #b91c1c; font-size: 13px; margin: 10px 0 0;
+  }
+  form.rowform { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  form.rowform input { width: 220px; }
+  .actions-cell { white-space: nowrap; text-align: right; }
+  footer { color: var(--muted); font-size: 13px; }
+  footer a { color: var(--accent); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+  .empty { color: var(--muted); font-style: italic; padding: 10px 0; }
+  tr.clients-row > td { background: var(--bg); padding: 0 10px 12px; }
+  table.clients-table { font-size: 13px; }
+  table.clients-table th { font-size: 11px; }
+  table.clients-table td, table.clients-table th { padding: 5px 10px; }
+  noscript { max-width: 980px; margin: 24px auto 0; padding: 0 20px; }
+  noscript p { color: #b45309; background: #fef3c7; padding: 10px 14px; border-radius: 8px; }
+  /* Wide tables (devices, wireless) live in a keyboard-scrollable region:
+     per-cell min-widths intentionally exceed the container, so the wrapper
+     scrolls instead of overflowing the page. sticky first column + header
+     need border-collapse: separate (collapse breaks sticky in WebKit) and
+     opaque backgrounds; z-order: column 1, header 2, top-left corner 3. */
+  .scroll {
+    overflow-x: auto; max-width: 100%; max-height: 65vh;
+    scrollbar-gutter: stable;
+  }
+  .scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  table.data-table { border-collapse: separate; border-spacing: 0; }
+  table.data-table > thead > tr > th,
+  table.data-table > tbody > tr > td,
+  table.data-table > tfoot > tr > td { white-space: nowrap; }
+  table.data-table > thead > tr > th {
+    position: sticky; top: 0; z-index: 2; background: var(--surface);
+  }
+  table.data-table > tbody > tr > td:first-child {
+    position: sticky; left: 0; z-index: 1; background: var(--surface);
+  }
+  table.data-table > thead > tr > th:first-child { z-index: 3; }
+  /* The full-width clients expansion row opts out of the sticky column. */
+  table.data-table > tbody > tr.clients-row > td { position: static; background: var(--bg); }

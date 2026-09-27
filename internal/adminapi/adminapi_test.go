@@ -10,6 +10,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"sort"
@@ -1740,10 +1742,31 @@ func TestRootServesEmbeddedConsole(t *testing.T) {
 		t.Fatalf("content-type: %q", ct)
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"open-unifi controller", "api/v1/devices", "Adopt"} {
+	// The built shell is thin: title + noscript text are the stable shell
+	// markers; the app content ("Adopt", ...) lives in the content-hashed
+	// /assets/*.js module script.
+	for _, want := range []string{"open-unifi controller", "needs JavaScript to call the REST API"} {
 		if !strings.Contains(body, want) {
-			t.Fatalf("console missing %q", want)
+			t.Fatalf("console shell missing %q", want)
 		}
+	}
+	var jsRef string
+	for _, name := range assetNameRe.FindAllString(body, -1) {
+		if strings.HasSuffix(name, ".js") {
+			jsRef = name
+			break
+		}
+	}
+	if jsRef == "" {
+		t.Fatalf("console shell references no /assets/*.js module script")
+	}
+	jrec := httptest.NewRecorder()
+	h.ServeHTTP(jrec, httptest.NewRequest("GET", jsRef, nil))
+	if jrec.Code != http.StatusOK {
+		t.Fatalf("JS bundle %s: %d", jsRef, jrec.Code)
+	}
+	if !strings.Contains(jrec.Body.String(), "Adopt") {
+		t.Fatalf("JS bundle missing app marker %q", "Adopt")
 	}
 }
 
@@ -2082,46 +2105,182 @@ func TestWirelessRejectsControlCharsAndBadID(t *testing.T) {
 	}
 }
 
-// ---- web console: embedded esc() + CSP (item 5) -----------------------------
-// These are mechanical tripwires on the embedded page: they prove the fix
-// ships (quote-escaping chain present, DOM-based esc absent) and that page()
-// serves the CSP header. Real JS behavior (whether esc() survives a u001F
-// edge case, event-handler breakout attempt at runtime etc.) is browser
-// behavior and NOT unit-testable from Go.
+// ---- web console: built dist + strict CSP (item 5) ---------------------------
+// The console is the Vite project in web/; its build output (static/dist) is
+// never committed — the CI web job builds it and feeds the Go jobs, the
+// Docker image builds it in a node stage, and locally the Makefile builds it
+// on demand (AGENTS.md). These tests run against whatever bundle was built
+// last. The source greps below target web/src and web/index.html,
+// NOT static/dist: go:embed cannot reach outside this package, and the dist
+// bundle embeds Vue runtime internals, so grepping it would false-positive.
+// Real JS behavior is browser behavior and NOT unit-testable from Go.
 
-func TestEmbeddedConsoleHasQuoteEscapingAndCSP(t *testing.T) {
-	src := string(indexHTML)
+var (
+	// scriptTagRe extracts the <script> open tags for the src= sweep:
+	// every tag in the built shell must reference an external module
+	// script, never inline JS (script-src 'self').
+	scriptTagRe = regexp.MustCompile(`<script[^>]*>`)
+	// scriptBodyRe captures each <script> tag's body: in the built shell
+	// every body must be empty.
+	scriptBodyRe = regexp.MustCompile(`(?s)<script[^>]*>(.*?)</script>`)
+	// styleAttrRe matches style="" presentation attributes in markup.
+	styleAttrRe = regexp.MustCompile(`(?i)<[a-z][^>]*\sstyle\s*=`)
+	// assetNameRe matches the content-hashed bundle references in the
+	// built shell (hash-agnostic by design — never hardcode the hashes).
+	assetNameRe = regexp.MustCompile(`/assets/[A-Za-z0-9._-]+\.(?:js|css)`)
+)
 
-	if !strings.Contains(src, `.replace(/"/g, "&quot;")`) {
-		t.Fatalf("esc() does not escape double quotes (required: output lands inside value=\"...\")")
+func TestConsoleSourceBansHTMLInjection(t *testing.T) {
+	seen := map[string]bool{}
+	for _, root := range []string{"../../web/src", "../../web/index.html"} {
+		err := filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() {
+				return nil
+			}
+			data, err := os.ReadFile(p)
+			if err != nil {
+				return err
+			}
+			seen[p] = true
+			src := string(data)
+			// v-html would bypass Vue's auto-escaping and re-open the
+			// stored-XSS channel the old esc() chain closed; innerHTML
+			// assignment is manual HTML building and equally banned.
+			if strings.Contains(src, "v-html") {
+				t.Errorf("%s uses v-html: device data must render through {{ }} interpolation only", p)
+			}
+			if strings.Contains(src, "innerHTML") {
+				t.Errorf("%s assigns innerHTML: manual HTML building is banned in the console", p)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("walk %s: %v", root, err)
+		}
 	}
-	if !strings.Contains(src, `.replace(/&/g, "&amp;")`) {
-		t.Fatalf("esc() must escape & first so later entities are not double-escaped")
+	for _, want := range []string{"../../web/src/main.ts", "../../web/src/App.vue", "../../web/index.html"} {
+		if !seen[want] {
+			t.Fatalf("console source tree missing %s", want)
+		}
 	}
-	if !strings.Contains(src, `&apos;`) && !strings.Contains(src, `&#39;`) {
-		t.Fatalf("esc() does not escape single quotes")
-	}
-	// The old textContent->innerHTML trick has no legitimate remaining user.
-	if strings.Contains(src, "d.innerHTML") {
-		t.Fatalf("old DOM-based esc remnant present")
-	}
+}
 
-	// page() must set the CSP defense-in-depth header.
+// The built shell must be CSP-clean: no inline script bodies, no style=
+// attributes, and a CSP without 'unsafe-inline'/'unsafe-eval'. The old
+// "open-unifi controller" body marker now lives in the JS bundle (the <h1>),
+// so the shell marker moves to the stable app div + noscript text.
+func TestServedConsoleShellIsCSPClean(t *testing.T) {
 	h := New(Config{}, newFakeBackend())
 	req := httptest.NewRequest("GET", "/", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /: got %d, want 200", rec.Code)
+	}
 	csp := rec.Header().Get("Content-Security-Policy")
 	for _, want := range []string{
-		"default-src 'self'", "object-src 'none'", "base-uri 'none'",
-		"frame-ancestors 'none'", "connect-src 'self'",
+		"default-src 'self'", "script-src 'self'", "style-src 'self'",
+		"connect-src 'self'", "object-src 'none'", "base-uri 'none'",
+		"frame-ancestors 'none'",
 	} {
 		if !strings.Contains(csp, want) {
 			t.Fatalf("CSP header missing %q; got %q", want, csp)
 		}
 	}
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "open-unifi controller") {
-		t.Fatalf("console page broken: %d %q", rec.Code, rec.Body.String()[:80])
+	for _, banned := range []string{"'unsafe-eval'", "'unsafe-inline'"} {
+		if strings.Contains(csp, banned) {
+			t.Fatalf("CSP header contains %q; got %q", banned, csp)
+		}
+	}
+	body := rec.Body.String()
+	for _, tag := range scriptTagRe.FindAllString(body, -1) {
+		if !strings.Contains(tag, "src=") {
+			t.Fatalf("script tag without src= in served shell: %q", tag)
+		}
+	}
+	for _, m := range scriptBodyRe.FindAllStringSubmatch(body, -1) {
+		if strings.TrimSpace(m[1]) != "" {
+			t.Fatalf("served shell contains an inline <script> body (script-src 'self'): %q", m[1])
+		}
+	}
+	if m := styleAttrRe.FindString(body); m != "" {
+		t.Fatalf("served shell has a style= attribute (style-src 'self'): %q", m)
+	}
+	if !strings.Contains(body, `<div id="app" v-cloak>`) ||
+		!strings.Contains(body, "needs JavaScript to call the REST API") {
+		t.Fatalf("console shell markers missing: %q", body[:80])
+	}
+}
+
+// The content-hashed bundles referenced by the served shell must come back
+// 200 with the right content type and the immutable cache header; the JS
+// bundle carries the console's <h1> marker; unknown names 404 (no listing).
+func TestServedConsoleAssets(t *testing.T) {
+	h := New(Config{}, newFakeBackend())
+	req := httptest.NewRequest("GET", "/", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /: got %d, want 200", rec.Code)
+	}
+
+	names := map[string]bool{}
+	for _, n := range assetNameRe.FindAllString(rec.Body.String(), -1) {
+		names[n] = true
+	}
+	var js, css []string
+	for n := range names {
+		switch {
+		case strings.HasSuffix(n, ".js"):
+			js = append(js, n)
+		case strings.HasSuffix(n, ".css"):
+			css = append(css, n)
+		}
+	}
+	if len(js) == 0 || len(css) == 0 {
+		t.Fatalf("served shell references no /assets/ js+css bundles; found %v", names)
+	}
+
+	for _, name := range append(js, css...) {
+		ar := httptest.NewRequest("GET", name, nil)
+		arec := httptest.NewRecorder()
+		h.ServeHTTP(arec, ar)
+		if arec.Code != http.StatusOK {
+			t.Fatalf("GET %s: got %d, want 200", name, arec.Code)
+		}
+		wantCT := "text/css"
+		if strings.HasSuffix(name, ".js") {
+			wantCT = "application/javascript"
+		}
+		if ct := arec.Header().Get("Content-Type"); ct != wantCT {
+			t.Fatalf("GET %s: Content-Type got %q, want %q", name, ct, wantCT)
+		}
+		if cc := arec.Header().Get("Cache-Control"); !strings.Contains(cc, "max-age=31536000") || !strings.Contains(cc, "immutable") {
+			t.Fatalf("GET %s: Cache-Control got %q, want max-age=31536000, immutable", name, cc)
+		}
+		if arec.Header().Get("X-Content-Type-Options") != "nosniff" {
+			t.Fatalf("GET %s: missing X-Content-Type-Options: nosniff", name)
+		}
+		if arec.Header().Get("Content-Security-Policy") == "" {
+			t.Fatalf("GET %s: missing Content-Security-Policy header", name)
+		}
+		if len(arec.Body.Bytes()) == 0 {
+			t.Fatalf("GET %s: empty body", name)
+		}
+	}
+
+	// The <h1> marker moved into the bundle: the JS asset must carry it.
+	ar := httptest.NewRequest("GET", js[0], nil)
+	arec := httptest.NewRecorder()
+	h.ServeHTTP(arec, ar)
+	if !strings.Contains(arec.Body.String(), "open-unifi controller") {
+		t.Fatalf("JS bundle %s missing the %q marker", js[0], "open-unifi controller")
+	}
+
+	nrec := httptest.NewRecorder()
+	h.ServeHTTP(nrec, httptest.NewRequest("GET", "/assets/nope.js", nil))
+	if nrec.Code != http.StatusNotFound {
+		t.Fatalf("GET /assets/nope.js: got %d, want 404", nrec.Code)
 	}
 }
 

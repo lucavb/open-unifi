@@ -13,6 +13,7 @@ env:
 
 jobs:
   check:
+    needs: web
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v6
@@ -20,12 +21,20 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+
+      # go:embed needs the console bundle; the web job builds it (AGENTS.md).
+      - name: Download console bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: console-dist
+          path: internal/adminapi/static/dist
 
       # check job only — lint is a separate job (see AGENTS.md).
       - name: Module gate
         run: make check
 
   build:
+    needs: web
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v6
@@ -33,11 +42,18 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+
+      - name: Download console bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: console-dist
+          path: internal/adminapi/static/dist
 
       - name: Build
         run: go build -v ./...
 
   lint:
+    needs: web
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v6
@@ -45,6 +61,12 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+
+      - name: Download console bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: console-dist
+          path: internal/adminapi/static/dist
 
       # Not covered by make check — agents must run this locally too (AGENTS.md).
       - name: golangci-lint
@@ -52,8 +74,35 @@ jobs:
         with:
           version: v2.11.4
 
+  web:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # The console bundle is build output, never committed: this job
+      # builds it from web/ and hands it to the Go jobs, whose go:embed
+      # needs it on disk (AGENTS.md).
+      - name: Build console bundle
+        run: |
+          npm ci
+          npm run build
+        working-directory: web
+
+      - name: Upload console bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: console-dist
+          path: internal/adminapi/static/dist
+          if-no-files-found: error
+
   docker:
-    needs: [check, build, lint]
+    needs: [check, build, lint, web]
     runs-on: ubuntu-26.04
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:

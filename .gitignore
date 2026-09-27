@@ -24,3 +24,10 @@ dist/
 /id_ed25519.pub
 # local scratch space (reference clones, throwaway checkouts) — never commit
 /tmp/
+
+# frontend: deps and the console bundle are never committed —
+# internal/adminapi/static/dist is build output, produced by
+# `make update-frontend` (the CI web job and the Docker console
+# stage build it the same way).
+web/node_modules/
+internal/adminapi/static/dist/

@@ -987,6 +987,9 @@ func New(cfg Config, be Backend) http.Handler {
 		page(w, r)
 	})
 
+	// Console's committed build bundles; "/assets/" takes precedence over "/".
+	mux.HandleFunc("GET /assets/", assets)
+
 	// Instrument every response: pattern-based route label keeps MACs out
 	// of the label space. The completion log rides the request context, so
 	// the wrapped logger injects trace_id/span_id when tracing is on.

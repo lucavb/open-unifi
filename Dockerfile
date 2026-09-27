@@ -1,5 +1,16 @@
-# Multi-stage build: static controller binary (CGO off, trimpath,
-# stripped), then a distroless nonroot runtime.
+# Multi-stage build: console bundle (node), static controller binary
+# (CGO off, trimpath, stripped), then a distroless nonroot runtime.
+
+# The admin console is build output, never committed: produce the
+# go:embed input here, mirroring `make update-frontend` (vite.config.js
+# writes ../internal/adminapi/static/dist relative to web/).
+FROM --platform=$BUILDPLATFORM node:24-alpine AS console
+WORKDIR /src/web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build
+
 FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
 
 ARG TARGETOS=linux
@@ -9,6 +20,10 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
+# Never embed a stale bundle from the build context: the console stage's
+# build is the source of truth for what goes into the binary.
+RUN rm -rf internal/adminapi/static/dist
+COPY --from=console /src/internal/adminapi/static/dist ./internal/adminapi/static/dist
 RUN mkdir -p /out/data
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -trimpath -ldflags="-s -w" -o /out/openunifi ./cmd/openunifi
