@@ -1,17 +1,19 @@
 # Multi-stage build: console bundle (node), static controller binary
 # (CGO off, trimpath, stripped), then a distroless nonroot runtime.
+# Base images are digest-pinned to what the mutable tags resolved to at fix
+# time (audit run 1, C9): bump by re-resolving the tag digest deliberately.
 
 # The admin console is build output, never committed: produce the
 # go:embed input here, mirroring `make update-frontend` (vite.config.js
 # writes ../internal/adminapi/static/dist relative to web/).
-FROM --platform=$BUILDPLATFORM node:24-alpine AS console
+FROM --platform=$BUILDPLATFORM node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS console
 WORKDIR /src/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
 COPY web/ ./
 RUN npm run build
 
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine@sha256:1ae0735f00daffa3aaf1363a5184c0d2dc55c78e3db4ec70241cdac97bf84b59 AS build
 
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
@@ -28,7 +30,7 @@ RUN mkdir -p /out/data
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -trimpath -ldflags="-s -w" -o /out/openunifi ./cmd/openunifi
 
-FROM gcr.io/distroless/static-debian13:nonroot
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:e2e927ec666bae08560abb3c55d0659eceabb657f56b6782ab500a9fc7f555e3
 COPY --from=build /out/openunifi /openunifi
 # The JSON store lives in /data (devices.json, wireless.json,
 # devices.json). Pre-create it nonroot-owned so a named volume
