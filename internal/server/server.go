@@ -78,6 +78,13 @@ type Config struct {
 	// main wires this hook to metrics.IncClientSessionEvents, the same
 	// ownership the inform middleware's IncInform has.
 	OnSessionEvents func(deviceMAC string, connects, disconnects int)
+
+	// OnSessionTransitions, when non-nil, receives the typed client-session
+	// transitions (connect, disconnect, radio change — with station
+	// context) of each COMMITTED inform cycle, under the same exactly-once
+	// rules as OnSessionEvents. deviceMAC is the AP's colon-hex MAC. main
+	// wires it to the client event tracker.
+	OnSessionTransitions func(deviceMAC string, ts []store.Transition)
 }
 
 // DefaultRegulatoryCountryCode is re-exported for callers that referenced
@@ -430,7 +437,7 @@ func (s *Server) handlePacket(ctx context.Context, w http.ResponseWriter, pkt *i
 	uerr := s.st.UpdateExisting(mac, func(rec *store.Device) error {
 		now := time.Now()
 		s.absorbInform(rec, jm, now, gcmReq)
-		connects, disconnects := refreshClientSessions(rec, jm, now)
+		transitions := refreshClientSessions(rec, jm, now)
 		out, aerr := s.decideInform(ctx, mac, adoption.Request{
 			Transport:      adoption.TransportEncrypted,
 			Device:         *rec,
@@ -442,7 +449,7 @@ func (s *Server) handlePacket(ctx context.Context, w http.ResponseWriter, pkt *i
 		if aerr != nil {
 			return s.mapEngineError(rec, aerr)
 		}
-		outcome = advanceResult{resp: s.applyOutcome(mac, rec, out), kind: string(out.Kind), connects: connects, disconnects: disconnects}
+		outcome = advanceResult{resp: s.applyOutcome(mac, rec, out), kind: string(out.Kind), transitions: transitions}
 		return nil
 	})
 	if uerr != nil {
@@ -475,22 +482,28 @@ func (s *Server) handlePacket(ctx context.Context, w http.ResponseWriter, pkt *i
 
 // advanceResult carries the inform response built inside the store's
 // read-modify-write cycle out to the HTTP writer, plus the client-session
-// event counts the cycle's refresh observed (observed through the
-// OnSessionEvents hook only after the cycle commits — exactly-once per
-// persisted transition).
+// transitions the cycle's refresh observed (surfaced through the
+// OnSessionEvents / OnSessionTransitions hooks only after the cycle
+// commits — exactly-once per persisted transition).
 type advanceResult struct {
 	resp        map[string]any
 	kind        string
-	connects    int
-	disconnects int
+	transitions []store.Transition
 }
 
 // countSessionEvents observes a committed cycle's client-session events
 // through the configured hook. No-op for cycles without transitions (the
 // advanceResult zero value) and when no hook is wired.
 func (s *Server) countSessionEvents(mac string, outcome advanceResult) {
-	if (outcome.connects > 0 || outcome.disconnects > 0) && s.cfg.OnSessionEvents != nil {
-		s.cfg.OnSessionEvents(store.ColonMAC(mac), outcome.connects, outcome.disconnects)
+	if len(outcome.transitions) == 0 {
+		return
+	}
+	colon := store.ColonMAC(mac)
+	if connects, disconnects := countTransitions(outcome.transitions); (connects > 0 || disconnects > 0) && s.cfg.OnSessionEvents != nil {
+		s.cfg.OnSessionEvents(colon, connects, disconnects)
+	}
+	if s.cfg.OnSessionTransitions != nil {
+		s.cfg.OnSessionTransitions(colon, outcome.transitions)
 	}
 }
 
@@ -598,7 +611,7 @@ func (s *Server) handlePlain(ctx context.Context, w http.ResponseWriter, mac str
 	uerr := s.st.UpdateExisting(mac, func(rec *store.Device) error {
 		now := time.Now()
 		s.absorbInform(rec, jm, now, false)
-		connects, disconnects := refreshClientSessions(rec, jm, now)
+		transitions := refreshClientSessions(rec, jm, now)
 		out, aerr := s.decideInform(ctx, mac, adoption.Request{
 			Transport:      adoption.TransportPlaintext,
 			Device:         *rec,
@@ -610,7 +623,7 @@ func (s *Server) handlePlain(ctx context.Context, w http.ResponseWriter, mac str
 		if aerr != nil {
 			return s.mapEngineError(rec, aerr)
 		}
-		outcome = advanceResult{resp: s.applyOutcome(mac, rec, out), kind: string(out.Kind), connects: connects, disconnects: disconnects}
+		outcome = advanceResult{resp: s.applyOutcome(mac, rec, out), kind: string(out.Kind), transitions: transitions}
 		return nil
 	})
 	if uerr != nil {

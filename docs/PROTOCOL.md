@@ -343,6 +343,9 @@ POST/GET/PUT/DELETE /api/v1/devices/{mac}/wireless/{name}
 GET    /api/v1/devices/{mac}/radios    (per-radio views: echo fields + intent overlay)
 PUT    /api/v1/devices/{mac}/radios/{radio}    {"channel"?: int, "txpower"?: int|"auto"}  -> wholesale replace
 DELETE /api/v1/devices/{mac}/radios/{radio}     (clear the radio's intent; echo-only again)
+GET    /api/v1/clients            (every client folded across APs: mac, hostname?, connected, ap, ap_name?, ssid?, radio?, channel?, since?, last_seen?)
+GET    /api/v1/events             ?client=&ap=&key=&since=&until=&limit=  -> {"enabled": bool, "events": [...]}, newest first
+GET    /api/v1/clients/{mac}/history   -> {"enabled": bool, "client": mac, "intervals": [{ap, ap_name?, ssid?, channel?, from, to?}]}
 GET    /api/v1/whoami
 GET    /healthz                   -> 200 ok
 GET    /metrics                   (promhttp; requires the token when one is set)
@@ -350,6 +353,18 @@ GET    /metrics                   (promhttp; requires the token when one is set)
 Auth: optional `--admin-token <hex>` (env fallback OPEN_UNIFI_ADMIN_TOKEN); when set,
 EVERY /api route AND /metrics require `Authorization: Bearer <token>` (401 otherwise) —
 only `/` (web console) and `/healthz` stay open. Terraform provider uses this.
+
+Client events (`internal/clientevents`): event documents mirror the official
+`stat/event` shape — `key` (`EVT_WU_Connected`, `EVT_WU_Disconnected`,
+`EVT_WU_Roam`, `EVT_WU_RoamRadio`), `time` (unix ms), `datetime`, `client`
+(the official `user`), `ap` or `ap_from`/`ap_to`, `ssid`, `radio*`,
+`channel*`, and on disconnect `duration` (s) / `bytes`, plus a System Log
+style `msg`. They are derived from `vap_table[].sta_table[]` session
+transitions after the store cycle commits. Station-row context fields
+(`hostname`, `ip`, `rssi`/`signal`, `tx_bytes`, `rx_bytes`, `uptime`) and the
+vap fields (`essid`, `bssid`, `radio`, `channel`) are decoded best-effort;
+only the nesting and `mac` are pinned by a bench capture (2026-09-20), so a
+capture of a populated station row should confirm the rest.
 
 Web UI (lane D): static page at `/`:
 - list of devices & pending adopters,

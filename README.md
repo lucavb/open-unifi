@@ -56,6 +56,9 @@ announce listener), `--data-dir` (devices.json), `--controller-url`
 (bearer auth for `/api/v1/*` AND `/metrics`; empty disables auth entirely and logs
 a loud startup warning — env fallback `OPEN_UNIFI_ADMIN_TOKEN`),
 `--allow-plaintext-inform` (reject by default, like the real controller),
+`--client-history` + `--client-history-retention` (opt-in client event history,
+see [Client events and AP history](#client-events-and-ap-history); env
+`OPEN_UNIFI_CLIENT_HISTORY` / `OPEN_UNIFI_CLIENT_HISTORY_RETENTION`),
 `--log-level`, `--log-format` (logging is human-readable TEXT by default;
 `--log-format json` / env `OPEN_UNIFI_LOG_FORMAT=json` opts into one-JSON-object-per-line
 output — this flips the prior always-JSON behavior),
@@ -142,6 +145,9 @@ GET/PUT       /api/v1/devices/{mac}/wireless   per-device WLAN envelope ({"wlans
 POST/GET/PUT/DELETE /api/v1/devices/{mac}/wireless/{name}   one WLAN on that device
 GET           /api/v1/devices/{mac}/radios          per-radio echo + admin intent
 PUT/DELETE    /api/v1/devices/{mac}/radios/{radio} set / clear per-radio intent
+GET           /api/v1/clients           every client, with its current (or last) AP
+GET           /api/v1/events            client event log (needs --client-history)
+GET           /api/v1/clients/{mac}/history   client's AP assignment history (needs --client-history)
 GET           /api/v1/whoami
 GET           /metrics                  Prometheus (requires the token when one is set)
 GET           /healthz
@@ -188,6 +194,37 @@ provisioning after a one-per-change cfgversion bump, and overlays the
 device's radio_table echo in the rendered `radio.<n>.channel`/`txpower`
 rows. Validation: channel `ng` 0–14 / `na` 0 or 36–165; fixed txpower
 must fit the device-reported bounds; unknown bands are rejected.
+
+## Client events and AP history
+
+The controller derives the same client events as the official System Log
+(*Client Devices*: WiFi Client Connected / Disconnected / Roamed) from the
+station tables the APs report. A roam shows up as a disconnect on one AP and
+a connect on another, in either order; the controller correlates the two
+(a disconnect is held for 30 s waiting for the client to appear elsewhere).
+Each event carries the client, AP(s), SSID, channel, and — on disconnect —
+the connection time and data used.
+
+- **Current assignment** needs no setup: the console's *Clients* card and
+  `GET /api/v1/clients` show which AP every client is on now (or was last seen
+  on).
+- **Log lines** are always written (`client event` at info level).
+- **Persisted history is opt-in**, because a per-client location history is
+  personal data. Enable it with `--client-history` or
+  `OPEN_UNIFI_CLIENT_HISTORY=true`; events are appended to
+  `<data-dir>/client-events.jsonl` (mode 0600) and kept for
+  `--client-history-retention` / `OPEN_UNIFI_CLIENT_HISTORY_RETENTION`
+  (default `30d`; `d` = days, also accepts `12h`, `90m`) up to a hard cap of
+  200,000 events. A flag overrides its environment variable; an invalid value
+  stops startup. Turning the flag off stops recording but does not delete the
+  file.
+
+With history on, the console's *Client events* card and
+`GET /api/v1/events?client=&ap=&key=&since=&until=&limit=` list the events
+(newest first), and `GET /api/v1/clients/{mac}/history` returns the AP
+assignment intervals `{ap, ap_name, ssid, channel, from, to}` (times in unix
+milliseconds; `to` is omitted while ongoing). With history off, both answer
+`{"enabled": false, ...}` with an empty list.
 
 ## Terraform
 

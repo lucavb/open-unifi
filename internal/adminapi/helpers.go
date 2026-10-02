@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/lucavb/open-unifi/internal/server/systemcfg"
 	"github.com/lucavb/open-unifi/internal/store"
@@ -86,6 +89,66 @@ type pendingEnvelope struct {
 // so the JSON is always a list, never null.
 type clientsEnvelope struct {
 	Clients []ClientView `json:"clients"`
+}
+
+// siteClientsEnvelope wraps the site-wide client listing (never null).
+type siteClientsEnvelope struct {
+	Clients []SiteClientView `json:"clients"`
+}
+
+const (
+	defaultEventsLimit = 500
+	maxEventsLimit     = 5000
+)
+
+// parseEventsQuery validates the /api/v1/events query string. client and ap
+// are MACs in any spelling (normalized to colon-hex); since/until are
+// RFC 3339 timestamps or unix seconds; limit defaults to 500 (max 5000).
+func parseEventsQuery(v url.Values) (EventsQuery, error) {
+	q := EventsQuery{Key: v.Get("key"), Limit: defaultEventsLimit}
+	var err error
+	if s := v.Get("client"); s != "" {
+		if q.Client, err = normalizeMAC(s); err != nil {
+			return q, fmt.Errorf("invalid client: %w", err)
+		}
+	}
+	if s := v.Get("ap"); s != "" {
+		if q.AP, err = normalizeMAC(s); err != nil {
+			return q, fmt.Errorf("invalid ap: %w", err)
+		}
+	}
+	if q.Since, err = parseQueryTime(v.Get("since")); err != nil {
+		return q, fmt.Errorf("invalid since: %w", err)
+	}
+	if q.Until, err = parseQueryTime(v.Get("until")); err != nil {
+		return q, fmt.Errorf("invalid until: %w", err)
+	}
+	if s := v.Get("limit"); s != "" {
+		n, err := strconv.Atoi(s)
+		if err != nil || n < 1 || n > maxEventsLimit {
+			return q, fmt.Errorf("invalid limit: want 1..%d", maxEventsLimit)
+		}
+		q.Limit = n
+	}
+	return q, nil
+}
+
+// parseQueryTime reads an optional RFC 3339 timestamp or unix seconds.
+func parseQueryTime(s string) (time.Time, error) {
+	if s == "" {
+		return time.Time{}, nil
+	}
+	if sec, err := strconv.ParseInt(s, 10, 64); err == nil {
+		if sec < 0 {
+			return time.Time{}, errors.New("must not be negative")
+		}
+		return time.Unix(sec, 0), nil
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}, errors.New("want RFC 3339 or unix seconds")
+	}
+	return t, nil
 }
 
 type whoAmI struct {

@@ -23,6 +23,7 @@ import (
 
 	"github.com/lucavb/open-unifi/internal/adminapi"
 	"github.com/lucavb/open-unifi/internal/app"
+	"github.com/lucavb/open-unifi/internal/clientevents"
 	"github.com/lucavb/open-unifi/internal/metrics"
 	"github.com/lucavb/open-unifi/internal/server"
 	"github.com/lucavb/open-unifi/internal/store"
@@ -46,7 +47,7 @@ func run() error {
 	discovery := flag.Bool("discovery", true, "enable the UDP discovery listener")
 	discoveryDiscoverable := flag.Bool("discovery-discoverable", false,
 		"answer V2 cmd-8 discovery probes even after adoption has started (classic-controller 'mgmt.discoverable' analogue; default: replies fire only while no device is adopting, mirroring the factory-default is_default state)")
-	dataDir := flag.String("data-dir", "data", "directory for devices.json")
+	dataDir := flag.String("data-dir", "data", "directory for devices.json (and client-events.jsonl with --client-history)")
 	controllerURL := flag.String("controller-url", "", "base URL devices are pointed at during adoption (e.g. http://10.0.0.5:8080)")
 	// Default from the provider's token env var; --admin-token overrides it.
 	adminToken := flag.String("admin-token", os.Getenv("OPEN_UNIFI_ADMIN_TOKEN"),
@@ -59,7 +60,12 @@ func run() error {
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, error")
 	logFormat := flag.String("log-format", os.Getenv("OPEN_UNIFI_LOG_FORMAT"), "log format: text (default) or json")
 	otlpEndpoint := flag.String("otlp-endpoint", os.Getenv("OPEN_UNIFI_OTLP_ENDPOINT"), "OTLP/HTTP trace endpoint (e.g. http://127.0.0.1:4318); empty = tracing off unless OTEL_EXPORTER_OTLP_ENDPOINT(_TRACES) is set")
+	historyFlags := registerClientHistoryFlags(flag.CommandLine, os.Getenv)
 	flag.Parse()
+	clientHistory, clientHistoryRetention, err := historyFlags.resolve(flag.CommandLine)
+	if err != nil {
+		return err
+	}
 	if err := validateAdminExposure(*listenAdmin, *adminToken, *allowAnonymousAdmin, *allowInsecureAdmin); err != nil {
 		return err
 	}
@@ -113,6 +119,39 @@ func run() error {
 		return fmt.Errorf("open device store: %w", err)
 	}
 	backend := app.New(st, logger)
+
+	// ---- client events -----------------------------------------------------
+	// Session transitions are always logged (slog); persisting them as a
+	// queryable per-client AP history is opt-in (--client-history).
+	sinks := []clientevents.Sink{clientevents.SlogSink{Logger: logger}}
+	var historySink *clientevents.FileSink
+	if clientHistory {
+		historySink, err = clientevents.NewFileSink(filepath.Join(*dataDir, "client-events.jsonl"),
+			clientevents.FileSinkOptions{Retention: clientHistoryRetention, Logger: logger})
+		if err != nil {
+			return fmt.Errorf("open client history: %w", err)
+		}
+		defer func() { _ = historySink.Close() }()
+		sinks = append(sinks, historySink)
+		backend.SetClientHistory(historySink)
+	}
+	tracker := clientevents.NewTracker(clientevents.Config{
+		Sinks: sinks,
+		APName: func(apMAC string) string {
+			canon, cerr := store.CanonicalMAC(apMAC)
+			if cerr != nil {
+				return ""
+			}
+			d, gerr := st.Get(canon)
+			if gerr != nil {
+				return ""
+			}
+			return d.Name
+		},
+	})
+	if devs, lerr := st.List(); lerr == nil {
+		tracker.Seed(devs)
+	}
 	adminH := adminapi.New(adminapi.Config{AdminToken: *adminToken}, backend)
 
 	if *allowAnonymousAdmin {
@@ -135,6 +174,8 @@ func run() error {
 		// wires the hook (post-commit, exactly-once per persisted
 		// transition).
 		OnSessionEvents: metrics.IncClientSessionEvents,
+		// The same post-commit seam feeds the client event tracker.
+		OnSessionTransitions: tracker.Observe,
 	}, st, logger)
 	// The SSH set-inform push lane (internal/app/setinform.go): armed here
 	// so the console Adopt action can hand never-informed factory pending
@@ -177,6 +218,13 @@ func run() error {
 	// ---- serving ---------------------------------------------------------
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Roam correlation flushes held disconnects on a timer; the history
+	// file compacts daily. Both stop with the signal context.
+	go tracker.Run(ctx)
+	if historySink != nil {
+		go historySink.Run(ctx)
+	}
 
 	informLn, err := net.Listen("tcp", *listenInform)
 	if err != nil {
@@ -268,6 +316,7 @@ func run() error {
 		"plaintext_inform", *allowPlainText,
 		"controller_url", *controllerURL,
 		"store", filepath.Join(*dataDir, "devices.json"),
+		"client_history", clientHistory,
 	)
 
 	// Serving goroutines; a running-server error tears everything down.

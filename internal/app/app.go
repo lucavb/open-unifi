@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/lucavb/open-unifi/internal/adminapi"
+	"github.com/lucavb/open-unifi/internal/clientevents"
 	"github.com/lucavb/open-unifi/internal/metrics"
 	"github.com/lucavb/open-unifi/internal/store"
 	"github.com/lucavb/open-unifi/internal/wireless"
@@ -48,6 +49,11 @@ type App struct {
 	// opt-in was not supplied: the lane never fires and AdoptPending keeps
 	// its whitelist-arming-only semantics.
 	informPush *setInformPush
+
+	// history is the opt-in persisted client event log
+	// (internal/app/clients.go). nil = --client-history is off. It is set
+	// once at startup, before the admin API serves.
+	history *clientevents.FileSink
 }
 
 // Compile-time proof that App satisfies the admin API storage contract.

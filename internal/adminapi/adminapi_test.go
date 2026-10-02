@@ -45,9 +45,15 @@ type fakeBackend struct {
 	blockedAdded   []string
 	blockedRemoved []string
 	// Client-session fixture (device MAC -> rows, colon-hex).
-	clients   map[string][]ClientView
-	radios    []RadioView
-	radioPuts []radioPutCall
+	clients map[string][]ClientView
+	// Site-wide client / event-log / history fixtures plus call recording.
+	siteClients     []SiteClientView
+	eventsView      EventsView
+	historyView     ClientHistoryView
+	lastEventsQuery EventsQuery
+	lastHistoryMAC  string
+	radios          []RadioView
+	radioPuts       []radioPutCall
 }
 
 func newFakeBackend() *fakeBackend {
@@ -262,6 +268,18 @@ func (f *fakeBackend) ListDeviceClients(_ context.Context, mac string) ([]Client
 		rows = []ClientView{}
 	}
 	return rows, nil
+}
+
+func (f *fakeBackend) ListClients(context.Context) []SiteClientView { return f.siteClients }
+
+func (f *fakeBackend) ListEvents(_ context.Context, q EventsQuery) EventsView {
+	f.lastEventsQuery = q
+	return f.eventsView
+}
+
+func (f *fakeBackend) GetClientHistory(_ context.Context, mac string) ClientHistoryView {
+	f.lastHistoryMAC = mac
+	return f.historyView
 }
 
 func (f *fakeBackend) RebootDevice(_ context.Context, mac string) (DeviceView, error) {

@@ -3,13 +3,14 @@
 // (halted() zero-request guard) and the render gate (rowsHaveEdits + the
 // focus check). App calls useConsole() exactly once and provides the store
 // down; components read it through useConsoleStore().
-import { inject, onBeforeUnmount, onMounted, reactive, ref } from "vue";
+import { computed, inject, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import type { InjectionKey } from "vue";
 import { api, is401, request } from "./api";
 import { lastSeenText, rowsFrom, rowsHaveEdits } from "./devices";
 import { RADIUS_MODES, SECS, collectWlans, defaultWlanRow, rowFromWlan } from "./wireless";
 import { useAuth } from "./useAuth";
 import type {
+  ClientHistoryView,
   ClientView,
   ClientsEnvelope,
   DevicesEnvelope,
@@ -17,8 +18,12 @@ import type {
   DeviceRowState,
   DeviceUpsert,
   DeviceView,
+  EventView,
+  EventsEnvelope,
   PendingEnvelope,
   PendingView,
+  SiteClientView,
+  SiteClientsEnvelope,
   WhoAmI,
   WlansEnvelope,
   WlanRowState
@@ -26,6 +31,15 @@ import type {
 
 const POLL_MS = 5000;
 const WL_MAC_KEY = "ou_wl_mac";
+const EVENTS_LIMIT = 1000;
+
+/** Time ranges of the event log filter (the official System Log's 1D/3D/1W/1M). */
+export const EVENT_RANGES: Record<string, number> = {
+  "1D": 86400,
+  "3D": 3 * 86400,
+  "1W": 7 * 86400,
+  "1M": 30 * 86400
+};
 
 export function useConsole() {
   const auth = useAuth();
@@ -43,6 +57,19 @@ export function useConsole() {
   const pending = ref<PendingView[]>([]); // raw pending candidates
   const addMac = ref("");
   const addName = ref("");
+
+  // Site-wide clients + client event log (opt-in --client-history).
+  const clientsError = ref("");
+  const siteClients = ref<SiteClientView[]>([]);
+  const clientSearch = ref("");
+  const selectedClient = ref(""); // MAC whose AP history is open
+  const clientHistory = ref<ClientHistoryView | null>(null);
+  const eventsError = ref("");
+  const eventsEnabled = ref<boolean | null>(null); // null until first fetch
+  const events = ref<EventView[]>([]);
+  const evSearch = ref("");
+  const evKey = ref("");
+  const evRange = ref("1W");
 
   const wlDevice = ref(""); // select value
   const wlMac = ref(window.sessionStorage.getItem(WL_MAC_KEY) || "");
@@ -149,7 +176,98 @@ export function useConsole() {
         pendingError.value = "pending: " + message(e);
       }
     }
+    if (auth.halted()) {
+      return;
+    }
+    await loadClients();
+    await loadEvents();
   }
+
+  // ---- site-wide clients + client event log -----------------------------------
+
+  async function loadClients(): Promise<void> {
+    try {
+      const env = await api<SiteClientsEnvelope>("/api/v1/clients");
+      siteClients.value = env.clients ?? [];
+      clientsError.value = "";
+    } catch (e) {
+      if (!is401(e)) {
+        clientsError.value = "clients: " + message(e);
+      }
+    }
+    if (selectedClient.value) {
+      await loadClientHistory();
+    }
+  }
+
+  async function loadClientHistory(): Promise<void> {
+    const mac = selectedClient.value;
+    if (!mac) {
+      clientHistory.value = null;
+      return;
+    }
+    try {
+      const h = await api<ClientHistoryView>("/api/v1/clients/" + encodeURIComponent(mac) + "/history");
+      if (selectedClient.value === mac) {
+        clientHistory.value = h;
+      }
+    } catch (e) {
+      if (!is401(e)) {
+        clientsError.value = "client history: " + message(e);
+      }
+    }
+  }
+
+  function selectClient(mac: string): void {
+    selectedClient.value = selectedClient.value === mac ? "" : mac;
+    clientHistory.value = null;
+    void loadClientHistory();
+  }
+
+  async function loadEvents(): Promise<void> {
+    const since = Math.floor(Date.now() / 1000) - (EVENT_RANGES[evRange.value] ?? EVENT_RANGES["1W"]);
+    const q = new URLSearchParams({ since: String(since), limit: String(EVENTS_LIMIT) });
+    if (evKey.value) {
+      q.set("key", evKey.value);
+    }
+    try {
+      const env = await api<EventsEnvelope>("/api/v1/events?" + q.toString());
+      eventsEnabled.value = env.enabled;
+      events.value = env.events ?? [];
+      eventsError.value = "";
+    } catch (e) {
+      if (!is401(e)) {
+        eventsError.value = "events: " + message(e);
+      }
+    }
+  }
+
+  /** Re-query when a server-side filter (event type, range) changes. */
+  function onEventFilterChange(): void {
+    void loadEvents();
+  }
+
+  const filteredClients = computed(() => {
+    const needle = clientSearch.value.trim().toLowerCase();
+    if (!needle) {
+      return siteClients.value;
+    }
+    return siteClients.value.filter((cl) =>
+      [cl.mac, cl.hostname, cl.ap, cl.ap_name, cl.ssid].some((v) => (v ?? "").toLowerCase().includes(needle))
+    );
+  });
+
+  const filteredEvents = computed(() => {
+    const needle = evSearch.value.trim().toLowerCase();
+    if (!needle) {
+      return events.value;
+    }
+    return events.value.filter((ev) =>
+      [ev.client, ev.hostname, ev.ap, ev.ap_name, ev.ap_from, ev.ap_from_name, ev.ap_to, ev.ap_to_name, ev.ssid, ev.msg].some(
+        (v) => (v ?? "").toLowerCase().includes(needle)
+      )
+    );
+  });
 
   // updateOpenClients refreshes the expansion rows: every open device
   // fetches its client sessions (lazily, on demand). A failed fetch (e.g.
@@ -458,6 +576,22 @@ export function useConsole() {
     saveSsh,
     clearSsh,
     lastSeenText,
+    clientsError,
+    siteClients,
+    clientSearch,
+    filteredClients,
+    selectedClient,
+    clientHistory,
+    selectClient,
+    eventsError,
+    eventsEnabled,
+    events,
+    filteredEvents,
+    evSearch,
+    evKey,
+    evRange,
+    eventRanges: Object.keys(EVENT_RANGES),
+    onEventFilterChange,
     pending,
     adopt,
     addMac,

@@ -239,6 +239,89 @@ type ClientView struct {
 	LastSeen int64 `json:"last_seen,omitempty"`
 }
 
+// SiteClientView is one client aggregated across ALL devices: the freshest
+// session row wins, so a connected client shows the AP it is on now and a
+// disconnected one the AP it was last seen on. MACs are colon-hex.
+type SiteClientView struct {
+	MAC       string `json:"mac"`
+	Hostname  string `json:"hostname,omitempty"`
+	IP        string `json:"ip,omitempty"`
+	Connected bool   `json:"connected"`
+	// AP/APName identify the current (or, when disconnected, last) AP.
+	AP      string `json:"ap"`
+	APName  string `json:"ap_name,omitempty"`
+	SSID    string `json:"ssid,omitempty"`
+	Radio   string `json:"radio,omitempty"`
+	Channel int    `json:"channel,omitempty"`
+	// Since is the unix-seconds start of the association (0 = unknown).
+	Since    int64 `json:"since,omitempty"`
+	LastSeen int64 `json:"last_seen,omitempty"`
+}
+
+// EventView is one client event (see internal/clientevents.Event; same
+// JSON shape, mirroring the official controller's stat/event documents).
+type EventView struct {
+	Key         string `json:"key"`
+	Time        int64  `json:"time"` // unix milliseconds
+	Datetime    string `json:"datetime"`
+	Client      string `json:"client"`
+	Hostname    string `json:"hostname,omitempty"`
+	IP          string `json:"ip,omitempty"`
+	AP          string `json:"ap,omitempty"`
+	APName      string `json:"ap_name,omitempty"`
+	APFrom      string `json:"ap_from,omitempty"`
+	APFromName  string `json:"ap_from_name,omitempty"`
+	APTo        string `json:"ap_to,omitempty"`
+	APToName    string `json:"ap_to_name,omitempty"`
+	SSID        string `json:"ssid,omitempty"`
+	Radio       string `json:"radio,omitempty"`
+	RadioFrom   string `json:"radio_from,omitempty"`
+	RadioTo     string `json:"radio_to,omitempty"`
+	Channel     int    `json:"channel,omitempty"`
+	ChannelFrom int    `json:"channel_from,omitempty"`
+	ChannelTo   int    `json:"channel_to,omitempty"`
+	Duration    int64  `json:"duration,omitempty"`
+	Bytes       int64  `json:"bytes,omitempty"`
+	Msg         string `json:"msg"`
+}
+
+// EventsQuery filters the client event log. Zero fields match everything.
+type EventsQuery struct {
+	Client string // colon-hex client MAC
+	AP     string // colon-hex AP MAC; matches ap, ap_from and ap_to
+	Key    string // e.g. EVT_WU_Roam
+	Since  time.Time
+	Until  time.Time
+	Limit  int
+}
+
+// EventsView is the client event log. Enabled is false when client history
+// is not switched on (--client-history); Events is then empty. Events is
+// never null and is ordered newest first.
+type EventsView struct {
+	Enabled bool        `json:"enabled"`
+	Events  []EventView `json:"events"`
+}
+
+// AssignmentView is one stretch a client spent on one AP. To is 0 while
+// the stretch is ongoing. Times are unix milliseconds.
+type AssignmentView struct {
+	AP      string `json:"ap"`
+	APName  string `json:"ap_name,omitempty"`
+	SSID    string `json:"ssid,omitempty"`
+	Channel int    `json:"channel,omitempty"`
+	From    int64  `json:"from"`
+	To      int64  `json:"to,omitempty"`
+}
+
+// ClientHistoryView is a client's AP assignment history, oldest first.
+// Enabled is false when client history is off; Intervals is never null.
+type ClientHistoryView struct {
+	Enabled   bool             `json:"enabled"`
+	Client    string           `json:"client"`
+	Intervals []AssignmentView `json:"intervals"`
+}
+
 // blockClientRequest is the POST body of the block route: the client MAC in
 // any common spelling (normalized at the boundary).
 type blockClientRequest struct {
@@ -353,6 +436,16 @@ type Backend interface {
 	// disconnect (connected=false); a device with no recorded sessions
 	// lists empty (never null). Unknown MACs are ErrNotFound.
 	ListDeviceClients(ctx context.Context, mac string) ([]ClientView, error)
+	// ListClients aggregates the session rows of all devices into one entry
+	// per client MAC (freshest row wins), connected clients first. Works
+	// without client history; never nil.
+	ListClients(ctx context.Context) []SiteClientView
+	// ListEvents returns the persisted client event log, newest first. When
+	// client history is off it returns Enabled=false and no events.
+	ListEvents(ctx context.Context, q EventsQuery) EventsView
+	// GetClientHistory returns one client's AP assignment history (Enabled
+	// =false when client history is off). mac is colon-hex.
+	GetClientHistory(ctx context.Context, mac string) ClientHistoryView
 	// ListPending returns discovery-beacon candidates.
 	ListPending(ctx context.Context) []PendingView
 	// AdoptPending attempts adoption of a pending candidate.
@@ -428,6 +521,9 @@ const (
 	routeDevicesList        = "/api/v1/devices"
 	routeDeviceItem         = "/api/v1/devices/{mac}"
 	routeDeviceClients      = "/api/v1/devices/{mac}/clients"
+	routeSiteClients        = "/api/v1/clients"
+	routeClientHistory      = "/api/v1/clients/{mac}/history"
+	routeEvents             = "/api/v1/events"
 	routeDeviceReboot       = "/api/v1/devices/{mac}/reboot"
 	routeDeviceFactoryReset = "/api/v1/devices/{mac}/factory-reset"
 	routeDeviceCmd          = "/api/v1/devices/{mac}/cmd"
@@ -715,6 +811,45 @@ func New(cfg Config, be Backend) http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, clientsEnvelope{clients})
+	}))
+	// Site-wide clients: every device's session rows folded into one entry
+	// per client (the AP it is on now, or was last seen on). Works with
+	// client history off — it reads the live session rows only.
+	mux.HandleFunc("GET "+routeSiteClients, requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+		clients := be.ListClients(r.Context())
+		if clients == nil {
+			clients = []SiteClientView{}
+		}
+		writeJSON(w, http.StatusOK, siteClientsEnvelope{clients})
+	}))
+	// Client event log (opt-in --client-history): connected, disconnected
+	// and roamed events, newest first. With history off the answer is
+	// {"enabled":false,"events":[]} rather than an error, so the console
+	// can show how to switch it on.
+	mux.HandleFunc("GET "+routeEvents, requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+		q, err := parseEventsQuery(r.URL.Query())
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		view := be.ListEvents(r.Context(), q)
+		if view.Events == nil {
+			view.Events = []EventView{}
+		}
+		writeJSON(w, http.StatusOK, view)
+	}))
+	// One client's AP assignment history, folded from its events.
+	mux.HandleFunc("GET "+routeClientHistory, requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
+		mac, err := normalizeMAC(r.PathValue("mac"))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid mac: "+err.Error())
+			return
+		}
+		view := be.GetClientHistory(r.Context(), mac)
+		if view.Intervals == nil {
+			view.Intervals = []AssignmentView{}
+		}
+		writeJSON(w, http.StatusOK, view)
 	}))
 	// Per-radio admin intent (channel/txpower): the admin-owned layer over
 	// the device's radio_table echo (CONTEXT.md trust policy). PUT is

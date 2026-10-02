@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { provide } from "vue";
 import AddDeviceCard from "./components/AddDeviceCard.vue";
+import ClientsCard from "./components/ClientsCard.vue";
 import DevicesCard from "./components/DevicesCard.vue";
+import EventsCard from "./components/EventsCard.vue";
 import PendingCard from "./components/PendingCard.vue";
 import TokenGate from "./components/TokenGate.vue";
 import WirelessCard from "./components/WirelessCard.vue";
@@ -19,6 +21,8 @@ provide(CONSOLE_KEY, store);
     <span class="pill" id="globalError" v-show="store.globalError">{{ store.globalError }}</span>
 
     <DevicesCard />
+    <ClientsCard />
+    <EventsCard />
     <PendingCard />
     <AddDeviceCard />
     <WirelessCard />
@@ -26,6 +30,8 @@ provide(CONSOLE_KEY, store);
     <footer>
       Endpoints: <a href="/api/v1/devices">/api/v1/devices</a> &middot;
       <a href="/api/v1/pending">/api/v1/pending</a> &middot;
+      <a href="/api/v1/clients">/api/v1/clients</a> &middot;
+      <a href="/api/v1/events">/api/v1/events</a> &middot;
       <span class="mono">/api/v1/devices/{mac}/wireless</span> &middot;
       <a href="/metrics">/metrics</a> &middot;
       <a href="/healthz">/healthz</a>

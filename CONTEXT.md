@@ -107,6 +107,32 @@ into a device record under the trust policy — the only way device data
 enters the record.
 _Avoid_: absorb inform, device merge, field sync.
 
+### Clients and history
+
+**Client session**: one AP's record of a client, derived from the station
+table in a full inform (present → connected, absent → disconnected). It is a
+controller-owned key and says nothing about other APs.
+_Avoid_: client record (a session is per AP).
+
+**Client event**: a UniFi-style fact about a client derived from session
+transitions — connected, disconnected, roamed, or changed radio
+(`EVT_WU_Connected` / `Disconnected` / `Roam` / `RoamRadio`). Always logged;
+persisted only with client history on.
+_Avoid_: alert, audit entry.
+
+**Roam**: a client moving from one AP to another. No AP reports it directly:
+it is a disconnect on the old AP correlated with a connect on the new one, in
+either order, inside the disconnect grace window.
+_Avoid_: handoff.
+
+**Assignment history**: the ordered intervals a client spent on each AP,
+folded from its client events. Exists only with client history on.
+_Avoid_: client history (that names the whole opt-in feature).
+
+**Client history**: the opt-in persisted client event log
+(`client-events.jsonl`, `--client-history`). Off by default because per-client
+location history is personal data.
+
 ### Admin surface
 
 **Admin intent**: an admin's desired change to a device record — one save

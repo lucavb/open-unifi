@@ -53,6 +53,16 @@ func TestRefreshSessionsRecordsRows(t *testing.T) {
 	if c, ok := row["connected"].(bool); !ok || !c {
 		t.Fatalf("row connected = %v (%T), want true", row["connected"], row["connected"])
 	}
+	// No station context: the context keys (including "ip") stay absent
+	// from the persisted row; "since" is set from the inform timestamp.
+	if s, ok := row["since"].(float64); !ok || s != 1000 {
+		t.Fatalf("row since = %v (%T), want float64(1000)", row["since"], row["since"])
+	}
+	for _, key := range []string{"hostname", "ip", "essid", "radio", "channel", "bytes"} {
+		if v, ok := row[key]; ok {
+			t.Fatalf("context-less row %s = %v (%T), want absent", key, v, v)
+		}
+	}
 	// No disconnect happened: the pending-event flag must stay absent.
 	if _, armed := d.Extra[SessionDisconnectEventExtraKey]; armed {
 		t.Fatal("connect-only refresh must not arm the disconnect event")
