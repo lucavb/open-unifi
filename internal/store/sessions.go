@@ -39,8 +39,10 @@ const sessionRowCap = 2048
 const (
 	// SessionsExtraKey holds the session rows: a JSON object keyed by
 	// canonical 12-hex client MAC, each row {"last_seen": <unix float>,
-	// "connected": <bool>}. The map key gives identity + dedup; the row
-	// never repeats the MAC.
+	// "connected": <bool>} plus the optional context keys "since",
+	// "hostname", "essid", "radio", "channel" and "bytes" (written only
+	// when known). The map key gives identity + dedup; the row never
+	// repeats the MAC.
 	SessionsExtraKey = "client_sessions"
 
 	// SessionDisconnectEventExtraKey is the one-shot pending-outcome flag
@@ -65,6 +67,60 @@ type ClientSession struct {
 	// disconnects (the row keeps the last proof) and stays put across
 	// sparse heartbeats.
 	LastSeen int64
+
+	// The fields below are best-effort context captured from the station
+	// table (zero = unknown; rows written before they existed read as
+	// zero). They let the client event log report a connection duration,
+	// the SSID/radio/channel the client sat on, and byte totals.
+
+	// Since is the unix-seconds time the current (or, once disconnected,
+	// the last) association was first observed.
+	Since    int64
+	Hostname string
+	ESSID    string
+	Radio    string
+	Channel  int
+	// Bytes is the last observed tx+rx byte total of the association.
+	Bytes int64
+}
+
+// StationInfo is one decoded station-table row as the store consumes it
+// (the server adapter converts inform.Station; this package stays free of
+// the inform codec). Every field but MAC is optional.
+type StationInfo struct {
+	MAC      string
+	Hostname string
+	ESSID    string
+	Radio    string
+	Channel  int
+	Bytes    int64
+}
+
+// TransitionKind classifies one observed session-row change.
+type TransitionKind string
+
+const (
+	// TransitionConnect: a new session, or a stored disconnected row seen
+	// again.
+	TransitionConnect TransitionKind = "connect"
+	// TransitionDisconnect: a connected row absent from the table.
+	TransitionDisconnect TransitionKind = "disconnect"
+	// TransitionRadioChange: a still-connected row whose radio or channel
+	// changed on the same device (the same-AP half of a roam).
+	TransitionRadioChange TransitionKind = "radio_change"
+)
+
+// Transition is one observed change of a client's session row on a device.
+type Transition struct {
+	// MAC is the canonical 12-hex client MAC.
+	MAC  string
+	Kind TransitionKind
+	// At is the inform timestamp (unix seconds) that observed the change.
+	At int64
+	// Session is the row after the change; Prev the row before it (zero
+	// value for a client never seen on this device).
+	Session ClientSession
+	Prev    ClientSession
 }
 
 // sessionRow is the JSON row shape (write side; reads tolerate only what
@@ -72,6 +128,19 @@ type ClientSession struct {
 type sessionRow struct {
 	connected bool
 	lastSeen  int64
+	since     int64
+	hostname  string
+	essid     string
+	radio     string
+	channel   int
+	bytes     int64
+}
+
+func (r sessionRow) session(mac string) ClientSession {
+	return ClientSession{
+		MAC: mac, Connected: r.connected, LastSeen: r.lastSeen, Since: r.since,
+		Hostname: r.hostname, ESSID: r.essid, Radio: r.radio, Channel: r.channel, Bytes: r.bytes,
+	}
 }
 
 // ClientSessions returns the device's session rows sorted by MAC.
@@ -81,7 +150,7 @@ func ClientSessions(d Device) []ClientSession {
 	rows := readSessionRows(d.Extra)
 	out := make([]ClientSession, 0, len(rows))
 	for mac, row := range rows {
-		out = append(out, ClientSession{MAC: mac, Connected: row.connected, LastSeen: row.lastSeen})
+		out = append(out, row.session(mac))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].MAC < out[j].MAC })
 	return out
@@ -108,38 +177,116 @@ func ClientSessions(d Device) []ClientSession {
 // Repeated disconnects keep the flag armed (idempotent true write) until
 // the engine consumes it.
 func RefreshSessions(d *Device, stationMACs []string, nowUnix int64) (connects, disconnects []string) {
-	rows := readSessionRows(d.Extra)
-	present := make(map[string]bool, len(stationMACs))
+	stations := make([]StationInfo, 0, len(stationMACs))
 	for _, m := range stationMACs {
-		c, err := CanonicalMAC(m)
+		stations = append(stations, StationInfo{MAC: m})
+	}
+	for _, t := range RefreshSessionStations(d, stations, nowUnix) {
+		switch t.Kind {
+		case TransitionConnect:
+			connects = append(connects, t.MAC)
+		case TransitionDisconnect:
+			disconnects = append(disconnects, t.MAC)
+		}
+	}
+	return connects, disconnects
+}
+
+// RefreshSessionStations is RefreshSessions with station context: the same
+// transition rules (and the same disconnect arming), but the rows keep the
+// per-association context and every observed change is returned as a typed
+// Transition, ordered by client MAC (connect, then disconnect, then
+// radio_change for a MAC). A still-connected row whose radio or channel
+// changed (both values known) additionally yields TransitionRadioChange.
+//
+// Context merge: a reconnect/new row takes only what this table reports;
+// a surviving row keeps its earlier values for fields the table omits.
+func RefreshSessionStations(d *Device, stations []StationInfo, nowUnix int64) []Transition {
+	rows := readSessionRows(d.Extra)
+	prev := make(map[string]sessionRow, len(rows))
+	for mac, row := range rows {
+		prev[mac] = row
+	}
+	var out []Transition
+	present := make(map[string]bool, len(stations))
+	for _, st := range stations {
+		c, err := CanonicalMAC(st.MAC)
 		if err != nil {
 			continue // tolerate odd rows; never fail an inform over noise
 		}
+		if present[c] {
+			continue // duplicate row for the same client in one table
+		}
 		present[c] = true
-		row, known := rows[c]
-		if !known || !row.connected {
-			connects = append(connects, c)
+		old, known := prev[c]
+		fresh := !known || !old.connected
+		next := sessionRow{connected: true, lastSeen: nowUnix}
+		if fresh {
+			next.since = nowUnix
+		} else {
+			next = old
+			next.lastSeen = nowUnix
 		}
-		rows[c] = sessionRow{connected: true, lastSeen: nowUnix}
+		if st.Hostname != "" {
+			next.hostname = st.Hostname
+		}
+		if st.ESSID != "" {
+			next.essid = st.ESSID
+		}
+		if st.Radio != "" {
+			next.radio = st.Radio
+		}
+		if st.Channel != 0 {
+			next.channel = st.Channel
+		}
+		if st.Bytes != 0 {
+			next.bytes = st.Bytes
+		}
+		rows[c] = next
+		switch {
+		case fresh:
+			out = append(out, Transition{MAC: c, Kind: TransitionConnect, At: nowUnix, Session: next.session(c), Prev: old.session(c)})
+		case (old.radio != "" && next.radio != "" && old.radio != next.radio) ||
+			(old.channel != 0 && next.channel != 0 && old.channel != next.channel):
+			out = append(out, Transition{MAC: c, Kind: TransitionRadioChange, At: nowUnix, Session: next.session(c), Prev: old.session(c)})
+		}
 	}
-	for mac, row := range rows {
+	armed := false
+	for mac, row := range prev {
 		if row.connected && !present[mac] {
-			row.connected = false
-			rows[mac] = row
-			disconnects = append(disconnects, mac)
+			gone := row
+			gone.connected = false
+			rows[mac] = gone
+			armed = true
+			out = append(out, Transition{MAC: mac, Kind: TransitionDisconnect, At: nowUnix, Session: gone.session(mac), Prev: row.session(mac)})
 		}
 	}
-	sort.Strings(connects)
-	sort.Strings(disconnects)
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].MAC != out[j].MAC {
+			return out[i].MAC < out[j].MAC
+		}
+		return transitionOrder(out[i].Kind) < transitionOrder(out[j].Kind)
+	})
 	enforceSessionRowCap(rows)
 	writeSessionRows(d, rows)
-	if len(disconnects) > 0 {
+	if armed {
 		if d.Extra == nil {
 			d.Extra = JSONMap{}
 		}
 		d.Extra[SessionDisconnectEventExtraKey] = true
 	}
-	return connects, disconnects
+	return out
+}
+
+func transitionOrder(k TransitionKind) int {
+	switch k {
+	case TransitionConnect:
+		return 0
+	case TransitionDisconnect:
+		return 1
+	default:
+		return 2
+	}
 }
 
 // enforceSessionRowCap evicts rows with the oldest last_seen (MAC as
@@ -189,6 +336,24 @@ func readSessionRows(extra JSONMap) map[string]sessionRow {
 		if ls, ok := row["last_seen"].(float64); ok {
 			sr.lastSeen = int64(ls)
 		}
+		if v, ok := row["since"].(float64); ok {
+			sr.since = int64(v)
+		}
+		if v, ok := row["hostname"].(string); ok {
+			sr.hostname = v
+		}
+		if v, ok := row["essid"].(string); ok {
+			sr.essid = v
+		}
+		if v, ok := row["radio"].(string); ok {
+			sr.radio = v
+		}
+		if v, ok := row["channel"].(float64); ok {
+			sr.channel = int(v)
+		}
+		if v, ok := row["bytes"].(float64); ok {
+			sr.bytes = int64(v)
+		}
 		out[mac] = sr
 	}
 	return out
@@ -208,10 +373,31 @@ func writeSessionRows(d *Device, rows map[string]sessionRow) {
 	}
 	out := make(map[string]any, len(rows))
 	for mac, row := range rows {
-		out[mac] = map[string]any{
+		m := map[string]any{
 			"last_seen": float64(row.lastSeen),
 			"connected": row.connected,
 		}
+		// Context keys are written only when known, so rows without
+		// station context keep their original two-key shape.
+		if row.since != 0 {
+			m["since"] = float64(row.since)
+		}
+		if row.hostname != "" {
+			m["hostname"] = row.hostname
+		}
+		if row.essid != "" {
+			m["essid"] = row.essid
+		}
+		if row.radio != "" {
+			m["radio"] = row.radio
+		}
+		if row.channel != 0 {
+			m["channel"] = float64(row.channel)
+		}
+		if row.bytes != 0 {
+			m["bytes"] = float64(row.bytes)
+		}
+		out[mac] = m
 	}
 	d.Extra[SessionsExtraKey] = out
 }

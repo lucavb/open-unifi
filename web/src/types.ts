@@ -1,7 +1,8 @@
 // API + UI state types for the admin console.
 //
 // The wire types mirror the Go JSON shapes in internal/adminapi (adminapi.go
-// DeviceView/DevicePatch/DeviceUpsert/PendingView/Wlan/ClientView,
+// DeviceView/DevicePatch/DeviceUpsert/PendingView/Wlan/ClientView/
+// SiteClientView/EventView/ClientHistoryView,
 // helpers.go envelope structs) — field names and casing are the wire
 // contract; do not rename without updating both sides. The RowState types
 // are UI-side only (the console's per-row editing state, not wire shapes).
@@ -94,6 +95,76 @@ export interface ClientView {
 /** Envelope: GET /api/v1/devices/{mac}/clients (helpers.go clientsEnvelope). */
 export interface ClientsEnvelope {
   clients: ClientView[];
+}
+
+/** One client aggregated across all devices (adminapi.go SiteClientView). */
+export interface SiteClientView {
+  mac: string;
+  hostname?: string;
+  connected: boolean;
+  /** Current (or, when disconnected, last) AP. */
+  ap: string;
+  ap_name?: string;
+  ssid?: string;
+  radio?: string;
+  channel?: number;
+  /** unix seconds the association started (0/omitted = unknown). */
+  since?: number;
+  last_seen?: number;
+}
+
+/** Envelope: GET /api/v1/clients (helpers.go siteClientsEnvelope). */
+export interface SiteClientsEnvelope {
+  clients: SiteClientView[];
+}
+
+/** One client event (adminapi.go EventView). */
+export interface EventView {
+  key: string;
+  /** unix milliseconds. */
+  time: number;
+  datetime: string;
+  client: string;
+  hostname?: string;
+  ap?: string;
+  ap_name?: string;
+  ap_from?: string;
+  ap_from_name?: string;
+  ap_to?: string;
+  ap_to_name?: string;
+  ssid?: string;
+  radio?: string;
+  radio_from?: string;
+  radio_to?: string;
+  channel?: number;
+  channel_from?: number;
+  channel_to?: number;
+  duration?: number;
+  bytes?: number;
+  msg: string;
+}
+
+/** GET /api/v1/events (adminapi.go EventsView). enabled=false: client history is off. */
+export interface EventsEnvelope {
+  enabled: boolean;
+  events: EventView[];
+}
+
+/** One stretch on one AP (adminapi.go AssignmentView); times are unix ms, to=0/omitted = ongoing. */
+export interface AssignmentView {
+  ap: string;
+  ap_name?: string;
+  ssid?: string;
+  channel?: number;
+  from: number;
+  to?: number;
+}
+
+/** GET /api/v1/clients/{mac}/history (adminapi.go ClientHistoryView). */
+export interface ClientHistoryView {
+  enabled: boolean;
+  client: string;
+  intervals: AssignmentView[];
 }
 
 /** One auth server of a WLAN's inline RADIUS profile (adminapi.go RadiusServer). */

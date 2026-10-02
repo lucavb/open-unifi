@@ -98,6 +98,12 @@
   table.clients-table { font-size: 13px; }
   table.clients-table th { font-size: 11px; }
   table.clients-table td, table.clients-table th { padding: 5px 10px; }
+  .filter-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+  .filter-row input[type="search"] { flex: 1; min-width: 200px; }
+  tr.client-line { cursor: pointer; }
+  tr.client-line:hover > td { background: var(--bg); }
+  tr.client-line.selected > td { background: var(--bg); }
+  .sub { color: var(--muted); font-size: 12px; }
   noscript { max-width: 980px; margin: 24px auto 0; padding: 0 20px; }
   noscript p { color: #b45309; background: #fef3c7; padding: 10px 14px; border-radius: 8px; }
   /* Wide tables (devices, wireless) live in a keyboard-scrollable region:
