@@ -12,7 +12,10 @@
 // Device PATCH validation adds a THIRD, one-directional edge: systemcfg
 // (the fail-closed RFC 4253 authorized_keys parser is the controller's
 // single key validator — the app verb and this REST layer fence through it;
-// systemcfg does not import this package, so the edge cannot cycle).
+// systemcfg does not import this package, so the edge cannot cycle). The
+// WLAN types are aliases of internal/wireless (a leaf that imports only
+// store), a FOURTH one-directional edge, so the admin wire and the stored
+// record share one type.
 package adminapi
 
 import (
@@ -27,6 +30,7 @@ import (
 	"time"
 
 	"github.com/lucavb/open-unifi/internal/metrics"
+	"github.com/lucavb/open-unifi/internal/wireless"
 )
 
 // Config is the minimal wiring input for New.
@@ -64,7 +68,7 @@ type DeviceView struct {
 	// is true only after the latest vap_table shows every enabled desired
 	// SSID RUNNING (SSID-presence check). It does NOT verify per-radio
 	// placement or that deleted WLANs have disappeared — that strict check
-	// lives in the server lane's settlePendingWLAN, which runs before this
+	// lives in DeliveryState.Settle, which runs before this
 	// view is served on every inform. nil means runtime evidence is absent.
 	InSync *bool `json:"in_sync,omitempty"`
 	// WLAN delivery is controller-side bookkeeping. It is independent of
@@ -188,53 +192,20 @@ type PendingView struct {
 	Name   string `json:"name,omitempty"`
 }
 
-// Wlan is one wireless network entry in the whole-doc wireless config.
-type Wlan struct {
-	ID         string `json:"id,omitempty"`
-	Name       string `json:"name,omitempty"`
-	SSID       string `json:"ssid"`
-	Security   string `json:"security"` // "open" | "wpa-p" | "wpa-eap"
-	Passphrase string `json:"passphrase,omitempty"`
-	VLAN       int    `json:"vlan"`
-	Enabled    bool   `json:"enabled"`
-	Band       string `json:"band,omitempty"`
-	// Inline RADIUS profile, wpa-eap only (mirrors wireless.Wlan): auth
-	// servers (1..4), the shared secret, and the dynamic-VLAN mode. The
-	// admin API rejects radius fields on any other security.
-	RadiusServers  []RadiusServer `json:"radius_servers,omitempty"`
-	RadiusSecret   string         `json:"radius_secret,omitempty"`
-	RadiusVLANMode string         `json:"radius_vlan_mode,omitempty"`
+// Wlan is one wireless network entry in the whole-doc wireless config. It is
+// the shared wireless.Wlan: its JSON tags are the admin wire, so the stored
+// record, the Provisioning plan and this API speak one type (no converters).
+type Wlan = wireless.Wlan
 
-	// Inline RADIUS profile accounting fields, wpa-eap only (mirrors
-	// wireless.Wlan; §12 rows 1013-1014): the accounting toggle, the
-	// accounting servers (0..4 entries, port 0 = the 1813 emission
-	// default), and the interim-update toggle. radius_das_enabled is
-	// accepted behind its requires-accounting gate — the das/dad rows
-	// emit under the jar's accounting_enabled gate (§12 row 1014
-	// implemented).
-	AccountingEnabled    bool               `json:"accounting_enabled,omitempty"`
-	AcctServers          []RadiusAcctServer `json:"acct_servers,omitempty"`
-	InterimUpdateEnabled bool               `json:"interim_update_enabled,omitempty"`
-	RadiusDASEnabled     bool               `json:"radius_das_enabled,omitempty"`
-}
-
-// RadiusServer is one auth server of a WLAN's inline RADIUS profile
-// (mirrors wireless.RadiusServer): ip plus an optional port (0 = the
-// system_cfg 1812 default).
-type RadiusServer struct {
-	IP   string `json:"ip"`
-	Port int    `json:"port,omitempty"`
-}
+// RadiusServer is one auth server of a WLAN's inline RADIUS profile: ip plus
+// an optional port (0 = the system_cfg 1812 default).
+type RadiusServer = wireless.RadiusServer
 
 // RadiusAcctServer is one accounting server of a WLAN's inline RADIUS
-// profile (mirrors wireless.RadiusAcctServer; §12 row 1013): ip plus an
-// optional port (0 = the system_cfg 1813 default). No per-server secret —
-// every acct row carries the profile-level radius_secret, like the auth
-// rows.
-type RadiusAcctServer struct {
-	IP   string `json:"ip"`
-	Port int    `json:"port,omitempty"`
-}
+// profile (§12 row 1013): ip plus an optional port (0 = the system_cfg 1813
+// default). No per-server secret: every acct row carries the profile-level
+// radius_secret, like the auth rows.
+type RadiusAcctServer = wireless.RadiusAcctServer
 
 // WlansEnvelope is the whole-document wireless config. PUT replaces it
 // wholesale (terraform-reconcilable); future refinements may apply subsets.

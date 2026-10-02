@@ -1,13 +1,12 @@
 package wireless
 
 import (
-	"encoding/json"
-
 	"github.com/lucavb/open-unifi/internal/store"
 )
 
 // DeviceWLANsExtraKey is the admin-owned per-device WLAN envelope stored in
-// Device.Extra (JSON array of Wlan objects, same encoding as wlan_cfg_pending_wlans).
+// Device.Extra (a stored WLAN blob, see EncodeStoredWlans; same encoding as
+// wlan_cfg_pending_wlans).
 const DeviceWLANsExtraKey = "device_wlans"
 
 // DeviceWLANs reads the admin-owned WLAN list from a device record. Missing or
@@ -20,8 +19,8 @@ func DeviceWLANs(d store.Device) []Wlan {
 	if !ok || raw == "" {
 		return nil
 	}
-	var out []Wlan
-	if json.Unmarshal([]byte(raw), &out) != nil {
+	out, err := DecodeStoredWlans([]byte(raw))
+	if err != nil {
 		return nil
 	}
 	return out
@@ -37,7 +36,7 @@ func SetDeviceWLANs(d *store.Device, wlans []Wlan) error {
 		delete(d.Extra, DeviceWLANsExtraKey)
 		return nil
 	}
-	b, err := json.Marshal(wlans)
+	b, err := EncodeStoredWlans(wlans)
 	if err != nil {
 		return err
 	}

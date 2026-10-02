@@ -357,10 +357,10 @@ func validateWlan(wl *Wlan) string {
 		return "vlan must be 1..4094"
 	}
 	if wl.Security == "open" {
-		if wl.hasRadiusFields() {
+		if hasRadiusFields(wl) {
 			return "radius_servers/radius_secret/radius_vlan_mode require security wpa-eap"
 		}
-		if wl.hasAcctFields() {
+		if hasAcctFields(wl) {
 			return "accounting_enabled/acct_servers/interim_update_enabled/radius_das_enabled require security wpa-eap"
 		}
 		if wl.Passphrase != "" {
@@ -376,10 +376,10 @@ func validateWlan(wl *Wlan) string {
 	// silently drop — fail loud instead. The WPA3 modes share the
 	// passphrase rule with wpa-p (≥ 8; the jar's SAE psk sub-writer rides
 	// the same getWpaPreSharedKey() fallback).
-	if wl.hasRadiusFields() {
+	if hasRadiusFields(wl) {
 		return "radius_servers/radius_secret/radius_vlan_mode require security wpa-eap"
 	}
-	if wl.hasAcctFields() {
+	if hasAcctFields(wl) {
 		return "accounting_enabled/acct_servers/interim_update_enabled/radius_das_enabled require security wpa-eap"
 	}
 	if len(wl.Passphrase) < 8 {
@@ -389,13 +389,13 @@ func validateWlan(wl *Wlan) string {
 }
 
 // hasRadiusFields reports whether any inline RADIUS profile field is set.
-func (wl *Wlan) hasRadiusFields() bool {
+func hasRadiusFields(wl *Wlan) bool {
 	return len(wl.RadiusServers) > 0 || wl.RadiusSecret != "" || wl.RadiusVLANMode != ""
 }
 
 // hasAcctFields reports whether any inline RADIUS profile accounting
 // field is set (§12 rows 1013-1014).
-func (wl *Wlan) hasAcctFields() bool {
+func hasAcctFields(wl *Wlan) bool {
 	return wl.AccountingEnabled || len(wl.AcctServers) > 0 || wl.InterimUpdateEnabled || wl.RadiusDASEnabled
 }
 
@@ -494,7 +494,7 @@ func hasControlChar(s string) bool {
 }
 
 // validateWlanID checks the wlans[].id field when the client supplies one.
-// Empty ID is fine (server derives sha256(nameSSID)[:24]); a supplied ID
+// Empty ID is fine (the server derives wireless.NewWlanID); a supplied ID
 // lands verbatim in WlanConf/WirelessConf `id` rows, so it must be a safe
 // token: visible printable ASCII minus value separators (no whitespace, no
 // = , ; " '), max 64 chars. Hex-style IDs like "wlan-1" pass.

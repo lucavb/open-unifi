@@ -564,7 +564,7 @@ client-side rows unchanged). All times UTC; controller log lines are
   non-DFS); sparse heartbeats never re-armed. No two-consecutive-miss
   guard is indicated by live evidence; a DFS channel (radar-driven
   vap downtime) stays untested and would re-open the question — the
-  guard remains one counter away in `wlanstate.go`.
+  guard remains one counter away in `wlanstate.go` (now `internal/wireless/delivery_state.go`).
 - **make check regression found and fixed**: this round's
   first check was red — `TestSetupTracingExportsOTLPHTTP` (landed
   hours earlier in the telemetry feature commit, self-skipping under
@@ -678,7 +678,7 @@ verified ~07:07 CEST) — A2 flips to `PROVEN`:**
   `59d7b3e1` → byte-identical re-push 00:32:11 → settle 00:32:29 (18 s),
   steady connected noops since. The re-provision was benign and
   unattended, but the false-fire means the not-running watchdog needs a
-  boot-grace (the two-consecutive-miss counter in `wlanstate.go`,
+  boot-grace (the two-consecutive-miss counter in `wlanstate.go`, now `internal/wireless/delivery_state.go`,
   previously "not indicated by live evidence", is now live-indicated).
 - Post-boot + 6.5 h AP-side verification (password lane — the
   users-apply wipes `/etc/dropbear/authorized_keys`, the file this

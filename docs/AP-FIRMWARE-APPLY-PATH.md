@@ -242,7 +242,7 @@ A2 PROVEN (WLAN-ACCEPTANCE round record). One deviation from the clean
 expectation: the not-running watchdog fired on the first post-boot
 inform (vap_table present, applied SSID not yet RUN — boot bring-up
 race) and re-provisioned byte-identically; a boot-grace /
-two-consecutive-miss counter in wlanstate.go is the indicated follow-up —
+two-consecutive-miss counter in wlanstate.go (now internal/wireless/delivery_state.go) is the indicated follow-up —
 implemented 2026-09-19 (lane boot-grace): a not-running proof increments
 the controller-owned `wlan_cfg_not_running_misses` bookkeeping, the
 SECOND consecutive proof fires the re-provision (same mint mechanics) and

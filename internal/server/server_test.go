@@ -1722,7 +1722,7 @@ func TestSettleFSMPlacementsAndExhaustion(t *testing.T) {
 	})
 
 	t.Run("exhausted", func(t *testing.T) {
-		// The retry budget check itself (wlanRetryDue): a pending hash with
+		// The retry budget check itself (WlanRetryDue): a pending hash with
 		// the attempt counter at the cap flips the delivery status to
 		// "exhausted" and stops rate-limiting (next inform re-provisions).
 		rec := store.Device{Extra: store.JSONMap{
@@ -1730,7 +1730,7 @@ func TestSettleFSMPlacementsAndExhaustion(t *testing.T) {
 			"wlan_cfg_attempt_sha": wireless.WlanListHash(env),
 			"wlan_cfg_attempts":    adoption.WlanMaxAttempts,
 		}}
-		if due := adoption.WlanRetryDue(rec.Extra, time.Now()); due {
+		if due := wireless.WlanRetryDue(rec.Extra, time.Now()); due {
 			t.Fatal("attempts at cap must not still be retry-due")
 		}
 		if rec.Extra["wlan_cfg_delivery_status"] != "exhausted" {

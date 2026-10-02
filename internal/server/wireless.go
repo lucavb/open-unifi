@@ -9,9 +9,8 @@ import (
 	"github.com/lucavb/open-unifi/internal/wireless"
 )
 
-// Wlan aliases the shared WLAN type (internal/wireless): every existing
-// server-side reference (and cmd/openunifi's converter) keeps compiling
-// unchanged while the type itself lives in its own package.
+// Wlan aliases the shared WLAN type (internal/wireless), which adminapi also
+// aliases: one type across the admin wire, the record and the renderer.
 type Wlan = wireless.Wlan
 
 // wirelessForDevice resolves WLAN intent for one device; nil source ⇒ empty list.

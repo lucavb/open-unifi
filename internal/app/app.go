@@ -17,7 +17,6 @@ import (
 	"log/slog"
 	"math"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 
@@ -184,8 +183,8 @@ func saveIntent[T any](a *App, mac string, mode saveMode, change func(d *store.D
 // view maps a store record to the admin API read model. Actions is the
 // minimal supported set (delete) and is omitted only if empty.
 func (a *App) view(d store.Device) adminapi.DeviceView {
-	desired := adminWlansFromDevice(d).Wlans
-	inSync := runtimeInSync(d, desired)
+	inSync := wireless.RuntimeInSync(d, wireless.DeviceWLANs(d))
+	delivery := wireless.LoadDeliveryState(d.Extra)
 	return adminapi.DeviceView{
 		MAC:                store.ColonMAC(d.MAC),
 		Name:               d.Name,
@@ -197,9 +196,9 @@ func (a *App) view(d store.Device) adminapi.DeviceView {
 		CfgVersion:         d.CfgVersion,
 		AppliedCfg:         d.AppliedCfg,
 		InSync:             inSync,
-		WLANDeliveryStatus: stringExtra(d.Extra, "wlan_cfg_delivery_status"),
-		WLANDeliveryCount:  intExtra(d.Extra, "wlan_cfg_attempts"),
-		WLANLastAttempt:    int64Extra(d.Extra, "wlan_cfg_last_attempt"),
+		WLANDeliveryStatus: delivery.DeliveryStatus(),
+		WLANDeliveryCount:  delivery.Attempts(),
+		WLANLastAttempt:    delivery.LastAttempt(),
 		// Devname-level runtime view, live-computed the same way the
 		// engine consumes it (vapsNotRunningDevice below): the same
 		// admin-owned envelope source, the same PlanVaps, the same
@@ -259,8 +258,6 @@ func flagArmed(m store.JSONMap, key string) bool {
 	}
 }
 
-func stringExtra(m store.JSONMap, key string) string { v, _ := m[key].(string); return v }
-
 // vapsNotRunningDevice computes the devname-level runtime view for one
 // record (the view's VAPsNotRunning field, internal/wireless.MissingVaps):
 // the planned vap devnames whose vap_table row is absent or not RUN. The
@@ -272,83 +269,6 @@ func stringExtra(m store.JSONMap, key string) string { v, _ := m[key].(string); 
 func vapsNotRunningDevice(d store.Device) []string {
 	vaps, _ := wireless.PlanVaps(d, wireless.DeviceWLANs(d))
 	return wireless.MissingVaps(vaps, d.Extra["vap_table"])
-}
-func intExtra(m store.JSONMap, key string) int {
-	if v, ok := m[key].(float64); ok {
-		return int(v)
-	}
-	if v, ok := m[key].(int); ok {
-		return v
-	}
-	return 0
-}
-func int64Extra(m store.JSONMap, key string) int64 {
-	if v, ok := m[key].(float64); ok {
-		return int64(v)
-	}
-	if v, ok := m[key].(int64); ok {
-		return v
-	}
-	return 0
-}
-
-// runtimeInSync deliberately does not infer runtime WLAN health from the
-// controller/device cfgversion pair.  Devices can echo a matching version
-// before applying the WLAN, so that pair is only transport bookkeeping.
-// This read-side predicate is SSID-PRESENCE-ONLY by design: a positive
-// result requires a reported vap_table in which every enabled desired SSID
-// is observed RUNNING. It does NOT verify per-radio placement or that a
-// deleted WLAN has disappeared from the table — that strict check lives in
-// the server lane's settlePendingWLAN, which runs before this view is
-// served on every inform. Missing runtime evidence is unknown (nil), while
-// an observed table that lacks a desired RUN SSID is false.
-//
-// The vap_table wire keys are firmware-verified: devices report "essid" (not
-// "ssid") and "state" (not "status"). The alternate spellings are tolerated
-// defensively, but "essid"/"state" are the primaries.
-func runtimeInSync(d store.Device, desired []adminapi.Wlan) *bool {
-	if d.Extra == nil {
-		return nil
-	}
-	if _, pending := d.Extra["wlan_cfg_pending_sha"]; pending {
-		v := false
-		return &v
-	}
-	vaps, ok := d.Extra["vap_table"].([]any)
-	if !ok || len(vaps) == 0 {
-		return nil
-	}
-	// A vap_table with no RUN desired SSIDs is meaningful evidence of being out
-	// of sync, but a missing/empty table is unknown rather than false.
-	want := make(map[string]bool)
-	for _, wlan := range desired {
-		if wlan.Enabled {
-			want[wlan.SSID] = true
-		}
-	}
-	if len(want) == 0 {
-		return nil
-	}
-	running := make(map[string]bool)
-	for _, raw := range vaps {
-		m, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		ssid, _ := m["essid"].(string)
-		if ssid == "" {
-			ssid, _ = m["ssid"].(string) // tolerated fallback spelling
-		}
-		state, _ := m["state"].(string)
-		if state == "" {
-			state, _ = m["status"].(string) // tolerated fallback spelling
-		}
-		if ssid != "" && strings.EqualFold(state, "RUN") && want[ssid] {
-			running[ssid] = true
-		}
-	}
-	v := len(running) == len(want)
-	return &v
 }
 
 // PatchDevice applies the admin's device-name/site/knob rows as one

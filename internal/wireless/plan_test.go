@@ -242,7 +242,7 @@ func TestPlanProvisioningAgreement(t *testing.T) {
 }
 
 // TestMissingVapsEvidenceSemantics pins the devname-level watchdog's evidence
-// reader (the same proof bar the engine's notRunningEvidence applies at SSID
+// reader (the same proof bar the engine's NotRunningEvidence applies at SSID
 // level): absent/empty tables are unknown (nil — no positive gap), a
 // non-RUN row for a planned devname is a miss, the legacy `status` spelling
 // and EqualFold "RUN" case stay honored, non-map rows are skipped, disabled
@@ -313,4 +313,29 @@ func equalStrs(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestWlanIDRulesArePinned freezes both ID derivations with vectors computed
+// independently (sha256sum): the save-time rule owns new IDs, the legacy
+// fallback only serves records whose WLAN has an empty ID. A change to either
+// moves the drift hash of existing records.
+func TestWlanIDRulesArePinned(t *testing.T) {
+	w := Wlan{Name: "corp", SSID: "Corp", VLAN: 20}
+	if got, want := NewWlanID(w), "b8fe390cbbcb51c029a384fa"; got != want { // sha256("corpCorp")[:24]
+		t.Fatalf("NewWlanID = %s, want %s", got, want)
+	}
+	if got, want := WlanID(store.Device{}, w), "19f4c684a3ff4f2dfa73b8d9"; got != want { // sha256("corp")[:24]
+		t.Fatalf("legacy WlanID(name) = %s, want %s", got, want)
+	}
+	if got, want := WlanID(store.Device{}, Wlan{SSID: "Corp"}), "5978098011b5ed92958bbd4c"; got != want { // sha256("Corp")[:24]
+		t.Fatalf("legacy WlanID(ssid only) = %s, want %s", got, want)
+	}
+	if got, want := WlanID(store.Device{}, Wlan{VLAN: 20}), "c4476f8d5f6f016c86fe2fe4"; got != want { // sha256("vlan20")[:24]
+		t.Fatalf("legacy WlanID(vlan only) = %s, want %s", got, want)
+	}
+	for _, f := range []func(Wlan) string{NewWlanID, func(w Wlan) string { return WlanID(store.Device{}, w) }} {
+		if got := f(Wlan{ID: "wlan-1", Name: "x", SSID: "y"}); got != "wlan-1" {
+			t.Fatalf("a persisted ID must win verbatim, got %s", got)
+		}
+	}
 }

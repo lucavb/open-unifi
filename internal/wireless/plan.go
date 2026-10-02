@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"sort"
 	"strconv"
-	"strings"
 
 	"github.com/lucavb/open-unifi/internal/store"
 )
@@ -23,6 +22,28 @@ func SSIDOf(w Wlan) string {
 	return w.Name
 }
 
+// NewWlanID derives the stable WlanConf._id for a WLAN that has none: the
+// save-time rule every admin write uses (app create/put/update persist the
+// result before the record is stored), sha256(Name+SSID) truncated to 24
+// hex characters. A supplied ID is returned verbatim. This is the OWNING
+// rule; the drift hash includes id, so it must never change for a WLAN that
+// already has one persisted.
+func NewWlanID(w Wlan) string {
+	if w.ID != "" {
+		return w.ID
+	}
+	sum := sha256.Sum256([]byte(w.Name + w.SSID))
+	return hex.EncodeToString(sum[:12])
+}
+
+// WlanID resolves the id the plan emits for a WLAN. A persisted ID always
+// wins. The derivation below is the LEGACY fallback, reached only by a
+// record that holds a WLAN with an empty ID (written before saves assigned
+// one, or injected directly into the record). It deliberately differs from
+// NewWlanID (Name preferred over SSID, vlanN last resort, different
+// preimage): changing it would change the drift hash of every such record
+// and re-provision it once, so it is frozen. New code must call NewWlanID at
+// save time instead of relying on this.
 func WlanID(d store.Device, w Wlan) string {
 	if w.ID != "" {
 		return w.ID
@@ -293,7 +314,7 @@ func UnknownBandRadios(d store.Device) int {
 //     provisioning.
 //
 // Placements keys SSID\x00radio_name → count, the shape the pending
-// confirmation (applyProvisioning/settle) persists.
+// confirmation (DeliveryState.Offer/Settle) persists.
 type ProvisioningPlan struct {
 	DriftHash  string     // WlanListHash(wls) — the FSM drift input
 	Vaps       []VapPlan  // vap plan in radio-sorted emission order
@@ -318,18 +339,16 @@ func PlanProvisioning(d store.Device, wls []Wlan) ProvisioningPlan {
 // are not reported RUN in the device vap_table. vapTable is the raw vap_table
 // value (the []any from the record Extra, passed through verbatim); absent or
 // empty is UNKNOWN — the devices that have never reported a table this inform
-// carry no negative evidence — so nil with zero rows. The state extraction
-// replicates notRunningEvidence's compare exactly (primary `state`, `status`
-// fallback, EqualFold "RUN") so the SSID-level and devname-level views can
-// never disagree about one row. The devname key is `name`, not `devname` —
-// vap rows key the devname by `name` (firmware-verified, mcad
-// FUN_0041cecc; corroborated by the live 2026-09-26 inform log — the same
-// statement as settle's wire-keys comment in the adoption wlanstate and the
+// carry no negative evidence — so nil with zero rows. The RUN rule and the
+// wire keys live in VapEvidence, so the SSID-level and devname-level views
+// can never disagree about one row. The devname key is `name`, not
+// `devname` — vap rows key the devname by `name` (firmware-verified, mcad
+// FUN_0041cecc; corroborated by the live 2026-09-26 inform log; see also the
 // dead-code note in PlanVaps above). The result is sorted for
 // deterministic display and equality in tests and the admin view.
 func MissingVaps(vaps []VapPlan, vapTable any) []string {
-	rawList, ok := vapTable.([]any)
-	if !ok || len(rawList) == 0 {
+	ev := ReadVapEvidence(vapTable)
+	if !ev.Known() {
 		return nil
 	}
 	need := map[string]bool{}
@@ -342,12 +361,8 @@ func MissingVaps(vaps []VapPlan, vapTable any) []string {
 	if len(need) == 0 {
 		return nil
 	}
-	for _, raw := range rawList {
-		m, ok := raw.(map[string]any)
-		if !ok || !strings.EqualFold(JSONStr(m, "state", JSONStr(m, "status", "")), "RUN") {
-			continue
-		}
-		delete(need, JSONStr(m, "name", ""))
+	for _, r := range ev.Running() {
+		delete(need, r.Name)
 	}
 	if len(need) == 0 {
 		return nil

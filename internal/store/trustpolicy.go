@@ -68,6 +68,28 @@ const (
 	// (wireless.DeviceWLANs / SetDeviceWLANs).
 	DeviceWLANsExtraKey = "device_wlans"
 
+	// The WLAN delivery state's record keys (CONTEXT.md "WLAN delivery
+	// state"): declared ONCE here, next to the trust registry that classes
+	// them, and read/written only by wireless.DeliveryState. The registry
+	// lists below use these constants; TestTrustRegistrySnapshot still pins
+	// the wire-named literals, so a constant drifted from its literal fails.
+	// All are controller-owned EXCEPT the last two (the devname watchdog's
+	// counter and one-shot marker), which are admin-owned prev-or-delete rows.
+	WlanCfgShaKey                   = "wlan_cfg_sha"
+	WlanCfgPendingShaKey            = "wlan_cfg_pending_sha"
+	WlanCfgPendingWlansKey          = "wlan_cfg_pending_wlans"
+	WlanCfgPendingOldWlansKey       = "wlan_cfg_pending_old_wlans"
+	WlanCfgAppliedWlansKey          = "wlan_cfg_applied_wlans"
+	WlanCfgPendingPlacementsKey     = "wlan_cfg_pending_placements"
+	WlanCfgAttemptShaKey            = "wlan_cfg_attempt_sha"
+	WlanCfgAttemptsKey              = "wlan_cfg_attempts"
+	WlanCfgLastAttemptKey           = "wlan_cfg_last_attempt"
+	WlanCfgDeliveryStatusKey        = "wlan_cfg_delivery_status"
+	WlanCfgNotRunningMissesKey      = "wlan_cfg_not_running_misses"
+	WlanCfgOfferedCfgversionKey     = "wlan_cfg_offered_cfgversion"
+	WlanCfgVapNotRunningMissesKey   = "wlan_cfg_vap_not_running_misses"
+	WlanCfgMaterializationRebootKey = "wlan_cfg_materialization_reboot"
+
 	// BlockedStaShaExtraKey is the blocked_sta delivery baseline
 	// (sha256 of the last EMITTED §4 wire string, adoption-blockedsta's
 	// offer-then-confirm bookkeeping). Admin-owned — the same
@@ -81,11 +103,11 @@ const (
 // client-session family. Package-private by design (the sealed surface:
 // Absorb is the only reader); nothing outside this file may copy it.
 var controllerOwnedKeys = []string{
-	"wlan_cfg_sha", "wlan_cfg_pending_sha", "wlan_cfg_pending_wlans",
-	"wlan_cfg_pending_old_wlans", "wlan_cfg_applied_wlans",
-	"wlan_cfg_pending_placements", "wlan_cfg_attempt_sha", "wlan_cfg_attempts",
-	"wlan_cfg_last_attempt", "wlan_cfg_delivery_status",
-	"wlan_cfg_not_running_misses", "wlan_cfg_offered_cfgversion",
+	WlanCfgShaKey, WlanCfgPendingShaKey, WlanCfgPendingWlansKey,
+	WlanCfgPendingOldWlansKey, WlanCfgAppliedWlansKey,
+	WlanCfgPendingPlacementsKey, WlanCfgAttemptShaKey, WlanCfgAttemptsKey,
+	WlanCfgLastAttemptKey, WlanCfgDeliveryStatusKey,
+	WlanCfgNotRunningMissesKey, WlanCfgOfferedCfgversionKey,
 	SessionsExtraKey, SessionDisconnectEventExtraKey,
 }
 
@@ -126,7 +148,7 @@ var adminOwnedKeys = []string{
 	BlockedStaExtraKey, BlockedStaShaExtraKey,
 	// The devname-level materialization watchdog's two rows (the
 	// consecutive-miss counter and the one-shot armed-reboot marker, per
-	// cfgversion — engine wlanstate). Admin-owned prev-or-delete, the same
+	// cfgversion — wireless.DeliveryState). Admin-owned prev-or-delete, the same
 	// shape as blocked_sta_sha: a controller-written row guarded against
 	// device-baseline forging. Prev-owns alone would let a device body
 	// INTRODUCE either row — the device learns its cfgversion from the
@@ -137,7 +159,7 @@ var adminOwnedKeys = []string{
 	// the watchdog needs either way: once the ENGINE wrote the row, a
 	// later sparse heartbeat (no body copy) restores the record's value,
 	// and a forged body copy never overwrites it.
-	"wlan_cfg_vap_not_running_misses", "wlan_cfg_materialization_reboot",
+	WlanCfgVapNotRunningMissesKey, WlanCfgMaterializationRebootKey,
 	SSHSha512PasswdKey, SSHMd5PasswdKey,
 	"led_override", "disabled", "led_override_color_brightness",
 	"led_override_color", "ssh_password",
@@ -170,7 +192,7 @@ var adminOwnedKeys = []string{
 // exported: the adoption engine is its sole consumer, so the class
 // membership itself stays sealed.
 var FactoryResetSweepKeys = append(excludeKey(controllerOwnedKeys, SSHSha512PasswdKey),
-	"wlan_cfg_vap_not_running_misses", "wlan_cfg_materialization_reboot")
+	WlanCfgVapNotRunningMissesKey, WlanCfgMaterializationRebootKey)
 
 // excludeKey copies keys without the one named (copy so a caller that
 // appends to one list can never clobber the other's backing array).

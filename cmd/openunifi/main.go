@@ -27,6 +27,7 @@ import (
 	"github.com/lucavb/open-unifi/internal/server"
 	"github.com/lucavb/open-unifi/internal/store"
 	"github.com/lucavb/open-unifi/internal/telemetry"
+	"github.com/lucavb/open-unifi/internal/wireless"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
@@ -121,12 +122,6 @@ func run() error {
 		logger.Warn("admin API and metrics are ANONYMOUS (LAB ONLY)")
 	}
 
-	// WirelessForDevice reads each device's admin-owned device_wlans at
-	// inform time (per-AP WLAN intent).
-	wirelessForDevice := func(d store.Device) []server.Wlan {
-		return app.DeviceWLANs(d)
-	}
-
 	srv := server.New(server.Config{
 		InformListenAddr:      *listenInform,
 		DiscoveryListen:       *discovery,
@@ -134,7 +129,7 @@ func run() error {
 		DiscoveryDiscoverable: *discoveryDiscoverable,
 		ControllerURL:         *controllerURL,
 		AllowPlainText:        *allowPlainText,
-		WirelessForDevice:     wirelessForDevice,
+		WirelessForDevice:     wireless.DeviceWLANs, // per-AP WLAN intent, read from the record at inform time
 		// Client-session transition observations ride the same ownership
 		// seam as IncInform: the transport stays Prometheus-free and main
 		// wires the hook (post-commit, exactly-once per persisted

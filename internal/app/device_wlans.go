@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 
@@ -11,77 +10,12 @@ import (
 	"github.com/lucavb/open-unifi/internal/wireless"
 )
 
-// DeviceWLANs returns the provisioned WLAN envelope for one device record
-// (inform-side wiring).
-func DeviceWLANs(d store.Device) []wireless.Wlan {
-	return wireless.DeviceWLANs(d)
-}
-
 func adminWlansFromDevice(d store.Device) adminapi.WlansEnvelope {
 	wls := wireless.DeviceWLANs(d)
-	out := make([]adminapi.Wlan, 0, len(wls))
-	for _, w := range wls {
-		out = append(out, wirelessWlanToAdmin(w))
+	if wls == nil {
+		wls = []wireless.Wlan{}
 	}
-	return adminapi.WlansEnvelope{Wlans: out}
-}
-
-func wirelessWlanToAdmin(w wireless.Wlan) adminapi.Wlan {
-	aw := adminapi.Wlan{
-		Name:                 w.Name,
-		SSID:                 w.SSID,
-		Security:             w.Security,
-		Passphrase:           w.Passphrase,
-		VLAN:                 w.VLAN,
-		Enabled:              w.Enabled,
-		ID:                   w.ID,
-		Band:                 w.Band,
-		RadiusSecret:         w.RadiusSecret,
-		RadiusVLANMode:       w.RadiusVLANMode,
-		AccountingEnabled:    w.AccountingEnabled,
-		InterimUpdateEnabled: w.InterimUpdateEnabled,
-		RadiusDASEnabled:     w.RadiusDASEnabled,
-	}
-	for _, s := range w.RadiusServers {
-		aw.RadiusServers = append(aw.RadiusServers, adminapi.RadiusServer{IP: s.IP, Port: s.Port})
-	}
-	for _, s := range w.AcctServers {
-		aw.AcctServers = append(aw.AcctServers, adminapi.RadiusAcctServer{IP: s.IP, Port: s.Port})
-	}
-	return aw
-}
-
-func adminWlanToWireless(w adminapi.Wlan) wireless.Wlan {
-	wl := wireless.Wlan{
-		Name:                 w.Name,
-		SSID:                 w.SSID,
-		Security:             w.Security,
-		Passphrase:           w.Passphrase,
-		VLAN:                 w.VLAN,
-		Enabled:              w.Enabled,
-		ID:                   w.ID,
-		Band:                 w.Band,
-		RadiusSecret:         w.RadiusSecret,
-		RadiusVLANMode:       w.RadiusVLANMode,
-		AccountingEnabled:    w.AccountingEnabled,
-		InterimUpdateEnabled: w.InterimUpdateEnabled,
-		RadiusDASEnabled:     w.RadiusDASEnabled,
-	}
-	for _, s := range w.RadiusServers {
-		wl.RadiusServers = append(wl.RadiusServers, wireless.RadiusServer{IP: s.IP, Port: s.Port})
-	}
-	for _, s := range w.AcctServers {
-		wl.AcctServers = append(wl.AcctServers, wireless.RadiusAcctServer{IP: s.IP, Port: s.Port})
-	}
-	return wl
-}
-
-func wlanID(w adminapi.Wlan) string {
-	if w.ID != "" {
-		return w.ID
-	}
-	sum := sha256.Sum256([]byte(w.Name + w.SSID))
-	return fmt.Sprintf("%x", sum[:12])
+	return adminapi.WlansEnvelope{Wlans: wls}
 }
 
 func validateDeviceWlans(env *adminapi.WlansEnvelope) error {
@@ -108,7 +42,7 @@ func normalizeDeviceWlanEnvelope(env *adminapi.WlansEnvelope) {
 	}
 	for i := range env.Wlans {
 		if env.Wlans[i].ID == "" {
-			env.Wlans[i].ID = wlanID(env.Wlans[i])
+			env.Wlans[i].ID = wireless.NewWlanID(env.Wlans[i])
 		}
 	}
 }
@@ -118,11 +52,7 @@ func (a *App) persistDeviceWLANs(d *store.Device, env adminapi.WlansEnvelope) er
 	if err := validateDeviceWlans(&env); err != nil {
 		return err
 	}
-	wls := make([]wireless.Wlan, 0, len(env.Wlans))
-	for _, w := range env.Wlans {
-		wls = append(wls, adminWlanToWireless(w))
-	}
-	return wireless.SetDeviceWLANs(d, wls)
+	return wireless.SetDeviceWLANs(d, env.Wlans)
 }
 
 // GetDeviceWireless returns the whole WLAN document for one device.
@@ -157,7 +87,7 @@ func (a *App) CreateDeviceWlan(_ context.Context, mac string, wlan adminapi.Wlan
 	if msg := adminapi.ValidateWlanName(wlan.Name); msg != "" {
 		return adminapi.Wlan{}, fmt.Errorf("%w: %s", adminapi.ErrConflict, msg)
 	}
-	wlan.ID = wlanID(wlan)
+	wlan.ID = wireless.NewWlanID(wlan)
 	out, err := saveIntent(a, mac, saveExisting, func(d *store.Device) (bool, error) {
 		env := adminWlansFromDevice(*d)
 		env.Wlans = append(append([]adminapi.Wlan(nil), env.Wlans...), wlan)

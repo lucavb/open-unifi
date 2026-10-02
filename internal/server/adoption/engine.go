@@ -32,12 +32,10 @@ import (
 // package, so aliasing it introduces no cycle).
 const defaultKeyHex = inform.DefaultKeyHex
 
-// WLAN delivery retry budget (bounded attempt bookkeeping per pushed hash).
-const (
-	WlanRetryBase   = 2 * time.Second
-	WlanRetryMax    = 60 * time.Second
-	WlanMaxAttempts = 6
-)
+// WlanMaxAttempts is the WLAN delivery attempt budget, owned by
+// wireless.DeliveryState and aliased here for the engine's tests and the
+// server lifecycle tests.
+const WlanMaxAttempts = wireless.WlanMaxAttempts
 
 // ErrDefaultKeyRejected (FID-1): an adopted device must never re-authenticate
 // with the factory key (devmgr "used default key in X state, reject it" →
@@ -540,8 +538,7 @@ func (e *Engine) armedLifecycle(d *store.Device) (Outcome, bool) {
 		// The devname-level watchdog's counter (below) carries the same
 		// rule: its window must re-arm from zero for the post-boot
 		// materialization grace.
-		delete(d.Extra, "wlan_cfg_not_running_misses")
-		delete(d.Extra, "wlan_cfg_vap_not_running_misses")
+		wireless.ClearWatchdogCounters(d.Extra)
 		return Outcome{Kind: KindReboot}, true
 	}
 	// §6.3 stored cmd task (last in the armed chain — see the precedence
@@ -632,16 +629,16 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 	// trigger.
 	// A system_cfg transmission is only an offer.  Its hash remains pending
 	// until a later inform proves the VAPs are actually running.
-	st := loadWlanCfgState(d.Extra)
+	st := wireless.LoadDeliveryState(d.Extra)
 	// The record's CURRENT cfgversion rides settle for the materialization
 	// marker's one-shot budget (see settle's doc): the record's desired
 	// version is read BEFORE any mint this decision might make (an operator
 	// or drift mint below concerns the NEXT operation, not the config the
 	// pending bookkeeping was written under).
-	st.settle(d.CfgVersion)
+	st.Settle(d.CfgVersion)
 	wlanDrift := false
-	if st.sha != "" {
-		if cur := plan.DriftHash; cur != st.sha {
+	if st.Baseline() != "" {
+		if cur := plan.DriftHash; cur != st.Baseline() {
 			wlanDrift = true
 			// Mint ONLY for a genuinely NEW envelope. Live finding
 			// (2026-09-19 EAP round, WLAN-ACCEPTANCE 6.8.2.15592): a
@@ -657,7 +654,7 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 			// pending gate's bounded budget govern re-offers, and let
 			// an echoed offer reach the equality branch's
 			// noop-pending-wlan instead of minting the equality away.
-			if !st.pendingSHAPresent || st.pendingSHA != cur {
+			if !st.PendingPresent() || st.PendingHash() != cur {
 				nv, kerr := e.keyChars(16)
 				if kerr != nil {
 					return Outcome{}, kerr
@@ -692,7 +689,7 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 		d.CfgVersion = nv
 		e.lg.Debug("inform: blocked_sta drift", "mac", d.MAC)
 	}
-	if st.pendingSHAPresent && st.pendingSHA != "" {
+	if st.PendingPresent() && st.PendingHash() != "" {
 		// A changed envelope is a new delivery operation. For the unchanged
 		// operation, rate-limit retries before the switch below; importantly,
 		// this does not clear pending or treat cfgversion equality as success.
@@ -702,15 +699,16 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 		// since assignedKeyFlow emits system_cfg unconditionally.
 		// An operator cfgversion mint (radio-intent / LED-override saves —
 		// the §6.2 "CONFIG changed" operator-save trigger) gets the SAME
-		// escape: applyProvisioning records the cfgversion the pending
+		// escape: Offer records the cfgversion the pending
 		// operation was last offered with (wlan_cfg_offered_cfgversion), and
 		// a record whose cfgversion has moved past that offer carries
 		// operator content this gate must not hold hostage while the
 		// envelope is unchanged. The rate limit still holds the UNCHANGED
 		// case (no mint since the last offer), and records whose pending
 		// predates the offered bookkeeping keep the hold-at-gate behavior.
-		operatorMint := st.offeredPresent && d.CfgVersion != st.offeredCfgversion
-		if !blockedDrift && !operatorMint && st.pendingSHA == plan.DriftHash && !st.retryDue(now) {
+		offered, offeredPresent := st.OfferedCfgversion()
+		operatorMint := offeredPresent && d.CfgVersion != offered
+		if !blockedDrift && !operatorMint && st.PendingHash() == plan.DriftHash && !st.RetryDue(now) {
 			return e.noopFor(d, now, req.PrevNoopTarget, KindNoopPendingWLAN), nil
 		}
 		wlanDrift = true
@@ -771,7 +769,7 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 		// cfgversion so the NEXT inform mismatches and flows through
 		// full provisioning, which captures the hash. Terminates: the
 		// provisioning path always stores it.
-		if st.sha == "" {
+		if st.Baseline() == "" {
 			nv, kerr := e.keyChars(16)
 			if kerr != nil {
 				return Outcome{}, kerr
@@ -780,7 +778,7 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 			e.lg.Debug("inform: no envelope baseline, forcing provisioning", "mac", d.MAC)
 			return e.noopFor(d, now, req.PrevNoopTarget, KindNoop), nil
 		}
-		if st.pendingSHAPresent {
+		if st.PendingPresent() {
 			return e.noopFor(d, now, req.PrevNoopTarget, KindNoopPendingWLAN), nil
 		}
 		// §6.2(e) reconnect push: a client-disconnect event pending on a
@@ -825,14 +823,14 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 		// mutates its inputs (the applied snapshot and vap_table — the
 		// counters are writes), so the reuse is the same value the review
 		// verified ad hoc on all reachable paths.
-		ev := st.notRunningEvidence()
+		ev := st.NotRunningEvidence()
 		switch ev {
-		case nrMiss:
-			if misses := st.recordNotRunningMiss(); misses < 2 {
+		case wireless.NotRunningMiss:
+			if misses := st.RecordNotRunningMiss(); misses < 2 {
 				e.lg.Debug("inform: applied WLANs not running (miss 1 of 2, boot-race grace)", "mac", d.MAC)
 				break
 			}
-			st.clearNotRunningMisses()
+			st.ClearNotRunningMisses()
 			nv, kerr := e.keyChars(16)
 			if kerr != nil {
 				return Outcome{}, kerr
@@ -840,8 +838,8 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 			d.CfgVersion = nv
 			e.lg.Debug("inform: applied WLANs not running, forcing re-provisioning", "mac", d.MAC)
 			return e.noopFor(d, now, req.PrevNoopTarget, KindNoop), nil
-		case nrRun:
-			st.clearNotRunningMisses()
+		case wireless.NotRunningRun:
+			st.ClearNotRunningMisses()
 		}
 		// Devname-level materialization watchdog (2026-09-26 production
 		// incident, 2.4 guest guest-net ath3): 6.8.2.15592 only
@@ -850,24 +848,24 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 		// configured-not-running forever while hostapd crash-looped. The
 		// SSID watchdog above cannot see this shape: a band=both WLAN
 		// reads RUN on ONE radio (SSID present in vap_table), so the SSID
-		// view is nrRun and the missing devname is invisible. This block
-		// runs ONLY on the SSID view's nrRun arm (the invisible case) and
-		// only when NO delivery can be in flight: for a REAL pending sha
-		// (the non-empty string applyProvisioning stores) this branch is
+		// view reads running and the missing devname is invisible. This
+		// block runs ONLY when the SSID view reads running (the invisible
+		// case) and only when NO delivery can be in flight: for a REAL pending sha
+		// (the non-empty string Offer stores) this branch is
 		// unreachable — the flow either answered noop-pending-wlan above
 		// when the unchanged-envelope retry was not yet due, or flagged
 		// wlanDrift and full-provisioned below — and the pendingSHAPresent
 		// precede-check here only catches a MALFORMED pending row (key
-		// present, "": a shape applyProvisioning never writes) to keep
+		// present, "": a shape Offer never writes) to keep
 		// delivery out of an armed watchdog. A plan vap whose devname is
 		// absent (or not RUN) from THIS inform's vap_table is the real
 		// gap. Monitored with the same two-consecutive-miss boot-race
 		// grace: the first miss can be the post-reboot bring-up race on
 		// the freshly materialized set. Evidence semantics are
 		// wireless.MissingVaps — absent/empty tables are UNKNOWN and leave
-		// the window untouched, exactly like notRunningEvidence above.
-		if ev == nrRun {
-			missing := wireless.MissingVaps(plan.Vaps, st.extra["vap_table"])
+		// the window untouched, exactly like NotRunningEvidence above.
+		if ev == wireless.NotRunningRun {
+			missing := wireless.MissingVaps(plan.Vaps, d.Extra["vap_table"])
 			if len(missing) == 0 {
 				// RUN proof at the devname level: everything planned is
 				// live on the wire. Reset the window AND retire the
@@ -875,11 +873,11 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 				// is the settle() path's job; same-version RUN proof
 				// means the materialization gap is GONE and the marker's
 				// purpose is served).
-				st.clearVapNotRunningMisses()
-				delete(d.Extra, "wlan_cfg_materialization_reboot")
+				st.ClearVapNotRunningMisses()
+				wireless.ClearMaterializationReboot(d.Extra)
 			} else {
 				alreadyPending := truthy(d.Extra[FlagRebootOnConnect])
-				armedCv, wasArmed := materializationRebootArmedFor(d.Extra)
+				armedCv, wasArmed := wireless.MaterializationRebootArmedFor(d.Extra)
 				switch {
 				case alreadyPending:
 					// Unreachable today: armedLifecycle consumes a truthy
@@ -899,7 +897,7 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 					// (the capacity case). The watchdog never re-arms
 					// while the marker stands for the same cfgversion —
 					// a marker only retires on a NEW config settling
-					// (st.settle deletes a stale-cfgversion one) or on a
+					// (Settle deletes a stale-cfgversion one) or on a
 					// RUN proof (which, for a recovery→regression under
 					// the SAME cfgversion, deliberately re-arms: each
 					// arm is separated by a delivered reboot and a
@@ -912,15 +910,15 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 					// same decision it stamps, and the reboot emission
 					// deletes the counter outright); re-running this
 					// branch stays a no-op.
-					st.clearVapNotRunningMisses()
+					st.ClearVapNotRunningMisses()
 				default:
-					if misses := st.recordVapNotRunningMiss(); misses < 2 {
+					if misses := st.RecordVapNotRunningMiss(); misses < 2 {
 						e.lg.Debug("inform: planned vap not running (miss 1 of 2, boot-race grace)", "mac", d.MAC, "vaps", missing)
 						// Fall through to the connected-noop flow below,
 						// byte-identical to miss#1 handling in the SSID
 						// watchdog (no early return).
 					} else {
-						st.clearVapNotRunningMisses()
+						st.ClearVapNotRunningMisses()
 						// §6.5 reboot arm — the jar-verbatim one-shot
 						// flag (adminOwnedKeys carries it through the
 						// adapter's wholesale Extra assignment; the
@@ -930,10 +928,10 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 						// arm's cfgversion — the watchdog never re-arms
 						// while it stands for the SAME cfgversion (the
 						// one-shot guard above), and a marker only
-						// retires via a new config settling (st.settle
+						// retires via a new config settling (DeliveryState.Settle
 						// deletes a stale-cfgversion one) or a RUN proof.
 						d.Extra[FlagRebootOnConnect] = true
-						setMaterializationRebootArmed(d.Extra, d.CfgVersion)
+						wireless.SetMaterializationRebootArmed(d.Extra, d.CfgVersion)
 						// Deliberate divergence — this is the adoption
 						// package's ONLY lg.Info call (even the §6.5
 						// reboot emission logs Debug, as does the SSID
@@ -1066,8 +1064,8 @@ func (e *Engine) assignedKeyFlow(ctx context.Context, d *store.Device, now time.
 	// sent.  Keep the desired snapshot as delivery evidence for the next
 	// device inform (including deletions, where absence must be observed).
 	placements := plan.Placements
-	st := loadWlanCfgState(d.Extra)
-	st.applyProvisioning(cur, now.Unix(), wls, placements, d.CfgVersion)
+	st := wireless.LoadDeliveryState(d.Extra)
+	st.Offer(cur, now.Unix(), wls, placements, d.CfgVersion)
 	// blocked_sta rides every full provisioning (§6.2(d)): render the §4
 	// wire string from the admin-owned set, carry it in the outcome, and
 	// stamp the delivery baseline so the next inform can tell confirmed

@@ -1,31 +1,35 @@
-package adoption
+package wireless
 
 import (
 	"encoding/json"
-	"strings"
 	"time"
 
 	"github.com/lucavb/open-unifi/internal/store"
-	"github.com/lucavb/open-unifi/internal/wireless"
 )
 
-// wlanCfgState is the typed view over the controller-owned wlan_cfg_* Extra
-// keys (the trust-policy "controller-owned keys" class). load reads them with
-// EXACTLY the type assertions today's readers used; the apply functions write
-// back EXACT key names and EXACT value formats (string/int/int64) so the
-// persisted Extra bytes stay identical to the pre-extraction behavior.
+// DeliveryState is the WLAN delivery state (CONTEXT.md): the typed handle
+// over one device record's in-flight WLAN push — the drift baseline, the
+// pending and last-applied WLANs with their placements, the attempt budget
+// and the watchdog counters. Drift settle and Delivery retry are its
+// operations. It is the ONLY reader and writer of the record keys declared
+// in store (store.WlanCfg*Key); nothing outside this module touches them by
+// name.
 //
-// Keys covered (all controller-owned, EXCEPT the last two — the devname
-// watchdog's counter and marker are admin-owned prev-or-delete rows since
-// the 2026-09-26 class move, the blocked_sta_sha shape):
+// It is bound to the record's Extra map: LoadDeliveryState reads with
+// EXACTLY the type assertions the former readers used, and the mutating
+// operations write back EXACT key names and EXACT value formats
+// (string/int/int64, WLAN snapshots via EncodeStoredWlans), so the persisted
+// bytes are identical to the pre-extraction behavior. The
+// adoption engine stays the only DECIDER; this module exposes evidence and
+// bookkeeping transitions and decides nothing about an inform.
 //
-//	wlan_cfg_sha, wlan_cfg_pending_sha, wlan_cfg_pending_wlans,
-//	wlan_cfg_pending_old_wlans, wlan_cfg_applied_wlans,
-//	wlan_cfg_pending_placements, wlan_cfg_attempt_sha, wlan_cfg_attempts,
-//	wlan_cfg_last_attempt, wlan_cfg_delivery_status,
-//	wlan_cfg_not_running_misses, wlan_cfg_offered_cfgversion,
-//	wlan_cfg_vap_not_running_misses, wlan_cfg_materialization_reboot.
-type wlanCfgState struct {
+// Trust classes are the store registry's call, not this module's: all keys
+// are controller-owned EXCEPT the devname watchdog's counter and one-shot
+// marker, which are admin-owned prev-or-delete rows (the blocked_sta_sha
+// shape). TestDeliveryStateKeysSurviveHostileBody pins that a device body
+// can neither forge nor clear any key this module writes, and cannot
+// introduce the two admin-owned ones.
+type DeliveryState struct {
 	// extra is the map the state was loaded from (apply functions write here).
 	extra store.JSONMap
 
@@ -41,10 +45,10 @@ type wlanCfgState struct {
 
 	// pendingWlans is wlan_cfg_pending_wlans decoded from its stored JSON
 	// string (nil when absent/not a string/not valid JSON).
-	pendingWlans []wireless.Wlan
+	pendingWlans []Wlan
 
 	// oldWlans is wlan_cfg_pending_old_wlans decoded the same way.
-	oldWlans []wireless.Wlan
+	oldWlans []Wlan
 
 	// appliedRaw is wlan_cfg_applied_wlans VERBATIM (copied to
 	// wlan_cfg_pending_old_wlans on the next provisioning, whatever type it
@@ -66,7 +70,7 @@ type wlanCfgState struct {
 	// notRunningMisses is wlan_cfg_not_running_misses: the consecutive
 	// not-running-proof counter behind the settled-state watchdog's
 	// two-consecutive-miss arming (the engine's connected-noop fire site;
-	// see notRunningEvidence). Controller-owned bookkeeping, so it
+	// see NotRunningEvidence). Controller-owned bookkeeping, so it
 	// survives sparse heartbeats and device bodies cannot clobber it
 	// (the store trust policy's controller-owned class). Absent = 0 =
 	// window unarmed.
@@ -84,7 +88,7 @@ type wlanCfgState struct {
 
 	// offeredCfgversion is wlan_cfg_offered_cfgversion: the cfgversion the
 	// pending delivery operation was last OFFERED with (written by
-	// applyProvisioning at emission, cleared by settle with the rest of the
+	// Offer at emission, cleared by Settle with the rest of the
 	// pending bookkeeping). The engine's pending gate compares it with the
 	// record's current cfgversion so an operator mint since the last offer
 	// (radio-intent / LED-override saves — the same escape blocked-set
@@ -99,69 +103,67 @@ type wlanCfgState struct {
 	offeredCfgversion string
 }
 
-// loadWlanCfgState reads the controller-owned keys from extra with exactly
+// LoadDeliveryState reads the controller-owned keys from extra with exactly
 // the type assertions of the pre-extraction readers.
-func loadWlanCfgState(extra store.JSONMap) wlanCfgState {
-	st := wlanCfgState{extra: extra}
-	if v, ok := extra["wlan_cfg_sha"].(string); ok {
+func LoadDeliveryState(extra store.JSONMap) *DeliveryState {
+	st := &DeliveryState{extra: extra}
+	if v, ok := extra[store.WlanCfgShaKey].(string); ok {
 		st.sha = v
 	}
-	if _, ok := extra["wlan_cfg_pending_sha"]; ok {
+	if _, ok := extra[store.WlanCfgPendingShaKey]; ok {
 		st.pendingSHAPresent = true
 	}
-	if v, ok := extra["wlan_cfg_pending_sha"].(string); ok {
+	if v, ok := extra[store.WlanCfgPendingShaKey].(string); ok {
 		st.pendingSHAIsString = true
 		st.pendingSHA = v
 	}
-	if raw, ok := extra["wlan_cfg_pending_wlans"].(string); ok {
-		var w []wireless.Wlan
-		if json.Unmarshal([]byte(raw), &w) == nil {
+	if raw, ok := extra[store.WlanCfgPendingWlansKey].(string); ok {
+		if w, err := DecodeStoredWlans([]byte(raw)); err == nil {
 			st.pendingWlans = w
 		}
 	}
-	if raw, ok := extra["wlan_cfg_pending_old_wlans"].(string); ok {
-		var w []wireless.Wlan
-		if json.Unmarshal([]byte(raw), &w) == nil {
+	if raw, ok := extra[store.WlanCfgPendingOldWlansKey].(string); ok {
+		if w, err := DecodeStoredWlans([]byte(raw)); err == nil {
 			st.oldWlans = w
 		}
 	}
-	if v, ok := extra["wlan_cfg_applied_wlans"]; ok {
+	if v, ok := extra[store.WlanCfgAppliedWlansKey]; ok {
 		st.appliedPresent = true
 		st.appliedRaw = v
 	}
-	if raw, ok := extra["wlan_cfg_pending_placements"].(string); ok {
+	if raw, ok := extra[store.WlanCfgPendingPlacementsKey].(string); ok {
 		placements := map[string]int{}
 		_ = json.Unmarshal([]byte(raw), &placements)
 		st.placements = placements
 	}
-	if v, ok := extra["wlan_cfg_attempt_sha"].(string); ok {
+	if v, ok := extra[store.WlanCfgAttemptShaKey].(string); ok {
 		st.attemptSHA = v
 	}
-	switch v := extra["wlan_cfg_attempts"].(type) {
+	switch v := extra[store.WlanCfgAttemptsKey].(type) {
 	case int:
 		st.attempts = v
 	case float64:
 		st.attempts = int(v)
 	}
-	switch v := extra["wlan_cfg_last_attempt"].(type) {
+	switch v := extra[store.WlanCfgLastAttemptKey].(type) {
 	case int64:
 		st.lastAttempt = v
 	case float64:
 		st.lastAttempt = int64(v)
 	}
-	switch v := extra["wlan_cfg_not_running_misses"].(type) {
+	switch v := extra[store.WlanCfgNotRunningMissesKey].(type) {
 	case int:
 		st.notRunningMisses = v
 	case float64:
 		st.notRunningMisses = int(v)
 	}
-	switch v := extra["wlan_cfg_vap_not_running_misses"].(type) {
+	switch v := extra[store.WlanCfgVapNotRunningMissesKey].(type) {
 	case int:
 		st.vapNotRunningMisses = v
 	case float64:
 		st.vapNotRunningMisses = int(v)
 	}
-	if v, ok := extra["wlan_cfg_offered_cfgversion"].(string); ok {
+	if v, ok := extra[store.WlanCfgOfferedCfgversionKey].(string); ok {
 		st.offeredPresent = true
 		st.offeredCfgversion = v
 	}
@@ -180,12 +182,12 @@ func loadWlanCfgState(extra store.JSONMap) wlanCfgState {
 // deleted here — the arming rule (engine.go) never re-arms while a marker
 // for the same cfgversion stands, and a stale marker standing onto a new
 // config would suppress a genuinely NEW materialization gap for free.
-func (st *wlanCfgState) settle(cfgversion string) {
+func (st *DeliveryState) Settle(cfgversion string) {
 	if !st.pendingSHAIsString {
 		return
 	}
-	vaps, ok := st.extra["vap_table"].([]any)
-	if !ok {
+	ev := ReadVapEvidence(st.extra["vap_table"])
+	if !ev.Present() {
 		return
 	}
 	desired := st.pendingWlans
@@ -197,42 +199,32 @@ func (st *wlanCfgState) settle(cfgversion string) {
 	}
 	removed := map[string]bool{}
 	for _, w := range old {
-		if w.Enabled && !containsEnabled(desired, wireless.SSIDOf(w)) {
-			removed[wireless.SSIDOf(w)] = true
+		if w.Enabled && !containsEnabled(desired, SSIDOf(w)) {
+			removed[SSIDOf(w)] = true
 		}
 	}
 	for _, w := range desired {
 		if w.Enabled {
-			need[wireless.SSIDOf(w)]++
+			need[SSIDOf(w)]++
 		}
 	}
 	// The old snapshot is not available as a separate desired/current pair in
 	// the record, so use the current source for positive proof and only require
 	// old names to be absent when they are no longer desired.
 	//
-	// Wire keys: the device's real vap_table uses essid/state/radio_name/name
-	// (firmware-verified, mcad FUN_0041cecc; corroborated by the live log
-	// "vap_table reports state RUN", docs/PROTOCOL.md:388;
-	// docs/AP-FIRMWARE-APPLY-PATH.md). The ssid/status/parent spellings only
-	// ever existed in our synthetic test fixtures — status/parent are kept
-	// as fallbacks here pending the capture cross-check so in-flight
-	// fixtures keep working. The placement construction side
-	// (the plan's Placements) keys on radio_table `name` values; the
-	// device-side radio_name carries the same strings.
-	for _, raw := range vaps {
-		m, ok := raw.(map[string]any)
-		if !ok || !strings.EqualFold(wireless.JSONStr(m, "state", wireless.JSONStr(m, "status", "")), "RUN") {
-			continue
-		}
-		ssid := wireless.JSONStr(m, "essid", wireless.JSONStr(m, "ssid", ""))
+	// The wire keys and the RUN rule live in VapEvidence. The
+	// placement construction side (the plan's Placements) keys on
+	// radio_table `name` values; the device-side radio_name carries the same
+	// strings.
+	for _, r := range ev.Running() {
+		ssid := r.SSID
 		if ssid == "" {
 			continue
 		}
 		if removed[ssid] {
 			return
 		}
-		parent := wireless.JSONStr(m, "radio_name", wireless.JSONStr(m, "parent", ""))
-		key := ssid + "\x00" + parent
+		key := ssid + "\x00" + r.Radio
 		if placements[key] > 0 {
 			placements[key]--
 			need[ssid]--
@@ -241,7 +233,7 @@ func (st *wlanCfgState) settle(cfgversion string) {
 		}
 	}
 	for _, w := range desired {
-		if w.Enabled && need[wireless.SSIDOf(w)] > 0 {
+		if w.Enabled && need[SSIDOf(w)] > 0 {
 			return
 		}
 	}
@@ -250,16 +242,16 @@ func (st *wlanCfgState) settle(cfgversion string) {
 	// A NEW config settling also retires the devname watchdog's armed marker
 	// when it was stamped for the PREVIOUS cfgversion (fresh one-shot budget —
 	// see the doc above); a marker for the current cfgversion stands.
-	if armedCv, armed := materializationRebootArmedFor(st.extra); armed && armedCv != cfgversion {
-		delete(st.extra, "wlan_cfg_materialization_reboot")
+	if armedCv, armed := MaterializationRebootArmedFor(st.extra); armed && armedCv != cfgversion {
+		delete(st.extra, store.WlanCfgMaterializationRebootKey)
 	}
-	st.extra["wlan_cfg_sha"] = st.pendingSHA
-	st.extra["wlan_cfg_applied_wlans"] = st.extra["wlan_cfg_pending_wlans"]
-	st.extra["wlan_cfg_delivery_status"] = "confirmed"
-	delete(st.extra, "wlan_cfg_pending_sha")
-	delete(st.extra, "wlan_cfg_pending_wlans")
-	delete(st.extra, "wlan_cfg_pending_placements")
-	delete(st.extra, "wlan_cfg_offered_cfgversion")
+	st.extra[store.WlanCfgShaKey] = st.pendingSHA
+	st.extra[store.WlanCfgAppliedWlansKey] = st.extra[store.WlanCfgPendingWlansKey]
+	st.extra[store.WlanCfgDeliveryStatusKey] = "confirmed"
+	delete(st.extra, store.WlanCfgPendingShaKey)
+	delete(st.extra, store.WlanCfgPendingWlansKey)
+	delete(st.extra, store.WlanCfgPendingPlacementsKey)
+	delete(st.extra, store.WlanCfgOfferedCfgversionKey)
 	// Mirror the promotion in the typed view so the post-settle drift and
 	// pending checks read the same values the former direct Extra reads did.
 	st.sha = st.pendingSHA
@@ -272,26 +264,26 @@ func (st *wlanCfgState) settle(cfgversion string) {
 	st.offeredCfgversion = ""
 }
 
-// notRunningClass is the settled-state watchdog's three-valued reading of
+// NotRunningClass is the settled-state watchdog's three-valued reading of
 // ONE inform's vap_table evidence about the applied WLAN set.
-type notRunningClass int
+type NotRunningClass int
 
 const (
-	// nrUnknown: no proof either way — an absent or empty table (a sparse
+	// NotRunningUnknown: no proof either way — an absent or empty table (a sparse
 	// heartbeat carries no vap_table), no applied snapshot, or an applied
 	// set with nothing enabled. The arming policy neither increments nor
 	// resets the counter on it.
-	nrUnknown notRunningClass = iota
-	// nrRun: a present, non-empty table proves every enabled applied SSID
+	NotRunningUnknown NotRunningClass = iota
+	// NotRunningRun: a present, non-empty table proves every enabled applied SSID
 	// has a RUN VAP — the counter's reset condition.
-	nrRun
-	// nrMiss: a present, non-empty table positively disproves the applied
+	NotRunningRun
+	// NotRunningMiss: a present, non-empty table positively disproves the applied
 	// set — an enabled applied SSID has no RUN VAP — the counter's
 	// increment condition.
-	nrMiss
+	NotRunningMiss
 )
 
-// notRunningEvidence classifies THIS inform's vap_table evidence about the
+// NotRunningEvidence classifies THIS inform's vap_table evidence about the
 // applied WLAN set. Live evidence (2026-09-18 F-row round, A2): a rebooted
 // device re-materializes factory config while still echoing the provisioned
 // cfgversion — settle's one-shot watchdog must be backed by a continuous
@@ -300,7 +292,7 @@ const (
 // table can show applied SSIDs not yet RUN while radios bring up), which
 // the two-consecutive-miss arming policy over this classification absorbs.
 //
-// Evidence semantics mirror runtimeInSync (internal/app): an absent or
+// Evidence semantics mirror RuntimeInSync (this package): an absent or
 // empty table is UNKNOWN, not regression. That neutrality is real, not a
 // defensive default: vap_table is in NO trust class, so Absorb's wholesale
 // Extra swap (store trustpolicy.go) REPLACES the record's table with the
@@ -312,49 +304,45 @@ const (
 // typed load) because settle() may have promoted it in this same decision.
 // SSID presence remains the proof bar, not per-radio placement — re-arming
 // must not false-fire on a band detail.
-func (st *wlanCfgState) notRunningEvidence() notRunningClass {
-	vaps, ok := st.extra["vap_table"].([]any)
-	if !ok || len(vaps) == 0 {
-		return nrUnknown
+func (st *DeliveryState) NotRunningEvidence() NotRunningClass {
+	ev := ReadVapEvidence(st.extra["vap_table"])
+	if !ev.Known() {
+		return NotRunningUnknown
 	}
-	raw, _ := st.extra["wlan_cfg_applied_wlans"].(string)
+	raw, _ := st.extra[store.WlanCfgAppliedWlansKey].(string)
 	if raw == "" {
-		return nrUnknown
+		return NotRunningUnknown
 	}
-	var applied []wireless.Wlan
-	if json.Unmarshal([]byte(raw), &applied) != nil {
-		return nrUnknown
+	applied, err := DecodeStoredWlans([]byte(raw))
+	if err != nil {
+		return NotRunningUnknown
 	}
 	need := map[string]bool{}
 	for _, w := range applied {
 		if w.Enabled {
-			need[wireless.SSIDOf(w)] = true
+			need[SSIDOf(w)] = true
 		}
 	}
 	if len(need) == 0 {
-		return nrUnknown
+		return NotRunningUnknown
 	}
-	for _, v := range vaps {
-		m, ok := v.(map[string]any)
-		if !ok || !strings.EqualFold(wireless.JSONStr(m, "state", wireless.JSONStr(m, "status", "")), "RUN") {
-			continue
-		}
-		delete(need, wireless.JSONStr(m, "essid", wireless.JSONStr(m, "ssid", "")))
+	for _, r := range ev.Running() {
+		delete(need, r.SSID)
 	}
 	if len(need) > 0 {
-		return nrMiss
+		return NotRunningMiss
 	}
-	return nrRun
+	return NotRunningRun
 }
 
 // appliedNotRunning reports whether THIS inform's vap_table positively
-// disproves the confirmed WLAN set (the nrMiss class of
-// notRunningEvidence): a present, non-empty table in which an enabled
+// disproves the confirmed WLAN set (the NotRunningMiss class of
+// NotRunningEvidence): a present, non-empty table in which an enabled
 // applied SSID has no RUN VAP. Proof semantics are unchanged from the
 // one-shot watchdog; only the arming policy around them (the
 // two-consecutive-miss counter, engine.go) is new.
-func (st *wlanCfgState) appliedNotRunning() bool {
-	return st.notRunningEvidence() == nrMiss
+func (st *DeliveryState) AppliedNotRunning() bool {
+	return st.NotRunningEvidence() == NotRunningMiss
 }
 
 // recordNotRunningMiss increments the consecutive not-running-proof counter
@@ -363,9 +351,9 @@ func (st *wlanCfgState) appliedNotRunning() bool {
 // it persists through the adapter's wholesale Extra assignment and survives
 // later sparse heartbeats via the store trust policy's controller-owned
 // class.
-func (st *wlanCfgState) recordNotRunningMiss() int {
+func (st *DeliveryState) RecordNotRunningMiss() int {
 	st.notRunningMisses++
-	st.extra["wlan_cfg_not_running_misses"] = st.notRunningMisses
+	st.extra[store.WlanCfgNotRunningMissesKey] = st.notRunningMisses
 	return st.notRunningMisses
 }
 
@@ -373,9 +361,9 @@ func (st *wlanCfgState) recordNotRunningMiss() int {
 // the two-consecutive-miss window can re-arm. Zero is stored as an absent
 // key, mirroring settle's consumed-key cleanup (no idle noise in the
 // persisted record).
-func (st *wlanCfgState) clearNotRunningMisses() {
+func (st *DeliveryState) ClearNotRunningMisses() {
 	st.notRunningMisses = 0
-	delete(st.extra, "wlan_cfg_not_running_misses")
+	delete(st.extra, store.WlanCfgNotRunningMissesKey)
 }
 
 // recordVapNotRunningMiss increments the consecutive devname-level miss
@@ -385,21 +373,21 @@ func (st *wlanCfgState) clearNotRunningMisses() {
 // uses, so it persists through the adapter's wholesale Extra assignment and
 // survives later sparse heartbeats via the store trust policy's admin-owned
 // prev-or-delete class.
-func (st *wlanCfgState) recordVapNotRunningMiss() int {
+func (st *DeliveryState) RecordVapNotRunningMiss() int {
 	st.vapNotRunningMisses++
-	st.extra["wlan_cfg_vap_not_running_misses"] = st.vapNotRunningMisses
+	st.extra[store.WlanCfgVapNotRunningMissesKey] = st.vapNotRunningMisses
 	return st.vapNotRunningMisses
 }
 
 // clearVapNotRunningMisses resets the devname-level miss counter. Zero is
 // stored as an absent key, mirroring clearNotRunningMisses (no idle noise in
 // the persisted record).
-func (st *wlanCfgState) clearVapNotRunningMisses() {
+func (st *DeliveryState) ClearVapNotRunningMisses() {
 	st.vapNotRunningMisses = 0
-	delete(st.extra, "wlan_cfg_vap_not_running_misses")
+	delete(st.extra, store.WlanCfgVapNotRunningMissesKey)
 }
 
-// setMaterializationRebootArmed stamps the one-shot arm marker:
+// SetMaterializationRebootArmed stamps the one-shot arm marker:
 // the engine has armed FlagRebootOnConnect to materialize THIS
 // config version's vaps (the devname watchdog miss#2 fire), and while the
 // marker stands for the same cfgversion the arming must never repeat — the
@@ -410,17 +398,17 @@ func (st *wlanCfgState) clearVapNotRunningMisses() {
 // under the single key ("cfgversion"), the same stored-row shape as the
 // §6.3 task (store.ArmCmdTask) — clone-serialized with the rest of the
 // record's Extra.
-func setMaterializationRebootArmed(extra store.JSONMap, cfgversion string) {
-	extra["wlan_cfg_materialization_reboot"] = store.JSONMap{"cfgversion": cfgversion}
+func SetMaterializationRebootArmed(extra store.JSONMap, cfgversion string) {
+	extra[store.WlanCfgMaterializationRebootKey] = store.JSONMap{"cfgversion": cfgversion}
 }
 
-// materializationRebootArmedFor reads the arm marker back: the cfgversion it
+// MaterializationRebootArmedFor reads the arm marker back: the cfgversion it
 // was armed for and whether it stands at all. (json round-trips through a
 // map[string]any, so both concrete map shapes are accepted — same tolerance
 // ArmedCmdTask uses for the stored task row.)
-func materializationRebootArmedFor(extra store.JSONMap) (string, bool) {
+func MaterializationRebootArmedFor(extra store.JSONMap) (string, bool) {
 	var row map[string]any
-	switch t := extra["wlan_cfg_materialization_reboot"].(type) {
+	switch t := extra[store.WlanCfgMaterializationRebootKey].(type) {
 	case store.JSONMap:
 		row = t
 	case map[string]any:
@@ -442,9 +430,9 @@ func materializationRebootArmedFor(extra store.JSONMap) (string, bool) {
 // noop-pending-wlan while the pending hash still equals the current
 // envelope hash; re-provisioning happens only when the envelope hash
 // CHANGES (a changed envelope is a new delivery operation).
-func (st wlanCfgState) retryDue(now time.Time) bool {
+func (st *DeliveryState) RetryDue(now time.Time) bool {
 	if st.attempts >= WlanMaxAttempts {
-		st.extra["wlan_cfg_delivery_status"] = "exhausted"
+		st.extra[store.WlanCfgDeliveryStatusKey] = "exhausted"
 		return false
 	}
 	delay := WlanRetryBase * time.Duration(1<<max(0, st.attempts-1))
@@ -458,51 +446,155 @@ func (st wlanCfgState) retryDue(now time.Time) bool {
 // now (the engine's bounded attempt budget with backoff). At the cap the
 // delivery status flips to "exhausted" in extra.
 func WlanRetryDue(extra store.JSONMap, now time.Time) bool {
-	return loadWlanCfgState(extra).retryDue(now)
+	return LoadDeliveryState(extra).RetryDue(now)
 }
 
-// applyProvisioning records one system_cfg delivery attempt (the assignedKey
+// Offer records one system_cfg delivery attempt (the assignedKey
 // bookkeeping): replacing the pending hash starts a fresh budget; retrying
 // the same hash increments it. offeredCfg is the cfgversion THIS offer
 // carries — the pending gate reads it back (wlan_cfg_offered_cfgversion) to
 // tell an operator mint from a genuinely unchanged record, so an exhausted
 // unchanged-envelope retry cannot hold operator content hostage. cur and
 // placements arrive from the decision's provisioning plan (the drift hash
-// and the Placements half of wireless.PlanProvisioning), not separate
+// and the Placements half of PlanProvisioning), not separate
 // recomputations. EXACT key names and value formats preserved.
-func (st wlanCfgState) applyProvisioning(cur string, nowUnix int64, wls []wireless.Wlan, placements map[string]int, offeredCfg string) {
-	st.extra["wlan_cfg_pending_sha"] = cur
+func (st *DeliveryState) Offer(cur string, nowUnix int64, wls []Wlan, placements map[string]int, offeredCfg string) {
+	st.extra[store.WlanCfgPendingShaKey] = cur
 	// Each emitted system_cfg is one bounded delivery attempt. Replacing the
 	// pending hash starts a fresh budget; retrying the same hash increments it.
 	if st.attemptSHA != cur {
-		st.extra["wlan_cfg_attempt_sha"] = cur
-		st.extra["wlan_cfg_attempts"] = 1
+		st.extra[store.WlanCfgAttemptShaKey] = cur
+		st.extra[store.WlanCfgAttemptsKey] = 1
 	} else {
-		st.extra["wlan_cfg_attempts"] = st.attempts + 1
+		st.extra[store.WlanCfgAttemptsKey] = st.attempts + 1
 	}
-	st.extra["wlan_cfg_last_attempt"] = nowUnix
-	st.extra["wlan_cfg_delivery_status"] = "pending"
-	st.extra["wlan_cfg_offered_cfgversion"] = offeredCfg
+	st.extra[store.WlanCfgLastAttemptKey] = nowUnix
+	st.extra[store.WlanCfgDeliveryStatusKey] = "pending"
+	st.extra[store.WlanCfgOfferedCfgversionKey] = offeredCfg
 	// Keep the previously applied snapshot for the settle check (verbatim
 	// value copy, whatever type it carries).
 	if st.appliedPresent {
-		st.extra["wlan_cfg_pending_old_wlans"] = st.appliedRaw
+		st.extra[store.WlanCfgPendingOldWlansKey] = st.appliedRaw
 	}
-	if snapshot, err := json.Marshal(wls); err == nil {
-		st.extra["wlan_cfg_pending_wlans"] = string(snapshot)
+	if snapshot, err := EncodeStoredWlans(wls); err == nil {
+		st.extra[store.WlanCfgPendingWlansKey] = string(snapshot)
 	}
 	// Record the intended SSID-to-radio placements so confirmation cannot be
 	// satisfied by a VAP on the wrong band/radio.
 	if raw, err := json.Marshal(placements); err == nil {
-		st.extra["wlan_cfg_pending_placements"] = string(raw)
+		st.extra[store.WlanCfgPendingPlacementsKey] = string(raw)
 	}
 }
 
-func containsEnabled(wls []wireless.Wlan, ssid string) bool {
+func containsEnabled(wls []Wlan, ssid string) bool {
 	for _, w := range wls {
-		if w.Enabled && wireless.SSIDOf(w) == ssid {
+		if w.Enabled && SSIDOf(w) == ssid {
 			return true
 		}
 	}
 	return false
+}
+
+// WLAN delivery retry budget (bounded attempt bookkeeping per pushed hash).
+const (
+	WlanRetryBase   = 2 * time.Second
+	WlanRetryMax    = 60 * time.Second
+	WlanMaxAttempts = 6
+)
+
+// Baseline is the drift baseline (wlan_cfg_sha): the hash of the last WLAN
+// set a device was proven running. "" means no baseline yet.
+func (st *DeliveryState) Baseline() string { return st.sha }
+
+// PendingPresent reports whether a delivery is in flight by PRESENCE of the
+// pending row (any type, even ""): the connected-noop branch asks this.
+func (st *DeliveryState) PendingPresent() bool { return st.pendingSHAPresent }
+
+// PendingHash is the in-flight delivery's hash, "" when the row is absent
+// or not a string (the drift-check and settle paths need the STRING-typed
+// non-empty value).
+func (st *DeliveryState) PendingHash() string { return st.pendingSHA }
+
+// OfferedCfgversion is the cfgversion the pending delivery was last offered
+// with, and whether that bookkeeping exists at all (a pending that predates
+// it keeps the hold-at-gate behavior).
+func (st *DeliveryState) OfferedCfgversion() (string, bool) {
+	return st.offeredCfgversion, st.offeredPresent
+}
+
+// DeliveryStatus is the last stamped status: "pending", "confirmed" or
+// "exhausted", "" when none. Write-only for the engine; the admin view reads
+// it.
+func (st *DeliveryState) DeliveryStatus() string {
+	v, _ := st.extra[store.WlanCfgDeliveryStatusKey].(string)
+	return v
+}
+
+// Attempts is the delivery attempt count for the current pending hash.
+func (st *DeliveryState) Attempts() int { return st.attempts }
+
+// LastAttempt is the unix time of the last delivery attempt, 0 when none.
+func (st *DeliveryState) LastAttempt() int64 { return st.lastAttempt }
+
+// ClearMaterializationReboot retires the one-shot materialization-reboot
+// marker (a RUN proof at the devname level means the gap it guarded is gone).
+func ClearMaterializationReboot(extra store.JSONMap) {
+	delete(extra, store.WlanCfgMaterializationRebootKey)
+}
+
+// ClearWatchdogCounters resets both consecutive-miss counters. A reboot is a
+// lifecycle boundary for the not-running windows: the next vap_table opens a
+// fresh boot window, so a miss recorded before the reboot must not straddle
+// it.
+func ClearWatchdogCounters(extra store.JSONMap) {
+	delete(extra, store.WlanCfgNotRunningMissesKey)
+	delete(extra, store.WlanCfgVapNotRunningMissesKey)
+}
+
+// NotRunningMisses is the SSID-level consecutive-miss counter, 0 when
+// absent (window unarmed).
+func (st *DeliveryState) NotRunningMisses() int { return st.notRunningMisses }
+
+// RuntimeInSync is the admin view's "is the WLAN running?" answer: nil when
+// unknown, otherwise whether the device runs the desired WLANs. It
+// deliberately does not infer runtime health from the controller/device
+// cfgversion pair — devices can echo a matching version before applying the
+// WLAN, so that pair is only transport bookkeeping. It is SSID-PRESENCE-ONLY
+// by design: a positive result requires a reported vap_table in which every
+// enabled desired SSID is observed RUNNING; per-radio placement and the
+// disappearance of a deleted WLAN are checked strictly by Settle, which runs
+// on every inform before this view is served. A delivery in flight reads
+// false; missing runtime evidence reads unknown (nil), while an observed
+// table that lacks a desired RUN SSID reads false.
+func RuntimeInSync(d store.Device, desired []Wlan) *bool {
+	if d.Extra == nil {
+		return nil
+	}
+	if LoadDeliveryState(d.Extra).PendingPresent() {
+		v := false
+		return &v
+	}
+	ev := ReadVapEvidence(d.Extra["vap_table"])
+	if !ev.Known() {
+		return nil
+	}
+	// A vap_table with no RUN desired SSIDs is meaningful evidence of being
+	// out of sync, but a missing/empty table is unknown rather than false.
+	want := make(map[string]bool)
+	for _, w := range desired {
+		if w.Enabled {
+			want[w.SSID] = true
+		}
+	}
+	if len(want) == 0 {
+		return nil
+	}
+	v := true
+	for ssid := range want {
+		if !ev.SSIDRunning(ssid) {
+			v = false
+			break
+		}
+	}
+	return &v
 }

@@ -638,7 +638,7 @@ func TestNotRunningSparseHeartbeatNeutral(t *testing.T) {
 // policy around them): SSID presence is the proof bar (not per-radio
 // placement), absent/empty tables and absent/no-enabled/unparsable applied
 // snapshots are unknown, and the snapshot is re-read from extra verbatim.
-// notRunningEvidence carries the same bar as a three-way classification
+// NotRunningEvidence carries the same bar as a three-way classification
 // (the policy's increment/reset/neutral inputs).
 func TestAppliedNotRunningProofSemantics(t *testing.T) {
 	enabled := []wireless.Wlan{{Name: "corp", SSID: "corpnet", Security: "open", Enabled: true}}
@@ -659,26 +659,26 @@ func TestAppliedNotRunningProofSemantics(t *testing.T) {
 	tests := []struct {
 		name  string
 		extra store.JSONMap
-		class notRunningClass
+		class wireless.NotRunningClass
 	}{
-		{"absent table is unknown", store.JSONMap{"wlan_cfg_applied_wlans": snap(enabled)}, nrUnknown},
-		{"empty table is unknown", store.JSONMap{"wlan_cfg_applied_wlans": snap(enabled), "vap_table": []any{}}, nrUnknown},
-		{"no applied snapshot is unknown", store.JSONMap{"vap_table": factory}, nrUnknown},
-		{"unparsable snapshot is unknown", store.JSONMap{"wlan_cfg_applied_wlans": "{bad", "vap_table": factory}, nrUnknown},
-		{"nothing enabled is unknown", store.JSONMap{"wlan_cfg_applied_wlans": snap(disabled), "vap_table": factory}, nrUnknown},
-		{"factory table is a miss", store.JSONMap{"wlan_cfg_applied_wlans": snap(enabled), "vap_table": factory}, nrMiss},
-		{"applied ssid not RUN is a miss", store.JSONMap{"wlan_cfg_applied_wlans": snap(enabled), "vap_table": appliedNotRun}, nrMiss},
-		{"run essid proves running", store.JSONMap{"wlan_cfg_applied_wlans": snap(enabled), "vap_table": runEssid}, nrRun},
-		{"legacy run spellings prove running", store.JSONMap{"wlan_cfg_applied_wlans": snap(enabled), "vap_table": runLegacy}, nrRun},
-		{"run on any radio proves running", store.JSONMap{"wlan_cfg_applied_wlans": snap(enabled), "vap_table": runOtherRadio}, nrRun},
+		{"absent table is unknown", store.JSONMap{"wlan_cfg_applied_wlans": snap(enabled)}, wireless.NotRunningUnknown},
+		{"empty table is unknown", store.JSONMap{"wlan_cfg_applied_wlans": snap(enabled), "vap_table": []any{}}, wireless.NotRunningUnknown},
+		{"no applied snapshot is unknown", store.JSONMap{"vap_table": factory}, wireless.NotRunningUnknown},
+		{"unparsable snapshot is unknown", store.JSONMap{"wlan_cfg_applied_wlans": "{bad", "vap_table": factory}, wireless.NotRunningUnknown},
+		{"nothing enabled is unknown", store.JSONMap{"wlan_cfg_applied_wlans": snap(disabled), "vap_table": factory}, wireless.NotRunningUnknown},
+		{"factory table is a miss", store.JSONMap{"wlan_cfg_applied_wlans": snap(enabled), "vap_table": factory}, wireless.NotRunningMiss},
+		{"applied ssid not RUN is a miss", store.JSONMap{"wlan_cfg_applied_wlans": snap(enabled), "vap_table": appliedNotRun}, wireless.NotRunningMiss},
+		{"run essid proves running", store.JSONMap{"wlan_cfg_applied_wlans": snap(enabled), "vap_table": runEssid}, wireless.NotRunningRun},
+		{"legacy run spellings prove running", store.JSONMap{"wlan_cfg_applied_wlans": snap(enabled), "vap_table": runLegacy}, wireless.NotRunningRun},
+		{"run on any radio proves running", store.JSONMap{"wlan_cfg_applied_wlans": snap(enabled), "vap_table": runOtherRadio}, wireless.NotRunningRun},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			st := loadWlanCfgState(tt.extra)
-			if got := st.notRunningEvidence(); got != tt.class {
-				t.Fatalf("notRunningEvidence = %v, want %v", got, tt.class)
+			st := wireless.LoadDeliveryState(tt.extra)
+			if got := st.NotRunningEvidence(); got != tt.class {
+				t.Fatalf("NotRunningEvidence = %v, want %v", got, tt.class)
 			}
-			if got, want := st.appliedNotRunning(), tt.class == nrMiss; got != want {
+			if got, want := st.AppliedNotRunning(), tt.class == wireless.NotRunningMiss; got != want {
 				t.Fatalf("appliedNotRunning = %v, want %v (miss class only)", got, want)
 			}
 		})
@@ -686,10 +686,10 @@ func TestAppliedNotRunningProofSemantics(t *testing.T) {
 
 	// The counter loads from both the engine's int write and the JSON
 	// round-trip float64 shape (persisted-store reload).
-	if got := loadWlanCfgState(store.JSONMap{"wlan_cfg_not_running_misses": 1}).notRunningMisses; got != 1 {
+	if got := wireless.LoadDeliveryState(store.JSONMap{"wlan_cfg_not_running_misses": 1}).NotRunningMisses(); got != 1 {
 		t.Fatalf("int counter load = %d, want 1", got)
 	}
-	if got := loadWlanCfgState(store.JSONMap{"wlan_cfg_not_running_misses": float64(2)}).notRunningMisses; got != 2 {
+	if got := wireless.LoadDeliveryState(store.JSONMap{"wlan_cfg_not_running_misses": float64(2)}).NotRunningMisses(); got != 2 {
 		t.Fatalf("float64 counter load = %d, want 2", got)
 	}
 }
@@ -1484,7 +1484,7 @@ func TestEnvelopeDriftDeliveryIsBounded(t *testing.T) {
 //
 // The SSID watchdog above cannot see the split-band materialization gap: a
 // band=both WLAN whose 4th 2.4GHz vap (ath3) never materialized still reads
-// nrRun (the SSID appears RUN on the radio where it DID materialize). The
+// running (the SSID appears RUN on the radio where it DID materialize). The
 // vapMaterializationHarness builds that shape: one band=both WLAN over two
 // radios, so the plan has two vaps (ath0 on the ng radio, ath1 on the na
 // radio) and a vap_table row for ath0 alone proves the SSID while ath1 is
@@ -1593,7 +1593,7 @@ func TestVapMaterializationGapArmsOneShotReboot(t *testing.T) {
 	if truthy(out.Extra[FlagRebootOnConnect]) {
 		t.Fatalf("miss#1 armed the reboot flag: %+v", out.Extra[FlagRebootOnConnect])
 	}
-	if _, armed := materializationRebootArmedFor(out.Extra); armed {
+	if _, armed := wireless.MaterializationRebootArmedFor(out.Extra); armed {
 		t.Fatalf("miss#1 stamped the arm marker: %+v", out.Extra)
 	}
 
@@ -1609,7 +1609,7 @@ func TestVapMaterializationGapArmsOneShotReboot(t *testing.T) {
 	if !truthy(out.Extra[FlagRebootOnConnect]) {
 		t.Fatalf("miss#2 did not arm the reboot flag: %+v", out.Extra)
 	}
-	if cv, armed := materializationRebootArmedFor(out.Extra); !armed || cv != "aaaa" {
+	if cv, armed := wireless.MaterializationRebootArmedFor(out.Extra); !armed || cv != "aaaa" {
 		t.Fatalf("miss#2 arm marker = %q/%v, want the current cfgversion aaaa", cv, armed)
 	}
 	if _, ok := vapMissCounter(out.Extra); ok {
@@ -1655,7 +1655,7 @@ func TestVapMaterializationRebootDoesNotRepeat(t *testing.T) {
 	}
 
 	dev := fixture(partialTable)
-	setMaterializationRebootArmed(dev.Extra, "aaaa") // marker stands, counter absent (cleared at emission)
+	wireless.SetMaterializationRebootArmed(dev.Extra, "aaaa") // marker stands, counter absent (cleared at emission)
 	out := decide(dev, 1000)
 	if out.Kind != KindNoop || out.SetCfgVersion {
 		t.Fatalf("post-reboot inform = %+v, want plain connected noop", out)
@@ -1690,7 +1690,7 @@ func TestVapMaterializationRunProofResets(t *testing.T) {
 	if n, ok := vapMissCounter(out.Extra); !ok || n != 1 {
 		t.Fatalf("pre-proof counter = %v/%v, want 1", n, ok)
 	}
-	setMaterializationRebootArmed(dev.Extra, "aaaa") // a marker standing for the current config
+	wireless.SetMaterializationRebootArmed(dev.Extra, "aaaa") // a marker standing for the current config
 	// The gap resolved: every planned devname is RUN.
 	applyDeltas(&dev, out)
 	dev.Extra["vap_table"] = runningTable
@@ -1701,7 +1701,7 @@ func TestVapMaterializationRunProofResets(t *testing.T) {
 	if _, ok := vapMissCounter(out.Extra); ok {
 		t.Fatalf("RUN proof left the counter armed: %v", out.Extra["wlan_cfg_vap_not_running_misses"])
 	}
-	if _, armed := materializationRebootArmedFor(out.Extra); armed {
+	if _, armed := wireless.MaterializationRebootArmedFor(out.Extra); armed {
 		t.Fatalf("RUN proof left the arm marker standing: %+v", out.Extra)
 	}
 	if truthy(out.Extra[FlagRebootOnConnect]) {
@@ -1781,7 +1781,7 @@ func TestVapEmissionClearsVapNotRunningWindow(t *testing.T) {
 	dev := settledLifecycleDevice()
 	dev.Extra[FlagRebootOnConnect] = true
 	dev.Extra["wlan_cfg_vap_not_running_misses"] = 1
-	setMaterializationRebootArmed(dev.Extra, dev.CfgVersion)
+	wireless.SetMaterializationRebootArmed(dev.Extra, dev.CfgVersion)
 
 	out, err := e.Decide(Request{
 		Transport: TransportEncrypted, Device: dev,
@@ -1799,7 +1799,7 @@ func TestVapEmissionClearsVapNotRunningWindow(t *testing.T) {
 			t.Fatalf("reboot emission left %s armed: %v", k, dev.Extra[k])
 		}
 	}
-	if cv, armed := materializationRebootArmedFor(dev.Extra); !armed || cv != dev.CfgVersion {
+	if cv, armed := wireless.MaterializationRebootArmedFor(dev.Extra); !armed || cv != dev.CfgVersion {
 		t.Fatalf("reboot emission disturbed the arm marker: %q/%v, want standing for %q", cv, armed, dev.CfgVersion)
 	}
 }
@@ -1828,28 +1828,28 @@ func TestSettleRetiresStaleMaterializationMarker(t *testing.T) {
 
 	// Stale marker (armed for the previous config) → deleted on settle.
 	extra := pend()
-	setMaterializationRebootArmed(extra, "old-aaaa")
-	st := loadWlanCfgState(extra)
-	st.settle("current-bbbb")
+	wireless.SetMaterializationRebootArmed(extra, "old-aaaa")
+	st := wireless.LoadDeliveryState(extra)
+	st.Settle("current-bbbb")
 	if sha, _ := extra["wlan_cfg_sha"].(string); sha != "pending-hash" {
 		t.Fatalf("settle did not promote the baseline: %v", extra["wlan_cfg_sha"])
 	}
-	if _, armed := materializationRebootArmedFor(extra); armed {
+	if _, armed := wireless.MaterializationRebootArmedFor(extra); armed {
 		t.Fatalf("settle kept the stale arm marker: %v", extra["wlan_cfg_materialization_reboot"])
 	}
 
 	// Marker of the CURRENT cfgversion → kept.
 	extra = pend()
-	setMaterializationRebootArmed(extra, "current-bbbb")
-	st = loadWlanCfgState(extra)
-	st.settle("current-bbbb")
-	if _, armed := materializationRebootArmedFor(extra); !armed {
+	wireless.SetMaterializationRebootArmed(extra, "current-bbbb")
+	st = wireless.LoadDeliveryState(extra)
+	st.Settle("current-bbbb")
+	if _, armed := wireless.MaterializationRebootArmedFor(extra); !armed {
 		t.Fatalf("settle deleted the current-config arm marker: %v", extra)
 	}
 }
 
 // A pending WLAN delivery SUPPRESSES the devname watchdog: with a real
-// pending sha (the non-empty string applyProvisioning writes) matching the
+// pending sha (the non-empty string Offer writes) matching the
 // live envelope and the unchanged-envelope retry NOT yet due, the inform is
 // a noop-pending-wlan before any watchdog runs — no devname miss is
 // recorded, nothing arms. The placements map deliberately carries ONLY the
@@ -1940,7 +1940,7 @@ func TestVapMaterializationStaleMarkerFreshBudget(t *testing.T) {
 	dev := fixture(partialTable)
 	dev.CfgVersion = "bbbb"
 	dev.AppliedCfg = "bbbb"
-	setMaterializationRebootArmed(dev.Extra, "old-aaaa")
+	wireless.SetMaterializationRebootArmed(dev.Extra, "old-aaaa")
 
 	// Miss#1 on the new config: the stale marker does not suppress it.
 	out := decide(dev, 1000)
@@ -1962,12 +1962,12 @@ func TestVapMaterializationStaleMarkerFreshBudget(t *testing.T) {
 	if !truthy(out.Extra[FlagRebootOnConnect]) {
 		t.Fatalf("stale-marker miss#2 did not arm: %+v", out.Extra)
 	}
-	if cv, armed := materializationRebootArmedFor(out.Extra); !armed || cv != "bbbb" {
+	if cv, armed := wireless.MaterializationRebootArmedFor(out.Extra); !armed || cv != "bbbb" {
 		t.Fatalf("re-stamped marker = %q/%v, want the current cfgversion bbbb", cv, armed)
 	}
 }
 
-// The nrRun gate keeps the two watchdogs from double-firing on the same
+// The SSID-running gate keeps the two watchdogs from double-firing on the same
 // regression: an ALL-INIT table positively disproves the applied SSID set,
 // so the SSID watchdog owns the inform — its counter moves, the devname
 // watchdog stays completely out (no devname counter, no arm).
@@ -1996,16 +1996,16 @@ func TestVapMaterializationNRRunGateKeepsDevnameWatchdogIdle(t *testing.T) {
 		t.Fatalf("SSID counter = %v/%v, want recorded 1 (the SSID watchdog owns this inform)", n, ok)
 	}
 	if _, ok := out.Extra["wlan_cfg_vap_not_running_misses"]; ok {
-		t.Fatalf("the nrRun gate let the devname watchdog run on an nrMiss inform: %+v", out.Extra)
+		t.Fatalf("the SSID-running gate let the devname watchdog run on a not-running-miss inform: %+v", out.Extra)
 	}
 	if truthy(out.Extra[FlagRebootOnConnect]) {
-		t.Fatalf("the nrRun gate armed the reboot flag: %+v", out.Extra)
+		t.Fatalf("the SSID-running gate armed the reboot flag: %+v", out.Extra)
 	}
 }
 
 // The devname proof is STATE-aware, not presence-aware: an ath1 row that IS
 // present but carries state INIT is still missing at the bar (EqualFold
-// state, "RUN") — the SSID evidence stays nrRun via the RUN ath0 row, so
+// state, "RUN") — the SSID evidence stays running via the RUN ath0 row, so
 // the devname watchdog runs and records miss#1. Every existing fixture
 // models this shape with an absent row; pinning it as a PRESENT non-RUN row
 // kills a presence-only (state-blind) implementation.

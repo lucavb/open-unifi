@@ -19,7 +19,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/lucavb/open-unifi/internal/server"
+	"github.com/lucavb/open-unifi/internal/wireless"
 )
 
 // fakeBackend implements Backend with fixed fixtures; it records calls so
@@ -2284,73 +2284,22 @@ func TestServedConsoleAssets(t *testing.T) {
 	}
 }
 
-// ---- Wlan struct parity (item 7) --------------------------------------------
+// ---- Wlan type identity -----------------------------------------------------
 //
-// adminapi.Wlan and server.Wlan are mirrored structs: the cmd/openunifi
-//converter and server's wlanListHash replicate the field list by hand.
-// ANY new field must be added to BOTH structs, the converter, AND
-// wlanListHash's map — or provisioning silently drops it. This reflect test
-// catches STRUCT drift (field name+type sets); converter/hash drift needs
-// review attention — its test lives with the server lane. Nested mirror
-// types (adminapi.RadiusServer vs wireless.RadiusServer) compare by
-// STRUCTURAL shape, not nominal identity — the packages are deliberately
-// decoupled.
+// adminapi.Wlan and its RADIUS rows are aliases of the wireless types, so the
+// admin wire, the stored record and the renderer cannot drift field by field.
+// This pins the aliasing: replacing an alias with a re-declared mirror struct
+// brings the converters (and the four-places-per-field edit) back.
 
-// sameShape reports structural type identity: builtin kinds must match
-// exactly; slices/pointers recurse into their elements; struct types
-// (the two packages' mirrored RadiusServer) match when their field
-// compositions match.
-func sameShape(a, b reflect.Type) bool {
-	if a == b {
-		return true
+func TestWlanTypesAreTheSharedWirelessTypes(t *testing.T) {
+	if reflect.TypeOf(Wlan{}) != reflect.TypeOf(wireless.Wlan{}) {
+		t.Fatal("adminapi.Wlan must be an alias of wireless.Wlan")
 	}
-	if a.Kind() != b.Kind() {
-		return false
+	if reflect.TypeOf(RadiusServer{}) != reflect.TypeOf(wireless.RadiusServer{}) {
+		t.Fatal("adminapi.RadiusServer must be an alias of wireless.RadiusServer")
 	}
-	switch a.Kind() {
-	case reflect.Slice, reflect.Pointer, reflect.Array:
-		return sameShape(a.Elem(), b.Elem())
-	case reflect.Struct:
-		if a.NumField() != b.NumField() {
-			return false
-		}
-		for i := 0; i < a.NumField(); i++ {
-			af, bf := a.Field(i), b.Field(i)
-			if af.Name != bf.Name || !sameShape(af.Type, bf.Type) {
-				return false
-			}
-		}
-		return true
-	default:
-		return false
-	}
-}
-
-func TestWlanStructParityWithServer(t *testing.T) {
-	a := reflect.TypeOf(Wlan{})
-	s := reflect.TypeOf(server.Wlan{})
-
-	if a.NumField() != s.NumField() {
-		t.Fatalf("field count drift: adminapi.Wlan has %d, server.Wlan has %d", a.NumField(), s.NumField())
-	}
-	afields := map[string]reflect.Type{}
-	for i := 0; i < a.NumField(); i++ {
-		f := a.Field(i)
-		afields[f.Name] = f.Type
-	}
-	for i := 0; i < s.NumField(); i++ {
-		sf := s.Field(i)
-		at, ok := afields[sf.Name]
-		if !ok {
-			t.Fatalf("server.Wlan field %q missing in adminapi.Wlan — add to BOTH structs, the cmd/openunifi converter AND server's wlanListHash", sf.Name)
-		}
-		if !sameShape(at, sf.Type) {
-			t.Fatalf("field %q type drift: adminapi %v vs server %v", sf.Name, at, sf.Type)
-		}
-		delete(afields, sf.Name)
-	}
-	for name := range afields {
-		t.Fatalf("adminapi.Wlan field %q missing in server.Wlan — add to BOTH structs, the cmd/openunifi converter AND server's wlanListHash", name)
+	if reflect.TypeOf(RadiusAcctServer{}) != reflect.TypeOf(wireless.RadiusAcctServer{}) {
+		t.Fatal("adminapi.RadiusAcctServer must be an alias of wireless.RadiusAcctServer")
 	}
 }
 

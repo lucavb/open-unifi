@@ -70,6 +70,19 @@ _Avoid_: WLAN sync.
 device has not yet confirmed.
 _Avoid_: retransmit (nothing is resent at the transport level).
 
+**WLAN delivery state**: the controller's typed record of one device's
+in-flight WLAN push — the drift baseline, the pending and last-applied WLANs
+with their placements, the attempt count, and the watchdog counters. Drift
+settle and Delivery retry are the operations on it.
+_Avoid_: wlan_cfg (that names a key prefix), delivery bookkeeping.
+
+**Vap evidence**: the reading of the vap_table a device reports, in three
+states — unknown (no table reported), running, or not running — queried by
+SSID or by planned vap devname. A missing or empty table is unknown, never
+regression; an empty table that is reported counts only as proof that a
+removed WLAN is gone (Drift settle with no enabled WLAN left).
+_Avoid_: vap status, runtime state.
+
 ### Trust policy
 
 **Controller-owned keys**: record fields the controller preserves verbatim
