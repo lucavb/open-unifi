@@ -18,14 +18,9 @@
 // setdefault demotion sweeps the controller-owned keys with it: a
 // factory-reset device re-adoption starts with fresh session state.
 //
-// Rows are bounded by a per-device retention cap: at most
-// sessionRowCap (2048) rows per device. When a refresh would leave a
-// device above the cap, the rows with the smallest last_seen (MAC as
-// the deterministic tie-break) are evicted until the device sits at
-// the cap, so persisted row growth is bounded per device (~2048 rows)
-// instead of the previously unbounded client population. This is the
-// retention policy cited by the audit run 1 sign-off (2026-09); before
-// that decision no recovered retention rule existed.
+// Rows are bounded by sessionRowCap per device. When a refresh exceeds the
+// cap, the oldest last_seen rows are evicted, with canonical MAC as the
+// deterministic tie-break.
 package store
 
 import "sort"

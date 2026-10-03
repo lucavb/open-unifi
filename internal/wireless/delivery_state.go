@@ -7,28 +7,14 @@ import (
 	"github.com/lucavb/open-unifi/internal/store"
 )
 
-// DeliveryState is the WLAN delivery state (CONTEXT.md): the typed handle
-// over one device record's in-flight WLAN push — the drift baseline, the
-// pending and last-applied WLANs with their placements, the attempt budget
-// and the watchdog counters. Drift settle and Delivery retry are its
-// operations. It is the ONLY reader and writer of the record keys declared
-// in store (store.WlanCfg*Key); nothing outside this module touches them by
-// name.
-//
-// It is bound to the record's Extra map: LoadDeliveryState reads with
-// EXACTLY the type assertions the former readers used, and the mutating
-// operations write back EXACT key names and EXACT value formats
-// (string/int/int64, WLAN snapshots via EncodeStoredWlans), so the persisted
-// bytes are identical to the pre-extraction behavior. The
-// adoption engine stays the only DECIDER; this module exposes evidence and
-// bookkeeping transitions and decides nothing about an inform.
-//
-// Trust classes are the store registry's call, not this module's: all keys
-// are controller-owned EXCEPT the devname watchdog's counter and one-shot
-// marker, which are admin-owned prev-or-delete rows (the blocked_sta_sha
-// shape). TestDeliveryStateKeysSurviveHostileBody pins that a device body
-// can neither forge nor clear any key this module writes, and cannot
-// introduce the two admin-owned ones.
+// DeliveryState owns the persisted WLAN delivery bookkeeping: the drift
+// baseline, pending/applied snapshots and placements, retry budget, and
+// watchdog counters. It is the only module that reads or writes the
+// store.WlanCfg* keys. Persisted key names and value formats are a storage
+// contract; snapshots use EncodeStoredWlans. The adoption engine remains the
+// decision-maker, while this type exposes evidence and state transitions.
+// Trust classes are defined by store: the devname watchdog counter and arm
+// marker are admin-owned; the other delivery keys are controller-owned.
 type DeliveryState struct {
 	// extra is the map the state was loaded from (apply functions write here).
 	extra store.JSONMap
@@ -103,8 +89,7 @@ type DeliveryState struct {
 	offeredCfgversion string
 }
 
-// LoadDeliveryState reads the controller-owned keys from extra with exactly
-// the type assertions of the pre-extraction readers.
+// LoadDeliveryState reads delivery bookkeeping from extra.
 func LoadDeliveryState(extra store.JSONMap) *DeliveryState {
 	st := &DeliveryState{extra: extra}
 	if v, ok := extra[store.WlanCfgShaKey].(string); ok {
@@ -283,27 +268,14 @@ const (
 	NotRunningMiss
 )
 
-// NotRunningEvidence classifies THIS inform's vap_table evidence about the
-// applied WLAN set. Live evidence (2026-09-18 F-row round, A2): a rebooted
-// device re-materializes factory config while still echoing the provisioned
-// cfgversion — settle's one-shot watchdog must be backed by a continuous
-// check or that regression noops forever; the 2026-09-19 A2 re-run then
-// proved the complementary hazard (the boot race: the first post-boot
-// table can show applied SSIDs not yet RUN while radios bring up), which
-// the two-consecutive-miss arming policy over this classification absorbs.
-//
-// Evidence semantics mirror RuntimeInSync (this package): an absent or
-// empty table is UNKNOWN, not regression. That neutrality is real, not a
-// defensive default: vap_table is in NO trust class, so Absorb's wholesale
-// Extra swap (store trustpolicy.go) REPLACES the record's table with the
-// inform body's — a body that omits vap_table DROPS it, there is no "the
-// record keeps the last observed one" to fall back on. A sparse heartbeat
-// therefore genuinely carries no table at all (unknown is the exact truth),
-// and a device that keeps reporting an empty table can never be misread as
-// regression evidence. The applied snapshot is re-read from extra (not the
-// typed load) because settle() may have promoted it in this same decision.
-// SSID presence remains the proof bar, not per-radio placement — re-arming
-// must not false-fire on a band detail.
+// NotRunningEvidence classifies this inform's vap_table against the applied
+// WLAN set. A present, non-empty table that lacks an applied RUN SSID is a
+// miss; a table proving every applied SSID RUN is a positive result. Missing
+// or empty tables are unknown: vap_table is replaced by each inform rather
+// than retained across sparse heartbeats. The engine requires consecutive
+// misses before re-arming, allowing for radio bring-up after reboot. Re-read
+// the applied snapshot from extra because Settle may have promoted it during
+// this decision. SSID presence, not radio placement, is the proof bar here.
 func (st *DeliveryState) NotRunningEvidence() NotRunningClass {
 	ev := ReadVapEvidence(st.extra["vap_table"])
 	if !ev.Known() {

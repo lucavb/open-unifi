@@ -958,11 +958,9 @@ func TestParsePublicKeyTable(t *testing.T) {
 	}
 }
 
-// R6(a) pin: sshd.auth.passwd renders "enabled" UNCONDITIONALLY — the
-// password-disable knob is gone (a live round proved the firmware's -s
-// respawn line bricks SSH on U7PG2 6.8.2.15592). The row must be present
-// exactly once with the enabled value whether the device record carries a
-// password or not, byte-exact in the deleted knob test's style.
+// R6(a) pin: sshd.auth.passwd renders "enabled" unconditionally; disabling
+// password authentication breaks SSH respawn on this firmware. Assert exactly
+// one enabled row regardless of whether the device record carries a password.
 func TestRenderSSHPasswdAlwaysEnabled(t *testing.T) {
 	for label, pw := range map[string]string{
 		"unset record":  "",

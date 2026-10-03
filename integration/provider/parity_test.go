@@ -12,11 +12,9 @@ import (
 func TestDeviceStructParityWithServer(t *testing.T) {
 	serverOnly := map[string]bool{
 		"actions": true,
-		// vaps_not_running is a transient controller-side runtime
-		// diagnostic (devname-level materialization watchdog projection,
-		// 2026-09-26) without a Terraform resource attribute: exempt until
-		// the provider wire structs mirror it (terraform-provider-open-unifi
-		// release, then the serverOnly exemption comes out).
+		// vaps_not_running is a transient controller diagnostic, not yet part
+		// of the Terraform provider wire contract. Remove this exemption when
+		// the provider adds the field.
 		"vaps_not_running": true,
 	}
 

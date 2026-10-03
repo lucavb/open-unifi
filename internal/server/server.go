@@ -704,11 +704,9 @@ func (s *Server) noopTargetSnapshot(mac string) int64 {
 	return s.noopTarget[mac]
 }
 
-// applyOutcome applies the engine's record deltas to the adapter's record
-// and serializes the outcome into the EXACT response JSON shapes of the
-// pre-extraction behavior (adoption push: mgmt_cfg only; full provisioning:
-// all four config keys; §6.2(e) reconnect push: blocked_sta only; noop:
-// interval).
+// applyOutcome applies the engine's record deltas and serializes the response
+// shapes: adoption pushes carry mgmt_cfg, full provisioning carries all four
+// config keys, reconnect pushes carry blocked_sta, and noops carry interval.
 func (s *Server) applyOutcome(mac string, rec *store.Device, out adoption.Outcome) map[string]any {
 	if out.SetState {
 		rec.State = out.State
@@ -846,8 +844,8 @@ func (s *Server) absorbInform(rec *store.Device, body map[string]any, now time.T
 // debug-level warnings) and the full-config diagnostic (digest and ordered
 // names, never config values; the "unavailable" wording keeps the debug path
 // bounded for malformed passthrough input without echoing a key name). All
-// logging happens inside the producer call, before Decide returns, restoring
-// the pre-extraction relative order (inline-during-render → diagnostic-after).
+// logging happens inside the producer call, before Decide returns, preserving
+// the required order: render diagnostics first, then the full-config summary.
 // plan is the engine's per-decision provisioning plan — the renderer emits
 // its wireless rows from the same value whose drift hash the decision
 // compared (systemcfg.RenderWithPlan, facts.WLANs = the same snapshot).

@@ -1,6 +1,6 @@
 package server
 
-// Regression for audit run-1 Fix 6 (C7): discoveryNote used to comma-join
+// Regression for discovery-note injection: discoveryNote used to comma-join
 // TLV-derived values verbatim, so a TLV3 (version) value of ",factory=true"
 // injected a standalone "factory=true" part that setInformCandidate honors
 // (internal/app/setinform.go). The addString closure in discovery.go now

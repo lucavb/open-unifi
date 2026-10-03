@@ -1,7 +1,7 @@
 package systemcfg
 
-// radio.<n>.txpower_mode / radio.<n>.txpower echo pins (2026-09-19
-// txpower lane; docs/PROTOCOL-systemcfg-wireless.md §9 resolved-as-echo).
+// radio.<n>.txpower_mode / radio.<n>.txpower echo pins
+// (docs/PROTOCOL-systemcfg-wireless.md §9).
 //
 // Jar evidence (the fleet parent's txpower packet — a verbatim
 // transcription of the com__ubnt__service__config__int.txt javap dump,

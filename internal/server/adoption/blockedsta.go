@@ -58,11 +58,10 @@ func blockedStaHash(wire string) string {
 
 // blockedStaDrift decides whether the blocked-client set differs from the
 // last delivered content. A KNOWN baseline drifts when the current wire no
-// longer hashes to it; an ABSENT baseline drifts only when there is
-// content to deliver — absent + empty must NOT drift, or every
-// never-touched device would re-enter provisioning after its baseline is
-// (re)introduced, breaking the post-adoption connected noop the
-// 2026-09-16 live round captured (docs/PROTOCOL-mgmt.md §6.2 equal path).
+// longer hashes to it; an ABSENT baseline drifts only when there is content
+// to deliver. Absent plus empty is steady state, so a device with no blocked
+// clients does not repeatedly re-enter provisioning (docs/PROTOCOL-mgmt.md
+// §6.2 equal path).
 func blockedStaDrift(d store.Device) (wire string, drift bool) {
 	wire = blockedStaWire(d)
 	baseline, known := d.Extra[extraBlockedStaSha].(string)

@@ -42,14 +42,10 @@ const WlanMaxAttempts = wireless.WlanMaxAttempts
 // Object.ÖoÓ000 → 404). The transport adapter maps this onto the HTTP 404.
 var ErrDefaultKeyRejected = errors.New("default key used by an adopted device")
 
-// informKnownTypes labels the NON-EMPTY request _type values the inform
-// state machine processes specially. Real firmware sends its periodic
-// status informs with an EMPTY _type (live evidence: U7PG2 on BZ.6.8.2,
-// captured during the 2026-09-16 acceptance session), and the jar runs its
-// main dispatcher (voidsuper — docs/PROTOCOL-mgmt.md §6.2) on exactly those
-// informs: adoption, re-key, and provisioning all ride the empty-_type
-// status inform. informTypeGentleNoop therefore lets "" through and only
-// noops unknown NON-EMPTY types.
+// informKnownTypes labels the non-empty _type values the state machine
+// processes specially. The empty _type is the main status inform and must
+// reach the dispatcher; only unknown non-empty types take the gentle-noop
+// path (docs/PROTOCOL-mgmt.md §6.2).
 var informKnownTypes = map[string]bool{
 	"info": true, "heartbeat": true, "cmd": true,
 	"setparam": true, "setparam-ack": true, "cmd-ack": true,
@@ -404,74 +400,15 @@ func (e *Engine) Decide(req Request) (Outcome, error) {
 	return out, nil
 }
 
-// armedLifecycle is the admin-armed remote-command lane (§6.5 reboot /
-// §6.6 setdefault / §6.3 stored cmd task): the admin API sets
-// admin-owned record rows; the NEXT decoded inform for that device
-// answers with the corresponding response instead of entering the
-// key/drift machinery, and the engine consumes the arming in the same
-// decision (one-shot). All transports run it, after their gentle-noop
-// gate (the armed commands ride the main status inform, exactly the
-// empty-_type informs real firmware sends).
-//
-// Position vs the key gate: decideEncrypted's key-confirmation gate
-// (the factory-default-key rejection, see the gate comment there) runs
-// BEFORE this lane, so an inform sealed with the factory key on a
-// record that already authenticated its per-device key never reaches
-// the armed arm at all — the rejection answers instead (findings C1/
-// C2: state alone cannot prove the record is pre-key; the persisted
-// confirmation marker separates "mid-handshake window" from "already
-// confirmed", and the gate closes the armed-lifecycle-before-auth break
-// of the classic ordering). Within the lane, setdefault outRANKS
-// reboot: a factory reset subsumes a pending reboot, and clearing the
-// reboot flag keeps the post-reset default-key re-adoption from being
-// preempted by a stale command. The armed lane keeps FULL precedence
-// over the decisions below it for every inform that survives that gate and
-// (plaintext) the claim-match check: an armed record whose inform is
-// authenticated with its per-device key answers the armed command
-// ahead of the key/drift machinery, exactly the classic dispatcher,
-// where the state-8 setdefault check (voidsuper line 1018) precedes
-// every §6.2 setparam site (§1117+) and the §6.3 task hook.
-//
-// The setdefault demotion itself is the one armed branch that writes
-// the key shape: it clears XAuthkey/Authkeys AND the KeyConfirmed
-// marker, so the post-reset factory-key re-inform re-enters through
-// the gate's pre-key window (recovery preserved — see the gate table
-// in docs/PROTOCOL.md §2).
-//
-// The jar's reboot emission site itself is not line-pinned in
-// docs/PROTOCOL-mgmt.md §6.5 (byte shape only); placing it in the same
-// early arm keeps the "next inform carries the response" contract —
-// recorded as a live-proof obligation in the lane docs. The §6.3 cmd
-// task slots AFTER the §6.6 setdefault arm: §6.3 is silent on the
-// task's ordering against the other armed commands — chosen: last, so
-// the line-pinned setdefault check keeps winning and a one-shot reboot
-// merely defers the task by exactly one inform without losing it (the
-// post-reboot inform replays it). An armed task OUTRANKS the drift
-// machinery: the §6.3 hook runs before the wireless/blocked drift arms
-// below, so a drifted device with an armed task gets the task
-// response, and after it delivers the SAME device falls back to the
-// drift outcome on its next inform (the replay is not lost — §6.3's
-// task cleanup is consumption, and the deferred provisioning re-fires
-// exactly like the §6.5 deferred delivery).
-//
-// cfgversion-mint semantics — §6.2 catalog entries matched: NONE for the
-// emissions themselves. Neither §6.5 reboot nor §6.6 setdefault nor the
-// §6.3 replay is a §6.2 setparam emission site, and the §6.2 mint-site
-// list (§501, §676, §826, §1117/1122, §1269, §3068) contains no
-// reboot/setdefault/cmd site, so arming and emitting mint NO cfgversion.
-// The follow-on decisions reuse existing catalog entries unchanged:
-//   - after a reboot, the device's retained-key re-inform re-enters the
-//     ordinary dispatcher (§6.1 noop on cfgversion match; §6.2 d full
-//     provisioning on mismatch — the appliedNotRunning re-arm covers the
-//     reboot regression the 2026-09-18 F-row round captured);
-//   - after a setdefault, the post-reset default-key re-inform runs the
-//     §8 default-key rotation path (the §6.2 a/c/f mgmt_cfg-only
-//     family), which mints the fresh 16-hex cfgversion exactly as every
-//     adoption does (rotateKeys — the §6.2 c "+ fresh 16-hex cfgversion
-//     stored" semantics);
-//   - after a cmd replay, the next inform re-enters the ordinary
-//     dispatcher wherever the record stood (a drifted record full
-//     provisions; a settled record noops).
+// armedLifecycle handles one-shot admin-armed commands on the next status
+// inform. It runs after the gentle-noop check and before key/drift decisions;
+// encrypted informs must also pass the key-confirmation gate, and plaintext
+// informs must match the assigned-key claim. Setdefault outranks reboot and
+// clears stale reboot/task state because factory reset supersedes both.
+// Reboot outranks a stored task without consuming it, so the next inform can
+// replay the task. A task is last and is consumed only when emitted. None of
+// these command responses mints a cfgversion; normal decision-making resumes
+// on the following inform (docs/PROTOCOL-mgmt.md §§6.3, 6.5, 6.6).
 func (e *Engine) armedLifecycle(d *store.Device) (Outcome, bool) {
 	if truthy(d.Extra[FlagSetdefaultArmed]) {
 		e.lg.Debug("inform: armed setdefault (factory reset)", "mac", d.MAC)
@@ -526,18 +463,9 @@ func (e *Engine) armedLifecycle(d *store.Device) (Outcome, bool) {
 	if truthy(d.Extra[FlagRebootOnConnect]) {
 		e.lg.Debug("inform: armed reboot", "mac", d.MAC)
 		delete(d.Extra, FlagRebootOnConnect)
-		// A reboot is a lifecycle boundary for the not-running window: the
-		// next vap_table opens a fresh boot window (the 2026-09-19 A2
-		// record: every raw reboot starts with a bring-up miss), so the
-		// consecutive-miss counter must not straddle the reboot — a miss
-		// recorded before it would otherwise fire a byte-identical
-		// re-provision on the first post-boot table, re-opening exactly the
-		// boot-race false fire the two-consecutive-miss arming closes.
-		// The setdefault demotion already sweeps the whole
-		// controller-owned family, so only the reboot path needs this.
-		// The devname-level watchdog's counter (below) carries the same
-		// rule: its window must re-arm from zero for the post-boot
-		// materialization grace.
+		// A reboot starts a new observation window. Do not let a pre-reboot
+		// miss combine with the first post-boot bring-up miss and trigger a
+		// false re-provision; setdefault already clears these rows in its sweep.
 		wireless.ClearWatchdogCounters(d.Extra)
 		return Outcome{Kind: KindReboot}, true
 	}
@@ -573,7 +501,7 @@ func CmdTaskString(task store.JSONMap) string {
 func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless.ProvisioningPlan, d *store.Device) (Outcome, error) {
 	now := req.Now
 
-	// Key-confirmation gate (findings C1+C2): the shared factory default
+	// Key-confirmation gate: the shared factory default
 	// key is accepted ONLY for a device that has not yet authenticated
 	// its per-device key — StatePending (the pre-adoption record,
 	// devmgr UNKNOWN(0)) or a keyed StateAdopting record whose marker is
@@ -609,24 +537,11 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 		return out, nil
 	}
 
-	// Wireless envelope drift (FSM hash bump): BEFORE the cfgversion drift
-	// check, compare sha256(canonical wireless envelope) with the stored
-	// Extra["wlan_cfg_sha"]. A mismatch regenerates CfgVersion, which the
-	// drift check then sees as unknown → full provisioning. The baseline
-	// is captured exclusively by settle — the drift-settle confirmation of
-	// a delivered system_cfg — and adoption deliberately does NOT seed it
-	// (2026-09-18 F-row live round: a seed equal to the current envelope
-	// hash made this check compare the intent against itself, so a freshly
-	// adopted device answered connected noops forever without ever
-	// receiving system_cfg). Live finding (2026-09-16 acceptance session,
-	// U7PG2 on BZ.6.8.2): real firmware echoes the adoption mgmt_cfg's
-	// cfgversion back on its first re-keyed inform — matching the jar's
-	// equal path (voidsuper bytes 3287-3306 jump to 3549) — so full
-	// provisioning never follows adoption on its own, and the drift
-	// baseline must NOT depend on assignedKeyFlow having run first. The
-	// jar bumps device.cfgversion on operator config saves ("CONFIG
-	// changed" log); this hash comparison is open-unifi's equivalent
-	// trigger.
+	// Compare the canonical WLAN envelope with the last confirmed baseline
+	// before cfgversion drift handling. A mismatch mints a version and forces
+	// full provisioning. Only Settle captures the baseline, after a later
+	// inform proves the offered config is running; adoption must not seed it
+	// or a fresh device could compare its intent against itself and noop.
 	// A system_cfg transmission is only an offer.  Its hash remains pending
 	// until a later inform proves the VAPs are actually running.
 	st := wireless.LoadDeliveryState(d.Extra)
@@ -640,20 +555,9 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 	if st.Baseline() != "" {
 		if cur := plan.DriftHash; cur != st.Baseline() {
 			wlanDrift = true
-			// Mint ONLY for a genuinely NEW envelope. Live finding
-			// (2026-09-19 EAP round, WLAN-ACCEPTANCE 6.8.2.15592): a
-			// drifted-but-still-pending envelope re-minted on EVERY
-			// inform — 37 offers in 3.5 minutes against a device that
-			// only sent sparse informs (no vap_table, so settle could
-			// never confirm) — and each fresh mint kept operatorMint
-			// true in the pending gate below, so WlanRetryDue never
-			// bounded the re-offers and the device's echo could never
-			// land on ours. While cur == the pending hash the delivery
-			// operation is UNCHANGED: keep the offered cfgversion
-			// stable (assignedKeyFlow re-offers it verbatim), let the
-			// pending gate's bounded budget govern re-offers, and let
-			// an echoed offer reach the equality branch's
-			// noop-pending-wlan instead of minting the equality away.
+			// Mint only for a new pending envelope. Keep the version stable
+			// for retries of the same operation so the retry budget can bound
+			// delivery and an echoed offer can reach the pending-noop branch.
 			if !st.PendingPresent() || st.PendingHash() != cur {
 				nv, kerr := e.keyChars(16)
 				if kerr != nil {
@@ -673,13 +577,10 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 	// machinery: mint a fresh cfgversion here (a blocked edit is a content
 	// change, so the echoed cfgversion must never enter the equality/noop
 	// branch), and the switch below forces assignedKeyFlow in THIS inform.
-	// The baseline semantics differ from wlan_cfg_sha in one way: absent
-	// baseline + EMPTY set is steady state, not drift — that combination is
-	// what a freshly adopted device presents (2026-09-16 live round: the
-	// equal path answers connected noops after adoption), and baseline
-	// capture happens at EMISSION (blocked content has no vap_table to
-	// observe; the cfgversion echo the equality path already tracks is the
-	// only confirmation there is).
+	// An absent baseline plus an empty set is steady state, not drift. Capture
+	// this baseline when blocked_sta content is emitted; unlike WLAN delivery,
+	// it has no runtime table to confirm, so cfgversion echo is the available
+	// completion signal.
 	if _, blockedChanged := blockedStaDrift(*d); blockedChanged {
 		blockedDrift = true
 		nv, kerr := e.keyChars(16)
@@ -731,11 +632,9 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 		if err := e.rotateKeys(d); err != nil {
 			return Outcome{}, err
 		}
-		// No baseline is seeded here (see the drift block above): the
-		// post-adoption echo reaches the no-baseline self-heal below,
-		// which forces exactly one full provisioning — the real-controller
-		// sequence the 2026-09-16 session captured — and settle captures
-		// the baseline only once that delivery is proven on the wire.
+		// Leave the WLAN baseline unset. The no-baseline self-heal forces
+		// one full provisioning, and settle records the baseline only after
+		// the device proves that delivery is running.
 		e.lg.Debug("inform: adoption push (default key)", "mac", d.MAC, "prevState", prev)
 		return e.adoptionPush(*d, req.UsedKey), nil
 
@@ -796,33 +695,12 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 			d.State = store.StateAdopted
 			return out, nil
 		}
-		// Settled-state regression (2026-09-18 F-row live round, A2
-		// finding): a device can echo a matching cfgversion while running
-		// something else — a rebooted device re-materializes factory config
-		// yet still reports the provisioned stamp, and the settle
-		// watchdog is one-shot. A PRESENT vap_table that disproves the
-		// applied WLANs re-arms delivery the same way the self-heal
-		// does: mint a fresh cfgversion so the NEXT inform mismatches
-		// and flows through full provisioning, re-entering drift
-		// settle. Absent/empty tables are unknown, not regression —
-		// sparse heartbeats must never re-arm delivery.
-		//
-		// Two-consecutive-miss arming (2026-09-19 boot-race finding,
-		// WLAN-ACCEPTANCE 6.8.2.15592 A2 re-run): the first post-boot
-		// inform can carry a present, non-empty table whose radios are
-		// still in bring-up — one not-running proof is the boot race,
-		// not genuine factory regression, so a single miss no longer
-		// fires. The controller-owned counter (wlan_cfg_not_running_misses)
-		// records the first miss; the SECOND consecutive miss fires with
-		// the same mechanics as before (mint → the next inform full
-		// provisions) and resets the window so it can re-arm; a RUN
-		// proof resets it; unknown informs (absent/empty table) leave it
-		// untouched in both directions.
-		// The evidence classification is computed ONCE (the watchdog arm
-		// below reuses it): nothing between the switch and the block
-		// mutates its inputs (the applied snapshot and vap_table — the
-		// counters are writes), so the reuse is the same value the review
-		// verified ad hoc on all reachable paths.
+		// cfgversion equality alone does not prove the device applied WLANs.
+		// A known table that disproves the applied set re-arms provisioning
+		// after two consecutive misses; one miss may be radio bring-up. A RUN
+		// proof resets the counter, while absent or empty tables are unknown
+		// and leave it unchanged. The devname watchdog below reuses this
+		// classification.
 		ev := st.NotRunningEvidence()
 		switch ev {
 		case wireless.NotRunningMiss:
@@ -841,29 +719,11 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 		case wireless.NotRunningRun:
 			st.ClearNotRunningMisses()
 		}
-		// Devname-level materialization watchdog (2026-09-26 production
-		// incident, 2.4 guest guest-net ath3): 6.8.2.15592 only
-		// MATERIALIZES new vap interfaces at boot — a live push
-		// reconfigures existing ones only, so the 4th 2.4 vap (ath3) sat
-		// configured-not-running forever while hostapd crash-looped. The
-		// SSID watchdog above cannot see this shape: a band=both WLAN
-		// reads RUN on ONE radio (SSID present in vap_table), so the SSID
-		// view reads running and the missing devname is invisible. This
-		// block runs ONLY when the SSID view reads running (the invisible
-		// case) and only when NO delivery can be in flight: for a REAL pending sha
-		// (the non-empty string Offer stores) this branch is
-		// unreachable — the flow either answered noop-pending-wlan above
-		// when the unchanged-envelope retry was not yet due, or flagged
-		// wlanDrift and full-provisioned below — and the pendingSHAPresent
-		// precede-check here only catches a MALFORMED pending row (key
-		// present, "": a shape Offer never writes) to keep
-		// delivery out of an armed watchdog. A plan vap whose devname is
-		// absent (or not RUN) from THIS inform's vap_table is the real
-		// gap. Monitored with the same two-consecutive-miss boot-race
-		// grace: the first miss can be the post-reboot bring-up race on
-		// the freshly materialized set. Evidence semantics are
-		// wireless.MissingVaps — absent/empty tables are UNKNOWN and leave
-		// the window untouched, exactly like NotRunningEvidence above.
+		// SSID presence can hide a missing radio-specific VAP: a band=both
+		// WLAN may be RUN on one radio while another planned devname is absent.
+		// Check planned devnames only when the SSID set is proven RUN and no
+		// delivery is pending. Two consecutive misses allow for boot-time
+		// radio bring-up; absent or empty tables remain unknown.
 		if ev == wireless.NotRunningRun {
 			missing := wireless.MissingVaps(plan.Vaps, d.Extra["vap_table"])
 			if len(missing) == 0 {
@@ -932,13 +792,8 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 						// deletes a stale-cfgversion one) or a RUN proof.
 						d.Extra[FlagRebootOnConnect] = true
 						wireless.SetMaterializationRebootArmed(d.Extra, d.CfgVersion)
-						// Deliberate divergence — this is the adoption
-						// package's ONLY lg.Info call (even the §6.5
-						// reboot emission logs Debug, as does the SSID
-						// watchdog above): at the default log level this
-						// arm is the only operator-visible record of why
-						// a device will spontaneously reboot — the
-						// 2026-09-26 incident was silent.
+						// Keep the arm at Info level: operators need to know why
+						// the device will reboot, even at the default log level.
 						e.lg.Info("inform: planned vaps not running after settle, arming materialization reboot", "mac", d.MAC, "vaps", missing)
 						return e.noopFor(d, now, req.PrevNoopTarget, KindNoop), nil
 					}
@@ -959,34 +814,11 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 	}
 }
 
-// decidePlain is the PLAINTEXT inform state machine. It NEVER rotates
-// keys (deviation from the classic debug-build rotation path — we treat
-// plaintext claims as assertions, not authenticators):
-//
-//   - XAuthkey unset  → noop; the record stays StatePending (plaintext can
-//     never initiate adoption — rotating/adopting from an unauthenticated
-//     channel would let any network observer seed a device's mgmt_cfg with
-//     an empty cfgversion/authkey);
-//   - claim ≠ XAuthkey → mgmt_cfg-only re-send push (re-key me), NO
-//     rotation, no cfgversion regen, and NO key material: BuildMgmtCfg
-//     is called with the record's own XAuthkey as usedKey so the
-//     authkey= line is omitted — the lane is uncredentials plaintext,
-//     and a wrong or omitted _authkey claim must never learn the
-//     assigned key from the reply (finding C3; a debug device that
-//     lost its key re-learns it over the encrypted path or by
-//     re-registration instead);
-//   - claim == XAuthkey → the assigned-key flow, which ALWAYS emits full
-//     provisioning (the plaintext lane runs no drift-settle and has no
-//     cfgversion-match noop — the encrypted lane's connected-noop branch
-//     is unreachable here).
-//
-// It NEVER rotates keys, NEVER initiates adoption, has no default-key
-// rejection, and performs no drift settle — it shares noopFor,
-// assignedKeyFlow and the adoption push with the encrypted lane.
-// Admin-armed lifecycle commands (§6.5/§6.6/§6.3) require the same
-// authenticated claim: armedLifecycle runs ONLY on a claim-match inform,
-// so an unauthenticated (wrong or omitted) claim can no longer fire the
-// armed setdefault/reboot/task responses nor consume the arming.
+// decidePlain treats plaintext key claims as assertions, not authenticators.
+// It never initiates adoption or rotates keys. An unset assignment noops; a
+// mismatched claim gets an mgmt_cfg-only resend with no authkey row; a matching
+// claim gets full provisioning. Armed commands also require a matching claim.
+// This lane does not perform drift settling or cfgversion-match noops.
 func (e *Engine) decidePlain(req Request, wls []wireless.Wlan, plan wireless.ProvisioningPlan, d *store.Device) (Outcome, error) {
 	now := req.Now
 	rtype, _ := req.Body["_type"].(string)

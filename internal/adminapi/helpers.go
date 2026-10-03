@@ -201,15 +201,9 @@ func ValidateSSHPublicKeyLines(lines []string) string {
 
 // ---- MAC normalization ---------------------------------------------------
 
-// normalizeMAC accepts common MAC spellings — colon/hyphen/dot/space
-// separated, or bare "aabbccddeeff" — and returns the admin API's
-// lowercase colon-hex form. Garbage is rejected. The implementation is
-// store.CanonicalMAC, the controller's single normalizer for MAC identity
-// (a private copy here once meant the REST boundary and the store could
-// disagree on what spellings name the same device; the Terraform
-// provider's own net.ParseMAC-based copy predates those lanes and sits
-// outside the controller, so it is not covered by this claim); ColonMAC
-// renders the canonical 12-hex into this lane's colon-hex wire spelling.
+// normalizeMAC accepts common MAC spellings and returns lowercase colon-hex.
+// It uses the store's canonicalizer so the REST boundary and record identity
+// agree; malformed values are rejected.
 func normalizeMAC(s string) (string, error) {
 	canon, err := store.CanonicalMAC(s)
 	if err != nil {

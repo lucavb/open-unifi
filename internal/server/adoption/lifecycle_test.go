@@ -35,9 +35,8 @@ func settledLifecycleDevice() store.Device {
 // TestArmedRebootEmitsOnceThenSteadyNoop pins the §6.5 one-shot contract:
 // the armed inform answers reboot, the flag is consumed in the same
 // decision, NO cfgversion is minted (the §6.2 catalog has no reboot
-// site), the record is otherwise untouched (soft reboot keeps device
-// config — 2026-09-18 A2 live round), and the next status inform is an
-// ordinary connected noop again.
+// site), the record's device configuration is retained, and the next
+// status inform is an ordinary connected noop again.
 func TestArmedRebootEmitsOnceThenSteadyNoop(t *testing.T) {
 	e := newTestEngine(t)
 	dev := settledLifecycleDevice()
@@ -258,14 +257,14 @@ func TestSetdefaultReadoptOnDefaultKey(t *testing.T) {
 	}
 }
 
-// TestSetdefaultFiresOnDefaultKeyInform pins the POST-KEY-GATE placement
-// (the C1+C2 key-confirmation fix): an inform sealed with a per-device key
+// TestSetdefaultFiresOnDefaultKeyInform pins the key-gate ordering: an
+// inform sealed with a per-device key
 // answers an armed setdefault ahead of the key/drift machinery (the armed
 // commands ride the main status inform), while the same inform sealed with
 // the FACTORY default key never reaches the armed arm at all — the
 // key-confirmation gate at the top of decideEncrypted rejects it before
-// every other decision (a confirmed record's admin arming cannot be fired
-// on an unauthenticated factory-key claim, finding C2).
+// every other decision; a confirmed record's admin arming cannot be fired
+// by an unauthenticated factory-key claim.
 func TestSetdefaultFiresOnDefaultKeyInform(t *testing.T) {
 	e := newTestEngine(t)
 

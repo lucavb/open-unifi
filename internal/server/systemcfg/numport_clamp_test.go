@@ -1,10 +1,7 @@
 package systemcfg
 
-// Regression tests for the ethernet_table num_port clamp (audit run 1,
-// unbounded num_port expansion): a device-reported num_port must not drive an
-// attacker-sized ethN expansion. Per entry n is capped at 8; the aggregate
-// total is capped at 64. Displaced validation fixture: zz_avail_numport_test.go
-// (which asserted the previously vulnerable unbounded behavior).
+// Regression tests ensure device-reported num_port cannot drive unbounded
+// ethN expansion. Each entry is capped at 8 ports and the aggregate at 64.
 
 import (
 	"testing"
