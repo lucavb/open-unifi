@@ -399,8 +399,10 @@ func (s *Server) handlePacket(ctx context.Context, w http.ResponseWriter, pkt *i
 		// FID-69: internal inform failures answer a 200 noop, not 500
 		// (classic: devmgr sentinels ØoÓ000/øOÓ000 flow back through the
 		// servlet as a real response for everything but the explicit
-		// unknown-device marker).
-		s.internalNoopResponse(w, pkt, nil, "", mac, "store error", err)
+		// unknown-device marker). No key is established before decryption,
+		// so the noop rides out as plain JSON.
+		s.lg.Error("inform: internal error, answering noop", "mac", mac, "cause", "store error", "err", err)
+		s.internalPlainNoopResponse(w, "store error", err)
 		return
 	}
 	s.lg.Debug("inform: packet", "mac", mac, "flags", fmt.Sprintf("0x%04x", pkt.Flags), "bodyLen", len(body))
@@ -421,56 +423,18 @@ func (s *Server) handlePacket(ctx context.Context, w http.ResponseWriter, pkt *i
 		return
 	}
 
-	// Read-modify-write is serialized per-MAC inside the store: advance
-	// never races a concurrent inform rotation or admin mutation for the
-	// same device (a lost rotation bricks the device's key).
-	// FID-71: UpdateExisting — informs must never create or resurrect
-	// device records; a MAC deleted mid-flight lands on the noop path.
-	var outcome advanceResult
-	uerr := s.st.UpdateExisting(mac, func(rec *store.Device) error {
-		now := time.Now()
-		s.absorbInform(rec, jm, now, gcmReq)
-		connects, disconnects := refreshClientSessions(rec, jm, now)
-		out, aerr := s.decideInform(ctx, mac, adoption.Request{
-			Transport:      adoption.TransportEncrypted,
-			Device:         *rec,
-			Body:           jm,
-			UsedKey:        usedKey,
-			Now:            now,
-			PrevNoopTarget: s.noopTargetSnapshot(mac),
-		})
-		if aerr != nil {
-			return s.mapEngineError(rec, aerr)
-		}
-		outcome = advanceResult{resp: s.applyOutcome(mac, rec, out), kind: string(out.Kind), connects: connects, disconnects: disconnects}
-		return nil
+	// The cycle and its error mapping are shared with the plaintext lane
+	// (runInformCycle); this lane only contributes the transport label,
+	// the authenticated key, the GCM-capability flag and the sealed
+	// respond.
+	s.runInformCycle(ctx, w, mac, jm, informLane{
+		transport: adoption.TransportEncrypted,
+		usedKey:   usedKey,
+		gcmReq:    gcmReq,
+		respond: func(w http.ResponseWriter, outcome advanceResult) {
+			s.writeInformResponse(w, pkt, keyBytes, outcome, mac)
+		},
 	})
-	if uerr != nil {
-		var rej *informRejectError
-		if errors.As(uerr, &rej) {
-			s.lg.Debug("inform: rejected", "mac", mac, "reason", rej.reason)
-			w.WriteHeader(rej.status)
-			return
-		}
-		// FID-71: UpdateExisting refuses to resurrect records — an
-		// ErrNotFound here means the device was deleted (or expired) between
-		// the Get and this write. The jar answers an unknown MAC with the
-		// ÖoÓ000 marker → servlet 404, so a mid-flight deletion maps onto the
-		// same status instead of the internal-error noop.
-		if errors.Is(uerr, store.ErrNotFound) {
-			s.lg.Debug("inform: device vanished before the RMW cycle", "mac", mac)
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		s.internalNoopResponse(w, pkt, keyBytes, usedKey, mac, "update error", uerr)
-		return
-	}
-
-	// The cycle committed: observe its client-session transitions now
-	// (exactly-once — an aborted cycle persists nothing and counts
-	// nothing).
-	s.countSessionEvents(mac, outcome)
-	s.writeInformResponse(w, pkt, keyBytes, outcome, mac, usedKey)
 }
 
 // advanceResult carries the inform response built inside the store's
@@ -494,12 +458,12 @@ func (s *Server) countSessionEvents(mac string, outcome advanceResult) {
 	}
 }
 
-// writeInformResponse renders outcome over the wire: plaintext informs get
-// plain JSON; encrypted ones get the classic sealed envelope. If sealing
-// fails (rand/cipher errors), a plain-JSON noop rides out under an HTTP 200
-// (FID-69: internal failures never surface as 500) rather than leaving the
-// socket empty.
-func (s *Server) writeInformResponse(w http.ResponseWriter, pkt *inform.Packet, keyBytes []byte, outcome advanceResult, mac, usedKey string) {
+// writeInformResponse is the encrypted lane's respond half: it renders the
+// outcome over the wire as the classic sealed envelope. If sealing fails
+// (rand/cipher errors) or the payload cannot marshal, a plain-JSON noop
+// rides out under an HTTP 200 (FID-69: internal failures never surface as
+// 500) rather than leaving the socket empty.
+func (s *Server) writeInformResponse(w http.ResponseWriter, pkt *inform.Packet, keyBytes []byte, outcome advanceResult, mac string) {
 	out, err := json.Marshal(outcome.resp)
 	if err != nil {
 		s.internalPlainNoopResponse(w, "response marshal failed", err)
@@ -518,19 +482,21 @@ func (s *Server) writeInformResponse(w http.ResponseWriter, pkt *inform.Packet, 
 	_, _ = w.Write(serialized)
 }
 
-// internalNoopResponse answers an internal inform-processing failure with
-// HTTP 200 and a noop payload (FID-69, decided: align, not 500). When the
-// request was encrypted and the per-device key is known, the noop is sealed
-// exactly like a real reply; when no key was established (e.g. the store
-// failed before decryption), it falls back to plain JSON.
-func (s *Server) internalNoopResponse(w http.ResponseWriter, pkt *inform.Packet, keyBytes []byte, usedKey string, mac, cause string, cerr error) {
-	s.lg.Error("inform: internal error, answering noop", "mac", mac, "cause", cause, "err", cerr)
-	outcome := advanceResult{resp: s.noopResp(), kind: "internal-error"}
-	if keyBytes == nil {
-		s.internalPlainNoopResponse(w, cause, cerr)
+// writePlainResponse is the plaintext lane's respond half: plain JSON over
+// HTTP 200. A marshal failure falls back to the plain noop (FID-69) — the
+// same discipline the sealed lane's writeInformResponse keeps, so both
+// lanes answer the same failure class with the same status, never a 500.
+func (s *Server) writePlainResponse(w http.ResponseWriter, mac string, outcome advanceResult) {
+	out, err := json.Marshal(outcome.resp)
+	if err != nil {
+		s.internalPlainNoopResponse(w, "response marshal failed", err)
 		return
 	}
-	s.writeInformResponse(w, pkt, keyBytes, outcome, mac, usedKey)
+	// Never log the plaintext auth claim.
+	s.lg.Debug("inform-plain: reply", "mac", mac, "kind", outcome.kind)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(out)
 }
 
 // internalPlainNoopResponse is the unsealed fallback of the noop path.
@@ -549,7 +515,11 @@ func (s *Server) internalPlainNoopResponse(w http.ResponseWriter, cause string, 
 
 // handlePlain processes a plaintext inform (AllowPlainText only): either an
 // unframed JSON body (mac from the body) or a framed no-flags packet
-// (mac from the header, section-1 gating upstream in handleInform).
+// (mac from the header, section-1 gating upstream in handleInform). The
+// record cycle and the error mapping are the shared runInformCycle; this
+// lane contributes only the transport label, the _authkey claim and the
+// plain-JSON respond (the GCM-capability flag keeps its false zero
+// value).
 func (s *Server) handlePlain(ctx context.Context, w http.ResponseWriter, mac string, jm map[string]any) {
 	if mac == "" {
 		s.lg.Debug("inform-plain: empty MAC")
@@ -575,17 +545,11 @@ func (s *Server) handlePlain(ctx context.Context, w http.ResponseWriter, mac str
 		return
 	}
 	if err != nil {
-		// FID-69: internal failure → 200 noop (plain JSON here).
-		s.lg.Error("inform-plain: store error", "err", err)
-		out, merr := json.Marshal(s.noopResp())
-		if merr != nil {
-			s.lg.Error("inform-plain: noop marshal failed", "err", merr)
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(out)
+		// FID-69: internal failure → 200 noop. No key is established on
+		// this lane, so the noop rides out as plain JSON — the same
+		// mapping the encrypted lane answers before decryption.
+		s.lg.Error("inform-plain: internal error, answering noop", "mac", mac, "cause", "store error", "err", err)
+		s.internalPlainNoopResponse(w, "store error", err)
 		return
 	}
 
@@ -594,67 +558,123 @@ func (s *Server) handlePlain(ctx context.Context, w http.ResponseWriter, mac str
 	if claim == "" {
 		claim = inform.DefaultKeyHex
 	}
+	// The cycle and its error mapping are shared with the encrypted lane
+	// (runInformCycle); this lane only contributes the transport label,
+	// the _authkey claim and the plain respond (the GCM-capability flag
+	// keeps its false zero value).
+	s.runInformCycle(ctx, w, mac, jm, informLane{
+		transport: adoption.TransportPlaintext,
+		usedKey:   claim,
+		respond: func(w http.ResponseWriter, outcome advanceResult) {
+			s.writePlainResponse(w, mac, outcome)
+		},
+	})
+}
+
+// informLane carries everything that differs between the encrypted and
+// plaintext transports once a body is decoded: the engine's transport
+// label, the key identity the decision checked against (the decrypted
+// usedKey — an authenticator — vs the body's _authkey claim, an
+// unverified assertion the engine match-checks, never an authenticator),
+// record absorption's GCM-capability input, and how one cycle outcome
+// rides the wire. The cycle itself — ordering, error mapping, session-
+// event counting — is shared (runInformCycle); a lane only adapts bytes.
+type informLane struct {
+	transport adoption.Transport
+	usedKey   string
+	gcmReq    bool
+
+	// respond writes one cycle outcome to the device: the sealed envelope
+	// for the encrypted lane, plain JSON for the plaintext lane.
+	// Marshal/seal failures fall back to the plain noop inside (FID-69:
+	// internal failures never surface as 500).
+	respond func(w http.ResponseWriter, outcome advanceResult)
+}
+
+// transportLabel names the lane in the shared cycle's log lines. The
+// rest of the package discriminates lanes by the "inform:" /
+// "inform-plain:" message prefixes; the cycle is shared, so it carries
+// the label as an attribute instead.
+func (l informLane) transportLabel() string {
+	if l.transport == adoption.TransportPlaintext {
+		return "plaintext"
+	}
+	return "encrypted"
+}
+
+// runInformCycle is the ONE inform cycle (CONTEXT.md's decision modules):
+// the record absorption then the client-session refresh (both inside
+// absorbInform, in that order), the adoption engine's decision, then the
+// outcome's record deltas — all inside a single per-MAC read-modify-
+// write. Every decoded inform reaches it whatever transport carried it;
+// only the lane differs.
+//
+// Read-modify-write is serialized per-MAC inside the store: advance never
+// races a concurrent inform rotation or admin mutation for the same device
+// (a lost rotation bricks the device's key).
+// FID-71: UpdateExisting — informs must never create or resurrect device
+// records; a MAC deleted mid-flight lands on the 404 path.
+func (s *Server) runInformCycle(ctx context.Context, w http.ResponseWriter, mac string, jm map[string]any, lane informLane) {
 	var outcome advanceResult
 	uerr := s.st.UpdateExisting(mac, func(rec *store.Device) error {
 		now := time.Now()
-		s.absorbInform(rec, jm, now, false)
-		connects, disconnects := refreshClientSessions(rec, jm, now)
+		connects, disconnects := s.absorbInform(rec, jm, now, lane.gcmReq)
 		out, aerr := s.decideInform(ctx, mac, adoption.Request{
-			Transport:      adoption.TransportPlaintext,
+			Transport:      lane.transport,
 			Device:         *rec,
 			Body:           jm,
-			UsedKey:        claim,
+			UsedKey:        lane.usedKey,
 			Now:            now,
 			PrevNoopTarget: s.noopTargetSnapshot(mac),
 		})
 		if aerr != nil {
-			return s.mapEngineError(rec, aerr)
+			return mapEngineError(aerr)
 		}
 		outcome = advanceResult{resp: s.applyOutcome(mac, rec, out), kind: string(out.Kind), connects: connects, disconnects: disconnects}
 		return nil
 	})
 	if uerr != nil {
-		// FID-71: a record deleted between the Get and this write answers
-		// the jar's unknown-MAC marker (404); any other failure is FID-69's
-		// 200 noop.
+		var rej *informRejectError
+		if errors.As(uerr, &rej) {
+			// A jar-parity protocol rejection (informRejectError) maps to a
+			// bare HTTP status with no body (InformServlet §143-182).
+			// Unreachable from the plaintext lane today (decidePlain has no
+			// rejection sentinel); a future one would flip that lane from
+			// the historical 200-noop fallthrough to this bare status.
+			s.lg.Debug("inform: rejected", "mac", mac, "transport", lane.transportLabel(), "reason", rej.reason)
+			w.WriteHeader(rej.status)
+			return
+		}
+		// FID-71: UpdateExisting refuses to resurrect records — an
+		// ErrNotFound here means the device was deleted (or expired) between
+		// the lane's Get and this write. The jar answers an unknown MAC with
+		// the ÖoÓ000 marker → servlet 404, so a mid-flight deletion maps onto
+		// the same status instead of the internal-error noop.
 		if errors.Is(uerr, store.ErrNotFound) {
-			s.lg.Debug("inform-plain: device vanished before the RMW cycle", "mac", mac)
+			s.lg.Debug("inform: device vanished before the RMW cycle", "mac", mac, "transport", lane.transportLabel())
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		s.lg.Error("inform-plain: store update error", "mac", mac, "err", uerr)
-		out, merr := json.Marshal(s.noopResp())
-		if merr != nil {
-			s.lg.Error("inform-plain: noop marshal failed", "err", merr)
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(out)
+		// FID-69: internal inform failures answer a 200 noop, not 500
+		// (classic: devmgr sentinels ØoÓ000/øOÓ000 flow back through the
+		// servlet as a real response for everything but the explicit
+		// unknown-device marker).
+		s.lg.Error("inform: internal error, answering noop", "mac", mac, "transport", lane.transportLabel(), "cause", "update error", "err", uerr)
+		lane.respond(w, advanceResult{resp: s.noopResp(), kind: "internal-error"})
 		return
 	}
+
 	// The cycle committed: observe its client-session transitions now
 	// (exactly-once — an aborted cycle persists nothing and counts
 	// nothing).
 	s.countSessionEvents(mac, outcome)
-	out, merr := json.Marshal(outcome.resp)
-	if merr != nil {
-		s.lg.Error("inform-plain: response marshal failed", "err", merr)
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-	// Never log the plaintext auth claim.
-	s.lg.Debug("inform-plain: reply", "mac", mac, "kind", outcome.kind)
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(out)
+	lane.respond(w, outcome)
 }
 
 // mapEngineError converts engine error sentinels onto the transport-layer
 // protocol rejections they map to (FID-1 default-key rejection → the 404
 // marker).
-func (s *Server) mapEngineError(rec *store.Device, err error) error {
+func mapEngineError(err error) error {
 	if errors.Is(err, adoption.ErrDefaultKeyRejected) {
 		return errDefaultKeyRejected
 	}
@@ -789,14 +809,19 @@ func (s *Server) applyOutcome(mac string, rec *store.Device, out adoption.Outcom
 	}
 }
 
-// absorbInform is the transport-adapter half of the record absorption
-// (CONTEXT.md): every Extra row — the wholesale Extra swap and the trust
-// policy that guards it — lives in the record itself (store.Device.Absorb,
-// whose registry holds the three ownership classes), and the per-MAC
-// read-modify-write serialization stays in the inform handlers'
-// UpdateExisting cycles above.
-func (s *Server) absorbInform(rec *store.Device, body map[string]any, now time.Time, gcmReq bool) {
+// absorbInform performs the record absorption (CONTEXT.md) — the single
+// trust-policy merge that folds a decoded inform body into the record
+// (store.Device.Absorb, whose registry holds the three ownership
+// classes) — immediately followed by the client-session refresh: the
+// controller-owned session rows plus the §6.2(e) disconnect-event flag
+// the engine's decision consumes in the same cycle. Both steps share one
+// function so their ordering cannot drift, and everything the engine
+// reads of the inform's evidence is in the record by the time it
+// returns. The per-MAC read-modify-write serialization stays in
+// runInformCycle's UpdateExisting cycle.
+func (s *Server) absorbInform(rec *store.Device, body map[string]any, now time.Time, gcmReq bool) (connects, disconnects int) {
 	rec.Absorb(body, now, gcmReq)
+	return refreshClientSessions(rec, body, now)
 }
 
 // ---- system_cfg producer wiring (the pure renderer) -----------------------
