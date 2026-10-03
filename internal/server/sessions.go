@@ -1,10 +1,12 @@
 // Client-session refresh on the inform path: the adapter-side step that
 // turns a decoded inform's station table into the record's
 // controller-owned session rows (internal/store sessions), computed inside
-// the per-MAC read-modify-write cycle BETWEEN absorbInform (which
-// preserves the previous rows through prev-wins) and the engine decision
-// (which reads the one-shot disconnect-event flag this refresh arms —
-// the §6.2(e) trigger).
+// the per-MAC read-modify-write cycle immediately after the record
+// absorption (absorbInform — whose rec.Absorb half preserves the
+// previous rows through the trust policy's prev-wins before this
+// refresh updates them) and BEFORE the engine decision (which reads the
+// one-shot disconnect-event flag this refresh arms — the §6.2(e)
+// trigger).
 //
 // Sparse heartbeats (no station table) refresh nothing and wipe nothing
 // (device-refreshable caps semantics): the present flag from

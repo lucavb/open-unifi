@@ -1,15 +1,18 @@
 package server
 
-// Client-session end-to-end on the ENCRYPTED lane (the §6.2(e) decision
-// lives in the connected-equality branch, which the plaintext lane never
-// reaches — decidePlain has no cfgversion-match noop): sealed informs
-// with station tables record session rows, survive sparse heartbeats
-// (device-refreshable caps semantics), fire the Config.OnSessionEvents
-// hook, and a disconnect event against a blocked set answers the very
-// inform that observed the absence with the §6.2(e) blocked_sta
-// reconnect push (docs/PROTOCOL-mgmt.md §6.2 catalog row (e)).
+// Client-session end-to-end. The §6.2(e) decision lives in the
+// connected-equality branch, which the plaintext lane never reaches
+// (decidePlain has no cfgversion-match noop), so the disconnect-push
+// coverage drives sealed informs; but the shared cycle's session
+// COUNTING runs on the plaintext lane too, pinned by the plaintext test
+// below. Sealed informs with station tables record session rows, survive
+// sparse heartbeats (device-refreshable caps semantics), fire the
+// Config.OnSessionEvents hook, and a disconnect event against a blocked
+// set answers the very inform that observed the absence with the §6.2(e)
+// blocked_sta reconnect push (docs/PROTOCOL-mgmt.md §6.2 catalog row (e)).
 
 import (
+	"encoding/json"
 	"net/http"
 	"testing"
 
@@ -270,5 +273,47 @@ func TestDisconnectEventDeliversReconnectPushOnTheWire(t *testing.T) {
 	// Sparse inform after: the event is one-shot, the plain noop returns.
 	if jm = seInform(t, h, xkey, cfg, nil, nil); jm["_type"] != "noop" {
 		t.Fatalf("post-push inform = %v, want noop (event is one-shot)", jm["_type"])
+	}
+}
+
+// TestPlainLaneCountsSessionEvents pins the shared cycle's session-event
+// counting on the PLAINTEXT lane: a claim-matching plain inform carrying
+// a station table records the connect through the same absorbInform →
+// countSessionEvents path the encrypted lane uses, and the hook fires
+// exactly once for the committed cycle (the §6.2(e) push itself stays
+// encrypted-lane-only — the plain lane's reply is the assigned-key flow's
+// full provisioning).
+func TestPlainLaneCountsSessionEvents(t *testing.T) {
+	se := &sessionEvents{}
+	st := store.NewMemStore()
+	h := New(Config{AllowPlainText: true, OnSessionEvents: se.hook()}, st, testLogger()).InformHandler()
+	const xkey = "11112222333344445555666677778888"
+	registerAdopted(t, st, "aaaa", xkey)
+
+	body := infoBody("aaaa")
+	body["_authkey"] = xkey
+	body["sta_table"] = staRows("00:11:22:33:44:55")
+	resp := post(t, h, mustJSON(t, body))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("plain inform status = %d %q", resp.Code, resp.Body.String())
+	}
+	var jm map[string]any
+	if err := json.Unmarshal(resp.Body.Bytes(), &jm); err != nil {
+		t.Fatal(err)
+	}
+	if jm["_type"] != "setparam" {
+		t.Fatalf("plain reply = %v, want setparam (the assigned-key flow)", jm["_type"])
+	}
+	if len(se.calls) != 1 ||
+		se.calls[0].mac != store.ColonMAC(testMAC) ||
+		se.calls[0].connects != 1 || se.calls[0].disconnects != 0 {
+		t.Fatalf("hook calls = %+v, want one connect counted on the plain lane", se.calls)
+	}
+	rec, err := st.Get(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows := store.ClientSessions(rec); len(rows) != 1 || !rows[0].Connected {
+		t.Fatalf("rows after the plain inform = %+v, want the client connected", rows)
 	}
 }

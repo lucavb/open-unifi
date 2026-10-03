@@ -2112,6 +2112,21 @@ func TestStoreGetErrorNoop(t *testing.T) {
 	if jm["_type"] != "noop" {
 		t.Fatalf("internal-error payload = %v, want noop", jm["_type"])
 	}
+
+	// Plaintext lane: the Get failure precedes everything lane-specific, so
+	// the shared mapping answers the same 200 plain-JSON noop.
+	h2 := New(Config{AllowPlainText: true}, st, testLogger()).InformHandler()
+	resp = post(t, h2, mustJSON(t, infoBody("")))
+	if resp.Code != http.StatusOK || resp.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("plaintext: want 200 plain-JSON noop on store Get error, got %d %s", resp.Code, resp.Header().Get("Content-Type"))
+	}
+	jm = nil
+	if err := json.Unmarshal(resp.Body.Bytes(), &jm); err != nil {
+		t.Fatal(err)
+	}
+	if jm["_type"] != "noop" {
+		t.Fatalf("plaintext internal-error payload = %v, want noop", jm["_type"])
+	}
 }
 
 // F3: a framed-plain inform whose payload decrypts (no crypto flags) but is
@@ -2229,6 +2244,61 @@ func TestStorePutErrorNoop(t *testing.T) {
 	}
 	if got.XAuthkey != "" || got.CfgVersion != "" || got.State != store.StatePending {
 		t.Fatalf("failed cycle persisted a rotation: %+v", got)
+	}
+
+	// Plaintext lane: the same FID-69 discipline through the shared cycle —
+	// a plain-JSON noop instead of the sealed envelope.
+	h2 := New(Config{AllowPlainText: true}, st, testLogger()).InformHandler()
+	resp = post(t, h2, mustJSON(t, infoBody("")))
+	if resp.Code != http.StatusOK || resp.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("plaintext: want 200 plain-JSON noop on store update error, got %d %s", resp.Code, resp.Header().Get("Content-Type"))
+	}
+	var pjm map[string]any
+	if err := json.Unmarshal(resp.Body.Bytes(), &pjm); err != nil {
+		t.Fatal(err)
+	}
+	if pjm["_type"] != "noop" {
+		t.Fatalf("plaintext internal-error payload = %v, want noop", pjm["_type"])
+	}
+}
+
+// The respond halves' marshal-failure fallback (FID-69): an unmarshalable
+// outcome value answers the plain-JSON noop under HTTP 200, on both the
+// plaintext lane (writePlainResponse) and the sealed lane
+// (writeInformResponse — the fallback fires before sealing). No
+// handler-level inform can reach the branch (applyOutcome emits only
+// marshalable values, and the pre-change plaintext lane answered 500
+// here), so the pin drives the respond halves directly with an
+// unmarshalable map value.
+func TestRespondMarshalFailureFallsBackToPlainNoop(t *testing.T) {
+	s := New(Config{}, store.NewMemStore(), testLogger())
+	bad := advanceResult{resp: map[string]any{"bad": make(chan int)}, kind: "unmarshalable"}
+
+	w := httptest.NewRecorder()
+	s.writePlainResponse(w, testMAC, bad)
+	if w.Code != http.StatusOK || w.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("plain: want 200 plain-JSON noop, got %d %s", w.Code, w.Header().Get("Content-Type"))
+	}
+	var jm map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &jm); err != nil {
+		t.Fatal(err)
+	}
+	if jm["_type"] != "noop" {
+		t.Fatalf("plain fallback payload = %v, want noop", jm["_type"])
+	}
+
+	pkt := &inform.Packet{MAC: testMACRaw(), Flags: inform.FlagEncCBC}
+	w = httptest.NewRecorder()
+	s.writeInformResponse(w, pkt, hexKey(t, inform.DefaultKeyHex), bad, testMAC)
+	if w.Code != http.StatusOK || w.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("sealed: want 200 plain-JSON noop, got %d %s", w.Code, w.Header().Get("Content-Type"))
+	}
+	jm = nil
+	if err := json.Unmarshal(w.Body.Bytes(), &jm); err != nil {
+		t.Fatal(err)
+	}
+	if jm["_type"] != "noop" {
+		t.Fatalf("sealed fallback payload = %v, want noop", jm["_type"])
 	}
 }
 
