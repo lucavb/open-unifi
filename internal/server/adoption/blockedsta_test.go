@@ -282,9 +282,8 @@ func TestBlockedStaExhaustedRetryCannotHoldDelivery(t *testing.T) {
 
 // TestBlockedStaEmptySetNoDrift pins the steady-state rule: a KNOWN
 // baseline plus an empty set is confirmed content (connected noop), and an
-// ABSENT baseline plus an empty set is not drift either — the post-adoption
-// equal path must keep answering noops (2026-09-16 live round), with the
-// equality self-heal minting exactly once.
+// ABSENT baseline plus an empty set is not drift either. The equality
+// self-heal may mint once, but must not provision nonexistent blocked content.
 func TestBlockedStaEmptySetNoDrift(t *testing.T) {
 	e := newTestEngine(t)
 	dev := driveToSettled(t, e)

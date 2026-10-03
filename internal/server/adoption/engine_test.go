@@ -204,9 +204,8 @@ func TestHappyAdoption(t *testing.T) {
 	}
 	// Deltas: State → adopting, fresh 32-hex x_authkey (in Authkeys), fresh
 	// 16-hex cfgversion. NO wireless baseline is seeded at adoption (the
-	// 2026-09-18 F-row live round: a seed equal to the current envelope
-	// hash suppressed delivery; settle captures the baseline after
-	// delivery proof instead).
+	// baseline must be captured by settle after delivery is proven, or the
+	// new device could compare its envelope to itself and skip provisioning.
 	if !out.SetState || out.State != store.StateAdopting {
 		t.Fatalf("state delta after inform#1: %+v", out)
 	}
@@ -258,9 +257,8 @@ func TestHappyAdoption(t *testing.T) {
 		t.Fatalf("state after inform#2 = %d, want adopting (delivery outstanding)", dev.State)
 	}
 
-	// Inform #3: device still echoes the mgmt cfgversion → mismatch against
-	// the minted one → full provisioning (the real-controller post-adoption
-	// sequence captured on 2026-09-16).
+	// Inform #3: the device still echoes the old mgmt cfgversion, so the
+	// mismatch triggers full provisioning.
 	out, err = e.Decide(Request{
 		Transport: TransportEncrypted,
 		Device:    dev,
@@ -365,15 +363,11 @@ func missCounter(extra store.JSONMap) (int, bool) {
 	return 0, false
 }
 
-// Settled-state regression (2026-09-18 F-row live round, A2 finding) under
-// the two-consecutive-miss arming (2026-09-19 boot-race finding): a
-// PRESENT vap_table that disproves the confirmed WLAN set re-arms delivery
-// only on the SECOND consecutive proof. Miss#1 is the boot-race grace — a
-// plain connected noop with the miss recorded as controller-owned
-// bookkeeping; miss#2 fires with the one-shot mechanics (minting noop →
-// full provisioning on the next inform) and resets the window. Absent or
-// empty tables stay unknown (sparse heartbearts never re-arm) and a table
-// proving the applied SSID RUNNING is steady state.
+// A present vap_table that disproves the applied WLAN set re-arms delivery
+// only on the second consecutive miss. The first miss is boot-race grace;
+// the second mints a cfgversion so the next inform provisions. Absent or
+// empty tables are unknown, and a table proving the applied SSID RUN is
+// steady state.
 func TestSettledRegressionRearms(t *testing.T) {
 	e, fixture, factoryTable, runningTable := notRunningHarness(t)
 	decide := func(dev store.Device, now int64) Outcome {
@@ -443,12 +437,9 @@ func TestSettledRegressionRearms(t *testing.T) {
 	}
 }
 
-// Boot-race (2026-09-19 A2 re-run finding, WLAN-ACCEPTANCE 6.8.2.15592):
-// a rebooted device's first re-inform can carry a present, non-empty
-// vap_table whose radios are still in bring-up — the applied SSID not yet
-// RUN is the race, not genuine factory regression. miss → later RUN = NO
-// fire, the RUN proof resets the window, and the reset window re-arms
-// fresh (it again takes two new consecutive misses to fire).
+// A rebooted device's first inform can carry a present, non-empty vap_table
+// while its radios are still starting. A later RUN proof resets the miss
+// window; a subsequent regression must again produce two consecutive misses.
 func TestNotRunningBootRaceGrace(t *testing.T) {
 	e, fixture, factoryTable, runningTable := notRunningHarness(t)
 	decide := func(dev store.Device, now int64) Outcome {
@@ -1338,20 +1329,12 @@ func TestOperatorMintEscapesExhaustedDeliveryGate(t *testing.T) {
 	}
 }
 
-// TestEnvelopeDriftDeliveryIsBounded reproduces the 2026-09-19 EAP live
-// storm (WLAN-ACCEPTANCE 6.8.2.15592, the wpa-eap push): a SETTLED record
-// whose envelope is admin-changed underneath it, against a device that
-// only ever sends SPARSE informs — no vap_table, so settle can never
-// confirm the delivery. The pre-fix engine re-minted the cfgversion on
-// EVERY drifted inform, which kept the pending gate's operatorMint
-// escape permanently true: WlanRetryDue never engaged and the re-offers
-// were unbounded (37 pushes in 3.5 live minutes), each carrying a fresh
-// version the device echo could never land on. The fixed contract, in
-// order: ONE mint for the genuinely new envelope; re-offers carry the
-// SAME version; the bounded budget caps them (exhausted at
-// WlanMaxAttempts); an echoed offer answers noop-pending-wlan without
-// re-offering; a later full inform settles the pending; and a NEW
-// envelope after settle mints fresh again.
+// TestEnvelopeDriftDeliveryIsBounded covers a settled record whose envelope
+// changes while the device sends sparse informs, so settle cannot confirm
+// delivery. A new envelope gets one version; retries retain it and are
+// bounded by WlanMaxAttempts. An echoed offer noops without re-offering, a
+// later full inform settles it, and a subsequent new envelope starts a fresh
+// delivery operation.
 func TestEnvelopeDriftDeliveryIsBounded(t *testing.T) {
 	base := []wireless.Wlan{{Name: "gate-check", SSID: "openunifi-gate-check", Security: "wpa-p", Passphrase: "pw", VLAN: 1, Enabled: true}}
 	eap := []wireless.Wlan{{
@@ -1480,15 +1463,11 @@ func TestEnvelopeDriftDeliveryIsBounded(t *testing.T) {
 	}
 }
 
-// ---- devname-level materialization watchdog (2026-09-26) --------------------
+// ---- devname-level materialization watchdog -------------------------------
 //
-// The SSID watchdog above cannot see the split-band materialization gap: a
-// band=both WLAN whose 4th 2.4GHz vap (ath3) never materialized still reads
-// running (the SSID appears RUN on the radio where it DID materialize). The
-// vapMaterializationHarness builds that shape: one band=both WLAN over two
-// radios, so the plan has two vaps (ath0 on the ng radio, ath1 on the na
-// radio) and a vap_table row for ath0 alone proves the SSID while ath1 is
-// devname-missing.
+// The SSID watchdog cannot see a missing radio-specific VAP when the same
+// SSID is RUN on another radio. vapMaterializationHarness models a band=both
+// WLAN on two radios, with one planned devname missing from vap_table.
 
 // vapMaterializationHarness: the settled-state fixture family of
 // notRunningHarness, plus the radio_table the plan needs. partialTable
@@ -1558,10 +1537,9 @@ func vapMissCounter(extra store.JSONMap) (int, bool) {
 	return 0, false
 }
 
-// Split-band materialization gap (2026-09-26 production incident): a
-// planned band=both vap (ath1 here, the incident's 4th 2.4GHz ath3) sits
-// configured-not-running after a post-boot push while every applied SSID
-// still proves RUN somewhere — invisible to the SSID watchdog. Two
+// A planned band=both VAP can remain configured-not-running after a post-boot
+// push while its SSID is RUN on another radio, invisible to the SSID
+// watchdog. Two
 // consecutive devname misses arm the ONE-SHOT materialization reboot: the
 // arming inform stays a plain noop, the next inform emits the §6.5 reboot,
 // and the arm is stamped with the cfgversion so the same version can never

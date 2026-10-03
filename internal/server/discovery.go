@@ -458,8 +458,7 @@ func (s *Server) recordDiscoveryCandidate(src *net.UDPAddr, info discoveryInfo) 
 func discoveryNote(info discoveryInfo) string {
 	var parts []string
 	addString := func(k, v string) {
-		// Invariant (audit run-1 Fix 6, C7 discovery-note injection): the
-		// note is comma-joined k=v parts, so a value must never contain a
+		// The note is comma-joined k=v parts, so a value must never contain a
 		// comma or it could compose a fake part (e.g. ",factory=true").
 		// Strings are informational only, so stripping commas is cosmetic.
 		v = strings.ReplaceAll(v, ",", "")
@@ -617,7 +616,7 @@ func (s *Server) parseDiscoveryModern(src *net.UDPAddr, b []byte) (discoveryInfo
 	// app's discovery probes are exactly this header-only shape
 	// ([02 08 00 00], no TLVs — com.ubnt.easyunifi ee4.java:138-140), so
 	// placing this branch behind the validity gate would drop them
-	// unanswered (APK-RE review T6, 2026-09-27).
+	// unanswered.
 	if info.ver == 2 && info.cmd == 8 {
 		return info, true
 	}

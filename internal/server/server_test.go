@@ -569,12 +569,9 @@ func TestFramedPlainZlib(t *testing.T) {
 	}
 }
 
-// (c-live) regression from the 2026-09-16 acceptance session: real firmware
-// (U7PG2 on BZ.6.8.2) sends its periodic status informs with NO _type key at
-// all, factory key, ~15 s cadence. The empty-_type inform IS the jar's
-// main-dispatcher (voidsuper) inform (PROTOCOL-mgmt.md §6.2): the adoption
-// push must fire on it, not the gentle noop, or a real device can never be
-// adopted (the original gate nooped it before the key/state switch ran).
+// The device's periodic status inform may omit _type. The empty-_type inform
+// is the main dispatcher (PROTOCOL-mgmt.md §6.2), so adoption must run rather
+// than taking the gentle-noop path.
 func TestEmptyTypeStatusInformAdopts(t *testing.T) {
 	h, st := newServerWith(Config{})
 	registerPending(t, st)
@@ -977,14 +974,11 @@ func TestVlanWiringStatusRowsAlwaysOn(t *testing.T) {
 	}
 }
 
-// Regression gate for the mcad validator keys (the root-cause fix behind
-// the netconf.1 emission in emitNetconfSection): the device firmware's mcad
-// daemon (fw 6.8.2.15592, Ghidra 0x0040a924 renamed
-// mcad_validate_system_cfg) hard-rejects any system_cfg whose parsed tree
+// Regression gate for the mcad validator keys: firmware rejects any
+// system_cfg whose parsed tree
 // lacks `users.1.status`, `netconf.1.status` or `sshd.status` — it logs
-// "[apply-config] Unable to write system.cfg or its contents are invalid."
-// and apply-config never runs (live-observed 2026-09-16;
-// docs/AP-FIRMWARE-APPLY-PATH.md §3). Every system_cfg generation path
+// an apply-config validation error and never applies the config
+// (docs/AP-FIRMWARE-APPLY-PATH.md §3). Every system_cfg generation path
 // must carry all three gate rows, each exactly once, with their emitted
 // values.
 //
@@ -1134,9 +1128,8 @@ func TestPartialEthInventoryWarns(t *testing.T) {
 	}
 }
 
-// FID-2 if_table fallback: 6.8.2 U7PG2 sends no ethernet_table (live
-// acceptance 2026-09-16) but reports its interfaces in if_table (observed:
-// [{name: "eth0", up: true}]). The ethN names there must feed the vlan rows
+// FID-2 if_table fallback: U7PG2 may omit ethernet_table but report its
+// interfaces in if_table. The ethN names there must feed the vlan rows
 // and silence the partial-inventory warn; non-eth interfaces in the same table
 // must not leak into the config.
 func TestEthInventoryFromIfTable(t *testing.T) {
@@ -1455,14 +1448,10 @@ func TestPerDeviceWirelessDriftIsolation(t *testing.T) {
 	}
 }
 
-// Adoption push (default key) must NOT seed the wireless-envelope baseline
-// (2026-09-18 F-row live finding): a seed equal to the current envelope
-// hash made the drift check compare the intent against itself, so a
-// freshly adopted device with a pre-existing envelope answered connected
-// noops forever without ever receiving system_cfg. The post-adoption echo
-// instead reaches the no-baseline self-heal (minting cfgversion → forced
-// full provisioning), which delivers the envelope; settle captures the
-// baseline only after delivery proof.
+// Adoption must not seed the wireless-envelope baseline: a fresh device
+// could compare its intent against itself and noop without receiving
+// system_cfg. The post-adoption echo instead triggers one full provisioning;
+// settle captures the baseline only after delivery is proven.
 func TestAdoptionDoesNotSeedBaseline(t *testing.T) {
 	env := []Wlan{{Name: "corp", SSID: "corp", Security: "wpa-p", Passphrase: "correcthorse", VLAN: 42, Enabled: true}}
 	st := store.NewMemStore()
@@ -1528,16 +1517,11 @@ func TestAdoptionDoesNotSeedBaseline(t *testing.T) {
 	}
 }
 
-// Live-sequence regression (2026-09-16 acceptance session + 2026-09-18
-// F-row round): adoption happened with zero WLANs; the device echoed the
-// adoption mgmt_cfg's cfgversion on its first re-keyed inform (matching
-// the jar's cfgversion-equal path, voidsuper bytes 3287-3306). Adoption
-// deliberately does NOT seed the drift baseline (seeding suppressed
-// delivery of pre-existing envelopes — the 2026-09-18 finding), so the
-// echo reaches the self-heal, which mints a cfgversion and forces exactly
-// one full provisioning; the operator's first WLAN either lands in that
-// forced push or mismatches via the minted cfgversion. The baseline is
-// captured exclusively by settle, after delivery is proven on the wire.
+// Adoption with no WLANs must leave the baseline unset. The device's first
+// re-keyed inform can echo the adoption cfgversion; the no-baseline self-heal
+// then mints a version and forces full provisioning. A WLAN added meanwhile
+// is included in that push or triggers a later drift push. Settle captures
+// the baseline only after delivery is proven.
 func TestAdoptionEchoThenEnvelopeDrift(t *testing.T) {
 	env := []Wlan{} // the live device adopted with an empty wireless config
 	st := store.NewMemStore()
@@ -1864,16 +1848,11 @@ func intExtra(extra store.JSONMap, key string) (int, bool) {
 	return 0, false
 }
 
-// Settled-state regression (live 2026-09-18 F-row round, A2 finding) with
-// the two-consecutive-miss arming (2026-09-19 boot-race finding): a
-// rebooted device re-materializes factory config while still echoing the
-// provisioned cfgversion — the engine re-arms delivery only on the SECOND
-// consecutive not-running proof (mint → forced full provisioning →
-// settle), recording the first as controller-owned bookkeeping. That
-// counter must survive the sparse heartbeats between the proofs
-// (absorbInform's prev-wins preservation) and must ignore device-supplied
-// values. Sparse informs WITHOUT a vap_table are unknown: they never
-// re-arm and never disturb the window.
+// A rebooted device can echo the provisioned cfgversion while its WLANs are
+// not running. The engine re-arms delivery only after two consecutive proofs;
+// the first is controller-owned bookkeeping that survives sparse heartbeats
+// and cannot be overwritten by device data. An absent vap_table is unknown
+// and does not disturb the window.
 func TestRebootRegressionReprovisions(t *testing.T) {
 	env := workedEnvelope()
 	st := store.NewMemStore()

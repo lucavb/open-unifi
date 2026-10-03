@@ -1647,10 +1647,9 @@ func TestPatchBookkeepingRowsMintNothing(t *testing.T) {
 
 // TestDeviceViewVAPsNotRunning pins the GET read model's devname-level
 // runtime field: when a planned vap's devname is absent/not-RUN from the
-// record's vap_table while the SSID still proves RUN on another radio
-// (the 2026-09-26 split-band materialization gap), GET device JSON carries
-// vaps_not_running with the missing devnames; when every planned devname is
-// RUN (or the device reported no table — unknown), the field is omitted.
+// record's vap_table while the SSID still proves RUN on another radio, GET
+// device JSON carries vaps_not_running with the missing devnames. The field is
+// omitted when every planned devname is RUN or the device reports no table.
 func TestDeviceViewVAPsNotRunning(t *testing.T) {
 	a, st := testApp(t)
 	ctx := context.Background()

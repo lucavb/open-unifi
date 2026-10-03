@@ -3,9 +3,8 @@ package inform
 // StationMACs decode gates: the absent/empty distinction (a sparse
 // heartbeat must not read as "zero clients" — CONTEXT.md device-refreshable
 // caps semantics), verbatim MAC spellings, and the never-fatal odd-row
-// tolerance. The nested-shape fixtures mirror the 2026-09-20 bench
-// capture (U7PG2, fw 6.8.2.15592): stations arrive inside the vap rows
-// as vap_table[].sta_table[], one vap's table possibly empty.
+// tolerance. The nested-shape fixtures cover stations under
+// vap_table[].sta_table[], including an empty per-vap table.
 
 import "testing"
 
@@ -76,9 +75,8 @@ func TestStationMACsOddRowsSkipped(t *testing.T) {
 }
 
 func TestStationMACsVapNestedLivePin(t *testing.T) {
-	// The live-pinned shape (2026-09-20 capture): stations nested in the
-	// vap rows; the 2.4 GHz vap's table is empty while 5 GHz carries the
-	// one associated client. Fixture mirrors the captured inform.
+	// Stations are nested in the vap rows; one vap has no clients while the
+	// other carries the associated client.
 	body := map[string]any{"vap_table": []any{
 		map[string]any{
 			"essid": "openunifi-gate-check", "name": "ath1", "radio": "na",

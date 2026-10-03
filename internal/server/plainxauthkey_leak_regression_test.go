@@ -1,14 +1,8 @@
 package server
 
-// Regression tests for audit run-1 finding C3
-// (decidePlain:plaintext-xauthkey-disclosure, ref f839fae), ported from the
-// validation fixture plainxauthkey_leak_test.go with the assertions FLIPPED
-// to the secure behavior: over the opt-in plaintext lane, a WRONG or OMITTED
-// _authkey claim gets the mgmt_cfg re-send WITHOUT any key material — the
-// authkey= line is never emitted, and the assigned key can no longer be
-// learned from the unencrypted reply. The matching-claim arm keeps the
-// healthy full-provisioning shape (config rows — here the ap_base rows —
-// come back exactly like before).
+// Regression tests ensure a wrong or omitted plaintext _authkey claim gets
+// an mgmt_cfg resend without exposing the assigned key. A matching claim
+// still receives the normal full-provisioning response.
 
 import (
 	"encoding/json"

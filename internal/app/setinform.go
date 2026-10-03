@@ -6,16 +6,13 @@
 // but a never-informed device does not know WHERE to inform, so the
 // whitelist arming alone never fires. This lane closes that gap for lab
 // use: when the operator opts in with --allow-ssh-set-inform-push, a
-// successful adopt of a FACTORY ANNOUNCE candidate additionally dials the
-// device over SSH with the factory default password and runs
+// successful adopt of a factory-announce candidate additionally dials the
+// device over SSH with its factory credentials and runs
 //
 //	mca-cli-op set-inform <inform-url>
 //
-// — the proven 2026-09-20 round-2 recovery lane (WLAN-ACCEPTANCE runbook:
-// `mca-cli-op <command> [args]`, `set-inform http://…/inform` →
-// "Adoption request sent to '<url>'"; a bare `mca-cli-op` invocation enters
-// an interactive CLI and hangs a non-tty, which is why the command prefix
-// always carries arguments).
+// A bare `mca-cli-op` opens an interactive CLI and can hang a non-tty SSH
+// session, so this lane always invokes the command with its arguments.
 package app
 
 import (

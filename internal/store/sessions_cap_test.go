@@ -1,9 +1,5 @@
-// Session-row cap tests: RefreshSessions' per-device retention cap
-// (sessionRowCap) with oldest-last_seen eviction, the retention policy
-// cited by the audit run 1 sign-off (2026-09). Drive through the public
-// API like the other session tests; every eviction expectation is
-// deterministic because the tie-break among equal last_seen values is
-// the row's canonical MAC.
+// Session-row cap tests cover oldest-last_seen eviction through the public
+// API. Ties are deterministic because canonical MAC is the tie-breaker.
 
 package store
 

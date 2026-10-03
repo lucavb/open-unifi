@@ -5,11 +5,10 @@
 // and diagnostics come back as Result.Warnings/Alerts values the adapter
 // logs; the renderer itself never logs and never takes a logger.
 //
-// The byte-verified emission contract is docs/PROTOCOL-mgmt.md §3 and
-// docs/PROTOCOL-systemcfg-wireless.md (§1 header block, §2 indexing,
-// §3 radio rows, §4 aaa rows, §5 wireless rows, §6 VLAN wiring, §7 worked
-// example, §8 admin-API mapping); the factory-echo policy is
-// /tmp/harness/minimal-diff-spec.md.
+// The emission contract is documented in docs/PROTOCOL-mgmt.md §3 and
+// docs/PROTOCOL-systemcfg-wireless.md. Factory-baseline rows preserve
+// unmanaged sections during full-config replacement; see the renderer
+// comments and WLAN-ACCEPTANCE-6.8.2.15592.md for the apply constraints.
 package systemcfg
 
 import (
@@ -38,39 +37,26 @@ type SiteFacts struct {
 
 // Result is one completed render.
 type Result struct {
-	// Text is the rendered system_cfg blob (byte-identical to the
-	// pre-extraction builder's output for identical inputs).
+	// Text is the rendered system_cfg blob.
 	Text string
 
 	// Warnings are the renderer's debug-level diagnostics; the adapter logs
 	// them at debug with the same wording.
 	Warnings []string
 
-	// Alerts are the renderer's warn-level diagnostics (newline-injected
-	// rows skipped, partial eth inventory, WPA-EAP without RADIUS); the
-	// adapter logs them at warn with the same wording. Msg carries the
-	// wording; Where/Key carry the structured slog attrs of the newline
-	// skip (the only attributed diagnostic — the pre-extraction lineWriter
-	// logged Warn(msg, "where", where, "key", key)); message-only alerts
-	// leave both empty and are logged without attrs, matching the
-	// pre-extraction call shapes exactly.
+	// Alerts are warn-level diagnostics (for example, skipped injected rows,
+	// partial ethernet inventory, or WPA-EAP without RADIUS). Where and Key
+	// are set for row-specific diagnostics; other alerts contain only Msg.
 	Alerts []Alert
 
-	// CredentialDeltas carries the ssh password-cache writes the render
-	// produced — exactly the keys/values the former in-place mutation wrote
-	// (ssh_md5passwd / ssh_sha512passwd). The renderer never mutates the
-	// device record: the adapter applies these inside the store's
-	// read-modify-write cycle at the same point the mutation used to land.
-	// Absent entries mean the cached hash matched and nothing was written.
+	// CredentialDeltas contains SSH password-cache updates. The renderer does
+	// not mutate the device; the adapter applies these in its store update.
+	// Absent entries mean the cached hash already matched.
 	CredentialDeltas map[string]string
 }
 
-// Alert is one warn-level renderer diagnostic, carrying the exact wording
-// the adapter logs. Where/Key carry the structured slog attrs of the
-// newline-injection skip (the only attributed diagnostic — the
-// pre-extraction lineWriter logged Warn(msg, "where", where, "key", key));
-// message-only alerts leave both empty and are logged without attrs,
-// matching the pre-extraction call shapes exactly.
+// Alert is one warn-level renderer diagnostic. Where and Key identify a
+// skipped config row when applicable; message-only alerts leave them empty.
 type Alert struct {
 	Msg   string
 	Where string
@@ -248,23 +234,13 @@ func RenderWithPlan(d store.Device, facts SiteFacts, plan wireless.ProvisioningP
 	// per PROTOCOL-mgmt.md §3 puts this before the sshd/syslog ones.
 	rd.emitWirelessCfg(&b, plan, d)
 
-	// 4b. Factory-baseline echo sections. The system_cfg apply is a
-	// FULL-CONFIG REPLACEMENT (mcad renames the staged file over
-	// /tmp/system.cfg; docs/AP-FIRMWARE-APPLY-PATH.md), and ubntconf's
-	// fast-apply restarts the on-device plugin for every section whose
-	// parsed tree CHANGES — including changes caused by ROW DELETION
-	// when the controller's render omits a section the running config
-	// carries. The two fatal live pushes (2026-09-16 09:43/13:54) proved
-	// the mechanism (net plugin restart → ifconfig br0/eth0 down → device
-	// dark; /etc/sysinit/net.conf fetched 2026-09-17). The rows below
-	// therefore ECHO the running factory baseline
-	// (/tmp/harness/ap-forensics/tmp/system.cfg, fetched from the
-	// factory-reset device 2026-09-17) so those parsed sections stay
-	// IDENTICAL and no plugin restarts fire. Section order follows the
-	// real builder where it emits these (PROTOCOL-mgmt.md §3 steps
-	// 7-9). These are device-class baseline constants, NOT controller
-	// state: do not "clean them up" without a live-validated apply.
-	// Full policy: /tmp/harness/minimal-diff-spec.md.
+	// 4b. Factory-baseline echo sections. Applying system_cfg replaces the
+	// full config, and fast-apply restarts a plugin whenever its parsed
+	// section changes—including when rows are deleted. Echo unmanaged
+	// baseline rows to avoid restarting plugins for sections this renderer
+	// does not own. These are device-class constants, not controller state;
+	// change them only with a validated device apply. See
+	// docs/AP-FIRMWARE-APPLY-PATH.md and WLAN-ACCEPTANCE-6.8.2.15592.md.
 
 	// # connectivity (§3 step 7 — mac/connectivity overrides). The
 	// plugin restarts the uplink-monitor inittab entry when this section
@@ -342,18 +318,9 @@ func RenderWithPlan(d store.Device, facts SiteFacts, plan wireless.ProvisioningP
 	// ebtables row is the EAPOL broute rule on the first vap slot.
 	// Factory echo = zero parsed diff = zero plugin restarts.
 	//
-	// EXCEPT mgmt.is_default: never echo it in any value. The device boot
-	// path (/lib/preinit/99_21_ubnt_ubntconf do_ubntconf, fw 6.8.2)
-	// restores the MTD blob text via `cfgmtd -r`, then greps it for
-	// `mgmt.is_default=true` — a hit replaces the restored text with the
-	// factory template before /tmp/system.cfg is sorted into place, so
-	// echoing the factory's is_default=true makes every reboot drop the
-	// provisioned WLANs while the tar part still restores mgmt/authkey
-	// (retained-key echo + watchdog re-provision ≈49 s). The real
-	// controller emits no mgmt.is_default row at all (no writer in
-	// config_String/int), so absence is the byte-exact form. device boot
-	// evidence 2026-09-18: /tmp/system.cfg line 258 carried
-	// mgmt.is_default=true from this echo; WLAN-ACCEPTANCE A2.
+	// Never echo mgmt.is_default: the firmware boot guard treats
+	// mgmt.is_default=true as a request to restore the factory template,
+	// dropping provisioned WLAN rows. The real controller emits no such row.
 	b.WriteString("# ebtables\n")
 	line("ebtables.status", "enabled")
 	line("ebtables.1.cmd", "-t broute -A BROUTING -p 0x888e -i ath0 -j DROP")
@@ -363,15 +330,10 @@ func RenderWithPlan(d store.Device, facts SiteFacts, plan wireless.ProvisioningP
 	line("dhcpd.1.status", "disabled")
 	line("httpd.status", "disabled")
 
-	// What is still deliberately missing here (bandsteering, airtime,
-	// stamgr, qos, mesh, snmp, resolv, iptables, cron — config_String/
-	// int): the factory baseline carries none of those rows either, so
-	// omitting them keeps the parsed diff empty under the full-config
-	// replacement semantics. Adding any row requires a live-validated
-	// apply first (two device resets already consumed 2026-09-16). The ONE
-	// deliberate addition since that policy: the site-fact
-	// sshd.auth.key.<n>.* rows (when keys are configured) — firmware-
-	// derived but still OWED a live-validated apply (docs §13).
+	// Do not add unowned sections unless the factory baseline and apply
+	// behavior are validated. In particular, configured sshd.auth.key rows
+	// are firmware-derived but still require a device-validated apply
+	// (WLAN-ACCEPTANCE-6.8.2.15592.md §13).
 
 	// 5. The admin "config.system_cfg.<idx>" passthrough lines
 	//    (config_String.java §appendix: raw pre-formatted lines). FID-62:

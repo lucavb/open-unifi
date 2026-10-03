@@ -10,20 +10,13 @@ import (
 	"github.com/lucavb/open-unifi/internal/store"
 )
 
-// LineWriter returns the shared INJECTION-GUARDED key=value line writer used
-// by every system_cfg/mgmt_cfg emission site. Any VALUE containing \n or \r
-// makes the whole row skipped — warn(where, key) is called with the skipped
-// row's context — instead of emitted: a newline smuggled in from an inform
-// body (forged radio fields, timezone strings, cookie comments) would
-// terminate the row early and inject attacker-chosen key=value rows into the
-// device's config. "Fail loud, never emit." (raw() admin passthrough lines
-// in the system_cfg renderer are the ONLY unguarded writer: admin-owned by
-// definition.)
+// LineWriter returns the shared key=value writer for system_cfg and mgmt_cfg.
+// Values containing CR or LF are skipped and reported: otherwise an inform
+// value could terminate a row and inject config. Admin-owned raw passthrough
+// lines in the system_cfg renderer are the only unguarded writer.
 //
-// The caller owns the logging/warning channel: the adoption engine's builder
-// passes a slog-backed sink, the pure system_cfg renderer passes a collector
-// that records the skip as a warn-level diagnostic value for its caller to
-// log.
+// The caller supplies the warning sink; the adoption builder logs directly,
+// while the pure renderer collects diagnostics for its caller.
 func LineWriter(warn func(where, key string), b *strings.Builder, where string) func(k, v string) {
 	return func(k, v string) {
 		if strings.ContainsAny(v, "\n\r") {

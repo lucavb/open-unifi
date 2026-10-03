@@ -37,8 +37,7 @@ const (
 	// defaultEthIface is the last-resort fallback uplink iface for `# vlan`
 	// rows when the record carries NO eth inventory at all (ethPortNames);
 	// with an inventory the emitted names come from ethernet_table, else from
-	// the ethN names in if_table, else from the learned uplink (6.8.2 U7PG2
-	// sends no ethernet_table — live acceptance 2026-09-16).
+	// the ethN names in if_table, else from the learned uplink.
 	defaultEthIface = "eth0"
 )
 
@@ -606,11 +605,8 @@ func (rd *render) emitWirelessRows(b *strings.Builder, n int, v wireless.VapPlan
 func (rd *render) emitVlanBlocks(b *strings.Builder, d store.Device, vaps []wireless.VapPlan) {
 	line := rd.lineWriter(b, "vlan-blocks")
 
-	// eth inventory from the device record's inform passthrough
-	// (ethernet_table num_port sum; Device.getPortNum fallback,
-	// Device.java §6941-6957), else from the ethN interfaces in if_table,
-	// else from the learned uplink (6.8.2 U7PG2 sends no ethernet_table —
-	// live acceptance 2026-09-16). port_table is deliberately NOT used: its
+	// Eth inventory comes from ethernet_table, then if_table, then the learned
+	// uplink. port_table is deliberately NOT used: its
 	// names are labels ("Main", "Secondary"), not ifaces, and the same record
 	// reports has_eth1=false with a lone eth0 in if_table. An absent/partial
 	// inventory is flagged: we then fall back to a single inferred uplink
@@ -699,76 +695,28 @@ func (rd *render) emitVlanBlocks(b *strings.Builder, d store.Device, vaps []wire
 	line("dhcpc.1.devname", mgmtDevOf(d))
 }
 
-// factoryMgmtIP / factoryMgmtNetmask are the factory-baseline management
-// netconf values for this firmware lane (U7PG2 / 6.8.2.15592): the
-// firmware's fallback STATIC address, as carried by /tmp/system.cfg on the
-// factory-reset device (/tmp/harness/ap-forensics/tmp/system.cfg:58-60, fetched
-// 2026-09-17). Runtime addressing is owned by udhcpc — the dhcpc.1=br0
-// section we push stays byte-identical to the factory one, so DHCP keeps
-// running and these rows never take effect while adopted.
+// factoryMgmtIP and factoryMgmtNetmask preserve the device's factory
+// baseline. Runtime addressing is owned by udhcpc; the emitted dhcpc.1=br0
+// section stays unchanged, so these fallback static rows do not affect an
+// adopted device.
 const (
 	factoryMgmtIP      = "192.168.1.20"
 	factoryMgmtNetmask = "255.255.255.0"
 )
 
-// emitNetconfSection writes the `# netconf` block as a FACTORY ECHO of the
-// running baseline inventory plus the tagged-vid bridge instances appended
-// after the base inventory.
+// emitNetconfSection echoes the factory network inventory before appending
+// tagged bridge instances. system_cfg is a full replacement, and changing
+// netconf can restart the network plugin and drop management connectivity;
+// preserve the baseline rows until a device-validated alternative exists.
 //
-// WHY an echo and not the real builder's render: the real controller
-// renders netconf from its site-networks model (intsuper javap offsets
-// 627-676: the mgmt instance is patched with the config_network ip/netmask —
-// type "dhcp" → ip 0.0.0.0, no netmask row), which on a factory-reset device
-// CHANGES netconf.1.ip (192.168.1.20 → 0.0.0.0) and restarts the `net`
-// plugin (/etc/sysinit/net.conf, fetched 2026-09-17: plugin_stop =
-// `ifconfig br0/eth0/ath0/ath1 down` + `killall dropbear`; plugin_start =
-// HARDCODED factory bootstrap br0=192.168.1.20/24). Real devices survive that
-// restart via the udhcpc inittab respawn; OUR two live first-pushes
-// (2026-09-16 09:43 both-band sha 11fddde5…, 13:54 2g-only sha f77521e8…)
-// did NOT recover — the pushed system_cfg is a FULL-CONFIG REPLACEMENT and
-// ours also deleted the eth0/ath0/ath1 instances the running config
-// carried. The recovery path is not yet understood (fast-apply diff
-// granularity; Ghidra u7pg2-ubntconf project available), so the first push
-// MUST NOT restart `net` at all: /tmp/harness/minimal-diff-spec.md. Every
-// base instance below therefore echoes the RUNNING factory values
-// row-for-row, keeping the parsed netconf tree IDENTICAL to the running
-// one → no `net` plugin restart → br0/eth0/ath* are never bounced.
-//
-// Base inventory + row order (factory file order per instance):
-//
-//	netconf.1  = mgmt bridge (mgmtDevOf; autoip.status, devname, ip,
-//	            netmask, status, up — the factory carries NO promisc row
-//	            for the mgmt instance). RECORDED DEVIATION from the real
-//	            builder's DHCP shape (ip 0.0.0.0, no netmask): deliberate
-//	            minimal-diff first-push policy
-//	            (docs/PROTOCOL-systemcfg-wireless.md §12 tracks it).
-//	netconf.2+ = one per eth port (ethPortNames — the same inventory the
-//	            bridge writer uses): ip 0.0.0.0, promisc=enabled,
-//	            up=enabled, no netmask row.
-//	then       = one ath<n> slot per radio_table entry (ath0, ath1, …):
-//	            ip 0.0.0.0, promisc=enabled, up=disabled — the factory
-//	            carries ath slots disabled even with vaps running (the
-//	            wireless plugin, not the net plugin, raises active vaps;
-//	            live-observed: factory vap_table RUN on ath0 while
-//	            netconf.3.up=disabled).
-//	then       = one br0.<vid> per tagged vid (additive rows for VLAN
-//	            WLANs, real-builder shape: status first).
-//
-// For the U7PG2 baseline this reproduces the factory numbering exactly
-// (1=br0, 2=eth0, 3=ath0, 4=ath1); tagged instances start at 5.
-//
-// mcad gate: the firmware's system_cfg validator (fw 6.8.2.15592,
-// reverse-engineered FUN_0040a924 "mcad_validate_system_cfg") requires
-// netconf.1.status in the parsed tree (together with users.1.status and
-// sshd.status), otherwise the config is REJECTED ("[apply-config] Unable
-// to write system.cfg or its contents are invalid.") and apply-config
-// never runs (live-observed 2026-09-16). The echo keeps the row, so the
-// gate stays green.
-//
-// An earlier `preserveMgmt` branch that asserted a recorded mgmt IP
-// (Extra["mgmt_ip"]) was deleted as dead code — mgmt_ip has no writer
-// anywhere in the repo. mgmt_dev may still steer netconf.1.devname via
-// mgmtDevOf (documented admin escape hatch, has its own test).
+// Numbering follows the factory inventory: netconf.1 is the management
+// bridge, followed by ethernet ports, radio slots, then tagged bridges.
+// The management row intentionally keeps the factory static address even
+// when the real builder would emit DHCP values. Ethernet and radio rows also
+// preserve the factory shape; active VAPs are raised by the wireless plugin.
+// netconf.1.status is required by the firmware validator, along with
+// users.1.status and sshd.status (docs/AP-FIRMWARE-APPLY-PATH.md §3).
+// mgmt_dev may override the management interface name via mgmtDevOf.
 func (rd *render) emitNetconfSection(b *strings.Builder, d store.Device, vids []int) {
 	line := rd.lineWriter(b, "netconf")
 
@@ -829,10 +777,9 @@ func (rd *render) emitNetconfSection(b *strings.Builder, d store.Device, vids []
 // ethPortNames derives the physical eth port names from the record's inform
 // passthrough: sum of ethernet_table num_port values (per the vlan writer's
 // port count), entries without num_port count as one each. When ethernet_table
-// is absent (6.8.2 U7PG2 never sends one — live acceptance 2026-09-16) the
-// ethN names in if_table are used, else the learned uplink. Returns known=false
-// when the record carries no usable inventory (caller flags partial inventory,
-// FID-2).
+// is absent, ethN names in if_table are used, else the learned uplink. Returns
+// known=false when no usable inventory is present (the caller flags partial
+// inventory, FID-2).
 func ethPortNames(d store.Device) (ports []string, known bool) {
 	if names, ok := ethPortNamesFromEthernetTable(d); ok {
 		return names, true
@@ -848,8 +795,7 @@ func ethPortNames(d store.Device) (ports []string, known bool) {
 
 // ethPortNamesFromEthernetTable expands ethernet_table entries into ethN names
 // (an entry without num_port counts as one port). Both counts are clamped:
-// num_port is a device-reported value, so a lying record must not drive an
-// attacker-sized allocation (unbounded num_port expansion, audit run 1).
+// num_port is device-reported, so it must not drive an unbounded allocation.
 // Per entry, n is capped at 8 (real APs carry 1-2 ports); the aggregate total
 // is capped at 64.
 func ethPortNamesFromEthernetTable(d store.Device) ([]string, bool) {
@@ -891,8 +837,7 @@ func ethPortNamesFromEthernetTable(d store.Device) ([]string, bool) {
 
 // ethPortNamesFromIfTable collects the distinct ethN interface names the
 // device reports in if_table (its interface inventory). This is the fallback
-// the 6.8.2 U7PG2 needs: it sends no ethernet_table (live acceptance
-// 2026-09-16, where if_table was [{name: "eth0", up: true}]). port_table is
+// the 6.8.2 U7PG2 needs when it omits ethernet_table. port_table is
 // deliberately not consulted — its entries are labels ("Main", "Secondary"),
 // not ifaces — and the same record reports has_eth1=false, so deriving a port
 // count from it would invent an eth1 the device does not have.

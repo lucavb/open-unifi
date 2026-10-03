@@ -1,16 +1,10 @@
 package adoption
 
-// Regression tests for the audit run-1 key-confirmation gate (findings C1
-// adopting-state-factory-key-acceptance and C2 armed-lifecycle-before-
-// default-key-rejection, ref f839fae). Ported from the validation fixture
-// engine_factorykeyrepro_test.go with the assertions FLIPPED to the secure
-// behavior: a record that has authenticated its per-device key (the
-// persisted KeyConfirmed marker, stamped by the Decide wrapper on any
-// key-authenticated inform) must reject the factory default key even in
-// StateAdopting, and even when a lifecycle command is armed — while the
-// documented mid-adoption window (docs/PROTOCOL.md §3 step 4: a keyed,
-// never-yet-confirmed adopting record) stays open for the legitimate
-// double-rotation.
+// Regression tests for the key-confirmation gate: once a record has
+// authenticated its per-device key, it must reject the factory key even in
+// StateAdopting and even when a lifecycle command is armed. The documented
+// mid-adoption window remains open for a keyed, not-yet-confirmed record
+// (docs/PROTOCOL.md §3 step 4).
 
 import (
 	"reflect"

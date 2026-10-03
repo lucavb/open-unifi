@@ -5,15 +5,10 @@
 // payloads are DEVICE-supplied bytes and a decode must never fail an
 // inform over odd rows.
 //
-// Wire shape, LIVE-PINNED (2026-09-20 bench capture, UAP-AC-Pro-Gen2
-// U7PG2, fw 6.8.2.15592, phone associated): the station table is nested
-// inside the vap rows — body["vap_table"][]["sta_table"][] — with each
-// station row identified by its "mac" field (colon-hex spelling, e.g.
-// "aa:bb:cc:dd:ee:01"). Every observed vap row carries a sta_table array,
-// empty when that vap has no associated clients. The earlier BLOCKED
-// verdict's top-level "sta_table" key was never observed on the wire; it
-// stays readable as a fallback union for firmware variants this worktree
-// has not captured.
+// The observed wire shape nests station rows under
+// body["vap_table"][]["sta_table"][]; each row identifies a client by its
+// "mac" field. The top-level "sta_table" form is retained as a fallback for
+// firmware variants that use it.
 //
 // Row identity is the "mac" field, the same identity spelling the §103
 // top-level body uses. Odd values are skipped, never fatal; an ABSENT
