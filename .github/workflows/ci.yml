@@ -26,7 +26,7 @@ jobs:
 
       # go:embed needs the console bundle; the web job builds it (AGENTS.md).
       - name: Download console bundle
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
         with:
           name: console-dist
           path: internal/adminapi/static/dist
@@ -46,7 +46,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Download console bundle
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
         with:
           name: console-dist
           path: internal/adminapi/static/dist
@@ -65,7 +65,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Download console bundle
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
         with:
           name: console-dist
           path: internal/adminapi/static/dist
