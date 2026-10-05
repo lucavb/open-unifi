@@ -8,7 +8,7 @@
 |--------|----------------|------------------|
 | `check` | `make check` | `make check` |
 | `build` | `go build -v ./...` | `go build ./...` |
-| `lint` | golangci-lint **v2.11.4** (workflow pin) | `golangci-lint run ./...` on that version |
+| `lint` | golangci-lint **v2.14.0** (workflow pin) | `golangci-lint run ./...` on that version |
 | `web` | `npm ci && npm run build` in `web/`, uploads `internal/adminapi/static/dist` as the `console-dist` artifact that `check`/`build`/`lint` download | `make update-frontend` |
 
 **`make check` is not the whole pipeline.** It covers tracked `gofmt`, `go vet`, and `go test -count=1` only. The `lint` job is separate: static analysis (e.g. `unused`) that `vet` does not run.
@@ -23,7 +23,7 @@ There is no committed `.golangci.yml`; CI uses golangci-lint defaults.
 
 CI does not run on every laptop commit; **lefthook** is the local gate ([`lefthook.yml`](lefthook.yml)): pre-commit runs `gofmt`, `go vet`, and `golangci-lint` on staged Go files; pre-push runs [`.lefthook/pre-push/ci-parity.sh`](.lefthook/pre-push/ci-parity.sh) for CI-parity checks.
 
-- One-time per clone: `make hooks` (runs [`scripts/install-hook-tools.sh`](scripts/install-hook-tools.sh) — pinned lefthook + golangci-lint **v2.11.4**, then `lefthook install`). In a restricted sandbox (nono blocks the release-download and `go install` hosts) the install fails — run it once from an unrestricted terminal; the `~/go/bin` binaries it installs then run fine from restricted shells (`scripts/hook-env.sh` wires the PATH).
+- One-time per clone: `make hooks` (runs [`scripts/install-hook-tools.sh`](scripts/install-hook-tools.sh) — pinned lefthook + golangci-lint **v2.14.0**, then `lefthook install`). In a restricted sandbox (nono blocks the release-download and `go install` hosts) the install fails — run it once from an unrestricted terminal; the `~/go/bin` binaries it installs then run fine from restricted shells (`scripts/hook-env.sh` wires the PATH).
 - Before you say a commit is verified or ready to push: `make verify-hooks` ([`scripts/verify-hooks.sh`](scripts/verify-hooks.sh)).
 - If `git commit` prints **`Can't find lefthook in PATH`**, hooks did **not** run — run `make hooks`, re-run `make check` / lint as needed, then commit again (do not treat that commit as hook-verified). `LEFTHOOK=0` bypasses hooks on purpose.
 
