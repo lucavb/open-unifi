@@ -1,17 +1,22 @@
 GO ?= go
 
-.PHONY: build test run check lint hooks hooks-prime update-frontend web-dist
+# Sandbox-safe Go caches: scripts/dev-env.sh relocates GOCACHE and
+# GOLANGCI_LINT_CACHE to the session temp dir when the defaults are not
+# writable (restricted shells); no-op otherwise.
+DEV_ENV := . ./scripts/dev-env.sh &&
+
+.PHONY: build test run check lint hooks hooks-prime verify-hooks update-frontend web-dist
 
 build: web-dist
-	$(GO) build ./...
+	$(DEV_ENV) $(GO) build ./...
 
 test: web-dist
-	$(GO) test ./...
+	$(DEV_ENV) $(GO) test ./...
 
 # Dev convenience: loopback-only admin with a throwaway token; for anything
 # exposed use a real --admin-token behind an HTTPS reverse proxy.
 run: web-dist
-	$(GO) run ./cmd/openunifi --listen-inform :8080 --listen-admin 127.0.0.1:8443 --admin-token dev-local
+	$(DEV_ENV) $(GO) run ./cmd/openunifi --listen-inform :8080 --listen-admin 127.0.0.1:8443 --admin-token dev-local
 
 # CI job "check" only — golangci-lint is a separate workflow job (AGENTS.md).
 # Format only the tracked sources: a bare `gofmt -l .` also walks gitignored
@@ -21,11 +26,11 @@ check: web-dist
 	@out=$$(for f in $$(git ls-files '*.go'); do [ -f "$$f" ] || continue; gofmt -l "$$f"; done | sort -u); if [ -n "$$out" ]; then \
 		echo "gofmt needed on:"; echo "$$out"; exit 1; \
 	fi
-	$(GO) vet ./...
-	$(GO) test -count=1 ./...
+	$(DEV_ENV) $(GO) vet ./...
+	$(DEV_ENV) $(GO) test -count=1 ./...
 
 lint: web-dist
-	PATH="$$(go env GOPATH)/bin:$$PATH" golangci-lint run
+	$(DEV_ENV) PATH="$$(go env GOPATH)/bin:$$PATH" golangci-lint run
 
 # Rebuild the admin console's dist bundle (web/ Vite project). The bundle
 # is build output, never committed: CI's web job and the Docker image's
@@ -45,8 +50,13 @@ web-dist:
 hooks:
 	bash scripts/install-hook-tools.sh
 
+# Local guardrail: lefthook + golangci-lint on PATH and git hooks installed.
+# Run before claiming a commit is verified (AGENTS.md).
+verify-hooks:
+	bash scripts/verify-hooks.sh
+
 hooks-prime: web-dist
-	$(GO) build ./...
-	$(GO) test -count=1 ./...
-	PATH="$$(go env GOPATH)/bin:$$PATH" golangci-lint run
+	$(DEV_ENV) $(GO) build ./...
+	$(DEV_ENV) $(GO) test -count=1 ./...
+	$(DEV_ENV) PATH="$$(go env GOPATH)/bin:$$PATH" golangci-lint run
 
