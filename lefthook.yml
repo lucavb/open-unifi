@@ -5,6 +5,8 @@
 #             @{push}` is empty (branch in sync) or unresolvable (first push
 #             of a new branch — the agent PR flow); script jobs are exempt
 #             from that implicit gate (upstream: evilmartians/lefthook#554).
+# commit-msg: trims git's cherry-pick conflict trailer (# Conflicts:) from
+#             the message.
 # Bypass for both hooks: LEFTHOOK=0.
 min_version: 2.0.0
 no_tty: true # headless/agent shells: never prompt, no spinner
@@ -35,3 +37,8 @@ pre-push:
     - name: ci-parity
       script: ci-parity.sh # lives in .lefthook/pre-push/
       runner: bash
+
+commit-msg:
+  jobs:
+    - name: strip-conflicts-trailer
+      run: scripts/strip-conflicts-trailer.sh {1}
