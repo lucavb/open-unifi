@@ -1,0 +1,105 @@
+// Renovate configuration: https://docs.renovatebot.com/
+//
+// Covers the Go module (go.mod/go.sum), the web/ npm lockfile, Dockerfile
+// base images, GitHub Actions refs, and the golangci-lint version pin in
+// ci.yml. The automerge line is drawn by CI coverage: PRs run the check,
+// build, lint, and web jobs, but the docker job runs only on pushes to
+// main, so Go and npm updates are CI-verified while image and action
+// bumps never are — those stay human-reviewed.
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  extends: [
+    // config:recommended plus config-migration PRs, docker digest pinning,
+    // GitHub Actions digest pinning, and devDependency pinning.
+    "config:best-practices",
+    // Pin `uses: ...@vN` refs (the web job still uses tag refs) to commit
+    // SHAs while keeping the tracked tag visible as a comment, so updates
+    // stay diffable — the same discipline the SHA-pinned actions follow.
+    "helpers:pinGitHubActionDigestsToSemver",
+    // Commit messages follow the repo's conventional-commit style:
+    // "chore(deps): update ...".
+    ":semanticCommits",
+  ],
+
+  // One pinned issue lists everything pending, approved, or held back.
+  dependencyDashboard: true,
+
+  // Run `go mod tidy` after Go updates so go.mod stays minimal and go.sum
+  // never accumulates stale hashes.
+  postUpdateOptions: ["gomodTidy"],
+
+  customManagers: [
+    {
+      // ci.yml pins the lint job's golangci-lint version, and local hooks
+      // install the same one (AGENTS.md). Track the upstream so the pin
+      // cannot silently rot; merges stay manual because a new lint version
+      // can fail the build on new findings.
+      customType: "regex",
+      managerFilePatterns: ["/^\\.github/workflows/ci\\.yml$/"],
+      matchStrings: ["version: (?<currentValue>v\\d+\\.\\d+\\.\\d+)"],
+      depNameTemplate: "golangci/golangci-lint",
+      datasourceTemplate: "github-releases",
+    },
+  ],
+
+  // Rules apply in order; when several match, later rules win.
+  packageRules: [
+    {
+      // Green CI (check/build/lint/web) is the review for non-major Go
+      // updates.
+      matchManagers: ["gomod"],
+      matchUpdateTypes: ["minor", "patch"],
+      groupName: "Go dependencies (non-major)",
+      groupSlug: "gomod-non-major",
+      automerge: true,
+    },
+    {
+      // Same for the admin console; `npm run build` runs vue-tsc, so type
+      // breakage fails the web job before merge.
+      matchManagers: ["npm"],
+      matchUpdateTypes: ["minor", "patch"],
+      groupName: "Web console dependencies (non-major)",
+      groupSlug: "web-non-major",
+      automerge: true,
+    },
+    {
+      // Transitive modules: nothing pins them directly, so green CI is the
+      // review; one grouped PR keeps the noise down.
+      matchManagers: ["gomod"],
+      matchDepTypes: ["indirect"],
+      enabled: true,
+      groupName: "Go indirect dependencies",
+      groupSlug: "gomod-indirect",
+      automerge: true,
+    },
+    {
+      // golang.org/x/* cut lockstep releases; group them so go.sum churn
+      // stays in one branch. After the indirect rule on purpose: x
+      // packages that are indirect take this group's name.
+      matchManagers: ["gomod"],
+      matchPackageNames: ["/^golang\\.org/x//"],
+      groupName: "golang.org/x",
+      groupSlug: "golang-x",
+      automerge: true,
+    },
+    {
+      // The go.mod `go` directive is a toolchain floor that other pins
+      // follow (the golang:1.25-alpine digest in the Dockerfile,
+      // setup-go's go-version-file, the golangci-lint pin). It moves only
+      // as one deliberate hand-coordinated bump, so propose it on the
+      // dependency dashboard instead of opening PRs.
+      matchManagers: ["gomod"],
+      matchDepTypes: ["golang"],
+      enabled: true,
+      dependencyDashboardApproval: true,
+    },
+    {
+      // Major upgrades change API surface — queue them on the dependency
+      // dashboard rather than parking open PRs; a PR opens on request.
+      // This also covers image major bumps (node 24 -> 25, distroless)
+      // and Actions major bumps.
+      matchUpdateTypes: ["major"],
+      dependencyDashboardApproval: true,
+    },
+  ],
+}
