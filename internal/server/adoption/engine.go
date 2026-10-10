@@ -1041,59 +1041,16 @@ func truthy(v any) bool {
 
 // ---- working clone + delta computation -------------------------------------
 
-// cloneDevice deep-copies a device record so the engine can work on it
-// without mutating the adapter's snapshot (every field the engine can change
-// is carried back as an explicit delta in the Outcome). Extra is always
-// materialized non-nil: the adapter's absorbInform guarantees a non-nil map
-// before the engine runs, and engine writes must never panic on one.
+// cloneDevice is the engine's working clone of a device record: a deep copy
+// the engine can mutate without touching the snapshot the Outcome's deltas
+// compare against. Extra is always materialized non-nil so engine writes
+// never panic on a nil map.
 func cloneDevice(d store.Device) store.Device {
-	out := d
-	out.Authkeys = append([]string(nil), d.Authkeys...)
-	out.Extra = cloneExtra(d.Extra)
+	out := store.CloneDevice(d)
 	if out.Extra == nil {
 		out.Extra = store.JSONMap{}
 	}
-	if d.LastUps != nil {
-		out.LastUps = cloneExtra(d.LastUps)
-	}
 	return out
-}
-
-// cloneExtra deep-copies a JSON map (maps, []any may nest arbitrarily).
-func cloneExtra(m store.JSONMap) store.JSONMap {
-	if m == nil {
-		return nil
-	}
-	out := make(store.JSONMap, len(m))
-	for k, v := range m {
-		out[k] = cloneValue(v)
-	}
-	return out
-}
-
-func cloneValue(v any) any {
-	switch t := v.(type) {
-	case store.JSONMap:
-		out := make(store.JSONMap, len(t))
-		for k, val := range t {
-			out[k] = cloneValue(val)
-		}
-		return out
-	case map[string]any:
-		out := make(map[string]any, len(t))
-		for k, val := range t {
-			out[k] = cloneValue(val)
-		}
-		return out
-	case []any:
-		out := make([]any, len(t))
-		for i, val := range t {
-			out[i] = cloneValue(val)
-		}
-		return out
-	default:
-		return v // scalars are values in Go
-	}
 }
 
 // deltas fills the Outcome's record-delta fields by comparing the engine's

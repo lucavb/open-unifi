@@ -319,9 +319,12 @@ func cloneValue(v any) any {
 	}
 }
 
-// cloneDevice deep-copies a Device record, including every nested map,
-// JSONMap and slice that aliasing bugs could otherwise reach through.
-func cloneDevice(d Device) Device {
+// CloneDevice is the canonical deep copy of a Device record — every nested
+// map, JSONMap and slice is duplicated, plus the LEDOverrideColorBrightness
+// pointee, so no caller can mutate the source through a returned pointer.
+// Other packages must use it instead of hand-rolling copies. nil Extra and
+// nil LastUps are preserved as nil.
+func CloneDevice(d Device) Device {
 	out := d
 	// The brightness knob is a pointer so explicit 0 survives the JSON
 	// round-trip; the clone re-points it so the copy's aliasing matches
@@ -356,7 +359,7 @@ func (m *db) Get(mac string) (Device, error) {
 	if !ok {
 		return Device{}, ErrNotFound
 	}
-	return cloneDevice(d), nil
+	return CloneDevice(d), nil
 }
 
 func (m *db) Put(d Device) error {
@@ -364,7 +367,7 @@ func (m *db) Put(d Device) error {
 	if d.MAC == "" {
 		return errors.New("store: empty MAC")
 	}
-	clone := cloneDevice(d)
+	clone := CloneDevice(d)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.devices[d.MAC] = clone
@@ -469,7 +472,7 @@ func (m *db) List() ([]Device, error) {
 	m.mu.RLock()
 	out := make([]Device, 0, len(m.devices))
 	for _, d := range m.devices {
-		out = append(out, cloneDevice(d))
+		out = append(out, CloneDevice(d))
 	}
 	m.mu.RUnlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].MAC < out[j].MAC })
