@@ -6,7 +6,7 @@
 # The admin console is build output, never committed: produce the
 # go:embed input here, mirroring `make update-frontend` (vite.config.js
 # writes ../internal/adminapi/static/dist relative to web/).
-FROM --platform=$BUILDPLATFORM node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS console
+FROM --platform=$BUILDPLATFORM node:24-alpine@sha256:44fce696f38ba8c987c4db89954051000bbd05ffd8d8659ba15ed4a8602e937f AS console
 WORKDIR /src/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
