@@ -1,9 +1,10 @@
 // The record trust policy (CONTEXT.md): three ownership classes over the
 // device record's Extra rows —
 //
-//	controller-owned keys: the controller preserves the record's value
-//	             verbatim against any device-supplied body (the wlan_cfg_*
-//	             bookkeeping, the client-session family);
+//	controller-owned keys: only controller code writes them; absorption
+//	             preserves the record's value verbatim when present and
+//	             deletes a body copy when absent (the wlan_cfg_* bookkeeping,
+//	             the client-session family);
 //	device-refreshable caps: only the device can supply them
 //	             (radio_table, wifi_caps, fw_caps, if_table,
 //	             ethernet_table, uplink, has_eth1) — a sparse heartbeat
@@ -16,10 +17,13 @@
 //	             password caches, the per-radio channel
 //	             intent, the §6.3 stored task).
 //
-// This file is the single declaration site for every class (Absorb guards
-// the ORDINARY record path; the §6.6 factory-reset demotion consults the
-// same registry through FactoryResetSweepKeys). Packages that owned their
-// own names before the policy consolidated here keep one-line aliases
+// This file is the single declaration site for every class. Absorb enforces
+// each class on the ordinary record path; the §6.6 factory-reset demotion
+// consults the controller-owned registry through FactoryResetSweepKeys.
+// Controller-owned and admin-owned remain separate ownership classes even
+// though both reject body introduction: they have different legitimate
+// writers and reset/sweep lifecycles. Packages that owned their own names
+// before the policy consolidated here keep one-line aliases
 // (adoption.FlagRebootOnConnect, wireless.RadioIntentExtraKey, …) so their
 // call sites and jar-fact comments stay put.
 package store
@@ -212,7 +216,9 @@ func excludeKey(keys []string, skip string) []string {
 // always took; the wholesale Extra swap runs under the trust policy, so the
 // three ownership classes survive it intact:
 //
-//	controller-owned — the record's value wins, whatever the body carries;
+//	controller-owned — the record's value wins when present; otherwise the
+//	                     body copy is deleted, so a fresh record cannot be
+//	                     seeded by a device;
 //	device-refreshable — the record's value survives only when the body
 //	                     omits the key;
 //	admin-owned — the record's value when present, DELETED otherwise (a
@@ -236,6 +242,8 @@ func (d *Device) Absorb(body map[string]any, now time.Time, gcmReq bool) {
 	for _, k := range controllerOwnedKeys {
 		if v, ok := prev[k]; ok {
 			d.Extra[k] = v
+		} else {
+			delete(d.Extra, k)
 		}
 	}
 	for _, k := range deviceRefreshableKeys {

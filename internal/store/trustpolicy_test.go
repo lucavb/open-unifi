@@ -84,32 +84,101 @@ func TestAbsorbControllerOwnedPrevWins(t *testing.T) {
 	}
 }
 
-// TestAbsorbControllerOwnedRestoresOnlyFromTheRecord pins the loop's exact
-// reach: prev-wins can PRESERVE a record value against a forged body, but
-// it can never overwrite or delete a body copy — a record that never held a
-// class member lets a body's forged copy stand (exactly what the inform
-// path always did; changing that reach is a behavior change, not a seam
-// move).
-func TestAbsorbControllerOwnedRestoresOnlyFromTheRecord(t *testing.T) {
-	rec := Device{MAC: "aabbccddeeff", Extra: JSONMap{}}
-	body := absorbBody()
-	rec.Absorb(body, absorbNow, false)
-	for _, k := range controllerOwnedKeys {
-		if v, ok := body[k]; ok {
-			if got := rec.Extra[k]; !reflect.DeepEqual(got, v) {
-				t.Fatalf("controller-owned %q body copy drifted: %v, want %v", k, got, v)
-			}
-		} else if v, ok := rec.Extra[k]; ok {
-			t.Fatalf("controller-owned %q appeared without record or body: %v", k, v)
+// TestAbsorbControllerOwnedKeysPreserveOrDelete exhaustively pins the
+// controller-owned class: a prior record value survives a forged or omitted
+// body field, while a fresh record deletes the body's attempted introduction.
+// Legitimate typed and device-refreshable payload fields continue to absorb.
+func TestAbsorbControllerOwnedKeysPreserveOrDelete(t *testing.T) {
+	previousValues := []struct {
+		name  string
+		value any
+	}{
+		{name: "map", value: JSONMap{"controller_value": "previous"}},
+		{name: "false", value: false},
+		{name: "zero", value: float64(0)},
+		{name: "nil", value: nil},
+	}
+	bodyWith := func(key string) map[string]any {
+		return map[string]any{
+			"model":       "fresh-model",
+			"radio_table": []any{map[string]any{"name": "radio-from-device"}},
+			"wifi_caps":   float64(17),
+			key:           "forged-by-device",
 		}
 	}
-	// And even with the transport flag set the restoration still takes the
-	// record's value, not the forged body copy (the sha512 cache is
-	// admin-owned now — prev-or-delete).
-	rec = Device{MAC: "aabbccddeeff", Extra: JSONMap{SSHSha512PasswdKey: "$6$prev-hash$"}}
+
+	for _, key := range controllerOwnedKeys {
+		t.Run(key, func(t *testing.T) {
+			fresh := Device{MAC: "aabbccddeeff", State: StatePending, Extra: JSONMap{}}
+			fresh.Absorb(bodyWith(key), absorbNow, false)
+			if _, ok := fresh.Extra[key]; ok {
+				t.Fatalf("fresh record accepted controller-owned %q = %#v", key, fresh.Extra[key])
+			}
+			if fresh.Model != "fresh-model" || fresh.Extra["wifi_caps"] != float64(17) ||
+				fresh.Extra["radio_table"].([]any)[0].(map[string]any)["name"] != "radio-from-device" {
+				t.Fatalf("legitimate body fields did not absorb beside %q: %+v", key, fresh)
+			}
+
+			for _, tc := range previousValues {
+				t.Run(tc.name, func(t *testing.T) {
+					seeded := Device{MAC: "aabbccddeeff", Extra: JSONMap{key: tc.value}}
+					seededBody := bodyWith(key) // independent: Absorb mutates its map
+					if got, ok := seededBody[key]; !ok || got != "forged-by-device" {
+						t.Fatalf("seeded input lost forged %q before Absorb: got %#v present=%v", key, got, ok)
+					}
+					seeded.Absorb(seededBody, absorbNow, false)
+					if got, ok := seeded.Extra[key]; !ok || !reflect.DeepEqual(got, tc.value) {
+						t.Fatalf("prior controller-owned %q (%s) changed: got %#v present=%v, want %#v", key, tc.name, got, ok, tc.value)
+					}
+
+					// A separate sparse body also keeps each prior value; this
+					// covers omission independently of forged-value protection.
+					seeded.Absorb(sparseBody(), absorbNow, false)
+					if got, ok := seeded.Extra[key]; !ok || !reflect.DeepEqual(got, tc.value) {
+						t.Fatalf("sparse absorption lost prior controller-owned %q (%s): got %#v present=%v, want %#v", key, tc.name, got, ok, tc.value)
+					}
+				})
+			}
+		})
+	}
+
+	// The admin-owned SSH cache remains protected by its separate registry and
+	// prev-or-delete semantics, independent of the controller-owned class.
+	rec := Device{MAC: "aabbccddeeff", Extra: JSONMap{SSHSha512PasswdKey: "$6$prev-hash$"}}
 	rec.Absorb(absorbBody(), absorbNow, true)
 	if got, want := rec.Extra[SSHSha512PasswdKey], "$6$prev-hash$"; got != want {
 		t.Fatalf("ssh cache not restored against forged body: %v, want %v", got, want)
+	}
+}
+
+func TestFirstRegisteredPendingAbsorbCannotSeedWLANDelivery(t *testing.T) {
+	// A manually registered, still-pending device has no controller delivery
+	// history. A factory-key inform cannot seed an exhausted pending operation
+	// that would suppress the adoption decision in the server engine.
+	rec := Device{MAC: "aabbccddeeff", State: StatePending}
+	body := map[string]any{
+		"model":                       "U7PG2",
+		"wlan_cfg_pending_sha":        "forged-current-hash",
+		"wlan_cfg_attempt_sha":        "forged-current-hash",
+		"wlan_cfg_attempts":           float64(6),
+		"wlan_cfg_delivery_status":    "exhausted",
+		"wlan_cfg_pending_wlans":      "forged-snapshot",
+		"wlan_cfg_pending_placements": "forged-placements",
+		"radio_table": []any{
+			map[string]any{"name": "ra0", "radio": "ng"},
+		},
+	}
+	rec.Absorb(body, absorbNow, false)
+	for _, key := range []string{
+		WlanCfgPendingShaKey, WlanCfgAttemptShaKey, WlanCfgAttemptsKey,
+		WlanCfgDeliveryStatusKey, WlanCfgPendingWlansKey, WlanCfgPendingPlacementsKey,
+	} {
+		if value, ok := rec.Extra[key]; ok {
+			t.Errorf("first pending inform seeded %s = %#v", key, value)
+		}
+	}
+	if rec.State != StatePending || rec.Model != "U7PG2" || rec.Extra["radio_table"] == nil {
+		t.Fatalf("controller-owned filtering changed legitimate pending record fields: %+v", rec)
 	}
 }
 

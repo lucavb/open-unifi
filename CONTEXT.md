@@ -85,9 +85,12 @@ _Avoid_: vap status, runtime state.
 
 ### Trust policy
 
-**Controller-owned keys**: record fields the controller preserves verbatim
-against device overwrite (the wlan_cfg_* bookkeeping, the client-session
-family).
+**Controller-owned keys**: record fields only controller code writes (the
+wlan_cfg_* bookkeeping and client-session family). Record absorption preserves
+a prior value verbatim and removes a device-supplied copy when no prior value
+exists; a fresh or swept record cannot be seeded by an inform body. This class
+remains distinct from admin-owned rows because its legitimate writers and
+factory-reset sweep lifecycle differ.
 _Avoid_: protected fields.
 
 **Device-refreshable caps**: record fields only the device can supply

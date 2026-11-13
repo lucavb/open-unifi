@@ -62,9 +62,8 @@ var declaredWlanCfgKeys = []string{
 // "a new key silently becomes device-writable" gap: for EVERY key the module
 // writes, an inform body that tries to forge it (set a value) or clear it
 // (omit it) must leave the record's value untouched through Device.Absorb.
-// INTRODUCE (a body adding a key the record lacks) is asserted only for the
-// two admin-owned prev-or-delete keys: the controller-owned class lets an
-// absent record value through from the body today.
+// A record that lacks any of these controller-owned or admin-owned rows must
+// also reject a body that tries to introduce one.
 func TestDeliveryStateKeysSurviveHostileBody(t *testing.T) {
 	written := exerciseEveryWriter(t)
 	keys := wlanCfgKeys(written)
@@ -93,16 +92,13 @@ func TestDeliveryStateKeysSurviveHostileBody(t *testing.T) {
 				t.Fatalf("a body forging %s overwrote the record: got %v, want %v", key, got, want)
 			}
 
-			// INTRODUCE: a record that does not hold the key must not gain
-			// it from a body (the admin-owned prev-or-delete rule; for the
-			// controller-owned class an absent record value lets the body's
-			// copy through today, so only the admin-owned two are asserted).
-			if key == store.WlanCfgVapNotRunningMissesKey || key == store.WlanCfgMaterializationRebootKey {
-				d = store.Device{MAC: "aabbccddeeff", Extra: store.JSONMap{}}
-				d.Absorb(map[string]any{key: "introduced-by-device", "model": "U7PG2"}, time.Unix(1, 0), false)
-				if v, ok := d.Extra[key]; ok {
-					t.Fatalf("a body introduced admin-owned %s = %v", key, v)
-				}
+			// INTRODUCE: neither class lets a body create a row absent from
+			// the record. Their distinction remains ownership and reset
+			// lifecycle, not an inform-body seeding exception.
+			d = store.Device{MAC: "aabbccddeeff", Extra: store.JSONMap{}}
+			d.Absorb(map[string]any{key: "introduced-by-device", "model": "U7PG2"}, time.Unix(1, 0), false)
+			if v, ok := d.Extra[key]; ok {
+				t.Fatalf("a body introduced %s = %v", key, v)
 			}
 		})
 	}
