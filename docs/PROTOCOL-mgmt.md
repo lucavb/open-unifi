@@ -443,35 +443,74 @@ Two-phase adoption (`o00000(string, device, x, …)` §902-924) stages:
    if device ready: `o00000(device, fwState, ...)` → `upgrade {version,url,…}`.
 3. EOL path: `\u300000000(device)` — removes device from DB (no body write).
 
-**open-unifi (2026-09-19 lifecycle lane).** Implemented. DEVIATION from the
-jar's arming shape: the classic controller arms factory reset as device
-STATE 8, a controller-side enum member this store deliberately lacks
-(adding one would redesign the pending-candidate lifecycle this lane
-reuses), so arming rides the admin-owned Extra flag `setdefault_armed`,
-set only by `POST /api/v1/devices/{mac}/factory-reset`. The device's NEXT
-decoded inform answers exactly
-`{"_type":"setdefault","server_time_in_utc":"<ms>"}` (the bare §6.6 shape
-plus the §5 universal timestamp), and at emission the record returns to
-the pending-candidate shape: state → pending, per-device key dropped,
-cfgversion + applied cfgversion cleared, authkey history cleared, and the
-controller-owned WLAN bookkeeping (`wlan_cfg_sha` & co., §6.2's drift
-baseline) deleted — a stale baseline would let the re-adopted device
-settle into connected noops while running factory config. The factory-reset
-device re-informs on the factory default key and is re-adopted by the
-existing §8 rotation path (§6.2 a/c/f mgmt_cfg-only family) unchanged.
-No cfgversion is minted at arming or emission (no §6.2 setdefault site).
-Precedence mirrors the dispatcher's layout: the state-8 check (§1018)
-precedes every §6.2 setparam site (§1117+) and the §11006+ key gate, so an
-armed setdefault outranks a simultaneously armed reboot and fires even on
-a default-key inform.
-Unrecoverable from the decompile (live-proof obligations): whether the real
-controller clears `x_authkey` at emission or keeps state 8 until the
-re-inform (our demotion happens at emission, one decision earlier); the
-jar's post-setdefault record mutation beyond the response itself; the
-armed-flag retention semantics across controller restarts; and the §6.5
-dropped-response case — the flag is consumed in the emission decision, so
-a failed seal or a dropped socket silently loses the factory reset (same
-open questions as §6.5).
+**open-unifi (two-phase reset lifecycle).** The controller still arms reset
+with the admin-owned Extra flag `setdefault_armed` because this store does
+not model the jar's controller-side STATE 8. Arming is allowed only for a
+non-pending record with a nonempty, non-factory assigned key and
+`key_confirmed=true`; otherwise the admin API returns 409 and directs the
+operator to wait for an encrypted inform using the assigned key. An
+authorized assigned-key reset inform emits the byte-identical response
+`{"_type":"setdefault","server_time_in_utc":"<ms>"}`. It consumes the
+reset/reboot/task arms and persists typed `factory_reset_in_flight=true`, but
+does NOT retire assigned decryption keys, `key_confirmed`, cfgversions, or
+WLAN delivery state. While in flight, assigned-key status informs re-emit
+the same response, so a response lost after commit can be retried across a
+controller restart. The admin view continues to report `pending_command:
+factory-reset`; repeated reset clicks are idempotent during this phase.
+
+The `key_confirmed` marker is written only after an ENCRYPTED inform
+authenticates with an assigned key. A legacy pre-key record that still has an
+armed reset must not emit its first `setdefault` on factory-key traffic: normal
+adoption proceeds, while the reset and any competing reboot/task arms remain
+pending for an assigned-key inform. That assigned-key encrypted inform emits
+`setdefault` and stamps `key_confirmed` in the same transaction. A legacy
+in-flight record without confirmation likewise cannot complete from a
+factory-key inform; it must retry `setdefault` with an assigned key first.
+Plaintext `_authkey` claims never establish confirmation. They may emit or
+retry `setdefault` only when confirmation already exists and the claim matches
+an assigned key, and never complete reset.
+
+Residual migration case: if a legacy unconfirmed in-flight device has already
+physically reset and no longer has its assigned key, it cannot perform that
+assigned-key retry. Its factory-key inform is deliberately rejected because
+the shared key cannot safely prove the reset. There is no automatic in-band
+recovery for this state; preserve the record and use an operator-assisted
+identity/reset reconciliation procedure. Do not clear the in-flight marker,
+retire the saved keys, or force completion based only on the factory-key
+inform.
+
+Only a previously in-flight, key-confirmed reset followed by an **encrypted
+factory-key status inform** (`_type` absent, present as the empty string, `info`, or
+`heartbeat`) confirms reset. A present non-string `_type` (`null`, boolean,
+number, object, or array) and any other string do not confirm; this boundary
+does not broaden generic inform dispatch. That
+single UpdateExisting transaction retires the old keys/versions and
+per-device reset-swept delivery/session bookkeeping, preserves WLAN/site/
+SSH/admin intent, clears the in-flight marker, and continues the ordinary
+factory-key adoption rotation in the same response (`setparam` with
+`mgmt_cfg`, fresh key and cfgversion). A plaintext `_authkey` claim, an
+unknown gentle-noop, a legacy in-flight marker without key confirmation, or
+a factory-key inform with no in-flight marker cannot confirm reset. An armed
+flag alone does not bypass the ordinary default-key state/key-confirmation
+gate. Encrypted assigned keys are revalidated inside
+the serialized update before absorption, so a request decoded with a key
+retired by a competing confirmation cannot mutate the new record.
+
+This is an at-least-once command retry protocol, not crash-proof exactly-once
+delivery. The factory key is shared firmware material, not cryptographic
+proof of a physical reset; the handshake is the controller's protocol-level
+confirmation. Do not silently time out an in-flight marker or drop its old
+keys. Operators must complete outstanding resets before downgrading to a
+version that does not understand this marker. A legacy record already
+demoted by an older release has irreversibly discarded its old assigned
+keys; the upgrade cannot recreate that retry capability.
+
+The wire response remains the §6.6 bare shape and no cfgversion is minted at
+arming or emission. Initial emission outranks a simultaneously armed reboot
+and consumes any queued task; the reset-sweep itself is deferred until the
+factory-key confirmation. The jar's exact reset-acknowledgement semantics
+remain unrecoverable; this in-flight rule is the explicit open-unifi
+reliability policy.
 
 ### 6.7 HTTP-status-only answers
 404 unknown MAC, 400 decrypt/parse/"Bad packet magic"/"Data version %d is not

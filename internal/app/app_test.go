@@ -595,6 +595,7 @@ func TestLifecycleArmingArmsOnlyTheFlag(t *testing.T) {
 	seeded := store.Device{
 		MAC: "f09fc2848f2a", State: store.StateAdopted, Model: "U7PG2",
 		XAuthkey: "0123456789abcdef", CfgVersion: "aaaabbbbccccdddd", AppliedCfg: "aaaabbbbccccdddd",
+		KeyConfirmed: true,
 	}
 	if err := st.Put(seeded); err != nil {
 		t.Fatal(err)
@@ -660,12 +661,15 @@ func TestLifecycleArmingArmsOnlyTheFlag(t *testing.T) {
 	}
 }
 
-// TestLifecycleArmingWorksOnNilExtra pins the nil-map arm path (a record
-// created without Extra): UpdateExisting allocates the map, the flag
-// lands, and nothing else changes.
+// TestLifecycleArmingWorksOnNilExtra pins the nil-map arm path for an
+// eligible confirmed device (a record created without Extra): UpdateExisting
+// allocates the map, the flag lands, and nothing else changes.
 func TestLifecycleArmingWorksOnNilExtra(t *testing.T) {
 	a, st := testApp(t)
-	if err := st.Put(store.Device{MAC: "a040a0aabbcc", State: store.StatePending}); err != nil {
+	if err := st.Put(store.Device{
+		MAC: "a040a0aabbcc", State: store.StateAdopted,
+		XAuthkey: "0123456789abcdef0123456789abcdef", KeyConfirmed: true,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	dv, err := a.FactoryResetDevice(context.Background(), "a0:40:a0:aa:bb:cc")
@@ -684,8 +688,50 @@ func TestLifecycleArmingWorksOnNilExtra(t *testing.T) {
 	if !truthyFlag(d.Extra["setdefault_armed"]) {
 		t.Fatalf("flag not armed: %+v", d.Extra)
 	}
-	if d.State != store.StatePending {
+	if d.State != store.StateAdopted {
 		t.Fatalf("arming changed state: %+v", d)
+	}
+}
+
+func TestFactoryResetArmRequiresConfirmedAssignedDevice(t *testing.T) {
+	tests := []struct {
+		name string
+		dev  store.Device
+	}{
+		{
+			name: "pending despite confirmation",
+			dev: store.Device{MAC: "112233445566", State: store.StatePending,
+				XAuthkey: "0123456789abcdef0123456789abcdef", KeyConfirmed: true},
+		},
+		{
+			name: "adopted but unconfirmed",
+			dev: store.Device{MAC: "112233445566", State: store.StateAdopted,
+				XAuthkey: "0123456789abcdef0123456789abcdef"},
+		},
+		{
+			name: "factory key is not an assignment",
+			dev: store.Device{MAC: "112233445566", State: store.StateAdopted,
+				XAuthkey: "ba86f2bbe107c7c57eb5f2690775c712", KeyConfirmed: true},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			a, st := testApp(t)
+			if err := st.Put(tc.dev); err != nil {
+				t.Fatal(err)
+			}
+			_, err := a.FactoryResetDevice(context.Background(), tc.dev.MAC)
+			if !errors.Is(err, adminapi.ErrConflict) || !strings.Contains(err.Error(), "wait for an encrypted inform") {
+				t.Fatalf("factory-reset arm error = %v, want actionable ErrConflict", err)
+			}
+			after, err := st.Get(tc.dev.MAC)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if truthyFlag(after.Extra[store.FlagSetdefaultArmed]) {
+				t.Fatalf("rejected reset arm was persisted: %+v", after.Extra)
+			}
+		})
 	}
 }
 
@@ -814,7 +860,10 @@ func TestEnqueueCmdTaskUnknownMACIsWrappedNotFound(t *testing.T) {
 func TestEnqueueCmdTaskViewPrecedence(t *testing.T) {
 	a, _ := testApp(t)
 	ctx := context.Background()
-	if err := a.st.Put(store.Device{MAC: "f09fc2848f2a", State: store.StateAdopted}); err != nil {
+	if err := a.st.Put(store.Device{
+		MAC: "f09fc2848f2a", State: store.StateAdopted,
+		XAuthkey: "0123456789abcdef0123456789abcdef", KeyConfirmed: true,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := a.EnqueueDeviceCmd(ctx, "f0:9f:c2:84:8f:2a", "restart"); err != nil {

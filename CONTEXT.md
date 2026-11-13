@@ -103,7 +103,25 @@ _Avoid_: device attributes.
 password and its ssh_sha512/md5 caches — the caches hold the LAST password
 hash the controller pushed for that device, so an unset render reuses the
 row verbatim, byte-stable). A device can neither write nor introduce any of
-them.
+them. The raw Extra twin of the typed `factory_reset_in_flight` marker is
+admin-owned and cannot be introduced by an inform.
+
+**In-flight factory reset**: the durable second phase after an admin reset
+arm is emitted as `setdefault`. The first response preserves assigned keys,
+key-confirmation state, cfgversions, and WLAN delivery state. Admin arming
+requires a non-pending device with a non-factory assigned key and prior
+encrypted key confirmation. Only a key-confirmed in-flight reset followed by
+an encrypted factory-key status inform confirms reset and retires old keys plus
+reset-swept controller bookkeeping. A legacy unconfirmed in-flight record must
+first retry with its assigned key over the encrypted lane. Plaintext claims
+never establish confirmation; they may emit/retry reset only for an already
+confirmed matching assignment. Repeated assigned-key informs re-emit setdefault
+until confirmation. This is at-least-once protocol delivery, not physical-reset
+attestation or crash-proof exactly-once behavior; do not silently expire the
+marker or its retry keys. A legacy unconfirmed in-flight device that has
+physically reset and lost its assigned key has no safe automatic in-band
+recovery; it requires operator-assisted identity/reset reconciliation, not
+clearing the marker or retiring its saved keys based on the factory key.
 
 **Record absorption**: the single merge that folds a decoded inform body
 into a device record under the trust policy — the only way device data

@@ -83,6 +83,9 @@ func applyDeltas(dev *store.Device, out Outcome) {
 	if out.SetKeyConfirmed {
 		dev.KeyConfirmed = out.KeyConfirmed
 	}
+	if out.SetFactoryResetInFlight {
+		dev.FactoryResetInFlight = out.FactoryResetInFlight
+	}
 	dev.Extra = out.Extra
 	for k, v := range out.CredentialDeltas {
 		dev.Extra[k] = v
@@ -1038,8 +1041,7 @@ func TestPlainMgmtResendNotGated(t *testing.T) {
 // equals the current envelope hash → the engine STILL returns full
 // provisioning. The plaintext lane runs no drift-settle and has NO
 // cfgversion-match noop branch: the assigned-key flow always full-provisions
-// on a claim match (this pins the actual behavior — the former doc comment
-// wrongly claimed "cfgversion match → noop + StateAdopted").
+// on a claim match, while preserving the incoming lifecycle state.
 func TestPlainClaimMatchAlwaysFullProvisions(t *testing.T) {
 	const k = "11112222333344445555666677778888"
 	e := newTestEngine(t)
@@ -1067,8 +1069,8 @@ func TestPlainClaimMatchAlwaysFullProvisions(t *testing.T) {
 		t.Fatalf("claim-match outcome = %+v, want full provisioning", out)
 	}
 	applyDeltas(&dev, out)
-	if dev.State != store.StateAdopting {
-		t.Fatalf("state after claim-match provision = %d, want adopting", dev.State)
+	if dev.State != store.StateAdopted {
+		t.Fatalf("state after claim-match provision = %d, want preserved adopted state", dev.State)
 	}
 }
 

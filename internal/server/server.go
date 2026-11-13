@@ -144,6 +144,11 @@ type Server struct {
 	// each lock covers UpdateExisting, post-commit side effects, and callbacks,
 	// but is released before the potentially slow response write.
 	informCycleStripes [informCycleStripeCount]sync.Mutex
+
+	// afterEncryptedDecode is a nil-by-default synchronization seam used by
+	// same-package handler tests to hold a successfully decoded request before
+	// it enters the serialized record cycle. Production never configures it.
+	afterEncryptedDecode func(mac, usedKey string)
 }
 
 // New builds a Server. A nil logger falls back to slog.Default().
@@ -367,6 +372,12 @@ func errMACMismatch(hdr, payload string) error {
 var errDefaultKeyRejected = &informRejectError{status: http.StatusNotFound,
 	reason: "default key used by an adopted device"}
 
+// errRetiredAssignedKey means decrypt succeeded against the preflight record
+// snapshot, but the serialized record cycle found that another committed
+// transition had already retired that assigned key. The transport maps it
+// back to the ordinary 400 decrypt-failure shape.
+var errRetiredAssignedKey = errors.New("authenticated key is no longer assigned")
+
 // payloadMACMatches enforces FID-35: the decrypted body's mac field (when
 // present) must canonicalize to the header MAC. The classic controller
 // rejects the whole inform otherwise (voidsuper §7771-7786).
@@ -441,6 +452,9 @@ func (s *Server) handlePacket(ctx context.Context, w http.ResponseWriter, pkt *i
 		s.lg.Error("invalid inform (mac inconsistent in header and payload)", "mac", mac, "payloadMac", mm) // FID-35, devmgr §7779
 		writeJSONErr(w, http.StatusBadRequest, errMACMismatch(mac, mm).Error())
 		return
+	}
+	if s.afterEncryptedDecode != nil {
+		s.afterEncryptedDecode(mac, usedKey)
 	}
 
 	// The cycle and its error mapping are shared with the plaintext lane
@@ -648,6 +662,15 @@ func (s *Server) runInformCycle(ctx context.Context, w http.ResponseWriter, mac 
 	func() {
 		defer s.lockInformCycle(mac)()
 		uerr = s.st.UpdateExisting(mac, func(rec *store.Device) error {
+			// Encrypted key lookup/decryption happens before this serialized
+			// mutation. A competing reset confirmation can retire a key after
+			// that snapshot but before this callback runs, so revalidate the
+			// assigned key before absorption or any side effect. Preserve the
+			// ordinary decrypt-failure HTTP status for this stale snapshot.
+			if lane.transport == adoption.TransportEncrypted &&
+				!strings.EqualFold(lane.usedKey, inform.DefaultKeyHex) && !hasAssignedKey(*rec, lane.usedKey) {
+				return errRetiredAssignedKey
+			}
 			now := time.Now()
 			s.absorbInform(rec, jm, now, lane.gcmReq)
 			transitions := refreshClientSessions(rec, jm, now)
@@ -681,6 +704,11 @@ func (s *Server) runInformCycle(ctx context.Context, w http.ResponseWriter, mac 
 		}
 	}()
 	if uerr != nil {
+		if errors.Is(uerr, errRetiredAssignedKey) {
+			s.lg.Debug("inform: authenticated key retired before serialized processing", "mac", mac)
+			writeJSONErr(w, http.StatusBadRequest, "unable to decrypt inform payload")
+			return
+		}
 		var rej *informRejectError
 		if errors.As(uerr, &rej) {
 			// A jar-parity protocol rejection (informRejectError) maps to a
@@ -714,6 +742,21 @@ func (s *Server) runInformCycle(ctx context.Context, w http.ResponseWriter, mac 
 	// The per-MAC cycle lock is released before either lane writes its
 	// response, so a slow socket cannot hold up later informs for this AP.
 	lane.respond(w, outcome)
+}
+
+func hasAssignedKey(d store.Device, key string) bool {
+	if key == "" {
+		return false
+	}
+	if strings.EqualFold(d.XAuthkey, key) {
+		return true
+	}
+	for _, assigned := range d.Authkeys {
+		if strings.EqualFold(assigned, key) {
+			return true
+		}
+	}
+	return false
 }
 
 // lockInformCycle serializes the server-side portions of one AP's inform
@@ -783,9 +826,12 @@ func (s *Server) applyOutcome(mac string, rec *store.Device, out adoption.Outcom
 	}
 	if out.SetKeyConfirmed {
 		// The key-confirmation marker (the adoption engine's factory-key
-		// gate input): set by key-authenticated informs, cleared by the
-		// setdefault demotion.
+		// gate input): set by key-authenticated informs, cleared only when
+		// reset confirmation retires the assigned keys.
 		rec.KeyConfirmed = out.KeyConfirmed
+	}
+	if out.SetFactoryResetInFlight {
+		rec.FactoryResetInFlight = out.FactoryResetInFlight
 	}
 	rec.Extra = out.Extra
 	// Credential-cache deltas from the pure renderer: the renderer no longer

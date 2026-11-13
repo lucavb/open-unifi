@@ -54,10 +54,17 @@ type Device struct {
 	// record no matter which lifecycle state it re-enters (the documented
 	// mid-adoption double-rotation window stays open for records whose
 	// assigned key was never proven used — docs/PROTOCOL.md §2/§3). The
-	// setdefault demotion clears it with XAuthkey/Authkeys.
-	KeyConfirmed bool    `json:"key_confirmed,omitempty"`
-	LastUps      JSONMap `json:"last_ups,omitempty"` // decoded stats snapshot from last inform
-	Extra        JSONMap `json:"extra,omitempty"`    // raw passthrough of interesting inform fields
+	// encrypted factory-reset confirmation clears it with XAuthkey/Authkeys.
+	KeyConfirmed bool `json:"key_confirmed,omitempty"`
+
+	// FactoryResetInFlight marks a durable two-phase factory-reset handoff.
+	// The initial setdefault emission retains assigned keys and this marker
+	// until an encrypted factory-key status inform confirms the reset; this
+	// makes a lost response/restart retryable without silently retiring the
+	// only keys that can receive it.
+	FactoryResetInFlight bool    `json:"factory_reset_in_flight,omitempty"`
+	LastUps              JSONMap `json:"last_ups,omitempty"` // decoded stats snapshot from last inform
+	Extra                JSONMap `json:"extra,omitempty"`    // raw passthrough of interesting inform fields
 
 	// LEDOverride is the admin-set per-device LED override — the classic
 	// controller's device record field "led_override"

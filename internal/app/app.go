@@ -17,11 +17,13 @@ import (
 	"log/slog"
 	"math"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/lucavb/open-unifi/internal/adminapi"
 	"github.com/lucavb/open-unifi/internal/clientevents"
+	"github.com/lucavb/open-unifi/internal/inform"
 	"github.com/lucavb/open-unifi/internal/metrics"
 	"github.com/lucavb/open-unifi/internal/store"
 	"github.com/lucavb/open-unifi/internal/wireless"
@@ -229,12 +231,12 @@ func (a *App) view(d store.Device) adminapi.DeviceView {
 // §6.6 setdefault / §6.3 stored cmd task) into the view's
 // PendingCommand: the value names the _type the device's NEXT inform
 // will carry. "reboot" when the reboot flag is armed, "factory-reset"
-// when the setdefault arm is set (outranking reboot), "cmd" when a
+// when setdefault is armed or the durable reset is in flight (outranking reboot), "cmd" when a
 // stored task is armed (last in the chain), "" when none. The order
 // mirrors the engine's armedLifecycle emission precedence exactly, so
 // the view can never name a response the engine would not fire.
 func armedCommand(d store.Device) string {
-	if flagArmed(d.Extra, store.FlagSetdefaultArmed) {
+	if d.FactoryResetInFlight || flagArmed(d.Extra, store.FlagSetdefaultArmed) {
 		return "factory-reset"
 	}
 	if flagArmed(d.Extra, store.FlagRebootOnConnect) {
@@ -909,13 +911,11 @@ func (a *App) DeleteDeviceRadioIntent(_ context.Context, mac, radio string) (adm
 // The listing includes TWO shapes:
 //   - unheard candidates (no device record yet), and
 //   - existing StatePending records that still carry a live map note —
-//     a record demoted back to the pending-candidate shape by factory
-//     reset (returning to state 1 until its next factory-key inform), or
-//     one just promoted and awaiting its first inform. Surfacing the
-//     latter lets the operator re-click Adopt on a factory-reset device
-//     with NO Forget step: AdoptPending's existing-record branch re-
-//     promotes state-1 records idempotently, one click = one push
-//     attempt per its documented contract.
+//     including legacy reset records demoted by an earlier release, or
+//     one just promoted and awaiting its first inform. New two-phase resets
+//     remain keyed/adopting until encrypted factory-key confirmation rather
+//     than entering this candidate shape. Surfacing legacy pending records
+//     lets operators re-click Adopt without a Forget step.
 //
 // Records in any other state (adopted/lost) are no longer candidates and
 // are skipped even when a stale note lingers. The Name column is filled
@@ -1020,11 +1020,10 @@ func (a *App) RebootDevice(_ context.Context, mac string) (adminapi.DeviceView, 
 	return a.armLifecycle(mac, store.FlagRebootOnConnect)
 }
 
-// FactoryResetDevice arms the factory reset: sets the admin-owned
-// setdefault flag, so the device's NEXT decoded inform answers
-// {"_type":"setdefault"} and the record then returns to the
-// pending-candidate shape the existing default-key adoption path
-// re-adopts (the demotion happens at emission, not at arming).
+// FactoryResetDevice arms the first reset phase through the admin-owned
+// setdefault flag. The inform adapter persists FactoryResetInFlight while
+// retaining the assigned keys; the device view keeps `factory-reset` pending
+// until an encrypted factory-key status inform confirms and completes reset.
 func (a *App) FactoryResetDevice(_ context.Context, mac string) (adminapi.DeviceView, error) {
 	return a.armLifecycle(mac, store.FlagSetdefaultArmed)
 }
@@ -1072,6 +1071,16 @@ func (a *App) EnqueueDeviceCmd(_ context.Context, mac, cmd string) (adminapi.Dev
 func (a *App) armLifecycle(mac, flag string) (adminapi.DeviceView, error) {
 	rec, err := saveIntent(a, mac, saveExisting,
 		func(d *store.Device) (bool, error) {
+			// The durable in-flight marker already represents this reset.
+			// Repeated admin clicks do not create another arm or disturb the
+			// old-key retry window; the view continues to report factory-reset.
+			if flag == store.FlagSetdefaultArmed && d.FactoryResetInFlight {
+				return false, nil
+			}
+			if flag == store.FlagSetdefaultArmed && (d.State == store.StatePending || d.XAuthkey == "" ||
+				strings.EqualFold(d.XAuthkey, inform.DefaultKeyHex) || !d.KeyConfirmed) {
+				return false, fmt.Errorf("%w: factory reset requires a confirmed assigned key; wait for an encrypted inform using the assigned key before retrying", adminapi.ErrConflict)
+			}
 			if d.Extra == nil {
 				d.Extra = store.JSONMap{}
 			}

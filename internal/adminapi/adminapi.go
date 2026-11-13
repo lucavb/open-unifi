@@ -471,12 +471,10 @@ type Backend interface {
 	// per-device key and cfgversion untouched (no §6.2 mint site exists
 	// for the reboot response). Unknown MACs are a wrapped ErrNotFound.
 	RebootDevice(ctx context.Context, mac string) (DeviceView, error)
-	// FactoryResetDevice arms the factory reset
-	// (docs/PROTOCOL-mgmt.md §6.6): the device's NEXT decoded inform
-	// answers {"_type":"setdefault"}, then the record returns to a
-	// pending-candidate shape — the device factory-resets, re-informs on
-	// the factory default key, and is re-adopted by the existing
-	// adoption flow. Like RebootDevice, arming changes only the flag.
+	// FactoryResetDevice arms the factory reset (docs/PROTOCOL-mgmt.md §6.6):
+	// setdefault retries on the retained assigned key until an encrypted
+	// factory-key status inform confirms reset and continues ordinary
+	// adoption. Like RebootDevice, arming changes only the admin flag.
 	FactoryResetDevice(ctx context.Context, mac string) (DeviceView, error)
 	// EnqueueDeviceCmd stores a §6.3 cmd task for the device
 	// (docs/PROTOCOL-mgmt.md §6.3): the device's NEXT decoded inform

@@ -166,7 +166,7 @@ func TestArmedCmdTaskPrecedenceVersusLifecycleCommands(t *testing.T) {
 		t.Fatalf("kind = %v, want setdefault to outrank the armed cmd task", out.Kind)
 	}
 	if _, armed := out.Extra[store.CmdTaskKey]; armed {
-		t.Fatalf("queued task survived the factory-reset demotion: %+v", out.Extra)
+		t.Fatalf("queued task survived initial factory-reset emission: %+v", out.Extra)
 	}
 
 	// reboot armed + task armed → reboot first, task still armed.

@@ -116,13 +116,10 @@ const (
 	KindReboot Kind = "reboot"
 
 	// KindSetdefault is the factory-reset response, docs/PROTOCOL-mgmt.md
-	// §6.6 (voidsuper line 1018, device state 8: `return new
-	// Object("setdefault")` — a bare _type with no payload keys). Fired
-	// once on the device's next decoded inform after an admin arms the
-	// flag; at emission the record returns to the pending-candidate shape
-	// (see armedLifecycle) so the post-reset re-inform on the factory
-	// default key runs the ordinary adoption path unchanged. NO
-	// cfgversion is minted.
+	// §6.6 (voidsuper line 1018: a bare `setdefault` _type). It is emitted
+	// at least once after an admin arm; the assigned-key/key-confirmation
+	// state is retained in a durable in-flight phase until a factory-key
+	// status inform confirms reset, then ordinary adoption resumes.
 	KindSetdefault Kind = "setdefault"
 
 	// KindCmd is the §6.3 stored-task replay, docs/PROTOCOL-mgmt.md §6.3
@@ -221,9 +218,8 @@ type Outcome struct {
 	SetCfgVersion bool
 	CfgVersion    string // also the full-provision payload top-level cfgversion
 	// SetAppliedCfg clears the record's last-reported applied cfgversion.
-	// Carried only by the setdefault demotion to the pending-candidate
-	// shape (every other outcome leaves AppliedCfg to the record
-	// absorption).
+	// Carried only by confirmed factory-reset completion (ordinary outcomes
+	// leave AppliedCfg to record absorption).
 	SetAppliedCfg bool
 	AppliedCfg    string
 	SetAuthkeys   bool
@@ -231,11 +227,13 @@ type Outcome struct {
 	// SetKeyConfirmed carries the key-confirmation marker delta: the
 	// Decide wrapper stamps the working clone KeyConfirmed=true when the
 	// inform authenticated with a per-device key (Authkeys never holds the
-	// factory key), the armed setdefault demotion clears it (true→false)
+	// factory key), confirmed reset completion clears it (true→false)
 	// with XAuthkey/Authkeys. Emits only on change, both directions.
-	SetKeyConfirmed bool
-	KeyConfirmed    bool
-	Extra           store.JSONMap
+	SetKeyConfirmed         bool
+	KeyConfirmed            bool
+	SetFactoryResetInFlight bool
+	FactoryResetInFlight    bool
+	Extra                   store.JSONMap
 
 	// CmdTask is the stored-task row replayed VERBATIM as the §6.3 cmd
 	// response's payload keys (`mergeFrom((X)task)`): non-nil only for
@@ -378,21 +376,23 @@ func (e *Engine) Decide(req Request) (Outcome, error) {
 		return Outcome{}, err
 	}
 	// Key-confirmation write (the persisted partner of the
-	// decideEncrypted gate): an inform authenticated with a per-device
-	// key — UsedKey equal to ANY Authkeys entry, case-insensitively
+	// decideEncrypted gate): only an ENCRYPTED inform authenticated with a
+	// per-device key — UsedKey equal to ANY Authkeys entry, case-insensitively
 	// (Authkeys never holds the factory default key, docs/PROTOCOL.md
-	// §6, so the gate's factory-key informs can never stamp this) proves
+	// §6, so factory-key informs cannot stamp this) proves
 	// the device runs controller-issued key material. The stamp rides
 	// the engine's deltas: deltas() emits the record delta only on
-	// change and the armed setdefault demotion clears it, so the wire
+	// change and confirmed reset completion clears it, so the wire
 	// effect is one marker field kept truthful by the same RMW cycle.
-	// Compared against the WORKING clone's Authkeys so a demotion in
-	// THIS decision (arm, then keys cleared) cannot re-confirm the
-	// record it just demoted.
-	for _, k := range work.Authkeys {
-		if strings.EqualFold(k, req.UsedKey) {
-			work.KeyConfirmed = true
-			break
+	// Compared against the WORKING clone's Authkeys so reset completion in
+	// THIS decision (confirm, then rotate keys) cannot re-confirm the
+	// record with the factory key.
+	if req.Transport == TransportEncrypted {
+		for _, k := range work.Authkeys {
+			if strings.EqualFold(k, req.UsedKey) {
+				work.KeyConfirmed = true
+				break
+			}
 		}
 	}
 	// Stamp the record deltas the branch performed onto the working clone.
@@ -409,56 +409,17 @@ func (e *Engine) Decide(req Request) (Outcome, error) {
 // replay the task. A task is last and is consumed only when emitted. None of
 // these command responses mints a cfgversion; normal decision-making resumes
 // on the following inform (docs/PROTOCOL-mgmt.md §§6.3, 6.5, 6.6).
-func (e *Engine) armedLifecycle(d *store.Device) (Outcome, bool) {
+func (e *Engine) armedLifecycle(d *store.Device, allowSetdefault bool) (Outcome, bool) {
 	if truthy(d.Extra[FlagSetdefaultArmed]) {
-		e.lg.Debug("inform: armed setdefault (factory reset)", "mac", d.MAC)
-		// §6.6 emission plus the pending-candidate demotion: after the
-		// device applies the factory reset it re-informs on the factory
-		// default key, and the record must be the shape the existing
-		// default-key adoption path accepts. Clearing the per-device key
-		// assignment means a pre-reset inform on the old key can no
-		// longer be decrypted (keyCandidates holds only Authkeys entries
-		// plus the factory key) — the same 400 a genuinely unknown
-		// record's non-default-key payload gets; the jar's own
-		// post-emission record mutation (whether it clears x_authkey at
-		// emission or keeps state 8 until the re-inform) was not
-		// recoverable from the decompile and is recorded in §6.6.
-		d.State = store.StatePending
-		d.XAuthkey = ""
-		d.CfgVersion = ""
-		d.AppliedCfg = ""
-		d.Authkeys = nil
-		// The confirmation marker dies with the key assignment: the
-		// post-reset re-inform arrives on the factory default key and
-		// must re-enter the adoption flow through the pre-key window
-		// (the key-confirmation gate at the top of decideEncrypted
-		// rejects factory-key informs for confirmed records — recovery
-		// preserved ONLY if the marker is cleared here too).
-		d.KeyConfirmed = false
-		// Drop the controller-owned per-device bookkeeping (store
-		// trust-policy registry, FactoryResetSweepKeys): a stale
-		// wlan_cfg_sha would let the re-adopted device settle into
-		// connected noops while running factory config. The baseline is
-		// re-captured by the post-adoption self-heal + drift settle,
-		// exactly like a fresh adoption (which deliberately seeds no
-		// baseline). The ssh password caches are deliberately NOT
-		// swept: they hold the DEVICE's last controller-pushed password
-		// and deliberately survive factory reset/setdefault demotion;
-		// the exclude keeps that survival.
-		for _, k := range store.FactoryResetSweepKeys {
-			delete(d.Extra, k)
+		// A reset arm outranks reboot and cmd even on a lane that cannot
+		// authorize setdefault. Leave every command armed until an eligible
+		// claim arrives rather than falling through and consuming a lower
+		// precedence command.
+		if !allowSetdefault {
+			return Outcome{}, false
 		}
-		delete(d.Extra, FlagSetdefaultArmed)
-		// A pending reboot is moot once the device factory-resets.
-		delete(d.Extra, FlagRebootOnConnect)
-		// A queued §6.3 cmd task is moot too: the post-reset re-inform
-		// arrives on the factory default key as a pending candidate, and
-		// a replayed task would preempt the re-adoption push that record
-		// must answer with. §6.3 is silent on task-vs-setdefault
-		// interplay — chosen: the reset discards the queued task (the
-		// same moot-clearing as the pending reboot).
-		delete(d.Extra, store.CmdTaskKey)
-		return Outcome{Kind: KindSetdefault}, true
+		e.lg.Debug("inform: armed setdefault (factory reset)", "mac", d.MAC)
+		return emitFactoryReset(d), true
 	}
 	if truthy(d.Extra[FlagRebootOnConnect]) {
 		e.lg.Debug("inform: armed reboot", "mac", d.MAC)
@@ -485,6 +446,60 @@ func (e *Engine) armedLifecycle(d *store.Device) (Outcome, bool) {
 	return Outcome{}, false
 }
 
+func emitFactoryReset(d *store.Device) Outcome {
+	// The response can be lost after the store commit. Retain all assigned
+	// keys and reset-sensitive state until a factory-key status inform signals
+	// reset completion; an in-flight retry simply re-emits.
+	d.FactoryResetInFlight = true
+	delete(d.Extra, FlagSetdefaultArmed)
+	delete(d.Extra, FlagRebootOnConnect)
+	delete(d.Extra, store.CmdTaskKey)
+	return Outcome{Kind: KindSetdefault}
+}
+
+func completeFactoryReset(d *store.Device) {
+	d.FactoryResetInFlight = false
+	d.State = store.StatePending
+	d.XAuthkey = ""
+	d.Authkeys = nil
+	d.CfgVersion = ""
+	d.AppliedCfg = ""
+	d.KeyConfirmed = false
+	for _, key := range store.FactoryResetSweepKeys {
+		delete(d.Extra, key)
+	}
+	delete(d.Extra, FlagSetdefaultArmed)
+	delete(d.Extra, FlagRebootOnConnect)
+	delete(d.Extra, store.CmdTaskKey)
+}
+
+func isResetStatusInform(body map[string]any) bool {
+	raw, present := body["_type"]
+	if !present {
+		return true
+	}
+	rtype, isString := raw.(string)
+	if !isString {
+		return false
+	}
+	return rtype == "" || rtype == "info" || rtype == "heartbeat"
+}
+
+func isAssignedKey(d store.Device, key string) bool {
+	if key == "" {
+		return false
+	}
+	if strings.EqualFold(d.XAuthkey, key) {
+		return true
+	}
+	for _, assigned := range d.Authkeys {
+		if strings.EqualFold(assigned, key) {
+			return true
+		}
+	}
+	return false
+}
+
 // CmdTaskString renders an armed task row's cmd for logs — the one §6.3
 // field with operator meaning. Never logs the whole row: future task
 // fields may carry more than the admin typed.
@@ -500,9 +515,34 @@ func CmdTaskString(task store.JSONMap) string {
 // usedKey is the lowercase hex key that authenticated the inform.
 func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless.ProvisioningPlan, d *store.Device) (Outcome, error) {
 	now := req.Now
+	rtype, _ := req.Body["_type"].(string)
 
-	// Key-confirmation gate: the shared factory default
-	// key is accepted ONLY for a device that has not yet authenticated
+	// Reset confirmation is deliberately narrower than the ordinary
+	// factory-key admission window: only a durable in-flight reset followed
+	// by an encrypted factory-key status inform confirms it. Clear reset
+	// state and continue the normal factory-key adoption rotation in this
+	// same store transaction, so a failed commit leaves the old-key retry
+	// record intact.
+	if d.FactoryResetInFlight && strings.EqualFold(req.UsedKey, defaultKeyHex) {
+		// A legacy in-flight marker without encrypted assigned-key history is
+		// not sufficient authority to retire the saved identity. Require the
+		// device to retry setdefault with its assigned key first; that encrypted
+		// request stamps KeyConfirmed and re-emits the command.
+		if !d.KeyConfirmed {
+			return Outcome{}, ErrDefaultKeyRejected
+		}
+		if req.Transport == TransportEncrypted && isResetStatusInform(req.Body) {
+			completeFactoryReset(d)
+			if err := e.rotateKeys(d); err != nil {
+				return Outcome{}, err
+			}
+			return e.adoptionPush(*d, req.UsedKey), nil
+		}
+	}
+
+	// Key-confirmation gate: apart from the exact in-flight reset
+	// confirmation above, the shared factory default key is accepted ONLY
+	// for a device that has not yet authenticated
 	// its per-device key — StatePending (the pre-adoption record,
 	// devmgr UNKNOWN(0)) or a keyed StateAdopting record whose marker is
 	// unset (the documented mid-adoption double-rotation window,
@@ -510,31 +550,50 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 	// pushed key yet → rotate then re-push). Once an inform was
 	// authenticated with a per-device key the Decide wrapper stamps the
 	// persisted KeyConfirmed marker, and a factory-key inform is then
-	// rejected ahead of EVERYTHING below — the gentle noop, the armed
-	// lifecycle (§6.6 setdefault included: a confirmed record's armed
-	// flag cannot be fired on an unauthenticated factory-key claim) and
+	// rejected ahead of the gentle noop and armed lifecycle — an armed-only
+	// §6.6 reset cannot be fired on an unauthenticated factory-key claim.
+	// The narrow in-flight status handshake above is the only exception.
+	// The decision then continues through
 	// the drift/key machinery. Adopted and lost records keep the classic
 	// state rejection (FID-1, devmgr "used default key in X state, reject
-	// it!" → Object.ÖoÓ000 → 404); the demotion's marker clear keeps the
-	// factory-reset recovery (armedLifecycle) admissible again.
+	// it!" → Object.ÖoÓ000 → 404); reset confirmation clears the marker and
+	// rotates into the ordinary adoption path.
 	if strings.EqualFold(req.UsedKey, defaultKeyHex) &&
 		d.State != store.StatePending &&
 		(d.State != store.StateAdopting || d.KeyConfirmed) {
 		return Outcome{}, ErrDefaultKeyRejected
 	}
 
-	rtype, _ := req.Body["_type"].(string)
 	if informTypeGentleNoop(rtype) {
 		e.lg.Debug("inform: gentle noop for _type", "mac", d.MAC, "type", rtype)
 		return e.noopFor(d, now, req.PrevNoopTarget, KindNoop), nil
+	}
+	if d.FactoryResetInFlight {
+		if strings.EqualFold(req.UsedKey, defaultKeyHex) {
+			// A factory-key non-status message is not reset confirmation. Do
+			// not let the ordinary pre-key adoption branch disturb an
+			// in-flight reset; retain the marker and wait for a status inform.
+			return e.noopFor(d, now, req.PrevNoopTarget, KindNoop), nil
+		}
+		if isAssignedKey(*d, req.UsedKey) {
+			return emitFactoryReset(d), nil
+		}
 	}
 
 	// Admin-armed remote commands (§6.3/§6.5/§6.6) preempt the drift and
 	// key machinery: the armed response is what this inform must carry,
 	// and the post-lifecycle inform re-enters the ordinary decisions
 	// below (deferred provisioning is not lost — see armedLifecycle).
-	if out, armed := e.armedLifecycle(d); armed {
-		return out, nil
+	// Legacy records may have a reset arm from before the key-confirmation
+	// gate existed. The factory key is never authority to emit that reset (or
+	// consume another command racing with it). Leave all arms intact and let
+	// the normal adoption branch run; a later assigned-key encrypted inform
+	// can emit setdefault and stamp confirmation atomically.
+	preKeyReset := strings.EqualFold(req.UsedKey, defaultKeyHex) && truthy(d.Extra[FlagSetdefaultArmed])
+	if !preKeyReset {
+		if out, armed := e.armedLifecycle(d, true); armed {
+			return out, nil
+		}
 	}
 
 	// Compare the canonical WLAN envelope with the last confirmed baseline
@@ -907,6 +966,15 @@ func (e *Engine) decidePlain(req Request, wls []wireless.Wlan, plan wireless.Pro
 		e.lg.Debug("inform-plain: gentle noop for _type", "mac", d.MAC, "type", rtype)
 		return e.noopFor(d, now, req.PrevNoopTarget, KindNoop), nil
 	}
+	if d.FactoryResetInFlight {
+		// A plaintext _authkey is only a claim. It may retry an already
+		// confirmed reset with an assigned-key claim, but cannot establish the
+		// encrypted-auth marker or complete a reset.
+		if d.KeyConfirmed && isAssignedKey(*d, req.UsedKey) {
+			return emitFactoryReset(d), nil
+		}
+		return e.noopFor(d, now, req.PrevNoopTarget, KindNoop), nil
+	}
 
 	// Admin-armed remote commands fire on this lane too (same record,
 	// same admin intent; the outcome serialization is shared) — but only
@@ -914,7 +982,7 @@ func (e *Engine) decidePlain(req Request, wls []wireless.Wlan, plan wireless.Pro
 	// not authenticate as the record's assigned key carries no admin
 	// result, gets no key echo, and consumes nothing.
 	if d.XAuthkey != "" && strings.EqualFold(d.XAuthkey, req.UsedKey) {
-		if out, armed := e.armedLifecycle(d); armed {
+		if out, armed := e.armedLifecycle(d, d.KeyConfirmed); armed {
 			return out, nil
 		}
 	}
@@ -932,7 +1000,14 @@ func (e *Engine) decidePlain(req Request, wls []wireless.Wlan, plan wireless.Pro
 		return e.adoptionPush(*d, d.XAuthkey), nil
 
 	default:
-		return e.assignedKeyFlow(req.Context, d, now, wls, plan)
+		// Plaintext assigned-key claims preserve the record's lifecycle state.
+		// In particular, full provisioning must not move an adopted/lost legacy
+		// unconfirmed record into StateAdopting, which would reopen factory-key
+		// admission. StateAdopting itself remains compatible with onboarding.
+		state := d.State
+		out, err := e.assignedKeyFlow(req.Context, d, now, wls, plan)
+		d.State = state
+		return out, err
 	}
 }
 
@@ -1154,6 +1229,9 @@ func (out *Outcome) deltas(snapshot, work *store.Device) {
 	}
 	if work.KeyConfirmed != snapshot.KeyConfirmed {
 		out.SetKeyConfirmed, out.KeyConfirmed = true, work.KeyConfirmed
+	}
+	if work.FactoryResetInFlight != snapshot.FactoryResetInFlight {
+		out.SetFactoryResetInFlight, out.FactoryResetInFlight = true, work.FactoryResetInFlight
 	}
 	out.Extra = work.Extra
 }

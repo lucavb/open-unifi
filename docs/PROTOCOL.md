@@ -63,8 +63,10 @@ Response construction (controller → device):
   lane also never carries key material BACK: the mgmt_cfg re-send a mismatching (or
   omitted) `_authkey` claim receives omits the `authkey=` line (a debug device that
   lost its key re-learns it over the encrypted path or by re-registration), and
-  admin-armed lifecycle responses (reboot/setdefault/cmd) fire only when the claim
-  matches the record's assigned key.
+  assigned-key full provisioning preserves the record's incoming lifecycle state
+  and never proves key possession. Reboot/cmd responses require a matching assigned
+  claim; setdefault may be retried on plaintext only for an already key-confirmed
+  record and matching assigned claim. Plaintext cannot establish that confirmation.
 - JSON body keys for every response: at minimum `server_time_in_utc` (ms epoch, string).
 
 ## 2. Encryption keys
@@ -95,17 +97,25 @@ Response construction (controller → device):
   Open-unifi adds a persisted refinement: the state enum alone cannot express
   "not yet authenticated its per-device key" (re-key flows re-enter
   `state=adopting` AFTER a key was assigned), so a per-device record carries
-  `key_confirmed` — set whenever an inform was authenticated with any assigned
-  per-device key (`authkeys` never holds the factory default), cleared with the
-  keys by the setdefault demotion. The gate accepts a default-key inform for
+  `key_confirmed` — set only when an ENCRYPTED inform was authenticated with any
+  assigned per-device key (`authkeys` never holds the factory default); a plaintext
+  `_authkey` claim never sets it. It is cleared when an in-flight factory reset is
+  confirmed and old keys are retired. The gate accepts a default-key inform for
   `state=pending` records, or keyed `state=adopting` records **without** the
   confirmation marker (the documented mid-adoption double-rotation window,
   step 4 of the handshake below); every other shape — adopting+confirmed,
   adopted, lost — is rejected before the gentle-noop and armed-lifecycle
-  decisions (a confirmed record's admin-armed factory reset cannot be fired
-  on an unauthenticated factory-key claim; recovery: admin deletes the
-  record, or re-registers the MAC, or — post-demotion — the cleared record
-  accepts the factory key again).
+  decisions, except for the narrow reset confirmation: a previously persisted
+  `factory_reset_in_flight`, `key_confirmed=true`, and an encrypted factory-key
+  status inform. A legacy in-flight record without confirmation must first retry
+  `setdefault` with its assigned key over the encrypted lane. An armed-but-not-in-flight
+  reset never bypasses this gate. Admin reset arming also requires a non-pending
+  record with a non-factory assigned key and prior encrypted key confirmation; wait
+  for an encrypted assigned-key inform before arming when that confirmation is absent.
+  The factory default
+  key is shared firmware material, not cryptographic proof that a physical
+  reset occurred; this handshake is the controller's protocol-level reset
+  confirmation, not a physical-attestation guarantee.
 - A device may have MULTIPLE valid keys (`device.authkeys` list); controller tries each
   until one decrypts. Include the default key in the list during adoption so we can
   decrypt the first packet.
@@ -300,7 +310,8 @@ record is absent); `Get` returns a deep copy. `Device` fields as implemented: MA
 (controller-side lifecycle: 1=pending, 2=adopting, 3=adopted, 4=lost), IP, InformURL,
 LastSeen, FirstSeen, CfgVersion, AppliedCfg, Authkeys (assigned-key history, newest
 last, capped at 2 — the factory default key is NEVER stored here), XAuthkey,
-KeyConfirmed (the key-confirmation gate marker above), AESGCM,
+  KeyConfirmed (the key-confirmation gate marker above),
+  FactoryResetInFlight (durable §6.6 retry marker), AESGCM,
 LastUps, Extra (inform-body passthrough; controller-owned `wlan_cfg_*` rows
 and admin-owned keys — `wlan_cfg_*` overrides, `radio_intent`, the typed
 `ssh_password` field's twin, and the `ssh_sha512passwd`/`ssh_md5passwd`

@@ -2,7 +2,7 @@ package adoption
 
 // Engine-direct lifecycle tests (§6.5 reboot / §6.6 setdefault): the
 // admin-armed remote-command lane, its one-shot semantics and precedence,
-// the setdefault demotion to the pending-candidate shape, and the
+// the two-phase setdefault retry/confirmation transition, and the
 // post-reset re-adoption on the factory default key. The BYTE shape of
 // the two responses is pinned at the adapter's serialization boundary in
 // package server (lifecycle_test.go there); these tests pin the decisions
@@ -120,35 +120,21 @@ func TestArmedRebootPreemptsPendingProvisioning(t *testing.T) {
 	}
 }
 
-// TestArmedSetdefaultDemotesToPendingCandidate pins the §6.6 emission plus
-// demotion: setdefault outranks a simultaneously armed reboot (both flags
-// consumed — the pending reboot is moot), the record returns to the
-// pending-candidate shape the default-key adoption path accepts, the
-// controller-owned WLAN bookkeeping is cleared (a stale wlan_cfg_sha would
-// let the re-adopted device settle into connected noops while running
-// factory config), and no cfgversion is MINTED — the CfgVersion delta is
-// the CLEAR to "" (the fresh 16-hex mint belongs to the re-adoption).
-func TestArmedSetdefaultDemotesToPendingCandidate(t *testing.T) {
+// TestArmedSetdefaultPreservesIdentityUntilConfirmation pins the first
+// phase: setdefault outranks reboot/task, records in-flight state, and keeps
+// the assigned keys, key-confirmation marker, cfgversions, and delivery
+// state for retries after a lost response.
+func TestArmedSetdefaultPreservesIdentityUntilConfirmation(t *testing.T) {
 	e := newTestEngine(t)
 	dev := settledLifecycleDevice()
 	dev.Extra[FlagSetdefaultArmed] = true
 	dev.Extra[FlagRebootOnConnect] = true // pending reboot is moot
 	dev.Extra["wlan_cfg_attempts"] = 3.0
 	dev.Extra["wlan_cfg_delivery_status"] = "pending"
-	// Seed the consecutive-miss counter too (float64 — the persisted
-	// reload shape): the demotion's controller-owned sweep must clear it
-	// with the rest of the family, or the re-adopted device would inherit
-	// a half-armed not-running window.
+	// Seed representative reset-sensitive delivery state; it stays intact
+	// until the factory-key confirmation transition.
 	dev.Extra["wlan_cfg_not_running_misses"] = 1.0
-	// Seed the site ssh password cache too: the sweep must SPARE it (a
-	// site-fact cache the first post-reset provisioning re-derives
-	// verbatim) — the lane's one deliberately distinctive demotion
-	// behavior, pinned here at engine level.
 	dev.Extra[store.SSHSha512PasswdKey] = "site-cache-sentinel"
-	// Seed the key-confirmation marker (an adopted, key-authenticated
-	// device that got armed): the demotion must clear it WITH the key
-	// assignment, or the post-reset factory-key re-inform would be
-	// rejected by the decideEncrypted gate (recovery broken).
 	dev.KeyConfirmed = true
 
 	out, err := e.Decide(Request{
@@ -167,53 +153,35 @@ func TestArmedSetdefaultDemotesToPendingCandidate(t *testing.T) {
 	if _, armed := out.Extra[FlagRebootOnConnect]; armed {
 		t.Fatalf("pending reboot flag not consumed by setdefault: %+v", out.Extra)
 	}
-	if !out.SetCfgVersion || out.CfgVersion != "" || !out.SetAppliedCfg || out.AppliedCfg != "" {
-		t.Fatalf("setdefault must CLEAR the cfgversions, not mint: %+v", out)
+	if !out.SetFactoryResetInFlight || !out.FactoryResetInFlight {
+		t.Fatalf("setdefault did not persist the in-flight marker: %+v", out)
 	}
-	if !out.SetState || out.State != store.StatePending {
-		t.Fatalf("setdefault must demote to pending: %+v", out)
-	}
-	if !out.SetXAuthkey || out.XAuthkey != "" {
-		t.Fatalf("setdefault must drop the per-device key: %+v", out)
-	}
-	if !out.SetAuthkeys || len(out.Authkeys) != 0 {
-		t.Fatalf("setdefault must drop the authkey history: %+v", out)
-	}
-	if !out.SetKeyConfirmed || out.KeyConfirmed {
-		t.Fatalf("setdefault must CLEAR the key-confirmation marker, not keep it: %+v", out)
+	if out.SetState || out.SetCfgVersion || out.SetAppliedCfg || out.SetXAuthkey || out.SetAuthkeys || out.SetKeyConfirmed {
+		t.Fatalf("initial setdefault altered identity/config before confirmation: %+v", out)
 	}
 
 	applyDeltas(&dev, out)
-	if dev.State != store.StatePending || dev.XAuthkey != "" ||
-		dev.CfgVersion != "" || dev.AppliedCfg != "" || len(dev.Authkeys) != 0 {
-		t.Fatalf("record not in pending-candidate shape: %+v", dev)
+	if !dev.FactoryResetInFlight || dev.State != store.StateAdopted || dev.XAuthkey != lifecycleKey ||
+		dev.CfgVersion == "" || dev.AppliedCfg == "" || len(dev.Authkeys) == 0 {
+		t.Fatalf("first reset phase lost assigned identity: %+v", dev)
 	}
-	if dev.KeyConfirmed {
-		t.Fatalf("key-confirmation marker survived the demotion: %+v", dev)
+	if !dev.KeyConfirmed {
+		t.Fatalf("first reset phase cleared the key-confirmation marker: %+v", dev)
 	}
-	for _, k := range store.FactoryResetSweepKeys {
-		if _, ok := dev.Extra[k]; ok {
-			t.Fatalf("controller-owned %q survived the setdefault demotion", k)
+	for _, key := range []string{"wlan_cfg_sha", "wlan_cfg_attempts", "wlan_cfg_not_running_misses"} {
+		if _, ok := dev.Extra[key]; !ok {
+			t.Fatalf("first reset phase prematurely swept %q", key)
 		}
 	}
-	// The specific assertion the family loop makes generic: the seeded
-	// not-running miss counter must be gone (the loop above would pass
-	// vacuously for keys that were never seeded).
-	if _, ok := dev.Extra["wlan_cfg_not_running_misses"]; ok {
-		t.Fatalf("the not-running miss counter survived the setdefault demotion: %v", dev.Extra["wlan_cfg_not_running_misses"])
-	}
-	// …and the one member the sweep must NOT touch: the site ssh password
-	// cache survives verbatim.
 	if got, want := dev.Extra[store.SSHSha512PasswdKey], "site-cache-sentinel"; got != want {
-		t.Fatalf("the §6.6 sweep must spare the site ssh password cache: %v, want %q", got, want)
+		t.Fatalf("first reset phase changed SSH cache: %v, want %q", got, want)
 	}
 }
 
 // TestSetdefaultReadoptOnDefaultKey closes the loop the task text demands:
-// after the demotion the (factory-reset) device re-informs on the factory
-// default key and the EXISTING adoption flow re-adopts it — §6.2 a/c/f
-// mgmt_cfg-only push with the authkey rotation line, fresh 32-hex
-// x_authkey, fresh 16-hex cfgversion, state adopting.
+// after initial setdefault, the in-flight device re-informs on the factory
+// default key and reset completion plus the ordinary adoption rotation occur
+// atomically — §6.2 a/c/f mgmt_cfg-only push with fresh key/version.
 func TestSetdefaultReadoptOnDefaultKey(t *testing.T) {
 	e := newTestEngine(t)
 	dev := settledLifecycleDevice()
@@ -228,8 +196,8 @@ func TestSetdefaultReadoptOnDefaultKey(t *testing.T) {
 	}
 	applyDeltas(&dev, out)
 
-	// Post-reset inform: factory default key, factory config (no
-	// cfgversion), pending record → ordinary adoption push.
+	// Factory-key status inform confirms reset, then rotates fresh adoption
+	// identity in this same decision.
 	out, err = e.Decide(Request{
 		Transport: TransportEncrypted, Device: dev,
 		Body: engineBody(""), UsedKey: defaultKeyHex, Now: time.Unix(1010, 0),
@@ -254,6 +222,9 @@ func TestSetdefaultReadoptOnDefaultKey(t *testing.T) {
 	}
 	if !out.SetCfgVersion || len(out.CfgVersion) != 16 || !isHexStr(out.CfgVersion) {
 		t.Fatalf("re-adoption cfgversion not fresh 16-hex: %q", out.CfgVersion)
+	}
+	if !out.SetFactoryResetInFlight || out.FactoryResetInFlight {
+		t.Fatalf("factory-key confirmation did not clear in-flight marker: %+v", out)
 	}
 }
 
@@ -316,6 +287,7 @@ func TestSetdefaultFiresOnDefaultKeyInform(t *testing.T) {
 func TestArmedLifecycleFiresOnPlaintextLane(t *testing.T) {
 	e := newTestEngine(t)
 	dev := settledLifecycleDevice()
+	dev.KeyConfirmed = true // prior encrypted assigned-key authentication
 	dev.Extra[FlagRebootOnConnect] = true
 
 	out, err := e.Decide(Request{
@@ -345,8 +317,10 @@ func TestArmedLifecycleFiresOnPlaintextLane(t *testing.T) {
 		t.Fatalf("plaintext post-reboot kind = %v full=%v, want the ordinary plain-lane full provisioning", out.Kind, out.FullProvision)
 	}
 
-	// Same for setdefault on the plaintext lane.
+	// A previously encrypted-confirmed assignment may also emit the armed
+	// reset on plaintext; the claim itself does not establish confirmation.
 	dev = settledLifecycleDevice()
+	dev.KeyConfirmed = true
 	dev.Extra[FlagSetdefaultArmed] = true
 	out, err = e.Decide(Request{
 		Transport: TransportPlaintext, Device: dev,

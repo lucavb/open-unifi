@@ -86,6 +86,26 @@ func postAdmin(t *testing.T, h http.Handler, method, path string) *httptest.Resp
 	return rec
 }
 
+func getPendingCommand(t *testing.T, admin http.Handler) string {
+	t.Helper()
+	rec := postAdmin(t, admin, http.MethodGet, "/api/v1/devices/aa:bb:cc:dd:ee:ff")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("device view: %d %s", rec.Code, rec.Body.String())
+	}
+	return getPendingCommandFromBody(t, rec.Body.Bytes())
+}
+
+func getPendingCommandFromBody(t *testing.T, body []byte) string {
+	t.Helper()
+	var view struct {
+		PendingCommand string `json:"pending_command"`
+	}
+	if err := json.Unmarshal(body, &view); err != nil {
+		t.Fatal(err)
+	}
+	return view.PendingCommand
+}
+
 // TestLifecycleResponseExactBytesAtSerializationBoundary pins the two
 // response shapes at Server.applyOutcome — the single serialization point
 // both transports seal. No record deltas ride these bare outcomes; the
@@ -185,42 +205,34 @@ func TestRebootLifecycleEndToEnd(t *testing.T) {
 	}
 }
 
-// TestFactoryResetLifecycleEndToEnd: admin POST
-// /devices/{mac}/factory-reset arms the flag on a CONFIRMED, key-authenticated
-// adopted record. The armed inform must be AUTHENTICATED to fire the lifecycle:
-// a factory-default-key inform on the confirmed record is rejected by the
-// key-confirmation gate (the 404 marker; record untouched, arming intact);
-// the device-key-sealed inform answers the §6.6 shape byte-exact and the
-// record lands in the pending-candidate shape (keys, cfgversions AND the
-// KeyConfirmed marker cleared, controller-owned WLAN bookkeeping cleared);
-// the factory-reset device re-informs on the factory default key and is
-// re-adopted by the existing flow (mgmt_cfg-only push with fresh key and
-// cfgversion), whose post-key-rotation follow-up inform takes the ordinary
-// full provisioning path — the recovery loop the demotion's marker clear
-// preserves.
+// TestFactoryResetLifecycleEndToEnd pins the durable two-phase reset: the
+// initial response retains old keys and reset-sensitive state, a lost
+// response can be retried after another admin click, and only an encrypted
+// factory-key status inform confirms reset and re-enters ordinary adoption.
 func TestFactoryResetLifecycleEndToEnd(t *testing.T) {
 	adminH, informH, st := lifecycleFixture(t)
 	const cfg = "aaaabbbbccccdddd"
 	const xkey = "11112222333344445555666677778888"
 	registerAdopted(t, st, cfg, xkey)
-	// The record has authenticated its per-device key in its history: the
-	// persisted confirmation marker (gate input) is set, matching any
-	// adopted production record.
+	// Seed a production-shaped confirmed device plus reset-surviving admin
+	// intent and reset-swept controller bookkeeping.
 	if err := st.UpdateExisting(testMAC, func(d *store.Device) error {
 		d.KeyConfirmed = true
-		// Stale controller-owned bookkeeping: the demotion must clear it, or
-		// the re-adopted device would settle into connected noops against a
-		// baseline its factory config never matched.
+		d.SiteID = "site-survives-reset"
+		d.SSHPassword = "admin-ssh-password"
+		d.SSHPublicKeys = []string{"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOUwWDD6bHEB1eu+jGdA8BnzE4bCQpNK77bGf1EF4MjJ admin@reset"}
+		d.LEDOverride = "off"
 		if d.Extra == nil {
 			d.Extra = store.JSONMap{}
 		}
 		d.Extra["wlan_cfg_sha"] = "stalebaseline"
 		d.Extra["wlan_cfg_attempts"] = 3.0
-		// Seed the per-device ssh password cache as well: absorption's
-		// prev-or-delete restoration carries it through the inform, and
-		// the §6.6 sweep deliberately spares it (it holds the DEVICE's
-		// last controller-pushed password and survives the demotion).
+		d.Extra[store.DeviceWLANsExtraKey] = `[{"name":"guest","ssid":"guest-net","enabled":true}]`
+		// Both per-device SSH caches and typed/admin intent survive reset.
 		d.Extra[store.SSHSha512PasswdKey] = "site-cache-sentinel"
+		d.Extra[store.SSHMd5PasswdKey] = "md5-cache-sentinel"
+		d.Extra[store.FlagRebootOnConnect] = true
+		d.Extra[store.CmdTaskKey] = store.JSONMap{"cmd": "restart", "mac": testMAC}
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -228,7 +240,7 @@ func TestFactoryResetLifecycleEndToEnd(t *testing.T) {
 	kx := hexKey(t, xkey)
 	kd := hexKey(t, inform.DefaultKeyHex)
 
-	// 1. arm the factory reset.
+	// 1. Arm factory reset; no key, version, or configuration is retired yet.
 	rec := postAdmin(t, adminH, http.MethodPost, "/api/v1/devices/aa:bb:cc:dd:ee:ff/factory-reset")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("factory-reset arm: %d %s", rec.Code, rec.Body.String())
@@ -240,8 +252,8 @@ func TestFactoryResetLifecycleEndToEnd(t *testing.T) {
 	if v, ok := d.Extra["setdefault_armed"]; !ok || v != true {
 		t.Fatalf("setdefault flag not armed after POST: %+v", d.Extra)
 	}
-	if !d.KeyConfirmed {
-		t.Fatalf("confirmation marker lost on the armed record: %+v", d)
+	if !d.KeyConfirmed || d.FactoryResetInFlight || d.CfgVersion != cfg || d.AppliedCfg != cfg || d.XAuthkey != xkey {
+		t.Fatalf("arming changed assigned identity/config or entered in-flight early: %+v", d)
 	}
 
 	// 2a. FACTORY-key inform on the confirmed record (even armed): the
@@ -263,8 +275,8 @@ func TestFactoryResetLifecycleEndToEnd(t *testing.T) {
 		t.Fatalf("arming not preserved past the rejected inform: %+v", d.Extra)
 	}
 
-	// 2b. GCM-sealed DEVICE-key inform → §6.6 bytes; record demoted
-	// (keys AND the confirmation marker cleared).
+	// 2b. GCM-sealed assigned-key inform emits the exact setdefault response,
+	// commits an in-flight marker, and preserves keys/config for retry.
 	resp = post(t, informH, encryptGCM(t, mustJSON(t, infoBody(cfg)), kx, bytes16(0x09)))
 	if resp.Code != http.StatusOK {
 		t.Fatalf("armed inform: %d", resp.Code)
@@ -280,48 +292,92 @@ func TestFactoryResetLifecycleEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.State != store.StatePending || d.XAuthkey != "" || d.CfgVersion != "" ||
-		d.AppliedCfg != "" || len(d.Authkeys) != 0 {
-		t.Fatalf("record not in pending-candidate shape: %+v", d)
+	if !d.FactoryResetInFlight || d.State != store.StateAdopted || d.XAuthkey != xkey || d.CfgVersion != cfg ||
+		d.AppliedCfg != cfg || len(d.Authkeys) == 0 || d.Authkeys[len(d.Authkeys)-1] != xkey {
+		t.Fatalf("initial setdefault did not retain the retry identity: %+v", d)
 	}
-	if d.KeyConfirmed {
-		t.Fatalf("key-confirmation marker survived the setdefault demotion: %+v", d)
+	if !d.KeyConfirmed {
+		t.Fatalf("initial reset emission cleared key confirmation: %+v", d)
 	}
 	if _, armed := d.Extra["setdefault_armed"]; armed {
 		t.Fatalf("setdefault flag survived emission: %+v", d.Extra)
 	}
-	for _, k := range store.FactoryResetSweepKeys {
-		if _, ok := d.Extra[k]; ok {
-			t.Fatalf("controller-owned %q survived the demotion: %+v", k, d.Extra)
+	for _, key := range []string{store.FlagRebootOnConnect, store.CmdTaskKey} {
+		if _, armed := d.Extra[key]; armed {
+			t.Fatalf("initial factory reset did not consume superseded %s: %+v", key, d.Extra)
 		}
 	}
+	if d.Extra["wlan_cfg_sha"] != "stalebaseline" || d.Extra["wlan_cfg_attempts"] != 3.0 {
+		t.Fatalf("initial emission swept delivery state: %+v", d.Extra)
+	}
 	if got, want := d.Extra[store.SSHSha512PasswdKey], "site-cache-sentinel"; got != want {
-		t.Fatalf("the §6.6 sweep must spare the per-device ssh password cache: %v, want %q", got, want)
+		t.Fatalf("initial emission changed SSH cache: %v, want %q", got, want)
+	}
+	if pending := getPendingCommand(t, adminH); pending != "factory-reset" {
+		t.Fatalf("in-flight reset disappeared from device view: %q", pending)
 	}
 
-	// 3. factory-reset device re-informs on the factory default key →
-	// existing adoption flow: mgmt_cfg-only push, fresh key + cfgversion
-	// (the demotion cleared the marker, so the gate's pre-key window
-	// admits it again — recovery preserved).
-	resp = post(t, informH, encryptCBC(t, mustJSON(t, infoBody("")), kd, testIV))
-	if resp.Code != http.StatusOK {
-		t.Fatalf("default-key re-inform: %d", resp.Code)
-	}
-	_, jm := decryptResponse(t, resp.Body.Bytes(), kd)
-	if jm["_type"] != "setparam" {
-		t.Fatalf("re-adoption response: %v", jm["_type"])
-	}
-	exactKeys(t, jm, "_type", "server_time_in_utc", "mgmt_cfg")
-	mgmt, _ := jm["mgmt_cfg"].(string)
-	if !strings.Contains(mgmt, "authkey=") {
-		t.Fatalf("re-adoption mgmt_cfg missing authkey rotation: %q", mgmt)
+	// A repeated admin click is idempotent while the reset is in flight, and
+	// the device's retry on its retained key gets the same byte shape. Ignore
+	// the first returned response above to model a response lost by the AP.
+	rec = postAdmin(t, adminH, http.MethodPost, "/api/v1/devices/aa:bb:cc:dd:ee:ff/factory-reset")
+	if rec.Code != http.StatusOK || getPendingCommandFromBody(t, rec.Body.Bytes()) != "factory-reset" {
+		t.Fatalf("idempotent in-flight reset click: %d %s", rec.Code, rec.Body.String())
 	}
 	d, err = st.Get(testMAC)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.State != store.StateAdopting {
-		t.Fatalf("re-adoption state: %+v", d)
+	if !d.FactoryResetInFlight {
+		t.Fatalf("repeated click cleared in-flight marker: %+v", d)
+	}
+	if _, armed := d.Extra[store.FlagSetdefaultArmed]; armed {
+		t.Fatalf("repeated click created a redundant arm during in-flight reset: %+v", d.Extra)
+	}
+	resp = post(t, informH, encryptCBC(t, mustJSON(t, infoBody(cfg)), kx, testIV))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("old-key reset retry: %d", resp.Code)
+	}
+	_, raw = decryptResponseRaw(t, resp.Body.Bytes(), kx)
+	if !reSetdefaultBytes.Match(raw) {
+		t.Fatalf("retry §6.6 response bytes = %q", raw)
+	}
+
+	// Unknown gentle noop on the assigned key cannot confirm or consume the
+	// reset marker.
+	gentle := infoBody(cfg)
+	gentle["_type"] = "scan"
+	resp = post(t, informH, encryptCBC(t, mustJSON(t, gentle), kx, testIV))
+	_, jm := decryptResponse(t, resp.Body.Bytes(), kx)
+	if jm["_type"] != "noop" {
+		t.Fatalf("unknown gentle inform = %v, want noop", jm["_type"])
+	}
+	d, err = st.Get(testMAC)
+	if err != nil || !d.FactoryResetInFlight || d.XAuthkey != xkey || !d.KeyConfirmed {
+		t.Fatalf("gentle noop changed in-flight reset: %+v (err=%v)", d, err)
+	}
+
+	// 3. Only encrypted factory-key status confirms the reset and runs the
+	// normal factory-key adoption rotation in this same atomic update.
+	resp = post(t, informH, encryptGCM(t, mustJSON(t, infoBody("")), kd, bytes16(0x0c)))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("factory-key reset confirmation: %d", resp.Code)
+	}
+	flags, jm = decryptResponse(t, resp.Body.Bytes(), kd)
+	if flags&inform.FlagGCM == 0 || jm["_type"] != "setparam" {
+		t.Fatalf("factory-key confirmation response flags=%04x payload=%v", flags, jm)
+	}
+	exactKeys(t, jm, "_type", "server_time_in_utc", "mgmt_cfg")
+	mgmt, _ := jm["mgmt_cfg"].(string)
+	if !strings.Contains(mgmt, "authkey=") {
+		t.Fatalf("factory-confirmation adoption missing authkey rotation: %q", mgmt)
+	}
+	d, err = st.Get(testMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.FactoryResetInFlight || d.State != store.StateAdopting || d.AppliedCfg != "" || d.KeyConfirmed {
+		t.Fatalf("factory confirmation did not atomically complete reset and start adoption: %+v", d)
 	}
 	if d.XAuthkey == "" || d.XAuthkey == xkey || !isHex(d.XAuthkey) || len(d.XAuthkey) != 32 {
 		t.Fatalf("re-adoption key not fresh 32-hex: %q", d.XAuthkey)
@@ -330,7 +386,27 @@ func TestFactoryResetLifecycleEndToEnd(t *testing.T) {
 		t.Fatalf("fresh key not in authkeys: %v", d.Authkeys)
 	}
 	if !isHex(d.CfgVersion) || len(d.CfgVersion) != 16 || d.CfgVersion == cfg {
-		t.Fatalf("re-adoption cfgversion not fresh 16-hex: %q", d.CfgVersion)
+		t.Fatalf("factory-confirmation cfgversion not fresh 16-hex: %q", d.CfgVersion)
+	}
+	for _, k := range store.FactoryResetSweepKeys {
+		if _, ok := d.Extra[k]; ok {
+			t.Fatalf("factory confirmation left reset-swept key %q: %+v", k, d.Extra)
+		}
+	}
+	if d.SiteID != "site-survives-reset" || d.SSHPassword != "admin-ssh-password" ||
+		d.LEDOverride != "off" || len(d.SSHPublicKeys) != 1 ||
+		d.Extra[store.DeviceWLANsExtraKey] == nil {
+		t.Fatalf("factory confirmation discarded admin intent: %+v", d)
+	}
+	if d.Extra[store.SSHSha512PasswdKey] != "site-cache-sentinel" || d.Extra[store.SSHMd5PasswdKey] != "md5-cache-sentinel" {
+		t.Fatalf("factory confirmation discarded SSH caches: %+v", d.Extra)
+	}
+
+	// The old key was retired atomically with reset confirmation; subsequent
+	// requests cannot be admitted from a pre-reset key snapshot.
+	resp = post(t, informH, encryptCBC(t, mustJSON(t, infoBody(cfg)), kx, testIV))
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("retired old-key inform status = %d, want decrypt rejection 400", resp.Code)
 	}
 
 	// 4. the post-key-rotation follow-up inform continues the ordinary
@@ -351,16 +427,15 @@ func TestFactoryResetLifecycleEndToEnd(t *testing.T) {
 	if _, ok := jm["cfgversion"]; !ok {
 		t.Fatalf("full provisioning missing top-level cfgversion: %v", jm)
 	}
-	// The step-4 inform authenticated with the freshly assigned key: the
-	// confirmation marker must be re-stamped by that inform itself.
+	// The post-reset inform authenticated with the freshly assigned key: the
+	// confirmation marker is stamped by that later inform.
 	if !d_confirmReStamped(st) {
 		t.Fatal("confirmation marker not re-stamped after the re-adoption inform")
 	}
 }
 
 // d_confirmReStamped reads st and asserts KeyConfirmed was re-set by the
-// re-adoption inform (a helper keeps the E2E linear: armed confirm →
-// reject → demoted unconfirm → re-adopt → the new inform confirms again).
+// post-reset assigned-key inform.
 func d_confirmReStamped(st store.DeviceStore) bool {
 	d, err := st.Get(testMAC)
 	if err != nil {

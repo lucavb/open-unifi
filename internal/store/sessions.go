@@ -12,9 +12,9 @@
 // when the record has none, including on a fresh or just-swept record. Record
 // absorption carries them across informs (the controllerOwnedKeys registry
 // in this package), and the only writer is the session refresh computed
-// adapter-side from decoded station data, never a passthrough. The §6.6
-// setdefault demotion sweeps the controller-owned keys with it: a
-// factory-reset device re-adoption starts with fresh session state.
+// adapter-side from decoded station data, never a passthrough. Confirmed §6.6
+// reset completion sweeps the controller-owned keys with it: a factory-reset
+// device re-adoption starts with fresh session state.
 //
 // Rows are bounded by sessionRowCap per device. When a refresh exceeds the
 // cap, the oldest last_seen rows are evicted, with canonical MAC as the

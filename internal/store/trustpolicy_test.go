@@ -16,7 +16,7 @@ func absorbFixture() Device {
 	return Device{
 		MAC: "aabbccddeeff", Model: "U7PG2", Firmware: "6.8.2.15592",
 		LastSeen: 1699999999, FirstSeen: 1690000000, AppliedCfg: "old-cfg",
-		AESGCM: true,
+		AESGCM: true, FactoryResetInFlight: true,
 		Extra: JSONMap{
 			// controller-owned: wlan bookkeeping + the client-session family
 			"wlan_cfg_sha":    "prev-sha",
@@ -30,6 +30,7 @@ func absorbFixture() Device {
 			"mgmt_dev":                      "br0",
 			"reboot_on_connect":             true,
 			"setdefault_armed":              true,
+			"factory_reset_in_flight":       true,
 			"led_override":                  "on",
 			"led_override_color_brightness": 42.0,
 			"blocked_sta":                   []any{"112233445566"},
@@ -61,6 +62,7 @@ func absorbBody() map[string]any {
 		"mgmt_dev":                      "eth9",
 		"reboot_on_connect":             "forged",
 		"setdefault_armed":              "forged",
+		"factory_reset_in_flight":       false,
 		"led_override":                  "off",
 		"led_override_color_brightness": 99.0,
 		"blocked_sta":                   "forged",
@@ -282,10 +284,10 @@ func TestAbsorbWatchdogRowsRejectIntroduction(t *testing.T) {
 	}
 }
 
-// TestAbsorbFactoryResetSweepExcludesSiteCache pins the demotion sweep's
+// TestAbsorbFactoryResetSweepExcludesSiteCache pins reset completion's sweep
 // shape: it clears exactly the per-device controller state plus the devname
 // materialization watchdog's two admin-owned rows (the marker/counter must
-// not survive a reset/demotion — see the factory-reset-sweep comment in
+// not survive reset completion — see the factory-reset-sweep comment in
 // trustpolicy.go) and never the per-device SSH password caches (they hold
 // the DEVICE's last controller-pushed password and deliberately survive the
 // demotion; both caches are admin-owned, so the class itself cannot land in
@@ -293,19 +295,21 @@ func TestAbsorbWatchdogRowsRejectIntroduction(t *testing.T) {
 func TestAbsorbFactoryResetSweepExcludesSiteCache(t *testing.T) {
 	for _, k := range FactoryResetSweepKeys {
 		if k == SSHSha512PasswdKey || k == SSHMd5PasswdKey {
-			t.Fatal("the demotion sweep must not clear the per-device ssh password caches")
+			t.Fatal("reset completion must not clear the per-device ssh password caches")
 		}
 		if !containsKey(controllerOwnedKeys, k) &&
-			k != "wlan_cfg_vap_not_running_misses" && k != "wlan_cfg_materialization_reboot" {
-			t.Fatalf("sweep key %q is neither controller-owned nor the admin-owned watchdog pair", k)
+			k != "wlan_cfg_vap_not_running_misses" && k != "wlan_cfg_materialization_reboot" &&
+			k != FactoryResetInFlightKey {
+			t.Fatalf("sweep key %q is neither controller-owned nor explicitly reset-swept", k)
 		}
 	}
 	if containsKey(controllerOwnedKeys, SSHSha512PasswdKey) || containsKey(controllerOwnedKeys, SSHMd5PasswdKey) {
 		t.Fatal("the ssh password caches must be admin-owned")
 	}
 	if !containsKey(adminOwnedKeys, "wlan_cfg_vap_not_running_misses") ||
-		!containsKey(adminOwnedKeys, "wlan_cfg_materialization_reboot") {
-		t.Fatal("the watchdog pair must be admin-owned while still swept")
+		!containsKey(adminOwnedKeys, "wlan_cfg_materialization_reboot") ||
+		!containsKey(adminOwnedKeys, FactoryResetInFlightKey) {
+		t.Fatal("watchdog/reset rows must be admin-owned while still swept")
 	}
 }
 
@@ -393,6 +397,7 @@ func TestTrustRegistrySnapshot(t *testing.T) {
 		"system_cfg_extra_lines", "mgmt_dev",
 		"anonymous_controller_id", "anonymous_site_id",
 		"reboot_on_connect", "setdefault_armed",
+		"factory_reset_in_flight",
 		"blocked_sta", "blocked_sta_sha",
 		"wlan_cfg_vap_not_running_misses", "wlan_cfg_materialization_reboot",
 		"ssh_sha512passwd", "ssh_md5passwd",
@@ -409,6 +414,7 @@ func TestTrustRegistrySnapshot(t *testing.T) {
 		"wlan_cfg_not_running_misses", "wlan_cfg_offered_cfgversion",
 		"client_sessions", "client_disconnect_pending",
 		"wlan_cfg_vap_not_running_misses", "wlan_cfg_materialization_reboot",
+		"factory_reset_in_flight",
 	}
 	cases := []struct {
 		name string
@@ -426,8 +432,8 @@ func TestTrustRegistrySnapshot(t *testing.T) {
 		}
 	}
 	// The sweep's derived half must be exactly controller-owned minus the
-	// ssh password caches — no other exclusion is licensed — plus the two
-	// admin-owned watchdog rows the demotion must still clear, and the
+	// ssh password caches — no other exclusion is licensed — plus the
+	// admin-owned watchdog rows and reset marker the transition clears; the
 	// caches are admin-owned so they cannot be swept by class either.
 	for _, k := range []string{SSHSha512PasswdKey, SSHMd5PasswdKey} {
 		if containsKey(controllerOwnedKeys, k) {

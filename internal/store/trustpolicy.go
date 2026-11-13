@@ -18,7 +18,7 @@
 //	             intent, the §6.3 stored task).
 //
 // This file is the single declaration site for every class. Absorb enforces
-// each class on the ordinary record path; the §6.6 factory-reset demotion
+// each class on the ordinary record path; the §6.6 reset-completion transition
 // consults the controller-owned registry through FactoryResetSweepKeys.
 // Controller-owned and admin-owned remain separate ownership classes even
 // though both reject body introduction: they have different legitimate
@@ -63,6 +63,10 @@ const (
 	// see adoption's flag comment block for the recovered facts.
 	FlagRebootOnConnect = "reboot_on_connect"
 	FlagSetdefaultArmed = "setdefault_armed"
+	// FactoryResetInFlightKey is the Extra twin of the persisted typed
+	// Device.FactoryResetInFlight marker. It is admin-owned so a device body
+	// cannot introduce a raw lookalike or alter the typed lifecycle state.
+	FactoryResetInFlightKey = "factory_reset_in_flight"
 
 	// RadioIntentExtraKey is the admin-owned per-radio channel/txpower
 	// intent map (wireless.PlanVaps' ProvisioningPlan input).
@@ -149,6 +153,7 @@ var adminOwnedKeys = []string{
 	SystemCfgExtraLinesKey, MgmtDevKey,
 	AnonymousControllerIDKey, AnonymousSiteIDKey,
 	FlagRebootOnConnect, FlagSetdefaultArmed,
+	FactoryResetInFlightKey,
 	BlockedStaExtraKey, BlockedStaShaExtraKey,
 	// The devname-level materialization watchdog's two rows (the
 	// consecutive-miss counter and the one-shot armed-reboot marker, per
@@ -171,8 +176,8 @@ var adminOwnedKeys = []string{
 	RadioIntentExtraKey, DeviceWLANsExtraKey, CmdTaskKey,
 }
 
-// FactoryResetSweepKeys is the subset of the trust registry the §6.6
-// factory-reset demotion clears: the PER-DEVICE controller state whose
+// FactoryResetSweepKeys is the subset of the trust registry confirmed §6.6
+// factory-reset completion clears: the PER-DEVICE controller state whose
 // staleness cannot survive a reset (a stale wlan_cfg_sha would let the
 // re-adopted device settle into connected noops while running factory
 // config), PLUS the devname materialization watchdog's two admin-owned rows
@@ -183,12 +188,12 @@ var adminOwnedKeys = []string{
 // because the post-reset re-adoption full-provisions and re-stamps it), but
 // a surviving marker would freeze the per-config one-shot budget across a
 // reset and a surviving counter would land the re-adopted device one
-// genuine miss away from an instant arm. So unlike blocked_sta_sha these
-// two are swept explicitly. SSHSha512PasswdKey is deliberately excluded —
+// genuine miss away from an instant arm. The raw Extra twin of the typed
+// in-flight marker is also swept explicitly. SSHSha512PasswdKey is deliberately excluded —
 // and the same survival holds by CLASS membership, not just by this
 // exclude: both password caches are admin-owned (they hold the DEVICE's
 // last controller-pushed password and deliberately survive factory
-// reset/setdefault demotion; the exclude keeps that survival even if the
+// reset completion; the exclude keeps that survival even if the
 // keys ever move classes again). Derived from controllerOwnedKeys for the
 // derived half, so that half can never fall out of sync with the class it
 // clears. TREAT AS IMMUTABLE (do not append or reorder; it holds the
@@ -196,7 +201,8 @@ var adminOwnedKeys = []string{
 // exported: the adoption engine is its sole consumer, so the class
 // membership itself stays sealed.
 var FactoryResetSweepKeys = append(excludeKey(controllerOwnedKeys, SSHSha512PasswdKey),
-	WlanCfgVapNotRunningMissesKey, WlanCfgMaterializationRebootKey)
+	WlanCfgVapNotRunningMissesKey, WlanCfgMaterializationRebootKey,
+	FactoryResetInFlightKey)
 
 // excludeKey copies keys without the one named (copy so a caller that
 // appends to one list can never clobber the other's backing array).
