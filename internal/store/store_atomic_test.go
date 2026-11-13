@@ -793,21 +793,30 @@ func TestDeleteQueuedUpdateAndPostDeleteUpdateStaySerialized(t *testing.T) {
 		}
 		if deleteLaunched && !deleteComplete {
 			select {
-			case <-deleteDone:
+			case err := <-deleteDone:
+				if err != nil {
+					t.Errorf("cleanup Delete failed: %v", err)
+				}
 			case <-time.After(3 * time.Second):
 				t.Error("cleanup timed out waiting for Delete")
 			}
 		}
 		if queuedLaunched && !queuedComplete {
 			select {
-			case <-queuedDone:
+			case err := <-queuedDone:
+				if err != nil {
+					t.Errorf("cleanup queued Update failed: %v", err)
+				}
 			case <-time.After(3 * time.Second):
 				t.Error("cleanup timed out waiting for queued Update")
 			}
 		}
 		if newLaunched && !newComplete {
 			select {
-			case <-newDone:
+			case err := <-newDone:
+				if err != nil {
+					t.Errorf("cleanup post-Delete Update failed: %v", err)
+				}
 			case <-time.After(3 * time.Second):
 				t.Error("cleanup timed out waiting for post-Delete Update")
 			}

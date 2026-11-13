@@ -324,7 +324,7 @@ type failAfterInformCallbackStore struct {
 }
 
 func (s *failAfterInformCallbackStore) UpdateExisting(mac string, fn func(*store.Device) error) error {
-	rec, err := s.DeviceStore.Get(mac)
+	rec, err := s.Get(mac)
 	if err != nil {
 		return err
 	}
@@ -347,7 +347,7 @@ func TestInformCommitFailurePublishesNoHooksOrNoopTarget(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			base := store.NewMemStore()
 			putInformCycleDevice(t, base, testMAC)
-			var db store.DeviceStore = base
+			db := base
 			if failCommit {
 				db = &failAfterInformCallbackStore{DeviceStore: base, err: errors.New("injected persistence failure")}
 			}
