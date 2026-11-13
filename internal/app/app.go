@@ -408,22 +408,16 @@ func (a *App) PatchDevice(_ context.Context, mac string, patch adminapi.DevicePa
 			}
 			return effective, nil
 		},
-		func(d *store.Device) store.Device {
-			// Detached snapshot for the returned view: scalars only —
-			// the inform passthrough (Extra), stats (LastUps) and key
-			// history (Authkeys) never belong on a device-row echo,
-			// and a save response must not leak the inform body it
-			// merely raced.
-			rec := *d
-			rec.LastUps = nil
-			rec.Extra = nil
-			rec.Authkeys = nil
-			return rec
+		func(d *store.Device) adminapi.DeviceView {
+			// a.view is the allowlist boundary: it can read Extra to compute
+			// pending/delivery/runtime fields without serializing the raw map,
+			// stats, or assigned-key history into the response.
+			return a.view(*d)
 		})
 	if err != nil {
 		return adminapi.DeviceView{}, err
 	}
-	return a.view(rec), nil
+	return rec, nil
 }
 
 // siteRefChangeRequiresProvisioning reports whether a site assignment change
@@ -538,20 +532,19 @@ func (a *App) CreateDevice(_ context.Context, up adminapi.DeviceUpsert) (adminap
 			// ordinary single cfgversion mint.
 			return siteRefChangeRequiresProvisioning(d, siteRefBefore), nil
 		},
-		// Detached snapshot for the returned view (view reads scalars only).
-		func(d *store.Device) store.Device {
-			return store.Device{
-				MAC: d.MAC, Name: d.Name, Model: d.Model, Firmware: d.Firmware,
-				IP: d.IP, State: d.State, LastSeen: d.LastSeen,
-				CfgVersion: d.CfgVersion, AppliedCfg: d.AppliedCfg,
-			}
+		// Project the complete safe view inside the save cycle, after any
+		// effective-site cfgversion mint; a.view consumes but never exposes Extra.
+		func(d *store.Device) adminapi.DeviceView {
+			// DeviceView is the allowlist: deriving it from the complete
+			// record keeps the mutation response current without exposing Extra.
+			return a.view(*d)
 		})
 	if err != nil {
 		return adminapi.DeviceView{}, err
 	}
-	a.lg.Debug("device created/updated via admin api", "mac", store.ColonMAC(rec.MAC),
+	a.lg.Debug("device created/updated via admin api", "mac", rec.MAC,
 		"state", rec.State, "created", created)
-	return a.view(rec), nil
+	return rec, nil
 }
 
 // DeleteDevice removes a device record. Unknown MACs wrap
@@ -988,6 +981,7 @@ func (a *App) ListPending(_ context.Context) []adminapi.PendingView {
 // other candidate shape (inform-noted, discovery note without a factory
 // mark) keeps the whitelist-arming-only semantics above.
 func (a *App) AdoptPending(ctx context.Context, mac string) (adminapi.DeviceView, error) {
+	var recordMAC string
 	rec, err := saveIntent(a, mac, savePending,
 		func(d *store.Device) (bool, error) {
 			// The RMW cycle seeds unknown MACs (savePending); a seeded
@@ -1010,28 +1004,28 @@ func (a *App) AdoptPending(ctx context.Context, mac string) (adminapi.DeviceView
 			}
 			// Records in any non-PENDING state already returned above; only
 			// fresh candidates (pending map only) and PENDING records persist.
+			recordMAC = d.MAC
 			return false, nil
 		},
-		func(d *store.Device) store.Device {
-			// The promotion response echoes the whitelist shape (the
-			// record before any inform handshake key/heartbeat has
-			// landed): scalars only, no cfgversion yet.
-			return store.Device{
-				MAC: d.MAC, Name: d.Name, Model: d.Model, Firmware: d.Firmware,
-				IP: d.IP, State: d.State, LastSeen: d.LastSeen,
-			}
+		func(d *store.Device) adminapi.DeviceView {
+			// Return the complete allowlisted pending-device view while
+			// preserving AdoptPending's contract: this only arms the
+			// whitelist; it does not return a cfgversion or expose raw Extra.
+			view := a.view(*d)
+			view.CfgVersion = ""
+			return view
 		})
 	if err != nil {
 		return adminapi.DeviceView{}, err
 	}
-	a.lg.Debug("device promoted to pending", "mac", store.ColonMAC(rec.MAC))
+	a.lg.Debug("device promoted to pending", "mac", rec.MAC)
 	// The whitelist promotion is committed above; the push lane (when
 	// armed) fires once here. A push failure surfaces wrapped
 	// ErrSetInformPushFailed (HTTP 502) while the promotion stands.
-	if perr := a.pushSetInform(ctx, rec.MAC); perr != nil {
+	if perr := a.pushSetInform(ctx, recordMAC); perr != nil {
 		return adminapi.DeviceView{}, perr
 	}
-	return a.view(rec), nil
+	return rec, nil
 }
 
 // ---- remote lifecycle commands (§6.5 reboot / §6.6 setdefault / §6.3 cmd) --

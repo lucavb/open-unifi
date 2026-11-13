@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -1816,6 +1818,274 @@ func TestCreateDeviceSiteRefMintDependsOnProvisioningState(t *testing.T) {
 				t.Fatalf("provisioned upsert state = %+v, view=%+v, err=%v", rec, view, err)
 			}
 		})
+	}
+}
+
+func allowlistedMutationFixture(t *testing.T, mac string, state int, resetInFlight bool) store.Device {
+	t.Helper()
+	d := store.Device{
+		MAC: mac, Name: "before", Model: "U7PG2", Firmware: "6.8.2.15592",
+		Serial: "private-serial", InformURL: "http://private-inform:8080/inform",
+		SiteID: "branch-a", State: state, LastSeen: 1_700_000_000,
+		CfgVersion: "aaaabbbbccccdddd", AppliedCfg: "aaaabbbbccccdddd",
+		Authkeys: []string{"private-auth-history"}, XAuthkey: "private-x-authkey",
+		AESGCM: true, KeyConfirmed: true, SSHPassword: "visible-admin-ssh-password",
+		SSHPublicKeys: []string{"ssh-ed25519 AAAATEST authorized-key"},
+		LastUps:       store.JSONMap{"private-stats": true},
+		Extra: store.JSONMap{
+			"radio_table": []any{map[string]any{"name": "ra0", "radio": "ng"}},
+			"vap_table": []any{map[string]any{
+				"name": "ath0", "essid": "view-ssid", "radio_name": "ra0", "state": "RUN",
+			}},
+			store.WlanCfgDeliveryStatusKey: "exhausted",
+			store.WlanCfgAttemptsKey:       4,
+			store.WlanCfgLastAttemptKey:    int64(1_700_000_000),
+			"private-extra-marker":         "private-extra-value",
+		},
+	}
+	if err := wireless.SetDeviceWLANs(&d, []wireless.Wlan{{
+		Name: "view", SSID: "view-ssid", Security: "open", Enabled: true,
+		ID: "view-wlan", Band: "2g",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	store.ArmCmdTask(&d, "restart")
+	if resetInFlight {
+		d.FactoryResetInFlight = true
+	} else {
+		d.Extra[store.FlagSetdefaultArmed] = true
+	}
+	return d
+}
+
+func allowlistedMutationRequest(t *testing.T, h http.Handler, method, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func decodeAllowlistedMutationBody(body []byte) (adminapi.DeviceView, error) {
+	var view adminapi.DeviceView
+	decoder := json.NewDecoder(strings.NewReader(string(body)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&view); err != nil {
+		return adminapi.DeviceView{}, err
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return adminapi.DeviceView{}, errors.New("multiple JSON values in mutation response")
+		}
+		return adminapi.DeviceView{}, err
+	}
+	var rawFields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &rawFields); err != nil {
+		return adminapi.DeviceView{}, err
+	}
+	for _, forbidden := range []string{
+		"extra", "last_ups", "authkeys", "x_authkey", "serial",
+		"inform_url", "aes_gcm", "key_confirmed", "factory_reset_in_flight",
+	} {
+		if _, ok := rawFields[forbidden]; ok {
+			return adminapi.DeviceView{}, fmt.Errorf("forbidden response field %q", forbidden)
+		}
+	}
+	for _, forbidden := range []string{
+		"private-extra-value", "private-stats", "private-auth-history", "private-x-authkey", "private-serial",
+	} {
+		if strings.Contains(string(body), forbidden) {
+			return adminapi.DeviceView{}, fmt.Errorf("forbidden response value %q", forbidden)
+		}
+	}
+	if !strings.Contains(string(body), `"ssh_password":"visible-admin-ssh-password"`) ||
+		!strings.Contains(string(body), `"ssh_public_keys":["ssh-ed25519 AAAATEST authorized-key"]`) {
+		return adminapi.DeviceView{}, fmt.Errorf("response dropped intentionally exposed SSH intent: %s", body)
+	}
+	return view, nil
+}
+
+func decodeAllowlistedMutationBodyForTest(t *testing.T, body []byte) adminapi.DeviceView {
+	t.Helper()
+	view, err := decodeAllowlistedMutationBody(body)
+	if err != nil {
+		t.Fatalf("mutation response is not an allowlisted DeviceView: %v (%s)", err, body)
+	}
+	return view
+}
+
+func assertMutationBodyMatchesGet(t *testing.T, a *App, body []byte, hideCfgVersion bool) adminapi.DeviceView {
+	t.Helper()
+	got, err := decodeAllowlistedMutationBody(body)
+	if err != nil {
+		t.Fatalf("mutation response is not an allowlisted DeviceView: %v (%s)", err, body)
+	}
+	want, err := a.GetDevice(context.Background(), got.MAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hideCfgVersion {
+		want.CfgVersion = ""
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("mutation DeviceView differs from immediate Get:\n got: %+v\nwant: %+v", got, want)
+	}
+	return got
+}
+
+func TestMutationResponseAllowlistCheckerRejectsInjectedRawFields(t *testing.T) {
+	valid, err := json.Marshal(adminapi.DeviceView{
+		MAC: "aa:bb:cc:dd:ee:ff", SSHPassword: "visible-admin-ssh-password",
+		SSHPublicKeys: []string{"ssh-ed25519 AAAATEST authorized-key"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeAllowlistedMutationBody(valid); err != nil {
+		t.Fatalf("valid allowlisted response rejected: %v", err)
+	}
+	for _, injected := range []string{
+		`"x_authkey":"private-x-authkey"`,
+		`"extra":{"private-extra-marker":"private-extra-value"}`,
+	} {
+		bad := strings.TrimSuffix(string(valid), "}") + "," + injected + "}"
+		if _, err := decodeAllowlistedMutationBody([]byte(bad)); err == nil {
+			t.Errorf("allowlist checker accepted injected response field %s", injected)
+		}
+	}
+}
+
+func TestMutationHandlersReturnCompleteAllowlistedDeviceViews(t *testing.T) {
+	a, st := testApp(t)
+	const adoptedMAC = "aabbccddeeff"
+	const cfg = "aaaabbbbccccdddd"
+	patchRec := allowlistedMutationFixture(t, adoptedMAC, store.StateAdopted, true)
+	patchRec.CfgVersion, patchRec.AppliedCfg = cfg, cfg
+	if err := st.Put(patchRec); err != nil {
+		t.Fatal(err)
+	}
+	h := adminapi.New(adminapi.Config{}, a)
+
+	patch := allowlistedMutationRequest(t, h, http.MethodPatch,
+		"/api/v1/devices/"+store.ColonMAC(adoptedMAC), `{"site_id":"branch-b"}`)
+	if patch.Code != http.StatusOK {
+		t.Fatalf("PATCH: %d %s", patch.Code, patch.Body.String())
+	}
+	patched := decodeAllowlistedMutationBodyForTest(t, patch.Body.Bytes())
+	if patched.CfgVersion == cfg || len(patched.CfgVersion) != 16 || patched.SiteID != "branch-b" {
+		t.Fatalf("PATCH response omitted committed site/cfgversion: %+v", patched)
+	}
+	if patched.PendingCommand != "factory-reset" || patched.WLANDeliveryStatus != "exhausted" ||
+		patched.WLANDeliveryCount != 4 || patched.InSync == nil || !*patched.InSync {
+		t.Fatalf("PATCH response dropped allowlisted Extra-derived state: %+v", patched)
+	}
+	patched = assertMutationBodyMatchesGet(t, a, patch.Body.Bytes(), false)
+	stored, err := st.Get(adoptedMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stored.FactoryResetInFlight || store.CmdTaskCmd(stored) != "restart" {
+		t.Fatalf("site patch disturbed the in-flight reset/task state: %+v", stored)
+	}
+
+	post := allowlistedMutationRequest(t, h, http.MethodPost, "/api/v1/devices",
+		`{"mac":"aa:bb:cc:dd:ee:ff","name":"post-upsert"}`)
+	if post.Code != http.StatusCreated {
+		t.Fatalf("POST duplicate upsert: %d %s", post.Code, post.Body.String())
+	}
+	posted := decodeAllowlistedMutationBodyForTest(t, post.Body.Bytes())
+	if posted.Name != "post-upsert" || posted.SiteID != "branch-b" || posted.PendingCommand != "factory-reset" {
+		t.Fatalf("POST response omitted committed or Extra-derived values: %+v", posted)
+	}
+	posted = assertMutationBodyMatchesGet(t, a, post.Body.Bytes(), false)
+
+	const pendingMAC = "112233445566"
+	pending := allowlistedMutationFixture(t, pendingMAC, store.StatePending, false)
+	pending.CfgVersion = "not-for-adopt-response"
+	pending.AppliedCfg = "previous-applied"
+	if err := st.Put(pending); err != nil {
+		t.Fatal(err)
+	}
+	adopt := allowlistedMutationRequest(t, h, http.MethodPost,
+		"/api/v1/pending/"+store.ColonMAC(pendingMAC)+"/adopt", "")
+	if adopt.Code != http.StatusOK {
+		t.Fatalf("adopt pending: %d %s", adopt.Code, adopt.Body.String())
+	}
+	adopted := decodeAllowlistedMutationBodyForTest(t, adopt.Body.Bytes())
+	if adopted.State != store.StatePending || adopted.CfgVersion != "" || adopted.AppliedCfg != "previous-applied" {
+		t.Fatalf("AdoptPending broke its PENDING/no-cfgversion view contract: %+v", adopted)
+	}
+	if adopted.SiteID != "branch-a" || adopted.PendingCommand != "factory-reset" || adopted.SSHPassword != "visible-admin-ssh-password" {
+		t.Fatalf("AdoptPending response omitted allowlisted state: %+v", adopted)
+	}
+	var adoptFields map[string]json.RawMessage
+	if err := json.Unmarshal(adopt.Body.Bytes(), &adoptFields); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := adoptFields["cfg_version"]; present {
+		t.Fatalf("AdoptPending response must omit cfg_version entirely: %s", adopt.Body.Bytes())
+	}
+	storedPending, err := st.Get(pendingMAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedPending.CfgVersion != "not-for-adopt-response" {
+		t.Fatalf("AdoptPending changed stored cfgversion: %q", storedPending.CfgVersion)
+	}
+	assertMutationBodyMatchesGet(t, a, adopt.Body.Bytes(), true)
+}
+
+func TestPatchSaveFailureReturnsNoProjectedViewOrMutation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "devices.json")
+	st, err := store.NewJSONStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const mac = "aabbccddeeff"
+	seeded := allowlistedMutationFixture(t, mac, store.StateAdopted, false)
+	seeded.CfgVersion, seeded.AppliedCfg = "aaaabbbbccccdddd", "aaaabbbbccccdddd"
+	if err := st.Put(seeded); err != nil {
+		t.Fatal(err)
+	}
+
+	// Force the real JSON-store save to fail after PatchDevice's change and
+	// projection callback, but before candidate publication.
+	backup := path + ".previous"
+	if err := os.Rename(path, backup); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	a := New(st, quietLogger())
+	view, err := a.PatchDevice(context.Background(), mac, adminapi.DevicePatch{
+		SiteID: deviceNamePtr("branch-b"),
+	})
+	if err == nil {
+		t.Fatal("PatchDevice succeeded despite JSON rename failure")
+	}
+	if view.MAC != "" || view.CfgVersion != "" || view.SiteID != "" {
+		t.Fatalf("failed save returned a speculative projected view: %+v", view)
+	}
+	after, err := st.Get(mac)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.SiteID != seeded.SiteID || after.CfgVersion != seeded.CfgVersion ||
+		after.LEDOverride != seeded.LEDOverride || store.CmdTaskCmd(after) != store.CmdTaskCmd(seeded) {
+		t.Fatalf("failed projected mutation changed the live record: %+v", after)
+	}
+	var persisted store.PersistedFile
+	raw, err := os.ReadFile(backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if got := persisted.Devices[mac].SiteID; got != seeded.SiteID {
+		t.Fatalf("failed projected mutation changed last committed disk site: %q", got)
 	}
 }
 
