@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installs the pinned hook toolchain (lefthook v2.1.14 + golangci-lint v2.14.0,
+# Installs the pinned hook toolchain (lefthook v2.1.14 + golangci-lint v2.15.0,
 # matching .github/workflows/ci.yml) and wires the git hooks via
 # `lefthook install` (pre-commit jobs + the pre-push script job, both defined
 # in lefthook.yml and .lefthook/).
@@ -18,7 +18,7 @@
 set -euo pipefail
 
 LEFTHOOK_VERSION="v2.1.14"
-GOLANGCI_LINT_VERSION="v2.14.0"
+GOLANGCI_LINT_VERSION="v2.15.0"
 
 fallback_root="${TMPDIR:-/tmp}/openunifi-hooks"
 fallback_bin="${TMPDIR:-/tmp}/openunifi-hook-tools"
