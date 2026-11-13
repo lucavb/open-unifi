@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -1662,11 +1663,10 @@ func TestCreateDeviceSiteIDBackendFence(t *testing.T) {
 	}
 }
 
-// TestPatchBookkeepingRowsMintNothing pins the save skeleton's mint
-// condition end to end: name and site_id are bookkeeping rows the device
-// is never provisioned from — saving them effectively changes NO
-// provisioning input and therefore mints no cfgversion.
-func TestPatchBookkeepingRowsMintNothing(t *testing.T) {
+// TestPatchNameAndEquivalentSiteRefMintNothing pins the no-mint cases: name
+// is bookkeeping, and empty/default SiteID spellings render to the same
+// SiteRef, so neither change alters provisioned configuration.
+func TestPatchNameAndEquivalentSiteRefMintNothing(t *testing.T) {
 	a, st := testApp(t)
 	ctx := context.Background()
 	if err := st.Put(store.Device{
@@ -1676,7 +1676,7 @@ func TestPatchBookkeepingRowsMintNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{
-		Name: deviceNamePtr("renamed"), SiteID: deviceNamePtr("lab"),
+		Name: deviceNamePtr("renamed"), SiteID: deviceNamePtr("default"),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1684,11 +1684,138 @@ func TestPatchBookkeepingRowsMintNothing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec.Name != "renamed" || rec.SiteID != "lab" {
+	if rec.Name != "renamed" || rec.SiteID != "default" {
 		t.Fatalf("bookkeeping rows not saved: %+v", rec)
 	}
 	if rec.CfgVersion != "aaaabbbbccccdddd" {
-		t.Fatalf("bookkeeping-only save minted a cfgversion: %q", rec.CfgVersion)
+		t.Fatalf("name and empty→default-equivalent site save minted a cfgversion: %q", rec.CfgVersion)
+	}
+	if _, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{Name: deviceNamePtr("renamed-again")}); err != nil {
+		t.Fatal(err)
+	}
+	rec, err = st.Get("aabbccddeeff")
+	if err != nil || rec.Name != "renamed-again" || rec.CfgVersion != "aaaabbbbccccdddd" {
+		t.Fatalf("name-only patch changed config version or failed to save: %+v err=%v", rec, err)
+	}
+
+	// The opposite raw value transition (default → empty) has the same
+	// effective SiteRef and likewise must not mint.
+	if _, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{SiteID: deviceNamePtr("")}); err != nil {
+		t.Fatal(err)
+	}
+	rec, err = st.Get("aabbccddeeff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.SiteID != "" || rec.CfgVersion != "aaaabbbbccccdddd" {
+		t.Fatalf("default-equivalent clear changed effective config: site=%q cfg=%q", rec.SiteID, rec.CfgVersion)
+	}
+}
+
+func TestPatchSiteRefChangesMintOnceWithOtherEffectiveRows(t *testing.T) {
+	a, st := testApp(t)
+	ctx := context.Background()
+	const seeded = "aaaabbbbccccdddd"
+	if err := st.Put(store.Device{
+		MAC: "aabbccddeeff", Model: "U7PG2", State: store.StateAdopted,
+		SiteID: "default", CfgVersion: seeded, AppliedCfg: seeded,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Site and LED changes share the saveIntent effective flag, so this save
+	// performs one cfgversion mint and the returned view echoes it.
+	dv, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{
+		SiteID: deviceNamePtr("building-a"), LEDOverride: ledOverridePtr("on"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dv.CfgVersion == seeded || len(dv.CfgVersion) != 16 || dv.SiteID != "building-a" || dv.LEDOverride != "on" {
+		t.Fatalf("effective site+LED patch response = %+v", dv)
+	}
+	rec, err := st.Get("aabbccddeeff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.CfgVersion != dv.CfgVersion {
+		t.Fatalf("returned cfgversion %q differs from committed %q", dv.CfgVersion, rec.CfgVersion)
+	}
+
+	// Clearing a non-default site changes SiteRef to "default" and therefore
+	// mints again; the no-op transition to/from an explicit "default" above
+	// is a different case.
+	cleared, err := a.PatchDevice(ctx, "aabbccddeeff", adminapi.DevicePatch{SiteID: deviceNamePtr("")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleared.SiteID != "" || cleared.CfgVersion == dv.CfgVersion || len(cleared.CfgVersion) != 16 {
+		t.Fatalf("effective site clear response = %+v", cleared)
+	}
+}
+
+func TestCreateDeviceSiteRefMintDependsOnProvisioningState(t *testing.T) {
+	a, st := testApp(t)
+	ctx := context.Background()
+
+	// A newly whitelisted device and an existing PENDING record have no
+	// applied config to re-provision; adoption consumes their current SiteRef.
+	fresh, err := a.CreateDevice(ctx, adminapi.DeviceUpsert{MAC: "aabbccddeeff", SiteID: "building-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.State != store.StatePending || fresh.CfgVersion != "" {
+		t.Fatalf("fresh whitelist create minted before adoption: %+v", fresh)
+	}
+	if _, err := a.CreateDevice(ctx, adminapi.DeviceUpsert{MAC: "aabbccddeeff", SiteID: "building-b"}); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := st.Get("aabbccddeeff"); err != nil || pending.SiteID != "building-b" || pending.CfgVersion != "" {
+		t.Fatalf("pending upsert should save site without mint: %+v err=%v", pending, err)
+	}
+
+	// POST/upsert must compare rendered SiteRef rather than the raw SiteID:
+	// empty and explicit "default" are equivalent once a device is provisioned.
+	const defaultCfg = "5555666677778888"
+	if err := st.Put(store.Device{
+		MAC: "445566778899", State: store.StateAdopted,
+		CfgVersion: defaultCfg, AppliedCfg: defaultCfg,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.CreateDevice(ctx, adminapi.DeviceUpsert{MAC: "445566778899", SiteID: "default"}); err != nil {
+		t.Fatal(err)
+	}
+	defaulted, err := st.Get("445566778899")
+	if err != nil || defaulted.SiteID != "default" || defaulted.CfgVersion != defaultCfg {
+		t.Fatalf("empty→default-equivalent upsert minted or failed to save site: %+v err=%v", defaulted, err)
+	}
+
+	for _, state := range []int{store.StateAdopting, store.StateAdopted, store.StateLost} {
+		t.Run(fmt.Sprintf("state-%d", state), func(t *testing.T) {
+			mac := map[int]string{
+				store.StateAdopting: "112233445566",
+				store.StateAdopted:  "223344556677",
+				store.StateLost:     "334455667788",
+			}[state]
+			const cfg = "1111222233334444"
+			if err := st.Put(store.Device{
+				MAC: mac, State: state, SiteID: "default", CfgVersion: cfg, AppliedCfg: cfg,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			view, err := a.CreateDevice(ctx, adminapi.DeviceUpsert{MAC: mac, SiteID: "building-a"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if view.CfgVersion == cfg || len(view.CfgVersion) != 16 {
+				t.Fatalf("provisioned upsert did not mint for site change: %+v", view)
+			}
+			rec, err := st.Get(mac)
+			if err != nil || rec.SiteID != "building-a" || rec.CfgVersion != view.CfgVersion {
+				t.Fatalf("provisioned upsert state = %+v, view=%+v, err=%v", rec, view, err)
+			}
+		})
 	}
 }
 

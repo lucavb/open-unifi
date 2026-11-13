@@ -23,6 +23,7 @@ import (
 
 	"github.com/lucavb/open-unifi/internal/adminapi"
 	"github.com/lucavb/open-unifi/internal/clientevents"
+	"github.com/lucavb/open-unifi/internal/configtext"
 	"github.com/lucavb/open-unifi/internal/inform"
 	"github.com/lucavb/open-unifi/internal/metrics"
 	"github.com/lucavb/open-unifi/internal/store"
@@ -281,15 +282,16 @@ func vapsNotRunningDevice(d store.Device) []string {
 
 // PatchDevice applies the admin's device-name/site/knob rows as one
 // admin-intent save (see saveIntent): the fence validates every supplied
-// row, the RMW cycle applies them, and an EFFECTIVE change — one of the
-// provisioning-carried LED rows or the per-device SSH password — mints a
-// fresh cfgversion; name/site_id
-// are bookkeeping rows the device is never provisioned from, so they mint
-// nothing.
+// row, the RMW cycle applies them, and an EFFECTIVE change mints a fresh
+// cfgversion. Name is bookkeeping; SiteID is compared by its rendered
+// SiteRef because it feeds both unifi.siteid and mgmt_url. A site change
+// mints only once a device has entered adoption/provisioning; a pending
+// whitelist still receives its current site on the ordinary adoption push.
 func (a *App) PatchDevice(_ context.Context, mac string, patch adminapi.DevicePatch) (adminapi.DeviceView, error) {
 	rec, err := saveIntent(a, mac, saveExisting,
 		func(d *store.Device) (bool, error) {
 			effective := false
+			siteRefBefore := configtext.SiteRef(*d)
 			if patch.Name != nil {
 				// Same fence the wlan flows apply (CreateWlan): the handler
 				// 400s first, but every Backend caller is still fenced in.
@@ -401,6 +403,9 @@ func (a *App) PatchDevice(_ context.Context, mac string, patch adminapi.DevicePa
 				}
 				d.SSHPublicKeys = next
 			}
+			if siteRefChangeRequiresProvisioning(d, siteRefBefore) {
+				effective = true
+			}
 			return effective, nil
 		},
 		func(d *store.Device) store.Device {
@@ -419,6 +424,24 @@ func (a *App) PatchDevice(_ context.Context, mac string, patch adminapi.DevicePa
 		return adminapi.DeviceView{}, err
 	}
 	return a.view(rec), nil
+}
+
+// siteRefChangeRequiresProvisioning reports whether a site assignment change
+// changes the value the renderer emits and the record has already entered the
+// device configuration lifecycle. A fresh or existing PENDING whitelist has
+// no applied configuration to update; adoption's mgmt_cfg reads its current
+// SiteRef. ADOPTING, ADOPTED, and LOST records may already have received a
+// site-bearing configuration and must be re-versioned to deliver a change.
+func siteRefChangeRequiresProvisioning(d *store.Device, before string) bool {
+	if configtext.SiteRef(*d) == before {
+		return false
+	}
+	switch d.State {
+	case store.StateAdopting, store.StateAdopted, store.StateLost:
+		return true
+	default:
+		return false
+	}
 }
 
 // intPtrEq is the nil-aware *int equality for the ledbar brightness knob:
@@ -471,16 +494,17 @@ func (a *App) GetDevice(_ context.Context, mac string) (adminapi.DeviceView, err
 // previous Get→mutate→Put interleave loss is structurally impossible.
 // Duplicate posts are an idempotent upsert: the existing record is returned
 // and its name/site updated, so provider re-applies never surface conflict
-// errors. Invalid MACs map to the skeleton's canonical wrapped-404 error
-// (adminapi itself 400s at the edge; this adapter-side mapping is the
-// backstop for other callers). The cycle reports never-effective: seeding
-// is not a provisioning change, so no cfgversion is minted — the device
-// gets everything it needs when its first inform reaches the adoption
-// engine.
+// errors. An effective SiteRef change on an existing adopting/provisioned
+// record mints a cfgversion; fresh and PENDING whitelist rows do not have an
+// applied configuration to update and receive their site on adoption. Invalid
+// MACs map to the skeleton's canonical wrapped-404 error (adminapi itself
+// 400s at the edge; this adapter-side mapping is the backstop for other
+// callers).
 func (a *App) CreateDevice(_ context.Context, up adminapi.DeviceUpsert) (adminapi.DeviceView, error) {
 	created := false
 	rec, err := saveIntent(a, up.MAC, savePending,
 		func(d *store.Device) (bool, error) {
+			siteRefBefore := configtext.SiteRef(*d)
 			// Seed step (own step, pending-map-INDEPENDENT — unlike
 			// AdoptPending, whose change closure re-checks the map): a
 			// manually created device is by definition known to the admin
@@ -501,16 +525,18 @@ func (a *App) CreateDevice(_ context.Context, up adminapi.DeviceUpsert) (adminap
 			}
 			if up.SiteID != "" {
 				// The site fence mirrors PatchDevice/PutWireless-adjacent
-				// fences: never-effective bookkeeping rows, but domain-
-				// validated on the way in.
+				// fences: validate the site name before comparing its
+				// effective rendered SiteRef below.
 				if msg := adminapi.ValidateSiteID(up.SiteID); msg != "" {
 					return false, fmt.Errorf("%w: %s", adminapi.ErrConflict, msg)
 				}
 				d.SiteID = up.SiteID
 			}
-			// Never effective: seeding + bookkeeping rows only — the save
-			// mints no cfgversion (no §6.2 mint site for manual create).
-			return false, nil
+			// Seeding and bookkeeping alone do not mint a version. A duplicate
+			// POST that changes the effective site of an adopting/provisioned
+			// record is an operator configuration change and uses saveIntent's
+			// ordinary single cfgversion mint.
+			return siteRefChangeRequiresProvisioning(d, siteRefBefore), nil
 		},
 		// Detached snapshot for the returned view (view reads scalars only).
 		func(d *store.Device) store.Device {
