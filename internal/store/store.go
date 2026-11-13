@@ -157,10 +157,12 @@ type DeviceStore interface {
 	// MAC is an error.
 	MarkPending(mac, note string) error
 	// Update serializes a per-MAC read-modify-write cycle: Promise-style
-	// lookup-mutate-persist under a per-MAC mutex, so concurrent inform
+	// lookup-mutate-persist under a stable per-MAC lock, so concurrent inform
 	// handling and admin mutations never interleave for the same device.
 	// Unknown MACs receive &Device{MAC: canonical mac} (upsert semantics).
-	// fn's error aborts the cycle without persisting.
+	// fn's error aborts the cycle without persisting. fn runs without the
+	// store-wide commit or data lock, so Get/List/Pending are safe from fn;
+	// callbacks must not invoke another mutation.
 	Update(mac string, fn func(*Device) error) error
 	// UpdateExisting is Update WITHOUT the upsert: an unknown MAC returns
 	// ErrNotFound and fn runs zero times (the inform handler can therefore
@@ -236,39 +238,48 @@ func ColonMAC(canonical string) string {
 	return b.String()
 }
 
-// db is the shared in-memory store core used by both implementations.
+// db is the shared store core used by both implementations.
 //
-// INVARIANT: every Device handed to or returned by the core (Get, List,
-// Put-copy, Update fn pointer) is a DETACHED deep clone; callers never hold
-// references into m.devices' maps/slices.
-//
-// NOTE: jsonStore must override every MUTATING method of this core
-// (Put/Delete/MarkPending/Update/UpdateExisting) so each mutation also
-// calls save(); the read methods are shared as-is.
+// Every mutation stages a private candidate under commitMu, persists that
+// candidate (if this is a JSON store), then publishes it under mu. Callback
+// execution is outside both locks. devices/pending are replaced as complete
+// maps only after persistence succeeds.
 type db struct {
 	mu      sync.RWMutex
 	devices map[string]Device
 	pending map[string]pendingEntry
 
-	// upMu serializes read-modify-write cycles per canonical MAC (small
-	// fixed-size map entry per known device; harmless at this scale).
-	upMu    sync.Mutex
-	upLocks map[string]*sync.Mutex
+	// commitMu orders candidate snapshot → durable save → publication. It is
+	// deliberately not held while an Update callback runs.
+	commitMu sync.Mutex
+	// stripes are permanent: deleting a device cannot split waiters that have
+	// already resolved the lock for its MAC from later mutations of that MAC.
+	stripes [macLockStripeCount]sync.Mutex
+	// persistCandidate is nil for the in-memory store and writes a complete
+	// candidate snapshot for JSON-backed stores. It runs under commitMu only.
+	persistCandidate func(PersistedFile) error
 
 	// now is the time source for pending TTL eviction; a test hook (nil ⇒
 	// time.Now).
 	now func() time.Time
 }
 
+const macLockStripeCount = 256
+
+type dbCandidate struct {
+	devices map[string]Device
+	pending map[string]pendingEntry
+}
+
 // pendingEntry is one discovery-beacon sighting. seenAt is first-seen (in
-// memory only — see save); it drives TTL eviction.
+// memory only — see PersistedFile); it drives TTL filtering and eviction.
 type pendingEntry struct {
 	note   string
 	seenAt int64 // unix seconds
 }
 
 func newDB() *db {
-	return &db{devices: map[string]Device{}, pending: map[string]pendingEntry{}, upLocks: map[string]*sync.Mutex{}}
+	return &db{devices: map[string]Device{}, pending: map[string]pendingEntry{}}
 }
 
 func (m *db) clockNow() time.Time {
@@ -278,16 +289,16 @@ func (m *db) clockNow() time.Time {
 	return time.Now()
 }
 
-// macLock returns the per-MAC serialization mutex (creating it lazily).
+// macLock returns the fixed stripe for a canonical MAC. Stripes are never
+// removed, so callers that resolved a lock before a deletion cannot diverge
+// from callers that arrive after it.
 func (m *db) macLock(mac string) *sync.Mutex {
-	m.upMu.Lock()
-	defer m.upMu.Unlock()
-	lk, ok := m.upLocks[mac]
-	if !ok {
-		lk = &sync.Mutex{}
-		m.upLocks[mac] = lk
+	var hash uint32 = 2166136261
+	for i := 0; i < len(mac); i++ {
+		hash ^= uint32(mac[i])
+		hash *= 16777619
 	}
-	return lk
+	return &m.stripes[hash%macLockStripeCount]
 }
 
 // cloneValue deep-copies one JSON leaf container recursively (maps, JSONMap
@@ -339,6 +350,11 @@ func CloneDevice(d Device) Device {
 		out.Authkeys = make([]string, len(d.Authkeys))
 		copy(out.Authkeys, d.Authkeys)
 	}
+	out.SSHPublicKeys = nil
+	if d.SSHPublicKeys != nil {
+		out.SSHPublicKeys = make([]string, len(d.SSHPublicKeys))
+		copy(out.SSHPublicKeys, d.SSHPublicKeys)
+	}
 	out.LastUps = nil
 	if d.LastUps != nil {
 		cloned := cloneValue(map[string]any(d.LastUps))
@@ -362,19 +378,100 @@ func (m *db) Get(mac string) (Device, error) {
 	return CloneDevice(d), nil
 }
 
+// candidateLocked builds a private root-map candidate while the caller holds
+// mu for reading. Unchanged Device values are immutable once published, so
+// they may be shared between root maps: every mutator replaces or deletes a
+// whole detached Device, while all public input/read/callback boundaries clone.
+func (m *db) candidateLocked() dbCandidate {
+	c := dbCandidate{
+		devices: make(map[string]Device, len(m.devices)),
+		pending: make(map[string]pendingEntry, len(m.pending)),
+	}
+	for mac, d := range m.devices {
+		c.devices[mac] = d
+	}
+	for mac, entry := range m.pending {
+		c.pending[mac] = entry
+	}
+	return c
+}
+
+// commit applies one internal edit to a detached latest-state candidate. The
+// global commit lock preserves changes from distinct MACs: each candidate is
+// based on the most recently published maps, persisted in full, then swapped
+// into visibility only after persistence succeeds. A false changed result is
+// a true no-op and skips both persistence and publication.
+func (m *db) commit(edit func(*dbCandidate) (changed bool, err error)) error {
+	m.commitMu.Lock()
+	defer m.commitMu.Unlock()
+
+	m.mu.RLock()
+	candidate := m.candidateLocked()
+	m.mu.RUnlock()
+
+	changed, err := edit(&candidate)
+	if err != nil || !changed {
+		return err
+	}
+	// Pending reads intentionally remain pure. Reap expired sightings only
+	// from a candidate that is already part of a real mutation, so unrelated
+	// successful commits cannot persist stale rows and restart their TTL.
+	cutoff := m.clockNow().Add(-pendingTTL).Unix()
+	for mac, entry := range candidate.pending {
+		if entry.seenAt < cutoff {
+			delete(candidate.pending, mac)
+		}
+	}
+	if m.persistCandidate != nil {
+		if err := m.persistCandidate(m.persistedFile(candidate)); err != nil {
+			return err
+		}
+	}
+	m.mu.Lock()
+	m.devices = candidate.devices
+	m.pending = candidate.pending
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *db) persistedFile(candidate dbCandidate) PersistedFile {
+	pf := PersistedFile{
+		Version: 1,
+		SavedAt: m.clockNow().Unix(),
+		Devices: make(map[string]Device, len(candidate.devices)),
+		Pending: make(map[string]string, len(candidate.pending)),
+	}
+	for mac, d := range candidate.devices {
+		// The candidate owns this root map, and its unchanged Device values
+		// are immutable shared records. JSON encoding only reads them under
+		// commitMu; do not deep-clone the full telemetry inventory here.
+		pf.Devices[mac] = d
+	}
+	for mac, entry := range candidate.pending {
+		// The v1 format remains map[string]string: first-seen stamps are
+		// in-memory only and restart their TTL clock on load.
+		pf.Pending[mac] = entry.note
+	}
+	return pf
+}
+
 func (m *db) Put(d Device) error {
 	d.MAC = canonicalMAC(d.MAC)
 	if d.MAC == "" {
 		return errors.New("store: empty MAC")
 	}
+	mac := d.MAC
 	clone := CloneDevice(d)
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.devices[d.MAC] = clone
-	return nil
+	lk := m.macLock(mac)
+	lk.Lock()
+	defer lk.Unlock()
+	return m.commit(func(candidate *dbCandidate) (bool, error) {
+		candidate.devices[mac] = clone
+		return true, nil
+	})
 }
 
-// Update serializes Get→mutate→Put under a per-MAC mutex. Unknown MACs
+// Update serializes Get→mutate→commit under a stable per-MAC stripe. Unknown MACs
 // start from the zero Device carrying the canonical MAC (upsert).
 func (m *db) Update(mac string, fn func(*Device) error) error {
 	return m.update(mac, fn, true)
@@ -386,7 +483,9 @@ func (m *db) UpdateExisting(mac string, fn func(*Device) error) error {
 	return m.update(mac, fn, false)
 }
 
-// update implements both flavors under one per-MAC cycle.
+// update implements both flavors under one per-MAC cycle. fn runs with only
+// the MAC stripe held: read methods are safe from the callback, but callbacks
+// must not start nested mutations.
 func (m *db) update(mac string, fn func(*Device) error, upsert bool) error {
 	mac = canonicalMAC(mac)
 	if mac == "" {
@@ -396,20 +495,29 @@ func (m *db) update(mac string, fn func(*Device) error, upsert bool) error {
 	lk.Lock()
 	defer lk.Unlock()
 
-	d, err := m.Get(mac)
-	switch {
-	case errors.Is(err, ErrNotFound):
+	m.mu.RLock()
+	d, exists := m.devices[mac]
+	if exists {
+		d = CloneDevice(d)
+	}
+	m.mu.RUnlock()
+	if !exists {
 		if !upsert {
 			return fmt.Errorf("%w: %s", ErrNotFound, mac)
 		}
 		d = Device{MAC: mac}
-	case err != nil:
-		return err
 	}
 	if ferr := fn(&d); ferr != nil {
 		return ferr // abort without persisting
 	}
-	return m.Put(d)
+	// MAC is the identity whose stripe is held for this cycle; callbacks may
+	// change record fields but cannot move the candidate to another identity.
+	d.MAC = mac
+	clone := CloneDevice(d) // detach from a pointer the callback may retain
+	return m.commit(func(candidate *dbCandidate) (bool, error) {
+		candidate.devices[mac] = clone
+		return true, nil
+	})
 }
 
 // maxPending caps the unadopted-candidate map (discovery beacons can churn;
@@ -427,45 +535,18 @@ const pendingTTL = 24 * time.Hour
 // NEW MAC (existing sightings still pass).
 var errPendingFull = errors.New("store: pending map full")
 
-// evictExpired drops TTL-expired sightings. Caller holds m.mu (write).
-func (m *db) evictExpiredLocked() {
-	if len(m.pending) == 0 {
-		return
-	}
-	cutoff := m.clockNow().Add(-pendingTTL).Unix()
-	for mac, e := range m.pending {
-		if e.seenAt < cutoff {
-			delete(m.pending, mac)
-		}
-	}
-}
-
 func (m *db) Delete(mac string) error {
 	mac = canonicalMAC(mac)
-	// Serialize under the same per-MAC lock as Update/UpdateExisting: a
-	// concurrent RMW cycle must not resurrect a device that Delete is
-	// removing (previously Delete only took m.mu, so a mid-cycle Update
-	// could put the record right back after the delete observed emptiness).
 	lk := m.macLock(mac)
 	lk.Lock()
 	defer lk.Unlock()
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if _, ok := m.devices[mac]; !ok {
-		return ErrNotFound
-	}
-	delete(m.devices, mac)
-
-	// Prune the per-MAC lock entry so churn cannot grow upLocks without
-	// bound. Safe under upMu while we hold the lock ourselves: goroutines
-	// that already resolved the pointer race with the prune only in the
-	// pre-existing "Update upserts onto a just-deleted MAC" way, which this
-	// locking deliberately permits (Delete is not a tombstone).
-	m.upMu.Lock()
-	delete(m.upLocks, mac)
-	m.upMu.Unlock()
-	return nil
+	return m.commit(func(candidate *dbCandidate) (bool, error) {
+		if _, ok := candidate.devices[mac]; !ok {
+			return false, ErrNotFound
+		}
+		delete(candidate.devices, mac)
+		return true, nil
+	})
 }
 
 func (m *db) List() ([]Device, error) {
@@ -480,45 +561,56 @@ func (m *db) List() ([]Device, error) {
 }
 
 func (m *db) Pending() (map[string]string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.evictExpiredLocked()
+	cutoff := m.clockNow().Add(-pendingTTL).Unix()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	out := make(map[string]string, len(m.pending))
 	for k, e := range m.pending {
-		out[k] = e.note
+		if e.seenAt >= cutoff {
+			out[k] = e.note
+		}
 	}
 	return out, nil
 }
 
-// markPending is the core mutation behind MarkPending. It reports whether
-// the persisted state changed, so jsonStore can skip its full save+fsync
-// when repeated sightings carry the same note.
-func (m *db) markPending(mac, note string) (bool, error) {
+// markPending stages expired-entry pruning and one sighting in the same
+// candidate. Any error (including a full cap after pruning) leaves published
+// memory and disk untouched.
+func (m *db) markPending(mac, note string) error {
 	mac = canonicalMAC(mac)
 	if mac == "" {
-		return false, errors.New("store: empty MAC")
+		return errors.New("store: empty MAC")
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.evictExpiredLocked()
-	if existing, ok := m.pending[mac]; ok {
-		if existing.note == note {
-			return false, nil // repeat sighting: nothing changed, nothing to persist
+	return m.commit(func(candidate *dbCandidate) (bool, error) {
+		now := m.clockNow()
+		cutoff := now.Add(-pendingTTL).Unix()
+		pruned := false
+		for key, entry := range candidate.pending {
+			if entry.seenAt < cutoff {
+				delete(candidate.pending, key)
+				pruned = true
+			}
 		}
-		m.pending[mac] = pendingEntry{note: note, seenAt: existing.seenAt}
+		if existing, ok := candidate.pending[mac]; ok {
+			if existing.note == note {
+				// Repeats stay no-ops unless this operation also pruned stale
+				// rows, which is a real persisted state change.
+				return pruned, nil
+			}
+			candidate.pending[mac] = pendingEntry{note: note, seenAt: existing.seenAt}
+			return true, nil
+		}
+		if len(candidate.pending) >= maxPending {
+			return false, errPendingFull
+		}
+		candidate.pending[mac] = pendingEntry{note: note, seenAt: now.Unix()}
 		return true, nil
-	}
-	if len(m.pending) >= maxPending {
-		return false, errPendingFull
-	}
-	m.pending[mac] = pendingEntry{note: note, seenAt: m.clockNow().Unix()}
-	return true, nil
+	})
 }
 
 // MarkPending records a discovery beacon sighting for adoption UI.
 func (m *db) MarkPending(mac, note string) error {
-	_, err := m.markPending(mac, note)
-	return err
+	return m.markPending(mac, note)
 }
 
 // memStore is the plain in-memory implementation (tests, ephemeral use).
@@ -529,16 +621,42 @@ type memStore struct {
 // NewMemStore returns a non-persisting DeviceStore for tests.
 func NewMemStore() DeviceStore { return &memStore{db: newDB()} }
 
-// jsonStore wraps the in-memory core with durable JSON persistence to a single
-// file. Saves are atomic (temp file + fsync + rename) AND ordered: saveMu is
-// held across the whole save — snapshot marshaling under db.mu.RLock taken
-// INSIDE saveMu, then tempfile/write/fsync/rename — so two concurrent savers
-// can never rename out of order (a stale snapshot landing last). Get/List
-// are not blocked by saveMu beyond the db.mu.RLock inside the snapshot.
+type atomicTempFile interface {
+	Name() string
+	Chmod(os.FileMode) error
+	Write([]byte) (int, error)
+	Sync() error
+	Close() error
+}
+
+// atomicFileOps are narrow filesystem seams for deterministic pre-rename
+// failure tests. Production uses the os functions below.
+type atomicFileOps struct {
+	createTemp func(dir, pattern string) (atomicTempFile, error)
+	rename     func(oldPath, newPath string) error
+	remove     func(path string) error
+	syncDir    func(dir string) error
+}
+
+func defaultAtomicFileOps() atomicFileOps {
+	return atomicFileOps{
+		createTemp: func(dir, pattern string) (atomicTempFile, error) {
+			return os.CreateTemp(dir, pattern)
+		},
+		rename:  os.Rename,
+		remove:  os.Remove,
+		syncDir: syncDir,
+	}
+}
+
+// jsonStore wraps the shared candidate-commit core with durable JSON
+// persistence. The commit mutex spans candidate snapshot, tempfile write,
+// fsync, rename, and publication; readers only take db.mu and can continue
+// to see the last committed state while a save is paused.
 type jsonStore struct {
 	*db
-	path   string
-	saveMu sync.Mutex
+	path string
+	ops  atomicFileOps
 }
 
 // NewJSONStore opens (or idempotently creates) a JSON-file-backed store at
@@ -549,7 +667,8 @@ func NewJSONStore(path string) (DeviceStore, error) {
 		return nil, errors.New("store: empty path")
 	}
 	core := newDB()
-	s := &jsonStore{db: core, path: path}
+	s := &jsonStore{db: core, path: path, ops: defaultAtomicFileOps()}
+	core.persistCandidate = s.persist
 
 	raw, err := os.ReadFile(path)
 	switch {
@@ -561,7 +680,7 @@ func NewJSONStore(path string) (DeviceStore, error) {
 		if pf.Devices != nil {
 			for k, d := range pf.Devices {
 				d.MAC = canonicalMAC(d.MAC)
-				core.devices[canonicalMAC(k)] = d
+				core.devices[canonicalMAC(k)] = CloneDevice(d)
 			}
 		}
 		if pf.Pending != nil {
@@ -582,92 +701,20 @@ func NewJSONStore(path string) (DeviceStore, error) {
 	return s, nil
 }
 
-func (s *jsonStore) Put(d Device) error {
-	if err := s.db.Put(d); err != nil {
-		return err
-	}
-	return s.save()
-}
-
-func (s *jsonStore) Delete(mac string) error {
-	if err := s.db.Delete(mac); err != nil {
-		return err
-	}
-	return s.save()
-}
-
-// MarkPending persists the mutation ONLY when the core reports a change:
-// discovery beacons re-announce every few seconds with an identical body,
-// and each one previously cost a full snapshot marshal + fsync + rename on
-// disk. Unchanged repeats now stop at the in-memory refresh.
-func (s *jsonStore) MarkPending(mac, note string) error {
-	changed, err := s.markPending(mac, note)
-	if err != nil {
-		return err
-	}
-	if !changed {
-		return nil
-	}
-	return s.save()
-}
-
-// Update runs the per-MAC cycle on the core, then persists on success.
-func (s *jsonStore) Update(mac string, fn func(*Device) error) error {
-	if err := s.db.Update(mac, fn); err != nil {
-		return err
-	}
-	return s.save()
-}
-
-// UpdateExisting runs the per-MAC cycle on the core without the upsert
-// seed, then persists on success. An unknown MAC is an error — nothing to
-// persist, no save.
-func (s *jsonStore) UpdateExisting(mac string, fn func(*Device) error) error {
-	if err := s.db.UpdateExisting(mac, fn); err != nil {
-		return err
-	}
-	return s.save()
-}
-
-// save persists the current snapshot atomically and ORDERED: saveMu spans
-// the snapshot + tempfile + fsync + rename so rename order == snapshot
-// order (two concurrent savers cannot invert).
-func (s *jsonStore) save() error {
-	s.saveMu.Lock()
-	defer s.saveMu.Unlock()
-
-	s.mu.RLock()
-	savedAt := s.db.clockNow().Unix()
-	pf := PersistedFile{
-		Version: 1,
-		SavedAt: savedAt,
-		Devices: make(map[string]Device, len(s.devices)),
-		Pending: make(map[string]string, len(s.pending)),
-	}
-	for k, d := range s.devices {
-		pf.Devices[k] = d
-	}
-	for k, e := range s.pending {
-		// Persisted pending format stays map[string]string (v1): TTL
-		// first-seen stamps are intentionally in-memory only; a reload
-		// restarts the eviction clock, which is bounded by pendingTTL.
-		pf.Pending[k] = e.note
-	}
+func (s *jsonStore) persist(pf PersistedFile) error {
 	blob, err := json.MarshalIndent(pf, "", "  ")
-	s.mu.RUnlock()
 	if err != nil {
 		return fmt.Errorf("store: marshal: %w", err)
 	}
-
 	dir := filepath.Dir(s.path)
-	tmp, err := os.CreateTemp(dir, filepath.Base(s.path)+".tmp-*")
+	tmp, err := s.ops.createTemp(dir, filepath.Base(s.path)+".tmp-*")
 	if err != nil {
 		return fmt.Errorf("store: temp file: %w", err)
 	}
 	tmpName := tmp.Name()
 	defer func() {
 		if tmpName != "" {
-			_ = os.Remove(tmpName)
+			_ = s.ops.remove(tmpName)
 		}
 	}()
 	// keep perms tight: the file contains per-device adoption keys
@@ -675,9 +722,14 @@ func (s *jsonStore) save() error {
 		_ = tmp.Close()
 		return fmt.Errorf("store: chmod: %w", err)
 	}
-	if _, err := tmp.Write(blob); err != nil {
+	n, err := tmp.Write(blob)
+	if err != nil {
 		_ = tmp.Close()
 		return fmt.Errorf("store: write: %w", err)
+	}
+	if n != len(blob) {
+		_ = tmp.Close()
+		return fmt.Errorf("store: write: short write: wrote %d of %d bytes", n, len(blob))
 	}
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
@@ -686,11 +738,11 @@ func (s *jsonStore) save() error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("store: close: %w", err)
 	}
-	if err := os.Rename(tmpName, s.path); err != nil {
+	if err := s.ops.rename(tmpName, s.path); err != nil {
 		return fmt.Errorf("store: rename: %w", err)
 	}
-	tmpName = "" // renamed successfully; nothing to clean up
-	syncDir(dir) // best effort: make the rename itself durable
+	tmpName = ""           // renamed successfully; nothing to clean up
+	_ = s.ops.syncDir(dir) // best effort: do not fail after the atomic commit
 	return nil
 }
 
@@ -698,11 +750,15 @@ func (s *jsonStore) save() error {
 // Best effort by design: some platforms reject directory fsync (macOS can
 // return errors on dir fds), and a durability-flushing failure must not
 // fail an otherwise-complete save.
-func syncDir(dir string) {
+func syncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
-		return
+		return err
 	}
-	_ = d.Sync()
-	_ = d.Close()
+	syncErr := d.Sync()
+	closeErr := d.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
 }

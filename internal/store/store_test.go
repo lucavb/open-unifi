@@ -312,14 +312,18 @@ func TestUpdateSerializesRaces(t *testing.T) {
 func TestDeepCopyIsolation(t *testing.T) {
 	st := NewMemStore()
 	rec := Device{MAC: "aabbccddeeff", Authkeys: []string{"k1"},
-		Extra: JSONMap{}, LastUps: JSONMap{"up": true}}
+		SSHPublicKeys: []string{"ssh-ed25519 AAAA first"},
+		Extra:         JSONMap{}, LastUps: JSONMap{"up": true}}
 	rec.Extra["radio_table"] = []any{map[string]any{"name": "ra0", "channel": "0"}}
 	if err := st.Put(rec); err != nil {
 		t.Fatal(err)
 	}
+	// Put must detach the caller's authorized_keys slice.
+	rec.SSHPublicKeys[0] = "ssh-ed25519 AAAA changed-after-put"
 	got, _ := st.Get("aabbccddeeff")
 	// mutate the returned copies (nested!) — store must stay clean.
 	got.Authkeys[0] = "hacked"
+	got.SSHPublicKeys[0] = "ssh-ed25519 AAAA hacked-get"
 	rtm := got.Extra["radio_table"].([]any)[0].(map[string]any)
 	rtm["name"] = "hacked"
 	got.LastUps["up"] = false
@@ -327,6 +331,9 @@ func TestDeepCopyIsolation(t *testing.T) {
 	fresh, _ := st.Get("aabbccddeeff")
 	if fresh.Authkeys[0] != "k1" {
 		t.Fatalf("Authkeys aliased: %v", fresh.Authkeys)
+	}
+	if fresh.SSHPublicKeys[0] != "ssh-ed25519 AAAA first" {
+		t.Fatalf("SSHPublicKeys aliased: %v", fresh.SSHPublicKeys)
 	}
 	rt := fresh.Extra["radio_table"].([]any)[0].(map[string]any)
 	if rt["name"] != "ra0" {
@@ -337,10 +344,26 @@ func TestDeepCopyIsolation(t *testing.T) {
 	}
 	// List detachment:
 	lst, _ := st.List()
+	lst[0].SSHPublicKeys[0] = "ssh-ed25519 AAAA hacked-list"
 	lst[0].Extra["radio_table"].([]any)[0].(map[string]any)["name"] = "hacked2"
 	fresh2, _ := st.Get("aabbccddeeff")
+	if fresh2.SSHPublicKeys[0] != "ssh-ed25519 AAAA first" {
+		t.Fatal("List aliases stored SSHPublicKeys")
+	}
 	if fresh2.Extra["radio_table"].([]any)[0].(map[string]any)["name"] != "ra0" {
 		t.Fatal("List aliases store internals")
+	}
+}
+
+func TestCloneDeviceSSHPublicKeysDetached(t *testing.T) {
+	source := Device{SSHPublicKeys: []string{"key"}}
+	clone := CloneDevice(source)
+	clone.SSHPublicKeys[0] = "changed"
+	if source.SSHPublicKeys[0] != "key" {
+		t.Fatalf("CloneDevice aliases SSHPublicKeys: %v", source.SSHPublicKeys)
+	}
+	if got := CloneDevice(Device{SSHPublicKeys: []string{}}).SSHPublicKeys; got == nil {
+		t.Fatal("CloneDevice must preserve a non-nil empty SSHPublicKeys slice")
 	}
 }
 
