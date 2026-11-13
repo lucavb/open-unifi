@@ -34,6 +34,8 @@ import (
 // factory-notype pending annotation.
 const informFactoryNotype = "inform:factory"
 
+const informCycleStripeCount = 256
+
 // Config describes the runtime configuration of the inform server.
 type Config struct {
 	// InformListenAddr is the TCP listen address for the inform endpoint (":8080").
@@ -70,19 +72,25 @@ type Config struct {
 	WirelessForDevice func(store.Device) []Wlan
 
 	// OnSessionEvents, when non-nil, receives the client-session
-	// transitions (connect/disconnect counts) each COMMITTED inform cycle
-	// observed in its station refresh — called after the store cycle
-	// persists (exactly-once per persisted transition; sparse heartbeats
-	// and eventless cycles are not called). deviceMAC is the device's
+	// transitions (connect/disconnect counts) each successfully COMMITTED
+	// inform cycle observed in its station refresh. The hook is invoked once
+	// after persistence within this Server's per-MAC ordering; this is not a
+	// crash-proof exactly-once delivery guarantee. Sparse heartbeats and
+	// eventless cycles are not called. deviceMAC is the device's
 	// colon-hex MAC. The transport stays Prometheus-free (package doc):
 	// main wires this hook to metrics.IncClientSessionEvents, the same
-	// ownership the inform middleware's IncInform has.
+	// ownership the inform middleware's IncInform has. Hooks may read the
+	// store, but must not synchronously re-enter inform processing for the
+	// same MAC on this Server: the per-MAC inform stripe is non-reentrant.
 	OnSessionEvents func(deviceMAC string, connects, disconnects int)
 
 	// OnSessionTransitions, when non-nil, receives the typed client-session
 	// transitions (connect, disconnect, radio change — with station
-	// context) of each COMMITTED inform cycle, under the same exactly-once
-	// rules as OnSessionEvents. deviceMAC is the AP's colon-hex MAC. main
+	// context) of each successfully COMMITTED inform cycle, under the same
+	// in-process ordering as OnSessionEvents. This is not crash-proof
+	// exactly-once delivery. It has the same store-read / same-MAC
+	// non-reentrancy constraints as OnSessionEvents. deviceMAC is the AP's
+	// colon-hex MAC. main
 	// wires it to the client event tracker.
 	OnSessionTransitions func(deviceMAC string, ts []store.Transition)
 }
@@ -131,6 +139,11 @@ type Server struct {
 
 	noopMu     sync.Mutex
 	noopTarget map[string]int64 // controller-owned steady-state target, by MAC
+
+	// informCycleStripes extend per-MAC ordering beyond the store transaction:
+	// each lock covers UpdateExisting, post-commit side effects, and callbacks,
+	// but is released before the potentially slow response write.
+	informCycleStripes [informCycleStripeCount]sync.Mutex
 }
 
 // New builds a Server. A nil logger falls back to slog.Default().
@@ -448,11 +461,13 @@ func (s *Server) handlePacket(ctx context.Context, w http.ResponseWriter, pkt *i
 // read-modify-write cycle out to the HTTP writer, plus the client-session
 // transitions the cycle's refresh observed (surfaced through the
 // OnSessionEvents / OnSessionTransitions hooks only after the cycle
-// commits — exactly-once per persisted transition).
+// commits).
 type advanceResult struct {
-	resp        map[string]any
-	kind        string
-	transitions []store.Transition
+	resp              map[string]any
+	kind              string
+	transitions       []store.Transition
+	persistNoopTarget bool
+	newNoopTarget     int64
 }
 
 // countSessionEvents observes a committed cycle's client-session events
@@ -629,24 +644,42 @@ func (l informLane) transportLabel() string {
 // records; a MAC deleted mid-flight lands on the 404 path.
 func (s *Server) runInformCycle(ctx context.Context, w http.ResponseWriter, mac string, jm map[string]any, lane informLane) {
 	var outcome advanceResult
-	uerr := s.st.UpdateExisting(mac, func(rec *store.Device) error {
-		now := time.Now()
-		s.absorbInform(rec, jm, now, lane.gcmReq)
-		transitions := refreshClientSessions(rec, jm, now)
-		out, aerr := s.decideInform(ctx, mac, adoption.Request{
-			Transport:      lane.transport,
-			Device:         *rec,
-			Body:           jm,
-			UsedKey:        lane.usedKey,
-			Now:            now,
-			PrevNoopTarget: s.noopTargetSnapshot(mac),
+	var uerr error
+	func() {
+		defer s.lockInformCycle(mac)()
+		uerr = s.st.UpdateExisting(mac, func(rec *store.Device) error {
+			now := time.Now()
+			s.absorbInform(rec, jm, now, lane.gcmReq)
+			transitions := refreshClientSessions(rec, jm, now)
+			out, aerr := s.decideInform(ctx, mac, adoption.Request{
+				Transport:      lane.transport,
+				Device:         *rec,
+				Body:           jm,
+				UsedKey:        lane.usedKey,
+				Now:            now,
+				PrevNoopTarget: s.noopTargetSnapshot(mac),
+			})
+			if aerr != nil {
+				return mapEngineError(aerr)
+			}
+			outcome = advanceResult{
+				resp:              s.applyOutcome(mac, rec, out),
+				kind:              string(out.Kind),
+				transitions:       transitions,
+				persistNoopTarget: out.PersistNoopTarget,
+				newNoopTarget:     out.NewNoopTarget,
+			}
+			return nil
 		})
-		if aerr != nil {
-			return mapEngineError(aerr)
+		if uerr == nil {
+			// The target and hooks are observable side effects, so stage them
+			// with the outcome and publish only once UpdateExisting committed.
+			// Store locks have been released by UpdateExisting before either
+			// operation; hooks may safely read the store.
+			s.publishNoopTarget(mac, outcome)
+			s.countSessionEvents(mac, outcome)
 		}
-		outcome = advanceResult{resp: s.applyOutcome(mac, rec, out), kind: string(out.Kind), transitions: transitions}
-		return nil
-	})
+	}()
 	if uerr != nil {
 		var rej *informRejectError
 		if errors.As(uerr, &rej) {
@@ -678,11 +711,36 @@ func (s *Server) runInformCycle(ctx context.Context, w http.ResponseWriter, mac 
 		return
 	}
 
-	// The cycle committed: observe its client-session transitions now
-	// (exactly-once — an aborted cycle persists nothing and counts
-	// nothing).
-	s.countSessionEvents(mac, outcome)
+	// The per-MAC cycle lock is released before either lane writes its
+	// response, so a slow socket cannot hold up later informs for this AP.
 	lane.respond(w, outcome)
+}
+
+// lockInformCycle serializes the server-side portions of one AP's inform
+// cycle that intentionally outlive the store transaction (noop scheduling
+// state and post-commit hooks). Hash collisions only serialize unrelated APs;
+// the fixed stripe set avoids an unbounded per-device lock registry.
+func (s *Server) lockInformCycle(mac string) func() {
+	stripe := &s.informCycleStripes[informCycleStripeIndex(mac)]
+	stripe.Lock()
+	return stripe.Unlock
+}
+
+func informCycleStripeIndex(mac string) uint32 {
+	h := uint32(2166136261)
+	for i := 0; i < len(mac); i++ {
+		h = (h ^ uint32(mac[i])) * 16777619
+	}
+	return h % informCycleStripeCount
+}
+
+func (s *Server) publishNoopTarget(mac string, outcome advanceResult) {
+	if !outcome.persistNoopTarget {
+		return
+	}
+	s.noopMu.Lock()
+	s.noopTarget[mac] = outcome.newNoopTarget
+	s.noopMu.Unlock()
 }
 
 // mapEngineError converts engine error sentinels onto the transport-layer
@@ -736,11 +794,6 @@ func (s *Server) applyOutcome(mac string, rec *store.Device, out adoption.Outcom
 	// persisted Extra bytes identical).
 	for k, v := range out.CredentialDeltas {
 		rec.Extra[k] = v
-	}
-	if out.PersistNoopTarget {
-		s.noopMu.Lock()
-		s.noopTarget[mac] = out.NewNoopTarget
-		s.noopMu.Unlock()
 	}
 	switch out.Kind {
 	case adoption.KindSetparam:
