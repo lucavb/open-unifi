@@ -10,10 +10,19 @@
 
 /** Registered by useAuth (called from the 401 path; no component involved). */
 let onUnauthorized: (() => void) | null = null;
+const TOKEN_KEY = "ou_token";
+let authGeneration = 0;
+export const REQUEST_TIMEOUT_MS = 15_000;
 
 /** useAuth wires the park transition (needToken + showToken) here. */
 export function setUnauthorizedHandler(fn: () => void): void {
   onUnauthorized = fn;
+}
+
+/** Store a replacement token and invalidate 401 responses from older requests. */
+export function setAuthToken(token: string): void {
+  window.sessionStorage.setItem(TOKEN_KEY, token);
+  authGeneration += 1;
 }
 
 export interface RequestOptions {
@@ -22,18 +31,35 @@ export interface RequestOptions {
   body?: unknown;
 }
 
-/** e instanceof Error check for the "unauthorized (401)" marker (401
- *  suppression: callers skip their error pills when is401(e) — the auth
- *  flow already surfaced it). */
+/** HTTP failure with its status kept separate from presentation text. */
+export class ApiError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+/** A bounded request failure, distinct from HTTP/auth failures. */
+export class ApiTimeoutError extends Error {
+  constructor(path: string) {
+    super("Request timed out after " + REQUEST_TIMEOUT_MS + "ms: " + path);
+    this.name = "ApiTimeoutError";
+  }
+}
+
+/** The auth flow already surfaces 401s in the token gate. */
 export function is401(e: unknown): boolean {
-  return e instanceof Error && e.message.includes("401");
+  return e instanceof ApiError && e.status === 401;
 }
 
 async function readJson(res: Response): Promise<unknown> {
   try {
     return await res.json();
   } catch {
-    throw new Error("HTTP " + res.status + " (unparseable body)");
+    throw new ApiError("HTTP " + res.status + " (unparseable body)", res.status);
   }
 }
 
@@ -45,15 +71,16 @@ async function errorFrom(res: Response): Promise<never> {
   if (body !== null && typeof body === "object" && "error" in body) {
     const err = (body as { error: unknown }).error;
     if (typeof err === "string") {
-      throw new Error(err);
+      throw new ApiError(err, res.status);
     }
   }
-  throw new Error("HTTP " + res.status);
+  throw new ApiError("HTTP " + res.status, res.status);
 }
 
-function rawFetch(path: string, opts: RequestOptions): Promise<Response> {
+function rawFetch(path: string, opts: RequestOptions, signal: AbortSignal): Promise<Response> {
   const headers: Record<string, string> = {};
-  const token = window.sessionStorage.getItem("ou_token");
+  const token = window.sessionStorage.getItem(TOKEN_KEY);
+  const requestAuthGeneration = authGeneration;
   if (token) {
     headers["Authorization"] = "Bearer " + token;
   }
@@ -62,40 +89,77 @@ function rawFetch(path: string, opts: RequestOptions): Promise<Response> {
     headers["Content-Type"] = "application/json";
     init.body = JSON.stringify(opts.body);
   }
+  init.signal = signal;
   return window.fetch(path, init).then((res) => {
+    // A fetch implementation may ignore AbortSignal and settle after the
+    // request deadline. Such a late response must not trigger auth effects.
+    if (signal.aborted) {
+      throw new ApiTimeoutError(path);
+    }
     if (res.status === 401) {
-      window.sessionStorage.removeItem("ou_token");
-      if (onUnauthorized !== null) {
-        onUnauthorized();
+      // A delayed failure from a request made with an older credential must
+      // not erase a replacement token or park an already reauthenticated UI.
+      if (
+        authGeneration === requestAuthGeneration &&
+        window.sessionStorage.getItem(TOKEN_KEY) === token
+      ) {
+        window.sessionStorage.removeItem(TOKEN_KEY);
+        authGeneration += 1;
+        if (onUnauthorized !== null) {
+          onUnauthorized();
+        }
       }
-      throw new Error("unauthorized (401)");
+      throw new ApiError("unauthorized (401)", 401);
     }
     return res;
   });
 }
 
-/** A request whose 2xx body is JSON-decoded into T (the GET endpoints). */
-export async function api<T>(path: string, opts: RequestOptions = {}): Promise<T> {
-  const res = await rawFetch(path, opts);
-  if (!res.ok) {
-    throw await errorFrom(res);
-  }
-  const body = await readJson(res);
-  if (body !== null && typeof body === "object" && "error" in body) {
-    const err = (body as { error: unknown }).error;
-    if (typeof err === "string") {
-      throw new Error(err);
+/** Bound both the network wait and all response processing to one deadline. */
+function withRequestTimeout<T>(path: string, operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const controller = new AbortController();
+  let timeout: number | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timeout = window.setTimeout(() => {
+      // Reject first so an abort-aware fetch/body cannot win the race with an
+      // AbortError and disguise the timeout as a different failure.
+      reject(new ApiTimeoutError(path));
+      controller.abort();
+    }, REQUEST_TIMEOUT_MS);
+  });
+  return Promise.race([operation(controller.signal), deadline]).finally(() => {
+    if (timeout !== undefined) {
+      window.clearTimeout(timeout);
     }
-  }
-  // The wire shape is declared at the call site (T); the JSON is the data.
-  return body as T;
+  });
+}
+
+/** A request whose 2xx body is JSON-decoded into T (the GET endpoints). */
+export function api<T>(path: string, opts: RequestOptions = {}): Promise<T> {
+  return withRequestTimeout(path, async (signal) => {
+    const res = await rawFetch(path, opts, signal);
+    if (!res.ok) {
+      throw await errorFrom(res);
+    }
+    const body = await readJson(res);
+    if (body !== null && typeof body === "object" && "error" in body) {
+      const err = (body as { error: unknown }).error;
+      if (typeof err === "string") {
+        throw new ApiError(err, res.status);
+      }
+    }
+    // The wire shape is declared at the call site (T); the JSON is the data.
+    return body as T;
+  });
 }
 
 /** A status-only request (POST/PATCH/DELETE): the 2xx body is intentionally
  *  NOT parsed — the old console consumed these without getJSON too. */
-export async function request(path: string, opts: RequestOptions = {}): Promise<void> {
-  const res = await rawFetch(path, opts);
-  if (!res.ok) {
-    throw await errorFrom(res);
-  }
+export function request(path: string, opts: RequestOptions = {}): Promise<void> {
+  return withRequestTimeout(path, async (signal) => {
+    const res = await rawFetch(path, opts, signal);
+    if (!res.ok) {
+      throw await errorFrom(res);
+    }
+  });
 }

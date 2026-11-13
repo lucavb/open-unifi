@@ -93,6 +93,7 @@ jobs:
       - name: Build console bundle
         run: |
           npm ci
+          npm run test
           npm run build
         working-directory: web
 

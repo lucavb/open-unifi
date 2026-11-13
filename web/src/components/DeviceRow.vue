@@ -52,5 +52,12 @@ const clients = computed(() => c.clientData[props.row.mac]);
       <button type="button" class="btn-ghost btn-small" @click="c.forget(row)">Forget</button>
     </td>
   </tr>
-  <ClientsPanel v-if="open && clients" :clients="clients" />
+  <ClientsPanel
+    v-if="open"
+    :clients="clients ?? []"
+    :has-data="clients !== undefined"
+    :loading="c.clientLoading[row.mac] ?? false"
+    :error="c.clientRowErrors[row.mac] ?? ''"
+    :mac="row.mac"
+  />
 </template>

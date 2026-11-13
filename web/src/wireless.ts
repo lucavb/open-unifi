@@ -10,6 +10,12 @@ export const SECS: readonly string[] = ["open", "wpa-p", "wpa3-p", "wpa2-wpa3", 
 /** The dynamic-VLAN mode options ("" = off, rendered "dynamic vlan: off"). */
 export const RADIUS_MODES: readonly string[] = ["", "disabled", "optional", "required"];
 
+let rowClientSequence = 0;
+function newRowClientId(): string {
+  rowClientSequence += 1;
+  return "wlan-row-" + rowClientSequence;
+}
+
 /** radiusServersText renders the inline RADIUS profile's auth servers back
  *  into the console's compact text form ("ip" or "ip:port", comma-
  *  separated). A host that itself contains colons (an IPv6 literal) is
@@ -68,8 +74,8 @@ export function validateWlan(w: WlanRowPayload): string {
   if (!w.ssid || w.ssid.length > 32) {
     return "ssid must be 1..32 characters";
   }
-  if (w.vlan < 1 || w.vlan > 4094) {
-    return "vlan must be 1..4094";
+  if (!Number.isInteger(w.vlan) || w.vlan < 1 || w.vlan > 4094) {
+    return "vlan must be a whole number from 1 to 4094";
   }
   if (w.security === "open") {
     if (w.passphrase) {
@@ -107,17 +113,26 @@ export function validateWlan(w: WlanRowPayload): string {
   return "";
 }
 
+/** Parse the editor value without truncating fractional or malformed input. */
+export function parseVlan(value: number | string): number | null {
+  const raw = String(value).trim();
+  if (!/^\d+$/.test(raw)) {
+    return null;
+  }
+  const vlan = Number(raw);
+  return Number.isInteger(vlan) && vlan >= 1 && vlan <= 4094 ? vlan : null;
+}
+
 /** rowFromWlan builds the per-row console state from a WLAN record.
- *  Preserve the accounting fields (§12) of a loaded wpa-eap row through
- *  console saves: the console has no accounting editor yet, but saving
- *  must not silently strip fields the admin API accepted. collectWlans
- *  re-attaches them for wpa-eap rows only — a security flip drops them,
- *  like the disabled radius inputs. radius_das_enabled needs no
- *  preservation: the API rejects it while set, so it can never be part
- *  of a stored row. */
+ *  Keep server-controlled identity/band/DAS fields and the non-editable
+ *  accounting block in the row state so edits do not erase accepted data.
+ *  RADIUS and accounting fields are emitted only for WPA-EAP rows, where
+ *  the API accepts them; a security change therefore cannot send invalid
+ *  fields. */
 export function rowFromWlan(w: Wlan): WlanRowState {
   const sec = SECS.indexOf(w.security) >= 0 ? w.security : "wpa-p";
   const row: WlanRowState = {
+    clientId: newRowClientId(),
     ssid: w.ssid || "",
     name: w.name || "",
     security: sec,
@@ -127,18 +142,19 @@ export function rowFromWlan(w: Wlan): WlanRowState {
     radiusSecret: w.radius_secret || "",
     radiusVlanMode: w.radius_vlan_mode || "",
     enabled: !!w.enabled,
-    acct: null
+    acct: null,
+    preserved: {
+      ...(w.id !== undefined ? { id: w.id } : {}),
+      ...(w.band !== undefined ? { band: w.band } : {}),
+      ...(w.radius_das_enabled !== undefined ? { radius_das_enabled: w.radius_das_enabled } : {})
+    }
   };
-  if (
-    sec === "wpa-eap" &&
-    (w.accounting_enabled || (w.acct_servers && w.acct_servers.length) || w.interim_update_enabled)
-  ) {
-    const acct: WlanAccounting = {
-      accounting_enabled: !!w.accounting_enabled,
-      acct_servers: w.acct_servers || [],
-      interim_update_enabled: !!w.interim_update_enabled
-    };
-    row.acct = acct;
+  if (sec === "wpa-eap") {
+    const acct: WlanAccounting = {};
+    if (w.accounting_enabled !== undefined) acct.accounting_enabled = w.accounting_enabled;
+    if (w.acct_servers !== undefined) acct.acct_servers = w.acct_servers.map((server) => ({ ...server }));
+    if (w.interim_update_enabled !== undefined) acct.interim_update_enabled = w.interim_update_enabled;
+    if (Object.keys(acct).length > 0) row.acct = acct;
   }
   return row;
 }
@@ -159,26 +175,34 @@ export function collectWlans(
   const wlans: WlanRowPayload[] = [];
   let err = "";
   rows.forEach((row, i) => {
+    const vlan = parseVlan(row.vlan);
     const w: WlanRowPayload = {
+      ...(row.preserved.id !== undefined ? { id: row.preserved.id } : {}),
       ssid: String(row.ssid).trim(),
       name: String(row.name).trim(),
       security: row.security,
       passphrase: row.passphrase,
-      vlan: parseInt(String(row.vlan), 10) || 0,
-      enabled: row.enabled
+      // Preserve an invalid value as an invalid sentinel so validateWlan
+      // reports it instead of parseInt silently truncating (e.g. 12.5 → 12).
+      vlan: vlan ?? 0,
+      enabled: row.enabled,
+      ...(row.preserved.band !== undefined ? { band: row.preserved.band } : {})
     };
     if (w.security === "wpa-eap") {
       w.radius_servers = parseRadiusServers(row.radiusServers);
       w.radius_secret = row.radiusSecret;
       w.radius_vlan_mode = row.radiusVlanMode;
+      if (row.preserved.radius_das_enabled !== undefined) {
+        w.radius_das_enabled = row.preserved.radius_das_enabled;
+      }
       // Re-attach preserved accounting fields (see rowFromWlan): the
       // console cannot edit them, but a save must keep what the admin
       // API stored. They ride only wpa-eap rows — the server rejects
       // them on any other security, so a security flip drops them.
       if (row.acct) {
-        w.accounting_enabled = row.acct.accounting_enabled;
-        w.acct_servers = row.acct.acct_servers;
-        w.interim_update_enabled = row.acct.interim_update_enabled;
+        if (row.acct.accounting_enabled !== undefined) w.accounting_enabled = row.acct.accounting_enabled;
+        if (row.acct.acct_servers !== undefined) w.acct_servers = row.acct.acct_servers.map((server) => ({ ...server }));
+        if (row.acct.interim_update_enabled !== undefined) w.interim_update_enabled = row.acct.interim_update_enabled;
       }
     }
     if (!err) {

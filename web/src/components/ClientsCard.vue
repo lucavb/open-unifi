@@ -18,14 +18,23 @@ const c = useConsoleStore();
     </div>
     <div class="scroll" tabindex="0" role="region" aria-label="Clients table">
       <table class="data-table" aria-label="Clients" id="clientRows">
-        <thead><tr><th>Client</th><th>State</th><th>AP</th><th>SSID</th><th>Channel</th><th>Connected</th><th>Last seen</th></tr></thead>
+        <thead><tr><th scope="col">Client</th><th scope="col">State</th><th scope="col">AP</th><th scope="col">SSID</th><th scope="col">Channel</th><th scope="col">Connected</th><th scope="col">Last seen</th></tr></thead>
         <tbody>
           <template v-if="c.filteredClients.length">
             <template v-for="cl in c.filteredClients" :key="cl.mac">
-              <tr class="client-line" :class="{ selected: c.selectedClient === cl.mac }" @click="c.selectClient(cl.mac)">
+              <tr class="client-line" :class="{ selected: c.selectedClient === cl.mac }">
                 <td>
-                  <div>{{ clientName(cl.hostname, cl.mac) }}</div>
-                  <div v-if="cl.hostname" class="mono sub">{{ cl.mac }}</div>
+                  <button
+                    type="button"
+                    class="client-history-toggle"
+                    :aria-expanded="c.selectedClient === cl.mac"
+                    :aria-controls="c.selectedClient === cl.mac ? c.clientHistoryId(cl.mac) : undefined"
+                    :aria-label="(c.selectedClient === cl.mac ? 'Hide AP history for ' : 'Show AP history for ') + clientName(cl.hostname, cl.mac)"
+                    @click="c.selectClient(cl.mac)"
+                  >
+                    <span>{{ clientName(cl.hostname, cl.mac) }}</span>
+                    <span v-if="cl.hostname" class="mono sub client-mac">{{ cl.mac }}</span>
+                  </button>
                 </td>
                 <td>
                   <span v-if="cl.connected" class="badge live">connected</span>
@@ -37,9 +46,12 @@ const c = useConsoleStore();
                 <td>{{ cl.connected ? sinceText(cl.since) : "\u2014" }}</td>
                 <td class="mono">{{ cl.last_seen ? new Date(cl.last_seen * 1000).toLocaleTimeString() : "\u2014" }}</td>
               </tr>
-              <tr v-if="c.selectedClient === cl.mac" class="clients-row">
+              <tr v-if="c.selectedClient === cl.mac" :id="c.clientHistoryId(cl.mac)" class="clients-row">
                 <td colspan="7">
-                  <div v-if="!c.clientHistory" class="empty">loading history&hellip;</div>
+                  <div v-if="c.clientHistoryError" class="empty" role="alert">
+                    {{ c.clientHistoryError }} <button type="button" class="btn-ghost btn-small" @click="c.refreshClientHistory">Try again</button>
+                  </div>
+                  <div v-else-if="!c.clientHistory" class="empty" role="status">Loading history&hellip;</div>
                   <div v-else-if="!c.clientHistory.enabled" class="empty">
                     AP history is off. Start the controller with <code>--client-history</code> (or set
                     <code>OPEN_UNIFI_CLIENT_HISTORY=true</code>) to record which AP this client used over time.

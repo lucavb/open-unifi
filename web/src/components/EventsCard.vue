@@ -20,11 +20,11 @@ const c = useConsoleStore();
     <template v-else>
       <div class="filter-row">
         <input v-model="c.evSearch" type="search" placeholder="Search client, AP, SSID" aria-label="Search events" />
-        <select v-model="c.evKey" aria-label="Event type" @change="c.onEventFilterChange()">
+        <select v-model="c.evKey" name="event_key" aria-label="Event type" @change="c.onEventFilterChange($event)">
           <option value="">All client events</option>
           <option v-for="k in EVENT_KINDS" :key="k.key" :value="k.key">{{ k.label }}</option>
         </select>
-        <select v-model="c.evRange" aria-label="Time range" @change="c.onEventFilterChange()">
+        <select v-model="c.evRange" name="event_range" aria-label="Time range" @change="c.onEventFilterChange($event)">
           <option v-for="r in c.eventRanges" :key="r" :value="r">{{ r }}</option>
         </select>
       </div>

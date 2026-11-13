@@ -236,13 +236,23 @@ export interface DeviceRowState {
 
 /** The §12 accounting block preserved through console saves (wpa-eap rows only). */
 export interface WlanAccounting {
-  accounting_enabled: boolean;
-  acct_servers: RadiusAcctServer[];
-  interim_update_enabled: boolean;
+  accounting_enabled?: boolean;
+  acct_servers?: RadiusAcctServer[];
+  interim_update_enabled?: boolean;
+}
+
+/** Server-controlled WLAN values not directly editable in the console. */
+export interface WlanPreservedFields {
+  id?: string;
+  band?: string;
+  /** The API accepts this only for WPA-EAP rows. */
+  radius_das_enabled?: boolean;
 }
 
 /** Per-WLAN console row: editable field state plus the preserved accounting block. */
 export interface WlanRowState {
+  /** Stable editor identity, never sent to the API. */
+  clientId: string;
   ssid: string;
   name: string;
   security: string;
@@ -256,20 +266,25 @@ export interface WlanRowState {
   enabled: boolean;
   /** null unless a loaded wpa-eap row carried accounting fields. */
   acct: WlanAccounting | null;
+  /** API fields kept intact across edits but not exposed as controls. */
+  preserved: WlanPreservedFields;
 }
 
 /** The wire payload of one WLAN row on save (collectWlans output element). */
 export interface WlanRowPayload {
+  id?: string;
   ssid: string;
   name: string;
   security: string;
   passphrase: string;
   vlan: number;
   enabled: boolean;
+  band?: string;
   radius_servers?: RadiusServer[];
   radius_secret?: string;
   radius_vlan_mode?: string;
   accounting_enabled?: boolean;
   acct_servers?: RadiusAcctServer[];
   interim_update_enabled?: boolean;
+  radius_das_enabled?: boolean;
 }
