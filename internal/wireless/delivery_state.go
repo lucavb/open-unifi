@@ -2,6 +2,7 @@ package wireless
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/lucavb/open-unifi/internal/store"
@@ -42,9 +43,12 @@ type DeliveryState struct {
 	appliedPresent bool
 	appliedRaw     any
 
-	// placements is wlan_cfg_pending_placements decoded (empty when
-	// absent/not a string/not valid JSON).
-	placements map[string]int
+	// placements is wlan_cfg_pending_placements decoded. Presence is tracked
+	// separately because absent metadata is a legacy SSID-only delivery, while
+	// present-but-invalid or empty metadata must not weaken placement proof.
+	placements        map[string]int
+	placementsPresent bool
+	placementsValid   bool
 
 	// attemptSHA/attempts/lastAttempt mirror the typed loads of today's
 	// readers. (wlan_cfg_delivery_status is write-only in the engine: the
@@ -116,10 +120,29 @@ func LoadDeliveryState(extra store.JSONMap) *DeliveryState {
 		st.appliedPresent = true
 		st.appliedRaw = v
 	}
-	if raw, ok := extra[store.WlanCfgPendingPlacementsKey].(string); ok {
-		placements := map[string]int{}
-		_ = json.Unmarshal([]byte(raw), &placements)
-		st.placements = placements
+	if raw, ok := extra[store.WlanCfgPendingPlacementsKey]; ok {
+		st.placementsPresent = true
+		if encoded, isString := raw.(string); isString {
+			var placements map[string]int
+			if err := json.Unmarshal([]byte(encoded), &placements); err == nil && placements != nil {
+				valid := true
+				for key, count := range placements {
+					sep := strings.IndexByte(key, '\x00')
+					// Valid WLAN envelopes have unique SSIDs, so a planned
+					// SSID/radio pair can occur only once. Reject larger counts:
+					// settlement cannot safely infer distinct VAP identities from
+					// row multiplicity alone.
+					if sep <= 0 || sep == len(key)-1 || count != 1 {
+						valid = false
+						break
+					}
+				}
+				if valid {
+					st.placements = placements
+					st.placementsValid = true
+				}
+			}
+		}
 	}
 	if v, ok := extra[store.WlanCfgAttemptShaKey].(string); ok {
 		st.attemptSHA = v
@@ -155,6 +178,28 @@ func LoadDeliveryState(extra store.JSONMap) *DeliveryState {
 	return st
 }
 
+// PendingPlacementsMatch reports whether valid persisted placement metadata
+// exactly matches the current plan. Recovery decisions use this to ensure
+// they are acting on the same positive plan that Settle is waiting to prove.
+func (st *DeliveryState) PendingPlacementsMatch(plan map[string]int) bool {
+	if !st.placementsPresent || !st.placementsValid || len(st.placements) != len(plan) {
+		return false
+	}
+	for key, count := range plan {
+		if st.placements[key] != count {
+			return false
+		}
+	}
+	return true
+}
+
+// PendingPlacementsChanged reports whether present pending placement
+// metadata differs from the current plan. Missing placement metadata remains
+// a legacy SSID-only delivery and is not treated as a known plan change.
+func (st *DeliveryState) PendingPlacementsChanged(plan map[string]int) bool {
+	return st.placementsPresent && !st.PendingPlacementsMatch(plan)
+}
+
 // settle promotes a sent WLAN hash only after the latest inform proves both
 // sides of the change: every desired SSID has RUN VAPs and every previously
 // enabled SSID being removed has disappeared. cfgversion equality is
@@ -177,11 +222,8 @@ func (st *DeliveryState) Settle(cfgversion string) {
 	}
 	desired := st.pendingWlans
 	old := st.oldWlans
-	need := map[string]int{}
-	placements := st.placements
-	if placements == nil {
-		placements = map[string]int{}
-	}
+	desiredSSIDs := map[string]bool{}
+	legacyNeed := map[string]int{}
 	removed := map[string]bool{}
 	for _, w := range old {
 		if w.Enabled && !containsEnabled(desired, SSIDOf(w)) {
@@ -190,8 +232,40 @@ func (st *DeliveryState) Settle(cfgversion string) {
 	}
 	for _, w := range desired {
 		if w.Enabled {
-			need[SSIDOf(w)]++
+			ssid := SSIDOf(w)
+			desiredSSIDs[ssid] = true
+			legacyNeed[ssid]++
 		}
+	}
+	if st.placementsPresent {
+		// Present placement metadata is authoritative. Invalid or empty
+		// metadata cannot silently downgrade an enabled delivery to the
+		// weaker legacy SSID-only proof.
+		if !st.placementsValid || len(st.placements) == 0 && len(desiredSSIDs) > 0 {
+			return
+		}
+		for key := range st.placements {
+			sep := strings.IndexByte(key, '\x00')
+			if sep <= 0 || !desiredSSIDs[key[:sep]] {
+				return
+			}
+		}
+		for ssid := range desiredSSIDs {
+			planned := false
+			for key := range st.placements {
+				if strings.HasPrefix(key, ssid+"\x00") {
+					planned = true
+					break
+				}
+			}
+			if !planned {
+				return
+			}
+		}
+	}
+	remainingPlacements := make(map[string]int, len(st.placements))
+	for key, count := range st.placements {
+		remainingPlacements[key] = count
 	}
 	// The old snapshot is not available as a separate desired/current pair in
 	// the record, so use the current source for positive proof and only require
@@ -209,17 +283,26 @@ func (st *DeliveryState) Settle(cfgversion string) {
 		if removed[ssid] {
 			return
 		}
-		key := ssid + "\x00" + r.Radio
-		if placements[key] > 0 {
-			placements[key]--
-			need[ssid]--
-		} else if need[ssid] > 0 && len(placements) == 0 {
-			need[ssid]--
+		if st.placementsPresent {
+			key := ssid + "\x00" + r.Radio
+			if remainingPlacements[key] > 0 {
+				remainingPlacements[key]--
+			}
+		} else if legacyNeed[ssid] > 0 {
+			legacyNeed[ssid]--
 		}
 	}
-	for _, w := range desired {
-		if w.Enabled && need[SSIDOf(w)] > 0 {
-			return
+	if st.placementsPresent {
+		for _, count := range remainingPlacements {
+			if count > 0 {
+				return
+			}
+		}
+	} else {
+		for _, count := range legacyNeed {
+			if count > 0 {
+				return
+			}
 		}
 	}
 	// A deleted WLAN is settled only when the old VAP is absent. Positive
@@ -247,6 +330,17 @@ func (st *DeliveryState) Settle(cfgversion string) {
 	st.placements = nil
 	st.offeredPresent = false
 	st.offeredCfgversion = ""
+}
+
+// SettleForPlan is Settle with a guard against promoting evidence collected
+// for stale placement metadata after the effective radio plan has changed.
+// Legacy pending records without placement metadata retain their historical
+// SSID-only settlement behavior.
+func (st *DeliveryState) SettleForPlan(cfgversion string, plan map[string]int) {
+	if st.PendingPlacementsChanged(plan) {
+		return
+	}
+	st.Settle(cfgversion)
 }
 
 // NotRunningClass is the settled-state watchdog's three-valued reading of
@@ -433,8 +527,10 @@ func WlanRetryDue(extra store.JSONMap, now time.Time) bool {
 func (st *DeliveryState) Offer(cur string, nowUnix int64, wls []Wlan, placements map[string]int, offeredCfg string) {
 	st.extra[store.WlanCfgPendingShaKey] = cur
 	// Each emitted system_cfg is one bounded delivery attempt. Replacing the
-	// pending hash starts a fresh budget; retrying the same hash increments it.
-	if st.attemptSHA != cur {
+	// pending hash or its effective radio placements starts a fresh budget;
+	// retrying the same plan increments it.
+	placementsChanged := placements != nil && st.PendingPlacementsChanged(placements)
+	if st.attemptSHA != cur || placementsChanged {
 		st.extra[store.WlanCfgAttemptShaKey] = cur
 		st.extra[store.WlanCfgAttemptsKey] = 1
 	} else {

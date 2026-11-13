@@ -1355,6 +1355,10 @@ func TestEnvelopeDriftDeliveryIsBounded(t *testing.T) {
 		Extra: store.JSONMap{
 			"wlan_cfg_sha":           wireless.WlanListHash(base),
 			"wlan_cfg_applied_wlans": string(snap),
+			"radio_table": []any{
+				map[string]any{"name": "wifi0", "radio": "ng"},
+				map[string]any{"name": "wifi1", "radio": "na"},
+			},
 		},
 	}
 	inform := func(now int64) Outcome {
@@ -1799,7 +1803,7 @@ func TestSettleRetiresStaleMaterializationMarker(t *testing.T) {
 		return store.JSONMap{
 			"wlan_cfg_pending_sha":        "pending-hash",
 			"wlan_cfg_pending_wlans":      string(snap),
-			"wlan_cfg_pending_placements": "{}",
+			"wlan_cfg_pending_placements": `{"guest-net\u0000ra0":1,"guest-net\u0000ra1":1}`,
 			"vap_table":                   runTable,
 		}
 	}
@@ -1830,12 +1834,9 @@ func TestSettleRetiresStaleMaterializationMarker(t *testing.T) {
 // pending sha (the non-empty string Offer writes) matching the
 // live envelope and the unchanged-envelope retry NOT yet due, the inform is
 // a noop-pending-wlan before any watchdog runs — no devname miss is
-// recorded, nothing arms. The placements map deliberately carries ONLY the
-// ra1 row, which the harness's partialTable (ath0 RUN at ra0) cannot
-// satisfy: with the literal two-row map the ath0 RUN row would
-// decrement the SSID need to zero and settle would CONFIRM the delivery on
-// this very table — settle re-reads only the SSID need counter, never the
-// leftover placement counts — voiding the pending shape. The retry clock
+// recorded, nothing arms. The exact plan placements include both radios,
+// which the harness's partialTable (ath0 RUN at ra0) cannot satisfy.
+// The retry clock
 // (wlan_cfg_last_attempt = the decide time) keeps the re-offer from
 // diverting the outcome into a setparam.
 func TestVapMaterializationPendingGatedByPendingSHA(t *testing.T) {
@@ -1848,7 +1849,7 @@ func TestVapMaterializationPendingGatedByPendingSHA(t *testing.T) {
 	pending := map[string]any{
 		"wlan_cfg_pending_sha":        wireless.WlanListHash(env),
 		"wlan_cfg_pending_wlans":      dev.Extra["wlan_cfg_applied_wlans"],
-		"wlan_cfg_pending_placements": `{"guest-net\u0000ra1":1}`,
+		"wlan_cfg_pending_placements": `{"guest-net\u0000ra0":1,"guest-net\u0000ra1":1}`,
 		"wlan_cfg_attempts":           1,
 		"wlan_cfg_last_attempt":       int64(1000), // retry not due at the decide time
 	}
@@ -1890,6 +1891,494 @@ func TestVapMaterializationPendingGatedByPendingSHA(t *testing.T) {
 	}
 	if _, ok := out.Extra["wlan_cfg_vap_not_running_misses"]; ok || truthy(out.Extra[FlagRebootOnConnect]) {
 		t.Fatalf("second pending inform disturbed the devname watchdog: %+v", out.Extra)
+	}
+}
+
+// A partial two-radio delivery remains pending under strict settlement, but
+// after all bounded offers are exhausted its positively observed partial
+// runtime state can use the same two-report, cfgversion-guarded materialization
+// reboot as the settled-state watchdog. Missing/sparse evidence and the
+// immediate post-offer report remain inert; a persistent post-reboot gap
+// cannot loop, and only both planned RUN placements settle the delivery.
+func TestPendingPartialDeliveryRecoversAfterRetryBudget(t *testing.T) {
+	e, _, partialTable, runningTable := vapMaterializationHarness(t)
+	env := []wireless.Wlan{{Name: "guest", SSID: "guest-net", Security: "wpa-p", Passphrase: "pw", VLAN: 2, Enabled: true}}
+	old := []wireless.Wlan{{Name: "old", SSID: "old-net", Security: "open", Enabled: true}}
+	oldSnapshot, err := wireless.EncodeStoredWlans(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const key = "11112222333344445555666677778888"
+	dev := store.Device{
+		MAC: engineMAC, State: store.StateAdopted,
+		CfgVersion: "aaaa", AppliedCfg: "aaaa",
+		XAuthkey: key, Authkeys: []string{key}, Model: "U7PG2",
+		Extra: store.JSONMap{
+			"wlan_cfg_sha":           wireless.WlanListHash(old),
+			"wlan_cfg_applied_wlans": string(oldSnapshot),
+			"radio_table": []any{
+				map[string]any{"name": "ra0", "radio": "ng"},
+				map[string]any{"name": "ra1", "radio": "na"},
+			},
+		},
+	}
+	decide := func(now int64) Outcome {
+		t.Helper()
+		out, err := e.Decide(Request{
+			Transport: TransportEncrypted, Device: dev,
+			Body: engineBody(dev.AppliedCfg), UsedKey: dev.XAuthkey,
+			Now: time.Unix(now, 0),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	// A real drift offer persists placements from the same two-radio plan the
+	// engine used to render the full provisioning payload.
+	plan := wireless.PlanProvisioning(dev, env)
+	if len(plan.Placements) != 2 {
+		t.Fatalf("test plan placements = %v, want both radios", plan.Placements)
+	}
+	out := decide(1000)
+	if out.Kind != KindSetparam || !out.FullProvision {
+		t.Fatalf("initial offer = %+v, want full provisioning", out)
+	}
+	applyDeltas(&dev, out)
+	dev.AppliedCfg = dev.CfgVersion // device echoes the offered cfgversion
+	if got := wireless.LoadDeliveryState(dev.Extra); !got.PendingPlacementsMatch(plan.Placements) {
+		t.Fatalf("Offer did not persist the real plan placements: %v", dev.Extra)
+	}
+
+	// A partial report before retry eligibility is not evidence of a failed
+	// materialization: it neither spends watchdog grace nor arms a reboot.
+	dev.Extra["vap_table"] = partialTable
+	out = decide(1001)
+	if out.Kind != KindNoopPendingWLAN || truthy(out.Extra[FlagRebootOnConnect]) {
+		t.Fatalf("immediate partial report = %+v, want pending noop without reboot", out)
+	}
+	if _, ok := out.Extra["wlan_cfg_vap_not_running_misses"]; ok {
+		t.Fatalf("immediate partial report spent watchdog grace: %v", out.Extra["wlan_cfg_vap_not_running_misses"])
+	}
+	applyDeltas(&dev, out)
+
+	// Drive the real retry clock to the bounded cap. Every transmission is
+	// another offer of the same current plan and the partial table cannot
+	// confirm it.
+	for attempt := 2; attempt <= WlanMaxAttempts; attempt++ {
+		last, _ := dev.Extra["wlan_cfg_last_attempt"].(int64)
+		out = decide(last + int64(wireless.WlanRetryMax/time.Second) + 1)
+		if out.Kind != KindSetparam || !out.FullProvision {
+			t.Fatalf("retry %d = %+v, want full provisioning", attempt, out)
+		}
+		applyDeltas(&dev, out)
+		dev.AppliedCfg = dev.CfgVersion
+		got, _ := dev.Extra["wlan_cfg_attempts"].(int)
+		if got != attempt {
+			t.Fatalf("attempt count after retry = %d, want %d", got, attempt)
+		}
+		if attempt < WlanMaxAttempts {
+			if truthy(dev.Extra[FlagRebootOnConnect]) {
+				t.Fatalf("partial report before retry exhaustion armed reboot at attempt %d", attempt)
+			}
+			if _, ok := dev.Extra["wlan_cfg_vap_not_running_misses"]; ok {
+				t.Fatalf("partial report before retry exhaustion spent watchdog grace at attempt %d", attempt)
+			}
+		}
+		if _, confirmed := dev.Extra["wlan_cfg_sha"]; confirmed && dev.Extra["wlan_cfg_sha"] == wireless.WlanListHash(env) {
+			t.Fatalf("partial retry %d incorrectly advanced the baseline", attempt)
+		}
+	}
+
+	// Exhaustion alone is not enough: absent and empty tables are not
+	// materialization evidence and must leave the counter and reboot untouched.
+	for _, table := range []struct {
+		name string
+		set  bool
+		v    any
+	}{{name: "absent"}, {name: "empty", set: true, v: []any{}}} {
+		if table.set {
+			dev.Extra["vap_table"] = table.v
+		} else {
+			delete(dev.Extra, "vap_table")
+		}
+		out = decide(20000)
+		if out.Kind != KindNoopPendingWLAN || truthy(out.Extra[FlagRebootOnConnect]) {
+			t.Fatalf("%s table under exhausted delivery = %+v, want quiet pending noop", table.name, out)
+		}
+		if _, ok := out.Extra["wlan_cfg_vap_not_running_misses"]; ok {
+			t.Fatalf("%s table spent watchdog grace: %v", table.name, out.Extra["wlan_cfg_vap_not_running_misses"])
+		}
+		applyDeltas(&dev, out)
+	}
+
+	// Two consecutive meaningful partial reports preserve the boot-race
+	// grace, then arm one one-shot reboot without confirming the delivery.
+	dev.Extra["vap_table"] = partialTable
+	out = decide(20001)
+	if out.Kind != KindNoopPendingWLAN {
+		t.Fatalf("exhausted partial miss#1 = %+v, want pending noop grace", out)
+	}
+	if n, ok := vapMissCounter(out.Extra); !ok || n != 1 {
+		t.Fatalf("exhausted partial miss#1 counter = %d/%v, want 1", n, ok)
+	}
+	applyDeltas(&dev, out)
+	out = decide(20002)
+	if out.Kind != KindNoop || !truthy(out.Extra[FlagRebootOnConnect]) {
+		t.Fatalf("exhausted partial miss#2 = %+v, want armed noop", out)
+	}
+	if cv, armed := wireless.MaterializationRebootArmedFor(out.Extra); !armed || cv != dev.CfgVersion {
+		t.Fatalf("one-shot marker = %q/%v, want current cfgversion %q", cv, armed, dev.CfgVersion)
+	}
+	if out.Extra["wlan_cfg_sha"] != wireless.WlanListHash(old) || out.Extra["wlan_cfg_pending_sha"] != wireless.WlanListHash(env) {
+		t.Fatalf("arming recovery confirmed or discarded partial delivery: %v", out.Extra)
+	}
+	applyDeltas(&dev, out)
+
+	out = decide(20003)
+	if out.Kind != KindReboot {
+		t.Fatalf("armed pending recovery = %+v, want one-shot reboot", out)
+	}
+	applyDeltas(&dev, out)
+	if dev.Extra["wlan_cfg_pending_sha"] != wireless.WlanListHash(env) || dev.Extra["wlan_cfg_sha"] != wireless.WlanListHash(old) {
+		t.Fatalf("reboot emission changed partial delivery state: %v", dev.Extra)
+	}
+
+	// A persistent post-reboot gap sees the standing cfgversion marker and
+	// cannot arm a second reboot, even across more than the grace window.
+	dev.Extra["vap_table"] = partialTable
+	for i := 0; i < 4; i++ {
+		out = decide(int64(20004 + i))
+		if out.Kind == KindReboot || truthy(out.Extra[FlagRebootOnConnect]) {
+			t.Fatalf("persistent gap re-armed reboot on inform %d: %+v", i+1, out)
+		}
+		if _, ok := vapMissCounter(out.Extra); ok {
+			t.Fatalf("persistent gap re-armed watchdog counter on inform %d: %v", i+1, out.Extra["wlan_cfg_vap_not_running_misses"])
+		}
+		applyDeltas(&dev, out)
+	}
+
+	// Only the complete planned table settles the offered delivery.
+	dev.Extra["vap_table"] = runningTable
+	out = decide(20010)
+	if out.Kind != KindNoop || out.Extra["wlan_cfg_delivery_status"] != "confirmed" {
+		t.Fatalf("complete post-reboot proof = %+v, want settled noop", out)
+	}
+	if out.Extra["wlan_cfg_sha"] != wireless.WlanListHash(env) {
+		t.Fatalf("complete proof baseline = %v, want %q", out.Extra["wlan_cfg_sha"], wireless.WlanListHash(env))
+	}
+	if _, pending := out.Extra["wlan_cfg_pending_sha"]; pending {
+		t.Fatalf("complete proof left delivery pending: %v", out.Extra)
+	}
+}
+
+func TestPendingDeliveryReoffersWhenEffectivePlacementsChange(t *testing.T) {
+	_, dev, decide, _, env := exhaustedPendingRecoveryFixture(t)
+	oldOffer, _ := dev.Extra["wlan_cfg_offered_cfgversion"].(string)
+	dev.Extra["radio_table"] = []any{
+		map[string]any{"name": "ra0", "radio": "ng"},
+		map[string]any{"name": "ra1", "radio": "na", "usage": "uplink", "mode": "managed"},
+	}
+	dev.Extra["vap_table"] = []any{
+		map[string]any{"essid": "guest-net", "state": "RUN", "radio_name": "ra0", "name": "ath0"},
+	}
+	newPlan := wireless.PlanProvisioning(*dev, env)
+	if len(newPlan.Placements) != 1 || newPlan.Placements["guest-net\x00ra0"] != 1 {
+		t.Fatalf("changed plan placements = %v, want guest-net on ra0 only", newPlan.Placements)
+	}
+
+	out := decide(40000)
+	if out.Kind != KindSetparam || !out.FullProvision {
+		t.Fatalf("changed effective placements = %+v, want a bounded fresh full offer", out)
+	}
+	applyDeltas(dev, out)
+	if dev.CfgVersion == oldOffer || out.CfgVersion != dev.CfgVersion {
+		t.Fatalf("placement change cfgversion = %q / %q, want a fresh version from %q", dev.CfgVersion, out.CfgVersion, oldOffer)
+	}
+	if attempts, _ := dev.Extra["wlan_cfg_attempts"].(int); attempts != 1 {
+		t.Fatalf("placement change attempts = %v, want reset budget 1", dev.Extra["wlan_cfg_attempts"])
+	}
+	if state := wireless.LoadDeliveryState(dev.Extra); !state.PendingPlacementsMatch(newPlan.Placements) {
+		t.Fatalf("re-offer did not replace stale placements: %v", dev.Extra["wlan_cfg_pending_placements"])
+	}
+	if dev.Extra["wlan_cfg_sha"] != wireless.WlanListHash([]wireless.Wlan{{Name: "old", SSID: "old-net", Security: "open", Enabled: true}}) {
+		t.Fatalf("stale partial evidence promoted the pending WLAN baseline: %v", dev.Extra["wlan_cfg_sha"])
+	}
+
+	// The newly offered placement is now the retry identity: once the device
+	// acknowledges its cfgversion, matching runtime proof settles without
+	// repeatedly re-offering the changed plan.
+	dev.AppliedCfg = dev.CfgVersion
+	out = decide(40001)
+	if out.Kind != KindNoop {
+		t.Fatalf("acknowledged placement follow-up = %+v, want noop", out)
+	}
+	if out.Extra["wlan_cfg_delivery_status"] != "confirmed" {
+		t.Fatalf("acknowledged placement did not settle: %v", out.Extra["wlan_cfg_delivery_status"])
+	}
+}
+
+func TestPendingMaterializationProofClearsMissDespiteRemovedWLAN(t *testing.T) {
+	_, dev, decide, partialTable, _ := exhaustedPendingRecoveryFixture(t)
+	dev.Extra["wlan_cfg_vap_not_running_misses"] = 1
+	completeWithOld := []any{
+		map[string]any{"essid": "guest-net", "state": "RUN", "radio_name": "ra0", "name": "ath0"},
+		map[string]any{"essid": "guest-net", "state": "RUN", "radio_name": "ra1", "name": "ath1"},
+		map[string]any{"essid": "old-net", "state": "RUN", "radio_name": "ra0", "name": "ath9"},
+	}
+	dev.Extra["vap_table"] = completeWithOld
+	out := decide(41000)
+	if out.Kind != KindNoopPendingWLAN {
+		t.Fatalf("complete desired proof with old WLAN = %+v, want pending noop", out)
+	}
+	if out.Extra["wlan_cfg_pending_sha"] == nil {
+		t.Fatalf("old removed WLAN should keep delivery pending: %v", out.Extra)
+	}
+	if _, ok := out.Extra["wlan_cfg_vap_not_running_misses"]; ok {
+		t.Fatalf("complete desired devname proof did not clear prior miss: %v", out.Extra["wlan_cfg_vap_not_running_misses"])
+	}
+	applyDeltas(dev, out)
+
+	// A subsequent real partial proof starts a new boot-race grace window;
+	// it must not combine with the pre-proof miss to arm a reboot.
+	partialWithOld := append(append([]any(nil), partialTable...), completeWithOld[2])
+	dev.Extra["vap_table"] = partialWithOld
+	out = decide(41001)
+	if out.Kind != KindNoopPendingWLAN || truthy(out.Extra[FlagRebootOnConnect]) {
+		t.Fatalf("partial regression after complete proof = %+v, want one-miss grace", out)
+	}
+	if n, ok := vapMissCounter(out.Extra); !ok || n != 1 {
+		t.Fatalf("partial regression miss counter = %d/%v, want fresh miss 1", n, ok)
+	}
+}
+
+// exhaustedPendingRecoveryFixture creates a real pending delivery through
+// PlanProvisioning, assignedKeyFlow and DeliveryState.Offer, then advances the
+// unchanged retry operation to its bounded cap. The caller controls later
+// cfgversion acknowledgements and can report the partial runtime table.
+func exhaustedPendingRecoveryFixture(t *testing.T) (*Engine, *store.Device, func(int64) Outcome, []any, []wireless.Wlan) {
+	t.Helper()
+	e, _, partialTable, _ := vapMaterializationHarness(t)
+	env := []wireless.Wlan{{Name: "guest", SSID: "guest-net", Security: "wpa-p", Passphrase: "pw", VLAN: 2, Enabled: true}}
+	old := []wireless.Wlan{{Name: "old", SSID: "old-net", Security: "open", Enabled: true}}
+	oldSnapshot, err := wireless.EncodeStoredWlans(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const key = "11112222333344445555666677778888"
+	dev := &store.Device{
+		MAC: engineMAC, State: store.StateAdopted,
+		CfgVersion: "aaaa", AppliedCfg: "aaaa",
+		XAuthkey: key, Authkeys: []string{key}, Model: "U7PG2",
+		Extra: store.JSONMap{
+			"wlan_cfg_sha":           wireless.WlanListHash(old),
+			"wlan_cfg_applied_wlans": string(oldSnapshot),
+			"radio_table": []any{
+				map[string]any{"name": "ra0", "radio": "ng"},
+				map[string]any{"name": "ra1", "radio": "na"},
+			},
+		},
+	}
+	decide := func(now int64) Outcome {
+		t.Helper()
+		out, err := e.Decide(Request{
+			Transport: TransportEncrypted, Device: *dev,
+			Body: engineBody(dev.AppliedCfg), UsedKey: dev.XAuthkey,
+			Now: time.Unix(now, 0),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	plan := wireless.PlanProvisioning(*dev, env)
+	if len(plan.Placements) != 2 {
+		t.Fatalf("test plan placements = %v, want both radios", plan.Placements)
+	}
+	out := decide(1000)
+	if out.Kind != KindSetparam || !out.FullProvision {
+		t.Fatalf("initial offer = %+v, want full provisioning", out)
+	}
+	applyDeltas(dev, out)
+	dev.AppliedCfg = dev.CfgVersion
+	if state := wireless.LoadDeliveryState(dev.Extra); !state.PendingPlacementsMatch(plan.Placements) {
+		t.Fatalf("Offer did not persist real plan placements: %v", dev.Extra)
+	}
+	for attempt := 2; attempt <= WlanMaxAttempts; attempt++ {
+		last, _ := dev.Extra["wlan_cfg_last_attempt"].(int64)
+		out = decide(last + int64(wireless.WlanRetryMax/time.Second) + 1)
+		if out.Kind != KindSetparam || !out.FullProvision {
+			t.Fatalf("retry %d = %+v, want full provisioning", attempt, out)
+		}
+		applyDeltas(dev, out)
+		dev.AppliedCfg = dev.CfgVersion
+	}
+	if attempts, _ := dev.Extra["wlan_cfg_attempts"].(int); attempts != WlanMaxAttempts {
+		t.Fatalf("attempts = %d, want exhausted cap %d", attempts, WlanMaxAttempts)
+	}
+	dev.Extra["vap_table"] = partialTable
+	return e, dev, decide, partialTable, env
+}
+
+func TestPendingRecoveryRequiresAcknowledgedOfferedCfgversion(t *testing.T) {
+	tests := []struct {
+		name          string
+		applied       string
+		removeOffered bool
+	}{
+		{name: "old applied cfgversion", applied: "aaaa"},
+		{name: "empty applied cfgversion", applied: ""},
+		{name: "missing offered cfgversion", removeOffered: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, dev, decide, _, _ := exhaustedPendingRecoveryFixture(t)
+			if tt.removeOffered {
+				delete(dev.Extra, "wlan_cfg_offered_cfgversion")
+			} else {
+				dev.AppliedCfg = tt.applied
+			}
+			// Existing grace is retained, not consumed, until the offer is
+			// explicitly acknowledged by the device.
+			dev.Extra["wlan_cfg_vap_not_running_misses"] = 1
+			for i := 0; i < 2; i++ {
+				out := decide(int64(30000 + i))
+				if out.Kind != KindNoopPendingWLAN {
+					t.Fatalf("partial report %d = %+v, want pending noop", i+1, out)
+				}
+				if truthy(out.Extra[FlagRebootOnConnect]) {
+					t.Fatalf("partial report %d armed reboot without acknowledgement", i+1)
+				}
+				if n, ok := vapMissCounter(out.Extra); !ok || n != 1 {
+					t.Fatalf("partial report %d consumed or cleared grace: %d/%v, want retained 1", i+1, n, ok)
+				}
+				if out.Extra["wlan_cfg_pending_sha"] != wireless.WlanListHash([]wireless.Wlan{{Name: "guest", SSID: "guest-net", Security: "wpa-p", Passphrase: "pw", VLAN: 2, Enabled: true}}) {
+					t.Fatalf("partial report %d changed pending hash: %v", i+1, out.Extra["wlan_cfg_pending_sha"])
+				}
+				applyDeltas(dev, out)
+			}
+		})
+	}
+}
+
+func TestPendingRecoveryOperatorMintReoffersBeforeAcknowledgementGuard(t *testing.T) {
+	_, dev, decide, _, env := exhaustedPendingRecoveryFixture(t)
+	oldOffer, _ := dev.Extra["wlan_cfg_offered_cfgversion"].(string)
+	dev.CfgVersion = "operator-minted-version"
+	dev.Extra["wlan_cfg_vap_not_running_misses"] = 1
+	out := decide(30000)
+	if out.Kind != KindSetparam || !out.FullProvision {
+		t.Fatalf("operator mint = %+v, want existing full-provision re-offer", out)
+	}
+	applyDeltas(dev, out)
+	newOffer, _ := dev.Extra["wlan_cfg_offered_cfgversion"].(string)
+	if newOffer != dev.CfgVersion || newOffer == oldOffer {
+		t.Fatalf("operator re-offer version = %q, want desired %q distinct from previous offer %q", newOffer, dev.CfgVersion, oldOffer)
+	}
+	if attempts, _ := dev.Extra["wlan_cfg_attempts"].(int); attempts != WlanMaxAttempts+1 {
+		t.Fatalf("operator mint did not retain re-offer behavior: attempts=%d", attempts)
+	}
+	if dev.AppliedCfg == newOffer {
+		t.Fatalf("fixture unexpectedly acknowledges operator re-offer %q", newOffer)
+	}
+	for i := 0; i < 2; i++ {
+		out = decide(int64(30001 + i))
+		if out.Kind != KindNoopPendingWLAN || truthy(out.Extra[FlagRebootOnConnect]) {
+			t.Fatalf("unacknowledged operator offer report %d = %+v, want no recovery", i+1, out)
+		}
+		if n, ok := vapMissCounter(out.Extra); !ok || n != 1 {
+			t.Fatalf("unacknowledged operator offer consumed grace: %d/%v, want retained 1", n, ok)
+		}
+		if out.Extra["wlan_cfg_pending_sha"] != wireless.WlanListHash(env) {
+			t.Fatalf("operator re-offer changed pending WLAN hash: %v", out.Extra["wlan_cfg_pending_sha"])
+		}
+		applyDeltas(dev, out)
+	}
+}
+
+func TestPendingRecoveryEmptyOfferedCfgversionCannotArm(t *testing.T) {
+	_, dev, decide, _, env := exhaustedPendingRecoveryFixture(t)
+	dev.Extra["wlan_cfg_offered_cfgversion"] = ""
+	dev.Extra["wlan_cfg_vap_not_running_misses"] = 1
+	dev.AppliedCfg = "aaaa"
+	out := decide(30500)
+	if out.Kind != KindSetparam || !out.FullProvision {
+		t.Fatalf("empty offered version = %+v, want existing operator-style re-offer", out)
+	}
+	applyDeltas(dev, out)
+	offered, _ := dev.Extra["wlan_cfg_offered_cfgversion"].(string)
+	if offered == "" || offered != dev.CfgVersion || dev.AppliedCfg == offered {
+		t.Fatalf("empty-version re-offer bookkeeping = offered %q, desired %q, applied %q", offered, dev.CfgVersion, dev.AppliedCfg)
+	}
+	for i := 0; i < 2; i++ {
+		out = decide(int64(30501 + i))
+		if out.Kind != KindNoopPendingWLAN || truthy(out.Extra[FlagRebootOnConnect]) {
+			t.Fatalf("unacknowledged re-offer report %d = %+v, want no recovery", i+1, out)
+		}
+		if n, ok := vapMissCounter(out.Extra); !ok || n != 1 {
+			t.Fatalf("unacknowledged re-offer consumed grace: %d/%v", n, ok)
+		}
+		if out.Extra["wlan_cfg_pending_sha"] != wireless.WlanListHash(env) {
+			t.Fatalf("re-offer changed pending WLAN hash: %v", out.Extra["wlan_cfg_pending_sha"])
+		}
+		applyDeltas(dev, out)
+	}
+}
+
+func TestPendingRecoveryRequiresDesiredRuntimeAndExactPlan(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*store.Device)
+	}{
+		{
+			name: "unrelated runtime SSID",
+			mutate: func(dev *store.Device) {
+				dev.Extra["vap_table"] = []any{map[string]any{"essid": "other-net", "state": "RUN", "radio_name": "ra0", "name": "ath0"}}
+			},
+		},
+		{
+			name: "changed placement plan",
+			mutate: func(dev *store.Device) {
+				dev.Extra["radio_table"] = []any{
+					map[string]any{"name": "ra0", "radio": "ng"},
+					map[string]any{"name": "ra2", "radio": "na"},
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, dev, decide, _, _ := exhaustedPendingRecoveryFixture(t)
+			dev.Extra["wlan_cfg_vap_not_running_misses"] = 1
+			tt.mutate(dev)
+			if tt.name == "changed placement plan" {
+				out := decide(31000)
+				if out.Kind != KindSetparam || !out.FullProvision || truthy(out.Extra[FlagRebootOnConnect]) {
+					t.Fatalf("changed placement plan = %+v, want fresh offer without recovery reboot", out)
+				}
+				applyDeltas(dev, out)
+				wantPlan := wireless.PlanProvisioning(*dev, []wireless.Wlan{{Name: "guest", SSID: "guest-net", Security: "wpa-p", Passphrase: "pw", VLAN: 2, Enabled: true}})
+				if state := wireless.LoadDeliveryState(dev.Extra); !state.PendingPlacementsMatch(wantPlan.Placements) {
+					t.Fatalf("changed plan did not update pending placements: %v", dev.Extra["wlan_cfg_pending_placements"])
+				}
+				if n, ok := vapMissCounter(dev.Extra); !ok || n != 1 {
+					t.Fatalf("changed plan disturbed the recovery grace counter: %d/%v", n, ok)
+				}
+				return
+			}
+			for i := 0; i < 2; i++ {
+				out := decide(int64(31000 + i))
+				if out.Kind != KindNoopPendingWLAN || truthy(out.Extra[FlagRebootOnConnect]) {
+					t.Fatalf("ineligible recovery report %d = %+v, want quiet pending noop", i+1, out)
+				}
+				if n, ok := vapMissCounter(out.Extra); !ok || n != 1 {
+					t.Fatalf("ineligible recovery consumed grace: %d/%v, want retained 1", n, ok)
+				}
+				applyDeltas(dev, out)
+			}
+		})
 	}
 }
 

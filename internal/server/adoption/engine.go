@@ -550,7 +550,8 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 	// version is read BEFORE any mint this decision might make (an operator
 	// or drift mint below concerns the NEXT operation, not the config the
 	// pending bookkeeping was written under).
-	st.Settle(d.CfgVersion)
+	placementDrift := st.PendingPlacementsChanged(plan.Placements)
+	st.SettleForPlan(d.CfgVersion, plan.Placements)
 	wlanDrift := false
 	if st.Baseline() != "" {
 		if cur := plan.DriftHash; cur != st.Baseline() {
@@ -609,8 +610,31 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 		// predates the offered bookkeeping keep the hold-at-gate behavior.
 		offered, offeredPresent := st.OfferedCfgversion()
 		operatorMint := offeredPresent && d.CfgVersion != offered
-		if !blockedDrift && !operatorMint && st.PendingHash() == plan.DriftHash && !st.RetryDue(now) {
-			return e.noopFor(d, now, req.PrevNoopTarget, KindNoopPendingWLAN), nil
+		if st.PendingHash() == plan.DriftHash && placementDrift && !operatorMint {
+			// Effective placements are part of the delivery operation even
+			// though the WLAN envelope hash intentionally excludes the current
+			// radio plan. Re-offer the same envelope under a fresh cfgversion;
+			// Offer resets the bounded budget for the changed plan.
+			nv, kerr := e.keyChars(16)
+			if kerr != nil {
+				return Outcome{}, kerr
+			}
+			d.CfgVersion = nv
+		}
+		if !blockedDrift && !operatorMint && !placementDrift && st.PendingHash() == plan.DriftHash {
+			if !st.RetryDue(now) {
+				// Strict placement settlement can leave a partially materialized
+				// delivery pending forever at the retry cap. Reuse the existing
+				// two-inform devname watchdog only after exhaustion, and only when
+				// this inform positively shows every desired SSID running while a
+				// planned VAP is still absent. Sparse/empty reports and the initial
+				// retry grace remain inert; the pending delivery is never confirmed
+				// by this recovery path.
+				if st.Attempts() >= wireless.WlanMaxAttempts && e.pendingMaterializationRecovery(st, d, wls, plan) {
+					return e.noopFor(d, now, req.PrevNoopTarget, KindNoop), nil
+				}
+				return e.noopFor(d, now, req.PrevNoopTarget, KindNoopPendingWLAN), nil
+			}
 		}
 		wlanDrift = true
 	}
@@ -812,6 +836,63 @@ func (e *Engine) decideEncrypted(req Request, wls []wireless.Wlan, plan wireless
 		e.lg.Debug("inform: full provisioning", "mac", d.MAC, "ours", d.CfgVersion, "device", d.AppliedCfg)
 		return out, nil
 	}
+}
+
+// pendingMaterializationRecovery is the exhausted-delivery counterpart of
+// the settled-state devname watchdog. It only arms for a real partial plan:
+// the table must be non-empty, all enabled desired SSIDs must be RUN, the
+// exact persisted placements must still match this plan, and at least one
+// planned VAP devname must be absent. It shares the settled watchdog's
+// consecutive-miss grace, one-shot cfgversion marker, and no-loop guard.
+func (e *Engine) pendingMaterializationRecovery(st *wireless.DeliveryState, d *store.Device, wls []wireless.Wlan, plan wireless.ProvisioningPlan) bool {
+	offered, offeredPresent := st.OfferedCfgversion()
+	if !offeredPresent || offered == "" || d.CfgVersion == "" || d.CfgVersion != offered || d.AppliedCfg != offered {
+		return false
+	}
+	ev := wireless.ReadVapEvidence(d.Extra["vap_table"])
+	if !ev.Known() || !st.PendingPlacementsMatch(plan.Placements) || len(plan.Vaps) == 0 {
+		return false
+	}
+	hasEnabled := false
+	for _, w := range wls {
+		if !w.Enabled {
+			continue
+		}
+		hasEnabled = true
+		if !ev.SSIDRunning(wireless.SSIDOf(w)) {
+			return false
+		}
+	}
+	if !hasEnabled {
+		return false
+	}
+	missing := wireless.MissingVaps(plan.Vaps, d.Extra["vap_table"])
+	if len(missing) == 0 {
+		// A complete desired devname proof closes any prior materialization
+		// miss window even if a removed WLAN is still running and therefore
+		// keeps strict delivery settlement pending. Unknown or partial evidence
+		// remains inert.
+		st.ClearVapNotRunningMisses()
+		wireless.ClearMaterializationReboot(d.Extra)
+		return false
+	}
+	if truthy(d.Extra[FlagRebootOnConnect]) {
+		return false
+	}
+	armedCV, armed := wireless.MaterializationRebootArmedFor(d.Extra)
+	if armed && armedCV == d.CfgVersion {
+		st.ClearVapNotRunningMisses()
+		return false
+	}
+	if misses := st.RecordVapNotRunningMiss(); misses < 2 {
+		e.lg.Debug("inform: pending planned vap not running (miss 1 of 2, boot-race grace)", "mac", d.MAC)
+		return false
+	}
+	st.ClearVapNotRunningMisses()
+	d.Extra[FlagRebootOnConnect] = true
+	wireless.SetMaterializationRebootArmed(d.Extra, d.CfgVersion)
+	e.lg.Info("inform: exhausted pending WLAN has a persistent planned-vap gap, arming materialization reboot", "mac", d.MAC)
+	return true
 }
 
 // decidePlain treats plaintext key claims as assertions, not authenticators.

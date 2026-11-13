@@ -188,6 +188,142 @@ func TestDeliveryStateRetryBudget(t *testing.T) {
 	}
 }
 
+func TestSettleRequiresPlannedPlacements(t *testing.T) {
+	dual := []Wlan{{Name: "corp", SSID: "corpnet", Enabled: true}}
+	single := []Wlan{{Name: "corp", SSID: "corpnet", Band: "5g", Enabled: true}}
+	placements := `{"corpnet\u0000wifi0":1,"corpnet\u0000wifi1":1}`
+	row := func(radio string) any {
+		return map[string]any{"essid": "corpnet", "state": "RUN", "radio_name": radio}
+	}
+	tests := []struct {
+		name        string
+		wlan        []Wlan
+		placement   *string
+		vaps        []any
+		wantSettled bool
+	}{
+		{name: "dual-band partial", wlan: dual, placement: &placements, vaps: []any{row("wifi0")}},
+		{name: "dual-band complete", wlan: dual, placement: &placements, vaps: []any{row("wifi0"), row("wifi1")}, wantSettled: true},
+		{name: "duplicate does not replace missing radio", wlan: dual, placement: &placements, vaps: []any{row("wifi0"), row("wifi0")}},
+		{name: "count two duplicate VAP identity rejected", wlan: dual, placement: stringPtr(`{"corpnet\u0000wifi0":2}`), vaps: []any{
+			map[string]any{"essid": "corpnet", "state": "RUN", "radio_name": "wifi0", "name": "ath0"},
+			map[string]any{"essid": "corpnet", "state": "RUN", "radio_name": "wifi0", "name": "ath0"},
+		}},
+		{name: "wrong radio", wlan: dual, placement: &placements, vaps: []any{row("other")}},
+		{name: "single-band placement", wlan: single, placement: stringPtr(`{"corpnet\u0000wifi1":1}`), vaps: []any{row("wifi1")}, wantSettled: true},
+		{name: "legacy metadata uses SSID fallback", wlan: dual, placement: nil, vaps: []any{row("unexpected")}, wantSettled: true},
+		{name: "malformed metadata fails closed", wlan: dual, placement: stringPtr(`not-json`), vaps: []any{row("wifi0"), row("wifi1")}},
+		{name: "empty metadata fails closed for enabled WLAN", wlan: dual, placement: stringPtr(`{}`), vaps: []any{row("wifi0"), row("wifi1")}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			extra := settlementExtra(t, tt.wlan, tt.placement, tt.vaps, nil)
+			beforePlacements := extra[store.WlanCfgPendingPlacementsKey]
+			st := LoadDeliveryState(extra)
+			var originalPlacements map[string]int
+			if st.placements != nil {
+				originalPlacements = make(map[string]int, len(st.placements))
+				for k, v := range st.placements {
+					originalPlacements[k] = v
+				}
+			}
+			st.Settle("cv1")
+			settled := extra[store.WlanCfgDeliveryStatusKey] == "confirmed"
+			if settled != tt.wantSettled {
+				t.Fatalf("settled = %v, want %v; extra=%v", settled, tt.wantSettled, extra)
+			}
+			if !settled {
+				if got := extra[store.WlanCfgPendingPlacementsKey]; got != beforePlacements {
+					t.Fatalf("failed settle mutated persisted placements: got %v, want %v", got, beforePlacements)
+				}
+				if !reflect.DeepEqual(st.placements, originalPlacements) {
+					t.Fatalf("failed settle mutated loaded placements: got %v, want %v", st.placements, originalPlacements)
+				}
+			}
+		})
+	}
+}
+
+func TestSettleRejectsMalformedPlacementMetadata(t *testing.T) {
+	desired := []Wlan{{Name: "corp", SSID: "corpnet", Enabled: true}}
+	completeTable := []any{
+		map[string]any{"essid": "corpnet", "state": "RUN", "radio_name": "wifi0"},
+		map[string]any{"essid": "corpnet", "state": "RUN", "radio_name": "wifi1"},
+	}
+	tests := []struct {
+		name  string
+		value any
+	}{
+		{name: "non-string metadata", value: 7},
+		{name: "json null", value: `null`},
+		{name: "array shape", value: `[]`},
+		{name: "zero count", value: `{"corpnet\u0000wifi0":0}`},
+		{name: "negative count", value: `{"corpnet\u0000wifi0":-1}`},
+		{name: "missing delimiter", value: `{"corpnet":1}`},
+		{name: "empty radio", value: `{"corpnet\u0000":1}`},
+		{name: "missing desired SSID", value: `{"other\u0000wifi0":1}`},
+		{name: "extraneous SSID", value: `{"corpnet\u0000wifi0":1,"other\u0000wifi1":1}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			extra := settlementExtra(t, desired, nil, completeTable, nil)
+			extra[store.WlanCfgPendingPlacementsKey] = tt.value
+			LoadDeliveryState(extra).Settle("cv1")
+			if extra[store.WlanCfgDeliveryStatusKey] == "confirmed" || extra[store.WlanCfgPendingShaKey] != "pending-hash" {
+				t.Fatalf("malformed placement metadata settled the delivery: %v", extra)
+			}
+		})
+	}
+}
+
+func TestSettleRemovalRequiresEvidenceAndAllowsNoPlacements(t *testing.T) {
+	removed := []Wlan{{SSID: "oldnet", Enabled: true}}
+	emptyPlacements := stringPtr(`{}`)
+	tests := []struct {
+		name        string
+		vaps        any
+		wantSettled bool
+	}{
+		{name: "removed WLAN still running", vaps: []any{map[string]any{"essid": "oldnet", "state": "RUN", "radio_name": "wifi0"}}},
+		{name: "absent table is not evidence", vaps: nil},
+		{name: "present empty table proves removal", vaps: []any{}, wantSettled: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			extra := settlementExtra(t, nil, emptyPlacements, tt.vaps, removed)
+			LoadDeliveryState(extra).Settle("cv1")
+			settled := extra[store.WlanCfgDeliveryStatusKey] == "confirmed"
+			if settled != tt.wantSettled {
+				t.Fatalf("settled = %v, want %v; extra=%v", settled, tt.wantSettled, extra)
+			}
+		})
+	}
+}
+
+func settlementExtra(t *testing.T, desired []Wlan, placements *string, vaps any, old []Wlan) store.JSONMap {
+	t.Helper()
+	desiredJSON, err := EncodeStoredWlans(desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldJSON, err := EncodeStoredWlans(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extra := store.JSONMap{
+		store.WlanCfgPendingShaKey:      "pending-hash",
+		store.WlanCfgPendingWlansKey:    string(desiredJSON),
+		store.WlanCfgPendingOldWlansKey: string(oldJSON),
+		"vap_table":                     vaps,
+	}
+	if placements != nil {
+		extra[store.WlanCfgPendingPlacementsKey] = *placements
+	}
+	return extra
+}
+
+func stringPtr(s string) *string { return &s }
+
 func TestRuntimeInSync(t *testing.T) {
 	run := func(ssid string) []any {
 		return []any{map[string]any{"essid": ssid, "state": "RUN"}}
