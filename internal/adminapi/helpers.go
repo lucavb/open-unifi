@@ -54,13 +54,17 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+const maxJSONBodyBytes = 1 << 20 // 1 MiB — caps admin JSON decode cost
+
 // readJSON decodes a request body strictly: JSON well-formedness, a
 // bounded size, NO unknown fields (typo'd or tampered clients must not
 // silently drop inputs — fail loud), and NO trailing data after the top
-// level value (trailing bytes are never accidental).
-func readJSON(r *http.Request, v any) error {
+// level value (trailing bytes are never accidental). w is passed to
+// http.MaxBytesReader so oversized bodies return 413 before buffering the
+// whole payload.
+func readJSON(w http.ResponseWriter, r *http.Request, v any) error {
 	defer func() { _ = r.Body.Close() }()
-	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBodyBytes))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
 		return err
@@ -71,6 +75,26 @@ func readJSON(r *http.Request, v any) error {
 		return fmt.Errorf("unexpected trailing data after JSON value: %w", err)
 	}
 	return nil
+}
+
+// writeJSONDecodeError maps readJSON failures to the canonical JSON error
+// body. Oversized bodies use 413; all other decode failures use 400.
+// detailPrefix, when non-empty, is prepended to the error text on 400
+// responses (e.g. "invalid JSON body: ").
+func writeJSONDecodeError(w http.ResponseWriter, err error, detailPrefix string) {
+	if isRequestBodyTooLarge(err) {
+		writeErr(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
+	msg := "invalid JSON body"
+	if detailPrefix != "" {
+		msg = detailPrefix + err.Error()
+	}
+	writeErr(w, http.StatusBadRequest, msg)
+}
+
+func isRequestBodyTooLarge(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "request body too large")
 }
 
 type devicesEnvelope struct {
@@ -364,7 +388,7 @@ func ValidateCmdString(cmd string) string {
 }
 
 // validateWlan enforces server-side rules. The web console mirrors the
-// length/security rules client-side (see static/index.html validateWlan);
+// length/security rules client-side (see web/src/wireless.ts validateWlan);
 // the control-character and ID-charset checks are deliberately
 // server-side-only defense-in-depth: control chars in SSID/Name/Passphrase
 // (or separators in an ID) could inject extra system_cfg rows at emission
