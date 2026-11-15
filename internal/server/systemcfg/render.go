@@ -106,10 +106,9 @@ func (rd *render) lineWriter(b *strings.Builder, where string) func(k, v string)
 // answer the inform with the noop path instead of persisting/shipping
 // partial config.
 //
-// TODO(wireless): see docs/PROTOCOL-systemcfg-wireless.md when it lands —
-// the wireless/aaa.<n>, vlan/bridge/netconf, qos/bandsteering, syslog, snmp
-// and cron/ntp sections from the real int builder are pending
-// reverse-engineering and must NOT be invented here.
+// Wireless/aaa and vlan/bridge/netconf coverage lives in
+// docs/PROTOCOL-systemcfg-wireless.md and the wireless renderer;
+// qos/bandsteering and snmp remain uncited and must NOT be invented here.
 func Render(d store.Device, facts SiteFacts) (Result, error) {
 	return RenderWithPlan(d, facts, wireless.PlanProvisioning(d, facts.WLANs))
 }
