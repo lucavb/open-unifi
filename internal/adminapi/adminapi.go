@@ -565,8 +565,8 @@ func New(cfg Config, be Backend) http.Handler {
 	}))
 	mux.HandleFunc("POST /api/v1/devices", requireToken(cfg, func(w http.ResponseWriter, r *http.Request) {
 		var up DeviceUpsert
-		if err := readJSON(r, &up); err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		if err := readJSON(w, r, &up); err != nil {
+			writeJSONDecodeError(w, err, "")
 			return
 		}
 		mac, err := normalizeMAC(up.MAC)
@@ -618,8 +618,8 @@ func New(cfg Config, be Backend) http.Handler {
 			return
 		}
 		var patch DevicePatch
-		if err := readJSON(r, &patch); err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		if err := readJSON(w, r, &patch); err != nil {
+			writeJSONDecodeError(w, err, "")
 			return
 		}
 		if patch.SiteID != nil {
@@ -717,8 +717,8 @@ func New(cfg Config, be Backend) http.Handler {
 			return
 		}
 		var req cmdTaskRequest
-		if err := readJSON(r, &req); err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		if err := readJSON(w, r, &req); err != nil {
+			writeJSONDecodeError(w, err, "")
 			return
 		}
 		if msg := ValidateCmdString(req.Cmd); msg != "" {
@@ -758,8 +758,8 @@ func New(cfg Config, be Backend) http.Handler {
 			return
 		}
 		var req blockClientRequest
-		if err := readJSON(r, &req); err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		if err := readJSON(w, r, &req); err != nil {
+			writeJSONDecodeError(w, err, "")
 			return
 		}
 		client, err := normalizeMAC(req.MAC)
@@ -877,8 +877,8 @@ func New(cfg Config, be Backend) http.Handler {
 			return
 		}
 		var up RadioIntentUpsert
-		if err := readJSON(r, &up); err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		if err := readJSON(w, r, &up); err != nil {
+			writeJSONDecodeError(w, err, "invalid JSON body: ")
 			return
 		}
 		view, err := be.PutDeviceRadioIntent(r.Context(), mac, radio, up)
@@ -953,8 +953,8 @@ func New(cfg Config, be Backend) http.Handler {
 			return
 		}
 		var env WlansEnvelope
-		if err := readJSON(r, &env); err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		if err := readJSON(w, r, &env); err != nil {
+			writeJSONDecodeError(w, err, "")
 			return
 		}
 		for i := range env.Wlans {
@@ -976,8 +976,8 @@ func New(cfg Config, be Backend) http.Handler {
 			return
 		}
 		var wlan Wlan
-		if err := readJSON(r, &wlan); err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		if err := readJSON(w, r, &wlan); err != nil {
+			writeJSONDecodeError(w, err, "")
 			return
 		}
 		if msg := ValidateWlanName(wlan.Name); msg != "" {
@@ -1025,8 +1025,8 @@ func New(cfg Config, be Backend) http.Handler {
 			return
 		}
 		var wlan Wlan
-		if err := readJSON(r, &wlan); err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		if err := readJSON(w, r, &wlan); err != nil {
+			writeJSONDecodeError(w, err, "")
 			return
 		}
 		if wlan.Name != "" && wlan.Name != name {

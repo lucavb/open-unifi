@@ -1323,6 +1323,13 @@ func TestWirelessNameCapAndBodyStrictness(t *testing.T) {
 		t.Fatalf("unknown envelope field: %d, want 400", rec.Code)
 	}
 
+	// Bodies over 1 MiB must be rejected before full buffering.
+	oversized := `{"wlans":[{"ssid":"x","security":"open","vlan":1,"name":"` + strings.Repeat("a", maxJSONBodyBytes) + `"}]}`
+	rec = putDeviceWireless(t, h, oversized)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized body: %d %q, want 413", rec.Code, rec.Body.String())
+	}
+
 	// Trailing data after the JSON value must be rejected.
 	rec = putDeviceWireless(t, h, `{"wlans":[]} trail`)
 	if rec.Code != http.StatusBadRequest {
