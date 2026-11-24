@@ -69,13 +69,13 @@ export function parseRadiusServers(text: string): RadiusServer[] {
  *  verbatim (the admin API answers with the same words). */
 export function validateWlan(w: WlanRowPayload): string {
   if (SECS.indexOf(w.security) < 0) {
-    return "bad security";
+    return "security must be one of open, wpa-p, wpa3-p, wpa2-wpa3, wpa-eap";
   }
   if (!w.ssid || w.ssid.length > 32) {
-    return "ssid must be 1..32 characters";
+    return "ssid length must be 1..32";
   }
   if (!Number.isInteger(w.vlan) || w.vlan < 1 || w.vlan > 4094) {
-    return "vlan must be a whole number from 1 to 4094";
+    return "vlan must be 1..4094";
   }
   if (w.security === "open") {
     if (w.passphrase) {
@@ -85,30 +85,30 @@ export function validateWlan(w: WlanRowPayload): string {
   }
   if (w.security === "wpa-eap") {
     if (!w.radius_servers || !w.radius_servers.length) {
-      return "wpa-eap requires at least one RADIUS server (" + w.ssid + ")";
+      return "wpa-eap requires at least one RADIUS server (radius_servers)";
     }
     if (w.radius_servers.length > 4) {
-      return "radius_servers supports at most 4 entries (" + w.ssid + ")";
+      return "radius_servers supports at most 4 entries";
     }
     for (let i = 0; i < w.radius_servers.length; i++) {
       const srv = w.radius_servers[i];
       if (!srv.ip) {
-        return "radius_servers[" + i + "].ip must not be empty (" + w.ssid + ")";
+        return "radius_servers[" + i + "].ip must not be empty";
       }
       if (srv.port && (srv.port < 1 || srv.port > 65535)) {
-        return "radius_servers[" + i + "].port must be 1..65535 (" + w.ssid + ")";
+        return "radius_servers[" + i + "].port must be 1..65535 (0 = the 1812 default)";
       }
     }
     if (!w.radius_secret) {
-      return "wpa-eap requires a RADIUS shared secret (" + w.ssid + ")";
+      return "wpa-eap requires a RADIUS shared secret (radius_secret)";
     }
     if (w.passphrase && w.passphrase.length < 8) {
-      return "passphrase must be at least 8 characters (" + w.ssid + ")";
+      return "passphrase must be at least 8 characters when security is " + w.security;
     }
     return "";
   }
   if (w.passphrase.length < 8) {
-    return "passphrase must be at least 8 characters (" + w.ssid + ")";
+    return "passphrase must be at least 8 characters when security is " + w.security;
   }
   return "";
 }
